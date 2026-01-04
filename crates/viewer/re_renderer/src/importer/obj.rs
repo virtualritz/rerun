@@ -94,6 +94,7 @@ pub fn load_obj_from_buffer(
                 index_range: 0..mesh.indices.len() as u32,
                 albedo: texture.clone(),
                 albedo_factor: crate::Rgba::WHITE,
+                use_matcap: false,
             }],
         };
 

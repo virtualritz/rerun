@@ -11,16 +11,17 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 include = [
-  "../../Cargo.lock",
-  "../../LICENSE-APACHE",
-  "../../LICENSE-MIT",
-  "**/*.rs",
-  "Cargo.toml",
-  "shader/*",
+    "../../Cargo.lock",
+    "../../LICENSE-APACHE",
+    "../../LICENSE-MIT",
+    "**/*.rs",
+    "Cargo.toml",
+    "shader/*",
 ]
 
-[lints]
-workspace = true
+# native
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+notify.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true
@@ -28,15 +29,19 @@ targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
 
 [package.metadata.cargo-shear]
 ignored = [
-  "profiling", # Needed to hook up wgpu, see below at dependency setup.
-  "js-sys", # Needed for wasm builds
-  "getrandom",
-  "wasm-bindgen",
+    "profiling",
+    # Needed to hook up wgpu, see below at dependency setup.
+    "js-sys",
+    # Needed for wasm builds
+    "getrandom",
+    "wasm-bindgen",
 ]
 
-
 [features]
-default = ["import-obj", "import-gltf", "import-stl"]
+default = ["import-obj", "import-gltf", "import-stl", "video"]
+
+## Enable memory sizing helpers.
+memory-stats = ["dep:re_byte_size"]
 
 ## Support importing .obj files
 import-obj = ["dep:tobj"]
@@ -47,16 +52,31 @@ import-gltf = ["dep:gltf"]
 ## Support importing binary & ascii .stl files
 import-stl = ["dep:stl_io"]
 
+## Enable video decoding/playback.
+video = ["dep:re_video"]
+
 ## Enable (de)serialization using serde.
 serde = ["dep:serde"]
 
+# web
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = [
+  "wasm_js",
+] } # getrandom needs the `js` feature to be enabled. It is dragged in indirectly.
+js-sys.workspace = true
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+web-sys.workspace = true
+
 [dependencies]
-re_byte_size.workspace = true
+# Rerun
+re_byte_size = { workspace = true, optional = true }
 re_error.workspace = true
 re_log.workspace = true
 re_tracing.workspace = true
-re_video = { workspace = true, default-features = true }
+re_video = { workspace = true, default-features = true, optional = true }
 
+# External
 ahash.workspace = true
 anyhow.workspace = true
 bitflags.workspace = true
@@ -84,31 +104,11 @@ type-map.workspace = true
 web-time.workspace = true
 wgpu.workspace = true
 
-# optional
+# External (optional)
 gltf = { workspace = true, optional = true }
-stl_io = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"], optional = true }
+stl_io = { workspace = true, optional = true }
 tobj = { workspace = true, optional = true }
-
-# native
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-notify.workspace = true
-
-# web
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { workspace = true, features = [
-  "wasm_js",
-] } # getrandom needs the `js` feature to be enabled. It is dragged in indirectly.
-js-sys.workspace = true
-wasm-bindgen-futures.workspace = true
-web-sys.workspace = true
-wasm-bindgen.workspace = true
-
-
-[dev-dependencies]
-re_log = { workspace = true, features = ["setup"] }
-pollster.workspace = true
-unindent.workspace = true
 
 # For build.rs:
 [build-dependencies]
@@ -121,3 +121,14 @@ cfg_aliases.workspace = true
 clean-path.workspace = true
 pathdiff.workspace = true
 walkdir.workspace = true
+
+[dev-dependencies]
+# Rerun
+re_log = { workspace = true, features = ["setup"] }
+
+# External
+pollster.workspace = true
+unindent.workspace = true
+
+[lints]
+workspace = true

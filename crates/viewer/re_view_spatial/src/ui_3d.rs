@@ -478,6 +478,7 @@ impl SpatialView3D {
                 plane: plane.into(),
                 spacing,
                 thickness_ui,
+                camera_radius: 0.0, // Use default behavior (height above plane)
             },
         )))
     }

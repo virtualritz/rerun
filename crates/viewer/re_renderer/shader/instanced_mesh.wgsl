@@ -14,6 +14,7 @@ const FORMAT_GRAYSCALE: u32 = 1;
 struct MaterialUniformBuffer {
     albedo_factor: vec4f,
     texture_format: u32,
+    use_matcap: u32,
 };
 
 @group(1) @binding(1)
@@ -71,42 +72,36 @@ fn vs_main(in_vertex: VertexIn, in_instance: InstanceIn) -> VertexOut {
 
 @fragment
 fn fs_main_shaded(in: VertexOut) -> @location(0) vec4f {
-    let sample = textureSample(albedo_texture, trilinear_sampler_repeat, in.texcoord);
-    var texture: vec3f;
-    switch material.texture_format {
-        case FORMAT_RGBA: { texture = linear_from_srgb(sample.rgb); }
-        case FORMAT_GRAYSCALE: { texture = linear_from_srgb(sample.rrr); }
-        default: { texture = vec3f(0.0); }
-    }
+    // Always use matcap shading. Fallback to +Z if a normal is missing.
+    let has_normal = any(in.normal_world_space != vec3f(0.0, 0.0, 0.0));
+    let normal_world = normalize(select(
+        vec3f(0.0, 0.0, 1.0),
+        in.normal_world_space,
+        vec3<bool>(has_normal, has_normal, has_normal),
+    ));
 
-    // TODO(andreas): We could just pass on vertex & texture alpha here and make use of it.
-    // However, we currently don't have the detection code on the CPU side to flag such meshes as transparent.
-    // Therefore, using alpha here would mean that you get it surprise-enabled once you change the tint & albedo factor.
-    // To avoid that, we simply ignore it for now.
-    var albedo = vec4f(texture * in.color, 1.0) * material.albedo_factor;
+    // view_from_world is a mat4x3f, so extract the 3x3 rotation part.
+    let view_normal = normalize(vec3f(
+        dot(vec3f(frame.view_from_world[0].x, frame.view_from_world[1].x, frame.view_from_world[2].x), normal_world),
+        dot(vec3f(frame.view_from_world[0].y, frame.view_from_world[1].y, frame.view_from_world[2].y), normal_world),
+        dot(vec3f(frame.view_from_world[0].z, frame.view_from_world[1].z, frame.view_from_world[2].z), normal_world)
+    ));
 
-    // The additive tint linear space with unmultiplied/separate (!!) alpha.
-    albedo += vec4f(in.additive_tint_rgba.rgb, 0.0);
-    albedo *= in.additive_tint_rgba.a;
+    // Map view-space normal XY from [-1,1] to [0,1] for texture lookup.
+    let matcap_uv = view_normal.xy * 0.5 + 0.5;
 
-    if all(in.normal_world_space == vec3f(0.0, 0.0, 0.0)) {
-        // no normal, no shading
-        return albedo;
-    } else {
-        let normal = normalize(in.normal_world_space);
+    // Sample matcap texture (passed as albedo_texture).
+    let matcap_sample = textureSample(albedo_texture, trilinear_sampler_repeat, matcap_uv);
+    var matcap_color = linear_from_srgb(matcap_sample.rgb);
 
-        var shading = 0.2;
+    // Apply albedo factor for tinting.
+    matcap_color *= material.albedo_factor.rgb;
 
-        // We use two lights so we get shading on all sides
-        shading += 1.0 * clamp(dot(normalize(vec3f(1.0, 2.0, 3.0)), normal), 0.0, 1.0);
-        shading += 0.5 * clamp(dot(normalize(vec3f(-1.0, -3.0, -5.0)), normal), 0.0, 1.0);
+    // Apply additive tint.
+    matcap_color += in.additive_tint_rgba.rgb;
+    matcap_color *= in.additive_tint_rgba.a;
 
-        shading = clamp(shading, 0.0, 1.0);
-
-        let radiance = albedo.rgb * shading;
-
-        return vec4f(radiance, albedo.a);
-    }
+    return vec4f(matcap_color, matcap_sample.a);
 }
 
 @fragment

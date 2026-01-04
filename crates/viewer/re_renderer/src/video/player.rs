@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+#[cfg(feature = "memory-stats")]
+use re_byte_size::SizeBytes;
 use re_video::{
     DecodeSettings, FrameInfo, GopIndex, SampleIndex, StableIndexDeque, Time, VideoDeliveryMethod,
 };
@@ -111,7 +113,8 @@ pub struct VideoPlayer {
     config: PlayerConfiguration,
 }
 
-impl re_byte_size::SizeBytes for VideoPlayer {
+#[cfg(feature = "memory-stats")]
+impl SizeBytes for VideoPlayer {
     fn heap_size_bytes(&self) -> u64 {
         self.sample_decoder.heap_size_bytes()
     }

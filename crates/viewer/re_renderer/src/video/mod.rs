@@ -6,6 +6,8 @@ use std::collections::hash_map::Entry;
 use ahash::HashMap;
 use parking_lot::Mutex;
 pub use player::PlayerConfiguration;
+#[cfg(feature = "memory-stats")]
+use re_byte_size::SizeBytes;
 use re_log::ResultExt as _;
 use re_video::{DecodeSettings, StableIndexDeque, VideoDataDescription};
 
@@ -165,7 +167,8 @@ pub struct VideoFrameTexture {
 
 pub struct VideoPlayerStreamId(pub u64);
 
-impl re_byte_size::SizeBytes for VideoPlayerStreamId {
+#[cfg(feature = "memory-stats")]
+impl SizeBytes for VideoPlayerStreamId {
     fn heap_size_bytes(&self) -> u64 {
         0
     }
@@ -183,7 +186,8 @@ struct PlayerEntry {
     used_last_frame: bool,
 }
 
-impl re_byte_size::SizeBytes for PlayerEntry {
+#[cfg(feature = "memory-stats")]
+impl SizeBytes for PlayerEntry {
     fn heap_size_bytes(&self) -> u64 {
         let Self {
             player,
@@ -203,7 +207,8 @@ pub struct Video {
     decode_settings: DecodeSettings,
 }
 
-impl re_byte_size::SizeBytes for Video {
+#[cfg(feature = "memory-stats")]
+impl SizeBytes for Video {
     fn heap_size_bytes(&self) -> u64 {
         let Self {
             debug_name,

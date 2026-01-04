@@ -183,11 +183,16 @@ pub struct Material {
     pub index_range: Range<u32>,
 
     /// Base color texture, also known as albedo.
+    /// When `use_matcap` is true, this should be a matcap texture.
     /// (not optional, needs to be at least a 1pix texture with a color!)
     pub albedo: GpuTexture2D,
 
     /// Factor applied to the decoded albedo color.
     pub albedo_factor: Rgba,
+
+    /// If true, uses the albedo texture as a matcap for view-dependent lighting.
+    /// The texture is sampled using view-space normals instead of UV coordinates.
+    pub use_matcap: bool,
 }
 
 #[derive(Clone)]
@@ -252,14 +257,26 @@ pub(crate) mod gpu_data {
     pub struct MaterialUniformBuffer {
         albedo_factor: ecolor::Rgba,
         texture_format: wgpu_buffer_types::U32RowPadded,
-        end_padding: [wgpu_buffer_types::PaddingRow; 16 - 2],
+        /// 1 = use matcap texture for lighting, 0 = use standard shading
+        use_matcap: wgpu_buffer_types::U32RowPadded,
+        end_padding: [wgpu_buffer_types::PaddingRow; 16 - 3],
     }
 
     impl MaterialUniformBuffer {
+        #[allow(dead_code)]
         pub fn new(albedo_factor: ecolor::Rgba, texture_format: TextureFormat) -> Self {
+            Self::with_matcap(albedo_factor, texture_format, false)
+        }
+
+        pub fn with_matcap(
+            albedo_factor: ecolor::Rgba,
+            texture_format: TextureFormat,
+            use_matcap: bool,
+        ) -> Self {
             Self {
                 albedo_factor,
                 texture_format: (texture_format as u32).into(),
+                use_matcap: (use_matcap as u32).into(),
                 end_padding: Default::default(),
             }
         }
@@ -351,13 +368,14 @@ impl GpuMesh {
                 ctx,
                 format!("{} - material uniforms", data.label).into(),
                 data.materials.iter().map(|material| {
-                    gpu_data::MaterialUniformBuffer::new(
+                    gpu_data::MaterialUniformBuffer::with_matcap(
                         material.albedo_factor,
                         if material.albedo.texture.format().components() == 1 {
                             gpu_data::TextureFormat::Grayscale
                         } else {
                             gpu_data::TextureFormat::Rgba
                         },
+                        material.use_matcap,
                     )
                 }),
             );

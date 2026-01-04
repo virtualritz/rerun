@@ -2,7 +2,9 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use ahash::{HashMap, HashMapExt as _};
-use anyhow::{Context as _, anyhow, ensure};
+#[cfg(load_shaders_from_disk)]
+use anyhow::Context as _;
+use anyhow::{anyhow, ensure};
 use clean_path::Clean as _;
 use parking_lot::RwLock;
 
@@ -46,9 +48,11 @@ pub fn get_filesystem() -> &'static MemFileSystem {
 /// A [`FileSystem`] implementation that simply delegates to `std::fs`.
 ///
 /// Used only for native debug builds, where shader hot-reloading is a thing.
+#[cfg(load_shaders_from_disk)]
 #[derive(Default)]
 pub struct OsFileSystem;
 
+#[cfg(load_shaders_from_disk)]
 impl FileSystem for OsFileSystem {
     fn read_to_string(&self, path: impl AsRef<Path>) -> anyhow::Result<Cow<'static, str>> {
         let path = path.as_ref();

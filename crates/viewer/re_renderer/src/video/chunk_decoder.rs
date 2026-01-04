@@ -3,6 +3,8 @@
 use std::collections::BTreeMap;
 
 use crossbeam::channel::{Receiver, Sender};
+#[cfg(feature = "memory-stats")]
+use re_byte_size::SizeBytes;
 use re_video::{Chunk, Frame, FrameContent, Time, VideoDataDescription};
 
 use crate::RenderContext;
@@ -39,7 +41,8 @@ impl DecoderOutput {
     }
 }
 
-impl re_byte_size::SizeBytes for DecoderOutput {
+#[cfg(feature = "memory-stats")]
+impl SizeBytes for DecoderOutput {
     fn heap_size_bytes(&self) -> u64 {
         let Self {
             frames_by_pts,
@@ -60,7 +63,8 @@ pub struct VideoSampleDecoder {
     decoder_output: DecoderOutput,
 }
 
-impl re_byte_size::SizeBytes for VideoSampleDecoder {
+#[cfg(feature = "memory-stats")]
+impl SizeBytes for VideoSampleDecoder {
     fn heap_size_bytes(&self) -> u64 {
         let Self {
             debug_name,

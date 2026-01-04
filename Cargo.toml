@@ -252,7 +252,7 @@ flatbuffers = "25.9.23"
 futures = "0.3.31"
 futures-util = "0.3.31"
 getrandom = "0.3.3"
-glam = { version = "0.30.8", features = ["debug-glam-assert", "serde"] }
+glam = { version = "0.32", features = ["debug-glam-assert", "serde"] }
 glob = "0.3.3"
 gltf = "1.4"
 h264-reader = "0.8.0"
@@ -282,7 +282,7 @@ linked-hash-map = { version = "0.5.6", default-features = false }
 log = "0.4.28"
 log-once = "0.4.1"
 lz4_flex = "0.12"
-macaw = "0.30.0"
+macaw = { git = "https://github.com/virtualritz/macaw.git" }
 mcap = "0.23.3"
 memmap2 = "0.9.8"
 memory-stats = "1.2"

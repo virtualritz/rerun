@@ -52,6 +52,7 @@ pub fn load_stl_from_buffer(
         index_range: 0..num_vertices as u32,
         albedo: ctx.texture_manager_2d.white_texture_unorm_handle().clone(),
         albedo_factor: crate::Rgba::WHITE,
+        use_matcap: false,
     };
 
     let vertex_positions = bytemuck::cast_vec(triangles);
