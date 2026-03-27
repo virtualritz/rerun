@@ -232,6 +232,13 @@ impl ::re_types_core::AsComponents for BarChart {
 
 impl ::re_types_core::ArchetypeReflectionMarker for BarChart {}
 
+impl crate::VisualizableArchetype for BarChart {
+    #[inline]
+    fn visualizer(&self) -> crate::Visualizer {
+        crate::Visualizer::new("BarChart").with_overrides(self)
+    }
+}
+
 impl BarChart {
     /// Create a new `BarChart`.
     #[inline]

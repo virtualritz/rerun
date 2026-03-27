@@ -1,4 +1,5 @@
 name: Release
+run-name: Release (${{ inputs.release-type }})
 
 on:
   workflow_dispatch:
@@ -11,6 +12,11 @@ on:
           - rc
           - final
         required: true
+      publish-crates:
+        description: "Publish crates (ignored for non-alpha release)"
+        type: boolean
+        required: false
+        default: true
 
 concurrency:
   group: ${{ github.ref_name }}
@@ -171,6 +177,9 @@ jobs:
 
       - run: pixi run toml-fmt
 
+      # We must re-sync uv after bumping the version
+      - run: pixi run uv lock
+
       - name: Commit new version
         id: commit
         if: steps.versioning.outputs.previous != steps.versioning.outputs.current
@@ -198,13 +207,10 @@ jobs:
           ### Next steps
           - Test the release
           - For alpha releases:
-            - [ ] Should the GH release be published for this alpha? Make a call (give extra love to alphas deployed to Rerun Cloud or when external testing is required).
-              - If yes:
-                - [ ] Edit and publish the GitHub release
+            - [ ] If a GH release should be published for this alpha (give extra love to alphas deployed to Rerun Cloud or when external testing is required):
+                - [ ] Create the GitHub release manually from the UI
                 - [ ] Stretch goal: generate a raw changelog and add it to the GH release with this disclaimer:
                       **DISCLAIMER**: This is an unreviewed, automatically generated changelog. We only provide fully reviewed changelogs for final releases.
-              - If no:
-                - [ ] Delete the GH release draft
             - [ ] Merge or close the release PR
               - **IFF** the release job succeeds and the link checker is happy, you may merge the PR.
               - Otherwise, close the PR without merging. Cherrypick any interesting commit to `main`, but *not* the version bump one (it would introduce bad links).
@@ -224,7 +230,7 @@ jobs:
                 - Once published, the release assets will sync to it automatically.
               - [ ] Update the [google colab notebooks](https://colab.research.google.com/drive/1R9I7s4o6wydQC_zkybqaSRFTtlEaked_) to install this version and re-execute the notebook.
               - [ ] Release a new version of gradio (@oxkitsune, @jprochazk)
-              - [ ] Merge the Release PR
+              - [ ] Create a new branch from the prepare-release branch, rebase that one on main and sync it to reality so it can be merged.
               - [ ] (A few hours later) Check on the [conda feedstock PR](https://github.com/conda-forge/rerun-sdk-feedstock/pulls) (ping Antoine, Nick and/or Jeremy in necessary)
 
           - [ ] Tests
@@ -242,6 +248,23 @@ jobs:
             --fill \
             --body-file pr-body.txt
 
+  uv-lock-check:
+    name: "Check uv.lock"
+    needs: [version]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.release-commit }}
+
+      - uses: prefix-dev/setup-pixi@v0.9.1
+        with:
+          pixi-version: v0.55.0
+
+      - name: Check uv.lock is up-to-date
+        run: pixi run uv-lock-check
+
   update-docs:
     name: "Update Docs"
     needs: [version, publish-web]
@@ -258,7 +281,8 @@ jobs:
 
   publish-crates:
     name: "Publish Crates"
-    needs: [version]
+    if: inputs.release-type != 'alpha' || inputs.publish-crates
+    needs: [version, uv-lock-check]
     uses: ./.github/workflows/reusable_release_crates.yml
     with:
       CONCURRENCY: ${{ github.ref_name }}
@@ -267,7 +291,7 @@ jobs:
 
   publish-rerun_c:
     name: "Build and Publish C/C++ SDKs"
-    needs: [version]
+    needs: [version, uv-lock-check]
     uses: ./.github/workflows/reusable_publish_rerun_c.yml
     with:
       release-version: ${{ needs.version.outputs.current }}
@@ -277,7 +301,7 @@ jobs:
 
   publish-rerun-cli:
     name: "Publish rerun-cli"
-    needs: [version]
+    needs: [version, uv-lock-check]
     uses: ./.github/workflows/reusable_publish_rerun_cli.yml
     with:
       release-version: ${{ needs.version.outputs.current }}
@@ -309,7 +333,7 @@ jobs:
 
   publish-js:
     name: "Publish JS"
-    needs: [version]
+    needs: [version, uv-lock-check]
     uses: ./.github/workflows/reusable_publish_js.yml
     with:
       release-version: ${{ needs.version.outputs.current }}
@@ -321,7 +345,7 @@ jobs:
   # The push to `docs-latest` also triggers a re-deploy of `rerun.io`.
   update-latest-branch:
     name: "Update Latest Branch"
-    if: inputs.release-type == 'final'
+    if: inputs.release-type == 'final' && !cancelled() && !failure()
     needs:
       [
         version,
@@ -353,6 +377,7 @@ jobs:
 
   tag-release:
     name: "Tag Release"
+    if: ${{ !cancelled() && !failure() }}
     needs:
       [
         version,
@@ -407,7 +432,7 @@ jobs:
           version="${{ needs.version.outputs.final }}"
 
           cat <<EOF > comment-body.txt
-          GitHub release draft: [$version](https://github.com/rerun-io/rerun/releases/tag/$version)
+          The GitHub release draft for $version can be found in the [release list](https://github.com/rerun-io/rerun/releases).
 
           Add a description, changelog, and a nice header video/picture, then click 'Publish release'.
           EOF
@@ -419,7 +444,7 @@ jobs:
   post-release-version-bump:
     name: "Post-Release Version Bump"
     # We don't need to bump versions for `rc` releases, because we don't merge those.
-    if: inputs.release-type == 'alpha' || inputs.release-type == 'final'
+    if: (inputs.release-type == 'alpha' || inputs.release-type == 'final') && !cancelled() && !failure()
     needs:
       [
         version,
@@ -475,6 +500,9 @@ jobs:
 
       - run: pixi run toml-fmt
 
+      # We must re-sync uv after bumping the version
+      - run: pixi run uv lock
+
       - name: Commit new version
         run: |
           git commit -am "Bump versions to ${{ steps.crates.outputs.version }}"
@@ -482,6 +510,7 @@ jobs:
 
   comment-artifact-links:
     name: "Link to artifacts"
+    if: ${{ !cancelled() && !failure() }}
     needs:
       [
         version,

@@ -275,6 +275,13 @@ impl ::re_types_core::AsComponents for GraphNodes {
 
 impl ::re_types_core::ArchetypeReflectionMarker for GraphNodes {}
 
+impl crate::VisualizableArchetype for GraphNodes {
+    #[inline]
+    fn visualizer(&self) -> crate::Visualizer {
+        crate::Visualizer::new("GraphNodes").with_overrides(self)
+    }
+}
+
 impl GraphNodes {
     /// Create a new `GraphNodes`.
     #[inline]

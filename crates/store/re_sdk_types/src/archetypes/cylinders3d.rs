@@ -438,6 +438,13 @@ impl ::re_types_core::AsComponents for Cylinders3D {
 
 impl ::re_types_core::ArchetypeReflectionMarker for Cylinders3D {}
 
+impl crate::VisualizableArchetype for Cylinders3D {
+    #[inline]
+    fn visualizer(&self) -> crate::Visualizer {
+        crate::Visualizer::new("Cylinders3D").with_overrides(self)
+    }
+}
+
 impl Cylinders3D {
     /// Create a new `Cylinders3D`.
     #[inline]

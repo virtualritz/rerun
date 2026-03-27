@@ -107,7 +107,7 @@ pub fn iter_external_loaders() -> impl ExactSizeIterator<Item = PathBuf> {
 ///
 /// Refer to our `external_data_loader` example for more information.
 ///
-/// Checkout our [guide](https://www.rerun.io/docs/reference/data-loaders/overview) on
+/// Checkout our [guide](https://www.rerun.io/docs/concepts/logging-and-ingestion/data-loaders/overview) on
 /// how to implement external loaders.
 pub struct ExternalLoader;
 
@@ -121,7 +121,7 @@ impl crate::DataLoader for ExternalLoader {
         &self,
         settings: &crate::DataLoaderSettings,
         filepath: PathBuf,
-        tx: std::sync::mpsc::Sender<crate::LoadedData>,
+        tx: crossbeam::channel::Sender<crate::LoadedData>,
     ) -> Result<(), crate::DataLoaderError> {
         use std::process::{Command, Stdio};
 
@@ -132,9 +132,9 @@ impl crate::DataLoader for ExternalLoader {
             EXTERNAL_LOADER_PATHS.iter()
         };
 
-        #[derive(PartialEq, Eq)]
+        #[derive(Debug, PartialEq, Eq)]
         struct CompatibleLoaderFound;
-        let (tx_feedback, rx_feedback) = std::sync::mpsc::channel::<CompatibleLoaderFound>();
+        let (tx_feedback, rx_feedback) = crossbeam::channel::bounded::<CompatibleLoaderFound>(64);
 
         let args = settings.to_cli_args();
         for exe in external_loaders {
@@ -230,7 +230,7 @@ impl crate::DataLoader for ExternalLoader {
                                 // The child process has started streaming data, it is therefore compatible.
                                 // Let's get out ASAP.
                                 re_log::debug!(loader = ?exe, ?filepath, "compatible external loader found");
-                                tx_feedback.send(CompatibleLoaderFound).ok();
+                                re_quota_channel::send_crossbeam(&tx_feedback, CompatibleLoaderFound).ok();
                                 break; // we still want to check for errors once it finally exits!
                             }
 
@@ -269,7 +269,7 @@ impl crate::DataLoader for ExternalLoader {
                         let stderr_indented = stderr_str.lines().map(|line| format!("  {line}")).collect::<Vec<_>>().join("\n");
                         re_log::debug!("Dataloader stderr:\n{stderr_indented}");
 
-                        tx_feedback.send(CompatibleLoaderFound).ok();
+                        re_quota_channel::send_crossbeam(&tx_feedback, CompatibleLoaderFound).ok();
                     } else {
                         re_log::error!(?filepath, loader = ?exe, %stderr_str, "Failed to execute external loader");
                     }
@@ -297,7 +297,7 @@ impl crate::DataLoader for ExternalLoader {
         _settings: &crate::DataLoaderSettings,
         path: PathBuf,
         _contents: std::borrow::Cow<'_, [u8]>,
-        _tx: std::sync::mpsc::Sender<crate::LoadedData>,
+        _tx: crossbeam::channel::Sender<crate::LoadedData>,
     ) -> Result<(), crate::DataLoaderError> {
         // TODO(#5324): You could imagine a world where plugins can be streamed rrd data via their
         // standard input… but today is not world.
@@ -308,7 +308,7 @@ impl crate::DataLoader for ExternalLoader {
 #[expect(clippy::needless_pass_by_value)]
 fn decode_and_stream(
     filepath: &std::path::Path,
-    tx: &std::sync::mpsc::Sender<crate::LoadedData>,
+    tx: &crossbeam::channel::Sender<crate::LoadedData>,
     is_sending_data: Arc<AtomicBool>,
     msgs: impl Iterator<Item = Result<re_log_types::LogMsg, re_log_encoding::DecodeError>>,
 ) {
@@ -320,13 +320,13 @@ fn decode_and_stream(
         let msg = match msg {
             Ok(msg) => msg,
             Err(err) => {
-                re_log::warn_once!("Failed to decode message in {filepath:?}: {err}");
+                re_log::warn!(?filepath, "Failed to decode message: {err}");
                 continue;
             }
         };
 
         let data = LoadedData::LogMsg(ExternalLoader::name(&ExternalLoader), msg);
-        if tx.send(data).is_err() {
+        if re_quota_channel::send_crossbeam(tx, data).is_err() {
             break; // The other end has decided to hang up, not our problem.
         }
     }

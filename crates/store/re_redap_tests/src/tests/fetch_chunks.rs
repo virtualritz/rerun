@@ -14,6 +14,7 @@ use re_types_core::Loggable as _;
 use crate::RecordBatchTestExt as _;
 use crate::tests::common::{
     DataSourcesDefinition, LayerDefinition, RerunCloudServiceExt as _, concat_record_batches,
+    entry_name,
 };
 
 /// This test makes a snapshot of all the chunks returned for a simple dataset.
@@ -38,13 +39,13 @@ pub async fn simple_dataset_fetch_chunk_snapshot(service: impl RerunCloudService
     let dataset_name = "dataset";
     service.create_dataset_entry_with_name(dataset_name).await;
     service
-        .register_with_dataset_name(dataset_name, data_sources_def.to_data_sources())
+        .register_with_dataset_name_blocking(dataset_name, data_sources_def.to_data_sources())
         .await;
 
     let chunk_info = service
         .query_dataset(
             tonic::Request::new(QueryDatasetRequest::default().into())
-                .with_entry_name(dataset_name)
+                .with_entry_name(entry_name(dataset_name))
                 .unwrap(),
         )
         .await
@@ -107,7 +108,7 @@ pub async fn multi_dataset_fetch_chunk_completeness(service: impl RerunCloudServ
     let dataset_name_1 = "dataset_1";
     service.create_dataset_entry_with_name(dataset_name_1).await;
     service
-        .register_with_dataset_name(dataset_name_1, data_sources_def_1.to_data_sources())
+        .register_with_dataset_name_blocking(dataset_name_1, data_sources_def_1.to_data_sources())
         .await;
 
     //
@@ -125,7 +126,7 @@ pub async fn multi_dataset_fetch_chunk_completeness(service: impl RerunCloudServ
     let dataset_name_2 = "dataset_2";
     service.create_dataset_entry_with_name(dataset_name_2).await;
     service
-        .register_with_dataset_name(dataset_name_2, data_sources_def_2.to_data_sources())
+        .register_with_dataset_name_blocking(dataset_name_2, data_sources_def_2.to_data_sources())
         .await;
 
     //
@@ -148,7 +149,7 @@ pub async fn multi_dataset_fetch_chunk_completeness(service: impl RerunCloudServ
                 }
                 .into(),
             )
-            .with_entry_name(dataset_name_1)
+            .with_entry_name(entry_name(dataset_name_1))
             .unwrap(),
         )
         .await
@@ -177,7 +178,7 @@ pub async fn multi_dataset_fetch_chunk_completeness(service: impl RerunCloudServ
                 }
                 .into(),
             )
-            .with_entry_name(dataset_name_1)
+            .with_entry_name(entry_name(dataset_name_1))
             .unwrap(),
         )
         .await

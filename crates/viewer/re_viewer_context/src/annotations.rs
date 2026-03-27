@@ -5,8 +5,7 @@ use ahash::HashMap;
 use nohash_hasher::IntSet;
 use re_chunk::RowId;
 use re_chunk_store::{
-    ChunkStore, ChunkStoreDiffKind, ChunkStoreEvent, ChunkStoreSubscriberHandle, LatestAtQuery,
-    PerStoreChunkSubscriber,
+    ChunkStore, ChunkStoreEvent, ChunkStoreSubscriberHandle, LatestAtQuery, PerStoreChunkSubscriber,
 };
 use re_entity_db::EntityPath;
 use re_log_types::StoreId;
@@ -14,7 +13,7 @@ use re_sdk_types::archetypes;
 use re_sdk_types::components::AnnotationContext;
 use re_sdk_types::datatypes::{AnnotationInfo, ClassDescription, ClassId, KeypointId, Utf8};
 
-use super::{ViewerContext, auto_color_egui};
+use super::auto_color_egui;
 
 const MISSING_ROW_ID: RowId = RowId::ZERO;
 
@@ -53,6 +52,9 @@ impl Annotations {
         }
     }
 
+    /// The [`RowId`] of the annotation context that was used to create this [`Annotations`].
+    ///
+    /// This can be used as a cache key to determine if the annotation context has changed.
     #[inline]
     pub fn row_id(&self) -> RowId {
         self.row_id
@@ -177,6 +179,17 @@ impl ResolvedAnnotationInfo {
     }
 }
 
+impl re_byte_size::SizeBytes for ResolvedAnnotationInfo {
+    #[inline]
+    fn heap_size_bytes(&self) -> u64 {
+        let Self {
+            class_id,
+            annotation_info,
+        } = self;
+        class_id.heap_size_bytes() + annotation_info.heap_size_bytes()
+    }
+}
+
 // ----------------------------------------------------------------------------
 
 /// Many [`ResolvedAnnotationInfo`], with optimization
@@ -187,6 +200,16 @@ pub enum ResolvedAnnotationInfos {
 
     /// All different
     Many(Vec<ResolvedAnnotationInfo>),
+}
+
+impl re_byte_size::SizeBytes for ResolvedAnnotationInfos {
+    #[inline]
+    fn heap_size_bytes(&self) -> u64 {
+        match self {
+            Self::Same(_count, info) => info.heap_size_bytes(),
+            Self::Many(infos) => infos.heap_size_bytes(),
+        }
+    }
 }
 
 impl ResolvedAnnotationInfos {
@@ -225,26 +248,22 @@ impl AnnotationMap {
     /// For each passed [`EntityPath`], walk up the tree and find the nearest ancestor
     ///
     /// An entity is considered its own (nearest) ancestor.
-    pub fn load(&mut self, ctx: &ViewerContext<'_>, time_query: &LatestAtQuery) {
+    pub fn load(&mut self, db: &re_entity_db::EntityDb, time_query: &LatestAtQuery) {
         re_tracing::profile_function!();
 
         let entities_with_annotation_context =
-            AnnotationContextStoreSubscriber::access(ctx.recording().store_id(), |entities| {
-                entities.clone()
-            })
-            .unwrap_or_default();
+            AnnotationContextStoreSubscriber::access(db.store_id(), |entities| entities.clone())
+                .unwrap_or_default();
 
         // Load current annotations.
         // (order doesn't matter, we're feeding into another hashmap)
         #[expect(clippy::iter_over_hash_type)]
         for entity in entities_with_annotation_context {
-            if let Some(((_time, row_id), ann_ctx)) =
-                ctx.recording().latest_at_component::<AnnotationContext>(
-                    &entity,
-                    time_query,
-                    archetypes::AnnotationContext::descriptor_context().component,
-                )
-            {
+            if let Some(((_time, row_id), ann_ctx)) = db.latest_at_component::<AnnotationContext>(
+                &entity,
+                time_query,
+                archetypes::AnnotationContext::descriptor_context().component,
+            ) {
                 let annotations = Annotations {
                     row_id,
                     class_map: ann_ctx
@@ -313,19 +332,21 @@ impl PerStoreChunkSubscriber for AnnotationContextStoreSubscriber {
 
     fn on_events<'a>(&mut self, events: impl Iterator<Item = &'a ChunkStoreEvent>) {
         for event in events {
-            if event
-                .chunk
+            let Some(delta_chunk) = event.delta_chunk() else {
+                continue;
+            };
+
+            if delta_chunk
                 .components()
                 .contains_key(&archetypes::AnnotationContext::descriptor_context().component)
             {
-                let path = event.chunk.entity_path();
-                match event.diff.kind {
-                    ChunkStoreDiffKind::Addition => {
-                        self.entities_with_annotation_context.insert(path.clone());
-                    }
-                    ChunkStoreDiffKind::Deletion => {
-                        self.entities_with_annotation_context.remove(path);
-                    }
+                let path = delta_chunk.entity_path();
+                if event.is_addition() {
+                    self.entities_with_annotation_context.insert(path.clone());
+                } else if event.is_deletion() {
+                    // Deletions do *not* account for chunks that were compacted away, and therefore this
+                    // will correctly mirror the number of additions above (including splits).
+                    self.entities_with_annotation_context.remove(path);
                 }
             }
         }

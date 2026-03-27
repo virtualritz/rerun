@@ -1,3 +1,5 @@
+use re_log::debug_assert;
+
 /// A size of something in either scene units or ui points.
 ///
 /// Implementation:
@@ -9,6 +11,18 @@
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct Size(pub f32);
+
+impl re_byte_size::SizeBytes for Size {
+    #[inline]
+    fn heap_size_bytes(&self) -> u64 {
+        0
+    }
+
+    #[inline]
+    fn is_pod() -> bool {
+        true
+    }
+}
 
 impl Size {
     /// Zero radius.

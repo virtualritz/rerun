@@ -29,7 +29,7 @@ async function load(base_url?: string): Promise<typeof wasm_bindgen.WebHandle> {
     ]);
   }
   let bindgen = get_wasm_bindgen();
-  await bindgen(_wasm_module);
+  await bindgen({ module_or_path: _wasm_module });
   return class extends bindgen.WebHandle {
     free() {
       super.free();
@@ -101,6 +101,13 @@ export interface WebViewerOptions {
    * enclosing notebook environment, it should be used to set the fallback token.
    */
   fallback_token?: string;
+
+  /**
+   * The color theme to use.
+   *
+   * If not set, the viewer uses the previously persisted theme preference or defaults to "system".
+   */
+  theme?: "dark" | "light" | "system";
 }
 
 // `AppOptions` and `WebViewerOptions` must be compatible
@@ -309,7 +316,7 @@ function delay(ms: number) {
  * ```
  *
  * Data may be provided to the Viewer as:
- * - An HTTP file URL, e.g. `viewer.start("https://app.rerun.io/version/0.28.0/examples/dna.rrd")`
+ * - An HTTP file URL, e.g. `viewer.start("https://app.rerun.io/version/0.29.0/examples/dna.rrd")`
  * - A Rerun gRPC URL, e.g. `viewer.start("rerun+http://127.0.0.1:9876/proxy")`
  * - A stream of log messages, via {@link WebViewer.open_channel}.
  *
@@ -327,6 +334,7 @@ export class WebViewer {
   //       On failure, call `this.stop` to prevent a memory leak, then re-throw the error.
   #handle: WebHandle | null = null;
   #canvas: HTMLCanvasElement | null = null;
+  #loader: HTMLDivElement | null = null;
   #state: "ready" | "starting" | "stopped" = "stopped";
   #fullscreen = false;
   #allow_fullscreen = false;
@@ -356,11 +364,29 @@ export class WebViewer {
 
     if (this.#state !== "stopped") return;
     this.#state = "starting";
+    this.#clearLoader();
 
     this.#canvas = document.createElement("canvas");
     this.#canvas.style.width = options.width ?? "640px";
     this.#canvas.style.height = options.height ?? "360px";
     parent.append(this.#canvas);
+
+    // Show loading spinner
+    this.#loader = document.createElement("div");
+    this.#loader.id = "rerun-loader";
+    this.#loader.innerHTML = `
+      <style>
+        @keyframes rerun-spin { to { transform: rotate(360deg); } }
+      </style>
+      <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; background-color: #1c1c1c; font-family: sans-serif; color: white;">
+        <div style="width: 40px; height: 40px; border: 3px solid #444; border-top-color: white; border-radius: 50%; animation: rerun-spin 1s linear infinite;"></div>
+        <div style="margin-top: 16px;">Loading Rerun…</div>
+      </div>
+    `;
+    this.#loader.style.position = "absolute";
+    this.#loader.style.inset = "0";
+    parent.style.position = "relative";
+    parent.append(this.#loader);
 
     // This yield appears to be necessary to ensure that the canvas is attached to the DOM
     // and visible. Without it we get occasionally get a panic about a failure to find a canvas
@@ -372,8 +398,18 @@ export class WebViewer {
       delete (options as any).base_url;
     }
 
-    let WebHandle_class = await load(base_url);
-    if (this.#state !== "starting") return;
+    let WebHandle_class: typeof wasm_bindgen.WebHandle;
+    try {
+      WebHandle_class = await load(base_url);
+    } catch (e) {
+      this.#clearLoader();
+      this.#fail("Failed to load rerun", String(e));
+      throw e;
+    }
+    if (this.#state !== "starting") {
+      this.#clearLoader();
+      return;
+    }
 
     const fullscreen = this.#allow_fullscreen
       ? {
@@ -404,17 +440,35 @@ export class WebViewer {
     try {
       await this.#handle.start(this.#canvas);
     } catch (e) {
-      this.stop();
+      this.#clearLoader();
+      this.#fail("Failed to start", String(e));
       throw e;
     }
-    if (this.#state !== "starting") return;
+    if (this.#state !== "starting") {
+      this.#clearLoader();
+      return;
+    }
 
+    this.#clearLoader();
     this.#state = "ready";
     this.#dispatch_event("ready");
 
     if (rrd) {
       this.open(rrd);
     }
+
+    let self = this;
+
+    function check_for_panic() {
+      if (self.#handle?.has_panicked()) {
+        self.#fail("Rerun has crashed.", self.#handle?.panic_message());
+      } else {
+        let delay_ms = 1000;
+        setTimeout(check_for_panic, delay_ms);
+      }
+    }
+
+    check_for_panic();
 
     return;
   }
@@ -566,7 +620,7 @@ export class WebViewer {
       try {
         this.#handle.add_receiver(url, options.follow_if_http);
       } catch (e) {
-        this.stop();
+        this.#fail("Failed to open recording", String(e));
         throw e;
       }
     }
@@ -589,7 +643,7 @@ export class WebViewer {
       try {
         this.#handle.remove_receiver(url);
       } catch (e) {
-        this.stop();
+        this.#fail("Failed to close recording", String(e));
         throw e;
       }
     }
@@ -609,6 +663,7 @@ export class WebViewer {
     this.#state = "stopped";
 
     this.#canvas?.remove();
+    this.#clearLoader();
 
     try {
       this.#handle?.destroy();
@@ -620,8 +675,47 @@ export class WebViewer {
 
     this.#canvas = null;
     this.#handle = null;
+    this.#loader = null;
     this.#fullscreen = false;
     this.#allow_fullscreen = false;
+  }
+
+  #fail(message: string, error_message?: string) {
+    console.error("WebViewer failure:", message, error_message);
+    if (this.canvas?.parentElement) {
+      const parent = this.canvas.parentElement;
+      parent.innerHTML = `
+        <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: white; font-family: sans-serif; background-color: #1c1c1c;">
+          <h1 id="fail-message"></h1>
+          <pre id="fail-error" style="text-align: left;"></pre>
+          <button id="fail-clear-cache">Clear caches and reload</button>
+        </div>
+      `;
+
+      document.getElementById("fail-message")!.textContent = message;
+
+      const errorEl = document.getElementById("fail-error")!;
+      if (error_message) {
+        errorEl.textContent = error_message;
+      } else {
+        errorEl.remove();
+      }
+
+      document.getElementById("fail-clear-cache")!.addEventListener("click", async () => {
+        if ("caches" in window) {
+          const keys = await caches.keys();
+          await Promise.all(keys.map((key) => caches.delete(key)));
+        }
+        window.location.reload();
+      });
+    }
+
+    this.stop();
+  }
+
+  #clearLoader() {
+    this.#loader?.remove();
+    this.#loader = null;
   }
 
   /**
@@ -643,7 +737,7 @@ export class WebViewer {
     try {
       this.#handle.open_channel(id, channel_name);
     } catch (e) {
-      this.stop();
+      this.#fail("Failed to open channel", String(e));
       throw e;
     }
 
@@ -657,7 +751,7 @@ export class WebViewer {
       try {
         this.#handle.send_rrd_to_channel(id, data);
       } catch (e) {
-        this.stop();
+        this.#fail("Failed to send data", String(e));
         throw e;
       }
     };
@@ -672,7 +766,7 @@ export class WebViewer {
       try {
         this.#handle.send_table_to_channel(id, data);
       } catch (e) {
-        this.stop();
+        this.#fail("Failed to send table", String(e));
         throw e;
       }
     }
@@ -687,7 +781,7 @@ export class WebViewer {
       try {
         this.#handle.close_channel(id);
       } catch (e) {
-        this.stop();
+        this.#fail("Failed to close channel", String(e));
         throw e;
       }
     };
@@ -713,7 +807,7 @@ export class WebViewer {
     try {
       this.#handle.override_panel_state(panel, state);
     } catch (e) {
-      this.stop();
+      this.#fail("Failed to override panel state", String(e));
       throw e;
     }
   }
@@ -733,7 +827,7 @@ export class WebViewer {
     try {
       this.#handle.toggle_panel_overrides(value as boolean | undefined);
     } catch (e) {
-      this.stop();
+      this.#fail("Failed to toggle panel overrides", String(e));
       throw e;
     }
   }

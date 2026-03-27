@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 use ahash::{HashMap, HashMapExt as _};
 use futures::StreamExt as _;
 use re_chunk_store::ChunkStoreHandle;
-use re_log_types::{EntityPath, EntryId};
+use re_log_types::{ComponentPath, EntityPath, EntryId};
 use re_protos::cloud::v1alpha1::ext::{
     CreateIndexRequest, IndexColumn, IndexConfig, SearchDatasetRequest,
 };
@@ -181,9 +181,9 @@ impl DatasetChunkIndexes {
             )
             .await
         else {
-            return Err(StoreError::IndexNotFound(format!(
-                "{}#{}",
-                &request.column.entity_path, &request.column.descriptor.component
+            return Err(StoreError::ComponentPathNotFound(ComponentPath::new(
+                request.column.entity_path,
+                request.column.descriptor.component,
             )))?;
         };
 
@@ -216,7 +216,7 @@ impl DatasetChunkIndexes {
             let indexes = self.indexes.read().await;
             let store = store.read();
 
-            for chunk in store.iter_chunks() {
+            for chunk in store.iter_physical_chunks() {
                 if let Some(entity_indexes) = indexes.get(chunk.entity_path()) {
                     // Find components by iterating on indexes (lower cardinality)
                     for (name, index) in entity_indexes {
@@ -235,9 +235,30 @@ impl DatasetChunkIndexes {
         }
 
         for (index, segment_id, layer_name, chunk) in worklist {
+            let checkout_latest = true;
             index
-                .store_chunks(vec![(segment_id.clone(), layer_name, chunk.clone())], true)
+                .store_chunks(
+                    vec![(segment_id.clone(), layer_name, chunk.clone())],
+                    checkout_latest,
+                )
                 .await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn on_layers_removed(
+        &self,
+        removed_layers: &[(SegmentId, String)],
+    ) -> Result<(), StoreError> {
+        let indexes = self.indexes.write().await;
+
+        for index in indexes
+            .values()
+            .flat_map(|per_component| per_component.values())
+        {
+            let checkout_latest = true;
+            index.remove_layers(removed_layers, checkout_latest).await?;
         }
 
         Ok(())
@@ -297,7 +318,7 @@ impl DatasetChunkIndexes {
         for (segment_id, segment) in dataset.segments() {
             for (layer_name, layer) in segment.layers() {
                 let store = layer.store_handle().read();
-                for chunk in store.iter_chunks() {
+                for chunk in store.iter_physical_chunks() {
                     if chunk.entity_path() == entity_path
                         && chunk.components().0.contains_key(component)
                     {
@@ -342,7 +363,7 @@ mod tests {
 
         let mut dataset = Dataset::new(
             EntryId::new(),
-            "test-data".to_owned(),
+            re_protos::EntryName::new("test-data").unwrap(),
             StoreKind::Recording,
             Default::default(),
         );
@@ -405,9 +426,16 @@ mod tests {
         );
         store.insert_chunk(&Arc::new(chunk))?;
         let handle = ChunkStoreHandle::new(store);
+        let store_slot_id = crate::store::StoreSlotId::new();
 
         dataset
-            .add_layer(segment_id, layer_name, handle, IfDuplicateBehavior::Error)
+            .add_layer(
+                segment_id,
+                layer_name,
+                store_slot_id,
+                handle,
+                IfDuplicateBehavior::Error,
+            )
             .await?;
 
         //----- Create the index

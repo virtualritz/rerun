@@ -1,11 +1,11 @@
 use re_sdk_types::Archetype as _;
 use re_sdk_types::archetypes::SegmentationImage;
-use re_sdk_types::components::{ImageFormat, Opacity};
+use re_sdk_types::components::{ImageBuffer, ImageFormat, MagnificationFilter, Opacity};
 use re_sdk_types::image::ImageKind;
 use re_viewer_context::{
     IdentifiedViewSystem, ImageInfo, ViewContext, ViewContextCollection, ViewQuery,
-    ViewSystemExecutionError, VisualizerExecutionOutput, VisualizerQueryInfo, VisualizerSystem,
-    typed_fallback_for,
+    ViewSystemExecutionError, VisualizerExecutionOutput, VisualizerQueryInfo,
+    VisualizerReportSeverity, VisualizerSystem, typed_fallback_for,
 };
 
 use super::SpatialViewVisualizerData;
@@ -37,8 +37,15 @@ impl IdentifiedViewSystem for SegmentationImageVisualizer {
 }
 
 impl VisualizerSystem for SegmentationImageVisualizer {
-    fn visualizer_query_info(&self) -> VisualizerQueryInfo {
-        VisualizerQueryInfo::from_archetype::<SegmentationImage>()
+    fn visualizer_query_info(
+        &self,
+        _app_options: &re_viewer_context::AppOptions,
+    ) -> VisualizerQueryInfo {
+        VisualizerQueryInfo::buffer_and_format::<ImageBuffer, ImageFormat>(
+            &SegmentationImage::descriptor_buffer(),
+            &SegmentationImage::descriptor_format(),
+            &SegmentationImage::all_components(),
+        )
     }
 
     fn execute(
@@ -47,41 +54,34 @@ impl VisualizerSystem for SegmentationImageVisualizer {
         view_query: &ViewQuery<'_>,
         context_systems: &ViewContextCollection,
     ) -> Result<VisualizerExecutionOutput, ViewSystemExecutionError> {
-        let mut output = VisualizerExecutionOutput::default();
+        let output = VisualizerExecutionOutput::default();
 
-        use super::entity_iterator::{iter_component, iter_slices, process_archetype};
+        use super::entity_iterator::process_archetype;
         process_archetype::<Self, SegmentationImage, _>(
             ctx,
             view_query,
             context_systems,
-            &mut output,
+            &output,
             self.data.preferred_view_kind,
             |ctx, spatial_ctx, results| {
-                use re_view::RangeResultsExt as _;
-
                 let entity_path = ctx.target_entity_path;
 
-                let Some(all_buffer_chunks) =
-                    results.get_required_chunks(SegmentationImage::descriptor_buffer().component)
-                else {
+                let all_buffers =
+                    results.iter_required(SegmentationImage::descriptor_buffer().component);
+                if all_buffers.is_empty() {
                     return Ok(());
-                };
-                let Some(all_formats_chunks) =
-                    results.get_required_chunks(SegmentationImage::descriptor_format().component)
-                else {
+                }
+                let all_formats =
+                    results.iter_required(SegmentationImage::descriptor_format().component);
+                if all_formats.is_empty() {
                     return Ok(());
-                };
-
-                let timeline = ctx.query.timeline();
-                let all_buffers_indexed = iter_slices::<&[u8]>(&all_buffer_chunks, timeline);
-                let all_formats_indexed =
-                    iter_component::<ImageFormat>(&all_formats_chunks, timeline);
+                }
                 let all_opacities =
-                    results.iter_as(timeline, SegmentationImage::descriptor_opacity().component);
+                    results.iter_optional(SegmentationImage::descriptor_opacity().component);
 
                 let data = re_query::range_zip_1x2(
-                    all_buffers_indexed,
-                    all_formats_indexed,
+                    all_buffers.slice::<&[u8]>(),
+                    all_formats.component_slow::<ImageFormat>(),
                     all_opacities.slice::<f32>(),
                 )
                 .filter_map(|((_time, row_id), buffers, formats, opacity)| {
@@ -116,6 +116,7 @@ impl VisualizerSystem for SegmentationImageVisualizer {
                         &image,
                         colormap,
                         multiplicative_tint,
+                        MagnificationFilter::default(),
                         SegmentationImage::name(),
                     ) {
                         Ok(textured_rect) => {
@@ -132,9 +133,11 @@ impl VisualizerSystem for SegmentationImageVisualizer {
                             );
                         }
                         Err(err) => {
-                            spatial_ctx
-                                .output
-                                .report_error_for(entity_path.clone(), re_error::format(err));
+                            results.report_for_component(
+                                SegmentationImage::descriptor_buffer().component,
+                                VisualizerReportSeverity::Error,
+                                re_error::format(err),
+                            );
                         }
                     }
                 }
@@ -150,10 +153,6 @@ impl VisualizerSystem for SegmentationImageVisualizer {
 
     fn data(&self) -> Option<&dyn std::any::Any> {
         Some(self.data.as_any())
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 

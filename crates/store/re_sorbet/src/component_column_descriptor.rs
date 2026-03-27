@@ -28,7 +28,8 @@ pub struct ComponentColumnDescriptor {
     /// and will also be set in the schema for the whole chunk.
     ///
     /// If this is missing from the metadata, it will be set to `/`.
-    pub entity_path: EntityPath, // TODO(#8744): make optional for general sorbet batches
+    // TODO(emilk): Should be optional for general sorbet batches instead?
+    pub entity_path: EntityPath,
 
     /// Optional name of the `Archetype` associated with this data.
     ///
@@ -63,6 +64,27 @@ pub struct ComponentColumnDescriptor {
     /// *IMPORTANT*: this is not always accurate, see [`crate::ChunkBatch::chunk_schema`].
     //TODO(#10315): fix this footgun
     pub is_semantically_empty: bool,
+}
+
+impl re_byte_size::SizeBytes for ComponentColumnDescriptor {
+    #[inline]
+    fn heap_size_bytes(&self) -> u64 {
+        let Self {
+            entity_path,
+            archetype,
+            component,
+            component_type,
+            store_datatype,
+            is_static: _,
+            is_tombstone: _,
+            is_semantically_empty: _,
+        } = self;
+        entity_path.heap_size_bytes()
+            + archetype.heap_size_bytes()
+            + component.heap_size_bytes()
+            + component_type.heap_size_bytes()
+            + store_datatype.heap_size_bytes()
+    }
 }
 
 impl PartialOrd for ComponentColumnDescriptor {
@@ -253,6 +275,24 @@ impl ComponentColumnDescriptor {
         self.store_datatype.clone()
     }
 
+    /// Returns the child's datatype of the outer list-array.
+    ///
+    /// Logs a warning if the outer type is not a list-array, which should never happen in current Sorbet versions.
+    pub fn inner_datatype(&self) -> ArrowDatatype {
+        match self.returned_datatype() {
+            arrow::datatypes::DataType::List(field) => field.data_type().clone(),
+
+            dt => {
+                re_log::warn_once!(
+                    "Component '{}' on entity '{}' has unexpected non-list-array type: {dt}",
+                    self.component,
+                    self.entity_path,
+                );
+                dt
+            }
+        }
+    }
+
     /// What we show in the UI
     pub fn display_name(&self) -> &str {
         self.component.as_str()
@@ -308,7 +348,7 @@ impl ComponentColumnDescriptor {
             } else if let Some(chunk_entity_path) = chunk_entity_path {
                 chunk_entity_path.clone()
             } else {
-                EntityPath::root() // TODO(#8744): make entity_path optional for general sorbet batches
+                EntityPath::root() // NOTE: should be optional for general sorbet batches
             };
 
         let component =

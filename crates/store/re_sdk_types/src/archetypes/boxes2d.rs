@@ -324,6 +324,13 @@ impl ::re_types_core::AsComponents for Boxes2D {
 
 impl ::re_types_core::ArchetypeReflectionMarker for Boxes2D {}
 
+impl crate::VisualizableArchetype for Boxes2D {
+    #[inline]
+    fn visualizer(&self) -> crate::Visualizer {
+        crate::Visualizer::new("Boxes2D").with_overrides(self)
+    }
+}
+
 impl Boxes2D {
     /// Create a new `Boxes2D`.
     #[inline]

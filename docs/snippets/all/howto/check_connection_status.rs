@@ -2,17 +2,18 @@
 //!
 //! This feature is experimental and may change in future releases.
 
+#![expect(clippy::disallowed_methods)] // We forbid naked `send` calls in core Rerun, but they are fine in snippets
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rec = rerun::RecordingStreamBuilder::new("rerun_example_check_connection_status")
         .connect_grpc()?;
 
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam::channel::bounded(1);
 
     loop {
         let tx = tx.clone();
         rec.inspect_sink(move |sink| {
-            let grpc_sink = sink
-                .as_any()
+            let grpc_sink = (sink as &dyn std::any::Any)
                 .downcast_ref::<rerun::sink::GrpcSink>()
                 .expect("Expected a GrpcSink");
             tx.send(grpc_sink.status()).ok();

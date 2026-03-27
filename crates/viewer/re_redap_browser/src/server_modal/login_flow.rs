@@ -3,10 +3,9 @@ mod native;
 #[cfg(target_arch = "wasm32")]
 mod web;
 
-use egui::{IntoAtoms as _, vec2};
 #[cfg(not(target_arch = "wasm32"))]
 use native::State;
-use re_ui::UiExt as _;
+use re_ui::ReButton;
 use re_ui::notifications::{Notification, NotificationLevel};
 use re_viewer_context::{CommandSender, SystemCommand, SystemCommandSender as _};
 #[cfg(target_arch = "wasm32")]
@@ -24,12 +23,32 @@ pub enum LoginFlowResult {
 }
 
 impl LoginFlow {
-    pub fn open(ui: &mut egui::Ui) -> Result<Self, String> {
-        State::open(ui).map(|state| Self {
+    pub fn open(egui_ctx: &egui::Context) -> Result<Self, String> {
+        State::open(egui_ctx).map(|state| Self {
             state,
             #[cfg(target_arch = "wasm32")]
             started: false,
         })
+    }
+
+    /// Create and immediately start the login flow (opens popup on web, opens browser on native).
+    pub fn open_and_start(egui_ctx: &egui::Context) -> Result<Self, String> {
+        let mut flow = Self::open(egui_ctx)?;
+        flow.state.start()?;
+        #[cfg(target_arch = "wasm32")]
+        {
+            flow.started = true;
+        }
+        Ok(flow)
+    }
+
+    /// Poll for completion without rendering any UI.
+    pub fn poll(&mut self) -> Option<LoginFlowResult> {
+        match self.state.done() {
+            Ok(Some(_credentials)) => Some(LoginFlowResult::Success),
+            Ok(None) => None,
+            Err(err) => Some(LoginFlowResult::Failure(err)),
+        }
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, cmd: &CommandSender) -> Option<LoginFlowResult> {
@@ -37,7 +56,8 @@ impl LoginFlow {
         {
             if !self.started {
                 // Show button to start the flow
-                if ActionButton::primary(&re_ui::icons::EXTERNAL_LINK, "Login", "Login")
+                if ActionButton::new(&re_ui::icons::EXTERNAL_LINK, "Log in", "Log in")
+                    .variant(re_ui::Variant::Outlined)
                     .show(ui, &mut false)
                     .clicked()
                 {
@@ -48,7 +68,7 @@ impl LoginFlow {
                 }
                 None
             } else {
-                // Show spinner while waiting
+                // Show loading indicator while waiting
                 self.state.ui(ui);
                 self.done(ui, cmd)
             }
@@ -64,7 +84,7 @@ impl LoginFlow {
     fn done(&mut self, ui: &egui::Ui, cmd: &CommandSender) -> Option<LoginFlowResult> {
         match self.state.done() {
             Ok(Some(credentials)) => {
-                ui.ctx().request_repaint();
+                ui.request_repaint();
 
                 cmd.send_system(SystemCommand::ShowNotification(Notification::new(
                     NotificationLevel::Success,
@@ -81,90 +101,40 @@ impl LoginFlow {
     }
 }
 
-#[derive(Clone, Copy)]
-enum ActionButtonStyle {
-    Primary,
-    Secondary,
-}
-
 pub struct ActionButton<'a> {
     icon: &'a re_ui::Icon,
     action_text: &'a str,
     feedback_text: &'a str,
-    style: ActionButtonStyle,
+    variant: re_ui::Variant,
 }
 
 impl<'a> ActionButton<'a> {
-    pub fn primary(icon: &'a re_ui::Icon, action_text: &'a str, feedback_text: &'a str) -> Self {
+    pub fn new(icon: &'a re_ui::Icon, action_text: &'a str, feedback_text: &'a str) -> Self {
         Self {
             icon,
             action_text,
             feedback_text,
-            style: ActionButtonStyle::Primary,
+            variant: re_ui::Variant::default(),
         }
     }
 
-    #[cfg_attr(target_arch = "wasm32", expect(dead_code))] // only used on native
-    pub fn secondary(icon: &'a re_ui::Icon, action_text: &'a str, feedback_text: &'a str) -> Self {
-        Self {
-            icon,
-            action_text,
-            feedback_text,
-            style: ActionButtonStyle::Secondary,
-        }
+    pub fn variant(mut self, style: re_ui::Variant) -> Self {
+        self.variant = style;
+        self
     }
 
     pub fn show(&self, ui: &mut egui::Ui, show_feedback: &mut bool) -> egui::Response {
-        let response = ui
-            .scope(|ui| {
-                let tokens = ui.tokens();
-                let visuals = &mut ui.style_mut().visuals;
+        let label = if *show_feedback {
+            self.feedback_text
+        } else {
+            self.action_text
+        };
 
-                if matches!(self.style, ActionButtonStyle::Primary) {
-                    visuals.override_text_color = Some(tokens.text_inverse);
-                }
-
-                let spacing = &mut ui.style_mut().spacing;
-                spacing.button_padding = vec2(5.0, 4.0);
-
-                let response = ui.ctx().read_response(ui.next_auto_id());
-                let fill_color = match self.style {
-                    ActionButtonStyle::Primary => {
-                        if response.is_some_and(|r| r.hovered()) {
-                            tokens.bg_fill_inverse_hover
-                        } else {
-                            tokens.bg_fill_inverse
-                        }
-                    }
-                    ActionButtonStyle::Secondary => {
-                        if response.is_some_and(|r| r.hovered()) {
-                            tokens.widget_active_bg_fill
-                        } else {
-                            tokens.widget_noninteractive_bg_stroke
-                        }
-                    }
-                };
-
-                let label = if *show_feedback {
-                    self.feedback_text
-                } else {
-                    self.action_text
-                };
-
-                let icon_tint = match self.style {
-                    ActionButtonStyle::Primary => tokens.icon_inverse,
-                    ActionButtonStyle::Secondary => tokens.list_item_default_icon,
-                };
-                let icon = self
-                    .icon
-                    .as_image()
-                    .tint(icon_tint)
-                    .fit_to_exact_size(vec2(16.0, 16.0));
-                let atoms = (egui::Atom::grow(), label, icon, egui::Atom::grow()).into_atoms();
-
-                ui.add(egui::Button::new(atoms).fill(fill_color).corner_radius(3.0))
-            })
-            .inner;
+        let response = ui.add(
+            ReButton::new((label, self.icon))
+                .variant(self.variant)
+                .small(),
+        );
 
         if response.clicked() {
             *show_feedback = true;

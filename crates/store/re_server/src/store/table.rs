@@ -10,6 +10,7 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::dml::InsertOp;
 use futures::StreamExt as _;
 use re_log_types::EntryId;
+use re_protos::EntryName;
 use re_protos::cloud::v1alpha1::EntryKind;
 use re_protos::cloud::v1alpha1::ext::{EntryDetails, ProviderDetails, TableEntry};
 
@@ -23,7 +24,7 @@ pub enum TableType {
 #[derive(Clone)]
 pub struct Table {
     id: EntryId,
-    name: String,
+    name: EntryName,
     table: TableType,
 
     created_at: jiff::Timestamp,
@@ -35,7 +36,7 @@ pub struct Table {
 impl Table {
     pub fn new(
         id: EntryId,
-        name: String,
+        name: EntryName,
         table: TableType,
         created_at: Option<jiff::Timestamp>,
         provider_details: ProviderDetails,
@@ -54,11 +55,11 @@ impl Table {
         self.id
     }
 
-    pub fn name(&self) -> &str {
+    pub fn name(&self) -> &EntryName {
         &self.name
     }
 
-    pub fn set_name(&mut self, name: String) {
+    pub fn set_name(&mut self, name: EntryName) {
         self.name = name;
         self.updated_at = jiff::Timestamp::now();
     }
@@ -232,20 +233,22 @@ impl Table {
     #[cfg(feature = "lance")]
     pub async fn create_table_entry(
         id: EntryId,
-        name: &str,
+        name: EntryName,
         url: &url::Url,
         schema: SchemaRef,
-    ) -> Result<Self, DataFusionError> {
+    ) -> Result<Self, super::error::Error> {
         use re_protos::cloud::v1alpha1::ext::LanceTable;
+
+        if lance::Dataset::open(url.as_str()).await.is_ok() {
+            return Err(super::error::Error::TableStorageAlreadyExists(
+                url.to_string(),
+            ));
+        }
 
         let rb = vec![Ok(RecordBatch::new_empty(Arc::clone(&schema)))];
         let rb = arrow::record_batch::RecordBatchIterator::new(rb.into_iter(), schema);
 
-        let ds = Arc::new(
-            lance::Dataset::write(rb, url.as_str(), None)
-                .await
-                .map_err(|err| DataFusionError::External(err.into()))?,
-        );
+        let ds = Arc::new(lance::Dataset::write(rb, url.as_str(), None).await?);
         let created_at = Some(jiff::Timestamp::now());
         let provider_details = LanceTable {
             table_url: url.clone(),
@@ -253,7 +256,7 @@ impl Table {
 
         Ok(Self::new(
             id,
-            name.to_owned(),
+            name,
             TableType::LanceDataset(ds),
             created_at,
             ProviderDetails::LanceTable(provider_details),
@@ -264,10 +267,13 @@ impl Table {
     #[expect(clippy::unused_async)]
     pub async fn create_table_entry(
         _id: EntryId,
-        _name: &str,
+        _name: EntryName,
         _url: &url::Url,
         _schema: SchemaRef,
-    ) -> Result<Self, DataFusionError> {
-        exec_err!("Create table not implemented for bare DataFusion table")
+    ) -> Result<Self, super::error::Error> {
+        Err(DataFusionError::NotImplemented(
+            "Create table not implemented for bare DataFusion table".to_owned(),
+        )
+        .into())
     }
 }

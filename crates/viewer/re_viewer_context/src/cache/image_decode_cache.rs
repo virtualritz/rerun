@@ -12,7 +12,7 @@ use re_sdk_types::image::{ImageKind, ImageLoadError};
 
 use crate::cache::filter_blob_removed_events;
 use crate::image_info::StoredBlobCacheKey;
-use crate::{Cache, CacheMemoryReport, CacheMemoryReportItem, ImageInfo};
+use crate::{Cache, ImageInfo};
 
 struct DecodedImageResult {
     /// Cached `Result` from decoding the image
@@ -144,7 +144,7 @@ fn decode_color_image(
     image_bytes: &[u8],
     media_type: &str,
 ) -> Result<ImageInfo, ImageLoadError> {
-    re_tracing::profile_function!();
+    re_tracing::profile_function!(media_type);
 
     let mut reader = image::ImageReader::new(std::io::Cursor::new(image_bytes));
 
@@ -257,6 +257,10 @@ fn decode_rvl_depth(
 }
 
 impl Cache for ImageDecodeCache {
+    fn name(&self) -> &'static str {
+        "ImageDecodeCache"
+    }
+
     fn begin_frame(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
         let max_decode_cache_use = 4_000_000_000;
@@ -272,28 +276,6 @@ impl Cache for ImageDecodeCache {
         }
 
         self.generation += 1;
-    }
-
-    fn memory_report(&self) -> CacheMemoryReport {
-        let mut items: Vec<_> = self
-            .cache
-            .iter()
-            .map(|(k, images)| CacheMemoryReportItem {
-                item_name: format!("{:x}", k.0.hash64()),
-                bytes_cpu: images.values().map(|image| image.memory_used).sum(),
-                bytes_gpu: None,
-            })
-            .collect();
-        items.sort_by(|a, b| a.item_name.cmp(&b.item_name));
-        CacheMemoryReport {
-            bytes_cpu: self.memory_used,
-            bytes_gpu: None,
-            per_cache_item_info: items,
-        }
-    }
-
-    fn name(&self) -> &'static str {
-        "Image Decodings"
     }
 
     fn purge_memory(&mut self) {
@@ -329,9 +311,28 @@ impl Cache for ImageDecodeCache {
         self.cache
             .retain(|cache_key, _per_key| !cache_key_removed.contains(cache_key));
     }
+}
 
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
+impl re_byte_size::MemUsageTreeCapture for ImageDecodeCache {
+    fn capture_mem_usage_tree(&self) -> re_byte_size::MemUsageTree {
+        let mut node = re_byte_size::MemUsageNode::new();
+
+        // Add per-item breakdown
+        let mut items: Vec<_> = self
+            .cache
+            .iter()
+            .map(|(k, images)| {
+                let bytes_cpu: u64 = images.values().map(|image| image.memory_used).sum();
+                (format!("{:x}", k.0.hash64()), bytes_cpu)
+            })
+            .collect();
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (item_name, bytes_cpu) in items {
+            node.add(item_name, re_byte_size::MemUsageTree::Bytes(bytes_cpu));
+        }
+
+        node.into_tree()
     }
 }
 

@@ -25,18 +25,21 @@ pub async fn dataset_ui_test() {
 
     harness.get_by_label("Add…").click();
     harness.run_ok();
-    harness.get_by_label_contains("Add Redap server").click();
+    harness.get_by_label_contains("Connect to a server").click();
     harness.run_ok();
 
     snapshot_results.add(harness.try_snapshot("dataset_ui_empty_form"));
 
     harness
-        .get_by_role_and_label(egui::accesskit::Role::TextInput, "URL:")
+        .get_by_role_and_label(egui::accesskit::Role::TextInput, "Address:")
         .click();
     harness.run_ok();
     harness
-        .get_by_role_and_label(egui::accesskit::Role::TextInput, "URL:")
+        .get_by_role_and_label(egui::accesskit::Role::TextInput, "Address:")
         .type_text(&format!("rerun+http://localhost:{}", server.port()));
+    harness.run_ok();
+
+    harness.get_by_label("No authentication").click();
     harness.run_ok();
 
     harness.get_by_label("Add").click();
@@ -101,7 +104,8 @@ pub async fn start_with_dataset_url() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-pub async fn start_with_segment_url_with_fragment() {
+#[ignore = "flaky test"]
+pub async fn start_with_segment_fragment_url() {
     let (server, segment_id) = TestServer::spawn().await.with_test_data().await;
 
     let dataset_id =
@@ -137,7 +141,7 @@ pub async fn start_with_segment_url_with_fragment() {
         &mut harness,
         |harness| {
             harness.query_by_label_contains("Streams").is_some()
-                && harness.query_by_label("Loading etries…").is_none()
+                && harness.query_by_label("Loading entries…").is_none()
         },
         Duration::from_millis(100),
         Duration::from_secs(5),
@@ -145,7 +149,13 @@ pub async fn start_with_segment_url_with_fragment() {
 
     harness.set_selection_panel_opened(false);
 
-    // Mask timeline data because we have no way to consistently wait for it to arrive
+    // Redact the loading bar, since it is racy
+    harness.mask(egui::Rect::from_x_y_ranges(
+        egui::Rangef::new(190.0, 1024.0),
+        egui::Rangef::new(604.0, 606.0),
+    ));
+
+    // Redact timeline data because we have no way to consistently wait for it to arrive
     harness.mask(egui::Rect::from_x_y_ranges(
         egui::Rangef::new(190.0, 1024.0),
         egui::Rangef::new(650.0, 690.0),

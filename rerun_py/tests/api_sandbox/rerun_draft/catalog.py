@@ -5,16 +5,16 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import datafusion
 from rerun import catalog as _catalog
+from typing_extensions import deprecated
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from datetime import datetime
 
+    import datafusion
     import pyarrow as pa
     from rerun.catalog import RegistrationHandle
-    from rerun.dataframe import IndexColumnDescriptor
 
     from rerun_bindings import IndexValuesLike  # noqa: TID251
 
@@ -22,8 +22,8 @@ if TYPE_CHECKING:
 class CatalogClient:
     """Client for a remote Rerun catalog server."""
 
-    def __init__(self, address: str, token: str | None = None) -> None:
-        self._inner = _catalog.CatalogClient(address, token)
+    def __init__(self, url: str, *, token: str | None = None) -> None:
+        self._inner = _catalog.CatalogClient(url, token=token)
         self.tmpdirs = []
         atexit.register(self._cleanup)
 
@@ -138,7 +138,7 @@ class Entry:
         return self._inner.delete()
 
     def set_name(self, name: str) -> None:
-        return self._inner.update(name=name)
+        return self._inner.set_name(name)
 
 
 # Re-export Schema from the SDK
@@ -192,8 +192,8 @@ class DatasetEntry(Entry):
 
         return self._inner.segment_table(join_meta, join_key)
 
-    def manifest(self) -> datafusion.DataFrame:
-        return self._inner.manifest()
+    def manifest(self, include_diagnostic_data: bool = False) -> datafusion.DataFrame:
+        return self._inner.manifest(include_diagnostic_data=include_diagnostic_data)
 
     def segment_url(
         self,
@@ -252,11 +252,14 @@ class DatasetEntry(Entry):
             fill_latest_at=fill_latest_at,
         )
 
-    def get_index_ranges(self, index: str | IndexColumnDescriptor) -> datafusion.DataFrame:
-        # Use the SDK's DatasetView.get_index_ranges()
+    def get_index_ranges(self) -> datafusion.DataFrame:
+        """Returns the range bounds of all indexes per segment."""
         view = self.filter_contents(["/**"])
-        return view.get_index_ranges(index)
+        return view.get_index_ranges()
 
+    @deprecated(
+        "Index creation is currently not supported. Contact Rerun if this is a feature you would like us to support."
+    )
     def create_fts_search_index(
         self,
         *,
@@ -265,13 +268,21 @@ class DatasetEntry(Entry):
         store_position: bool = False,
         base_tokenizer: str = "simple",
     ) -> None:
-        return self._inner.create_fts_search_index(
-            column=column,
-            time_index=time_index,
-            store_position=store_position,
-            base_tokenizer=base_tokenizer,
-        )
+        try:
+            return self._inner.create_fts_search_index(  # ty: ignore[deprecated]
+                column=column,
+                time_index=time_index,
+                store_position=store_position,
+                base_tokenizer=base_tokenizer,
+            )
+        except Exception as err:
+            raise NotImplementedError(
+                "Index creation is currently not supported. Contact Rerun if this is a feature you would like us to support."
+            ) from err
 
+    @deprecated(
+        "Index creation is currently not supported. Contact Rerun if this is a feature you would like us to support."
+    )
     def create_vector_search_index(
         self,
         *,
@@ -281,13 +292,18 @@ class DatasetEntry(Entry):
         num_sub_vectors: int = 16,
         distance_metric: Any = ...,
     ) -> Any:
-        return self._inner.create_vector_search_index(
-            column=column,
-            time_index=time_index,
-            target_partition_num_rows=target_partition_num_rows,
-            num_sub_vectors=num_sub_vectors,
-            distance_metric=distance_metric,
-        )
+        try:
+            return self._inner.create_vector_search_index(  # ty: ignore[deprecated]
+                column=column,
+                time_index=time_index,
+                target_partition_num_rows=target_partition_num_rows,
+                num_sub_vectors=num_sub_vectors,
+                distance_metric=distance_metric,
+            )
+        except Exception as err:
+            raise NotImplementedError(
+                "Index creation is currently not supported. Contact Rerun if this is a feature you would like us to support."
+            ) from err
 
     def list_search_indexes(self) -> list:
         return self._inner.list_search_indexes()
@@ -295,11 +311,27 @@ class DatasetEntry(Entry):
     def delete_search_indexes(self, column: Any) -> list[Any]:
         return self._inner.delete_search_indexes(column)
 
+    @deprecated(
+        "Index search is currently not supported. Contact Rerun if this is a feature you would like us to support."
+    )
     def search_fts(self, query: str, column: Any) -> datafusion.DataFrame:
-        return self._inner.search_fts(query, column)
+        try:
+            return self._inner.search_fts(query, column)  # ty: ignore[deprecated]
+        except Exception as err:
+            raise NotImplementedError(
+                "Index search is currently not supported. Contact Rerun if this is a feature you would like us to support."
+            ) from err
 
+    @deprecated(
+        "Index search is currently not supported. Contact Rerun if this is a feature you would like us to support."
+    )
     def search_vector(self, query: Any, column: Any, top_k: int) -> datafusion.DataFrame:
-        return self._inner.search_vector(query, column, top_k)
+        try:
+            return self._inner.search_vector(query, column, top_k)  # ty: ignore[deprecated]
+        except Exception as err:
+            raise NotImplementedError(
+                "Index search is currently not supported. Contact Rerun if this is a feature you would like us to support."
+            ) from err
 
     def do_maintenance(
         self,
@@ -394,57 +426,6 @@ class DatasetView:
             Whether to fill null values with the latest valid data.
 
         """
-        import logging
-
-        # Convert DataFrame to dict form first
-        if isinstance(using_index_values, datafusion.DataFrame):
-            using_index_values = self._dataframe_to_index_values_dict(using_index_values, index)
-
-        # Handle dict-based using_index_values (per-segment semantics)
-        if isinstance(using_index_values, dict):
-            # Get available segment IDs in this view
-            available_segments = set(self._inner.segment_ids())
-
-            # Check for segments in dict that don't exist or are filtered out
-            requested_segments = set(using_index_values.keys())
-            missing_segments = requested_segments - available_segments
-            if missing_segments:
-                logging.warning(
-                    f"Index values for the following inexistent or filtered segments were ignored: {', '.join(sorted(missing_segments))}"
-                )
-
-            # Call reader per segment and union the results
-            dfs = []
-            for segment_id, segment_index_values in using_index_values.items():
-                if segment_id not in available_segments:
-                    continue
-                view = self._inner.filter_segments([segment_id])
-                df = view.reader(
-                    index=index,
-                    include_semantically_empty_columns=include_semantically_empty_columns,
-                    include_tombstone_columns=include_tombstone_columns,
-                    fill_latest_at=fill_latest_at,
-                    using_index_values=segment_index_values,
-                )
-                dfs.append(df)
-
-            if not dfs:
-                # Return empty result with schema from view
-                return self._inner.reader(
-                    index=index,
-                    include_semantically_empty_columns=include_semantically_empty_columns,
-                    include_tombstone_columns=include_tombstone_columns,
-                    fill_latest_at=fill_latest_at,
-                    using_index_values=None,
-                ).limit(0)
-
-            # Union all DataFrames
-            result = dfs[0]
-            for df in dfs[1:]:
-                result = result.union(df)
-            return result
-
-        # Simple case: None
         return self._inner.reader(
             index=index,
             include_semantically_empty_columns=include_semantically_empty_columns,
@@ -453,24 +434,14 @@ class DatasetView:
             using_index_values=using_index_values,
         )
 
-    def get_index_ranges(self, index: str | IndexColumnDescriptor) -> datafusion.DataFrame:
-        import datafusion.functions as F
-        from datafusion import col
+    def get_index_ranges(self) -> datafusion.DataFrame:
+        """Returns the range bounds of all indexes per segment."""
+        exprs = ["rerun_segment_id"]
+        for index_col in self.schema().index_columns():
+            exprs.append(f"{index_col.name}:start")
+            exprs.append(f"{index_col.name}:end")
 
-        schema = self.schema()
-        exprs = []
-
-        for index_column in schema.index_columns():
-            exprs.append(F.min(col(index_column.name)).alias(f"{index_column.name}:min"))
-            exprs.append(F.max(col(index_column.name)).alias(f"{index_column.name}:max"))
-
-        # TODO(ab, jleibs): we're still unsure about these, so let's keep them aside for now.
-        # for component_column in schema.component_columns():
-        #     if component_column.name.startswith("property:"):
-        #         continue
-        #     exprs.append(F.count(col(component_column.name)).alias(f"count({component_column.name})"))
-
-        return self.reader(index=index).aggregate("rerun_segment_id", exprs)
+        return self.segment_table().select(*exprs)
 
     def filter_segments(self, segment_ids: datafusion.DataFrame | Sequence[str]) -> DatasetView:
         """Returns a new DatasetView filtered to the given segment IDs."""
@@ -479,39 +450,6 @@ class DatasetView:
     def filter_contents(self, exprs: Sequence[str]) -> DatasetView:
         """Returns a new DatasetView filtered to the given entity paths."""
         return DatasetView(self._inner.filter_contents(list(exprs)))
-
-    def _dataframe_to_index_values_dict(
-        self, df: datafusion.DataFrame, index: str | None
-    ) -> dict[str, IndexValuesLike]:
-        """Convert a DataFrame with segment_id + index columns to a dict."""
-        import numpy as np
-
-        table = df.to_arrow_table()
-
-        if "rerun_segment_id" not in table.schema.names:
-            raise ValueError("using_index_values DataFrame must have a 'rerun_segment_id' column")
-
-        if index is None:
-            raise ValueError("index must be provided when using_index_values is a DataFrame")
-
-        if index not in table.schema.names:
-            raise ValueError(f"using_index_values DataFrame must have an '{index}' column")
-
-        # Group by segment_id
-        segment_id_col = table.column("rerun_segment_id")
-        index_col = table.column(index)
-
-        # Build dict of segment_id -> index values
-        index_values_by_segment: dict[str, list] = {}
-        for i in range(table.num_rows):
-            seg_id = segment_id_col[i].as_py()
-            idx_val = index_col[i].as_py()
-            if seg_id not in index_values_by_segment:
-                index_values_by_segment[seg_id] = []
-            index_values_by_segment[seg_id].append(idx_val)
-
-        # Convert to numpy arrays
-        return {seg_id: np.array(vals, dtype="datetime64[ns]") for seg_id, vals in index_values_by_segment.items()}
 
 
 class TableEntry(Entry):
@@ -569,14 +507,9 @@ class TableEntry(Entry):
         """Returns the schema of the table."""
         return self.reader().schema()
 
-    def to_polars(self) -> Any:
-        """Returns the table as a Polars DataFrame."""
-        return self.reader().to_polars()
-
 
 AlreadyExistsError = _catalog.AlreadyExistsError
 EntryId = _catalog.EntryId
 EntryKind = _catalog.EntryKind
 NotFoundError = _catalog.NotFoundError
-TableInsertMode = _catalog.TableInsertMode
 VectorDistanceMetric = _catalog.VectorDistanceMetric

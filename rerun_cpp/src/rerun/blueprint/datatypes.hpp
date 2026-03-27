@@ -3,6 +3,7 @@
 #pragma once
 
 #include "blueprint/datatypes/component_column_selector.hpp"
+#include "blueprint/datatypes/component_source_kind.hpp"
 #include "blueprint/datatypes/filter_by_range.hpp"
 #include "blueprint/datatypes/filter_is_not_null.hpp"
 #include "blueprint/datatypes/selected_columns.hpp"
@@ -10,3 +11,4 @@
 #include "blueprint/datatypes/text_log_column.hpp"
 #include "blueprint/datatypes/text_log_column_kind.hpp"
 #include "blueprint/datatypes/timeline_column.hpp"
+#include "blueprint/datatypes/visualizer_component_mapping.hpp"

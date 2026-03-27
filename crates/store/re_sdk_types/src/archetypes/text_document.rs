@@ -216,6 +216,13 @@ impl ::re_types_core::AsComponents for TextDocument {
 
 impl ::re_types_core::ArchetypeReflectionMarker for TextDocument {}
 
+impl crate::VisualizableArchetype for TextDocument {
+    #[inline]
+    fn visualizer(&self) -> crate::Visualizer {
+        crate::Visualizer::new("TextDocument").with_overrides(self)
+    }
+}
+
 impl TextDocument {
     /// Create a new `TextDocument`.
     #[inline]

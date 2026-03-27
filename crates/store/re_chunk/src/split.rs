@@ -28,6 +28,9 @@ impl Chunk {
     /// Naively splits a chunk if it exceeds the configured thresholds.
     ///
     /// The resulting pieces may still be larger than [`ChunkSplitConfig::chunk_max_bytes`].
+    ///
+    /// The Chunk is *deeply* sliced, as opposed to shallowly. Refer to [`Chunk::row_sliced_deep`]
+    /// to learn more about that and why it matters.
     pub fn split_chunk_if_needed(chunk: Arc<Self>, cfg: &ChunkSplitConfig) -> Vec<Arc<Self>> {
         let ChunkSplitConfig {
             chunk_max_bytes,
@@ -76,9 +79,8 @@ impl Chunk {
             let remaining_rows = chunk.num_rows() - start_idx;
             let chunk_size = remaining_rows.min(target_rows);
 
-            // TODO(#11971): keep track of the split chunks' lineage
             let split_chunk = chunk
-                .row_sliced(start_idx, chunk_size)
+                .row_sliced_deep(start_idx, chunk_size)
                 .with_id(ChunkId::new());
 
             result.push(Arc::new(split_chunk));

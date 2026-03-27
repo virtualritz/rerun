@@ -7,7 +7,7 @@ use egui_kittest::kittest::Queryable as _;
 use re_sdk_types::components::Colormap;
 use re_test_context::TestContext;
 use re_viewer::viewer_test_utils::{self, HarnessOptions};
-use re_viewer_context::{MaybeMutRef, ViewerContext};
+use re_viewer_context::MaybeMutRef;
 
 /// Navigates from welcome to settings screen and snapshots it.
 #[tokio::test]
@@ -26,7 +26,7 @@ async fn settings_screen() {
     harness.get_by_label("Menu").click();
     harness.run_ok();
     harness.get_by_label_contains("Settings…").click();
-    // Wait for the FFmpeg-check loading spinner to disappear.
+    // Wait for the FFmpeg-check loading indicator to disappear.
     viewer_test_utils::step_until(
         "Settings screen shows up with FFMpeg binary not found error",
         &mut harness,
@@ -50,7 +50,7 @@ async fn menu_without_recording() {
     let mut harness = viewer_test_utils::viewer_harness(&HarnessOptions::default());
     harness.get_by_label("Menu").click();
     harness.run_ok();
-    // Mask the shortcut for quitting, it's platform-dependent.
+    // Redact the shortcut for quitting as it's platform-dependent.
     harness.mask(harness.get_by_label_contains("Quit").rect());
     harness.snapshot("menu_without_recording");
 }
@@ -69,7 +69,7 @@ fn colormap_selector_ui() {
         .build_ui(|ui| {
             re_ui::apply_style_and_install_loaders(ui.ctx());
 
-            test_context.run(&ui.ctx().clone(), |ctx: &ViewerContext<'_>| {
+            test_context.run_recording(&ui.ctx().clone(), |ctx| {
                 ui.horizontal(|ui| {
                     ui.label("Colormap:");
 
@@ -97,4 +97,22 @@ fn colormap_selector_ui() {
     harness.fit_contents();
     harness.run();
     harness.snapshot("colormap_selector_open");
+}
+
+#[test]
+fn ci_runners_use_software_rendering() {
+    if std::env::var("CI").is_ok() {
+        let test_context = TestContext::new();
+        let _viewer = test_context.setup_kittest_for_rendering_3d([200.0, 100.0]);
+        let render_state_guard = test_context.egui_render_state.lock();
+        let render_state = render_state_guard.as_ref().unwrap();
+        assert_eq!(
+            render_state.adapter.get_info().device_type,
+            wgpu::DeviceType::Cpu
+        );
+        assert_eq!(
+            render_state.adapter.get_info().backend,
+            wgpu::Backend::Vulkan
+        );
+    }
 }

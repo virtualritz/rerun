@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from datetime import datetime, timedelta
 
+    import datafusion
     import numpy as np
 
     from .blueprint import BlueprintLike
@@ -22,8 +23,18 @@ if TYPE_CHECKING:
 from rerun import bindings
 from rerun.error_utils import RerunMissingDependencyError
 
-from .event import (
-    ViewerEvent,
+from ._event import (
+    ContainerSelectionItem as ContainerSelectionItem,
+    EntitySelectionItem as EntitySelectionItem,
+    PauseEvent as PauseEvent,
+    PlayEvent as PlayEvent,
+    RecordingOpenEvent as RecordingOpenEvent,
+    SelectionChangeEvent as SelectionChangeEvent,
+    SelectionItem as SelectionItem,
+    TimelineChangeEvent as TimelineChangeEvent,
+    TimeUpdateEvent as TimeUpdateEvent,
+    ViewerEvent as ViewerEvent,
+    ViewSelectionItem as ViewSelectionItem,
     _viewer_event_from_json_str,
 )
 from .recording_stream import RecordingStream, get_data_recording
@@ -49,9 +60,9 @@ def set_default_size(*, width: int | None, height: int | None) -> None:
 
     Parameters
     ----------
-    width : int
+    width:
         The width of the viewer in pixels.
-    height : int
+    height:
         The height of the viewer in pixels.
 
     """
@@ -67,7 +78,7 @@ class Viewer:
     """
     A viewer embeddable in a notebook.
 
-    This viewer is a wrapper around the [`rerun_notebook.Viewer`][] widget.
+    This viewer is a wrapper around the `rerun_notebook.Viewer` widget.
     """
 
     def __init__(
@@ -79,6 +90,7 @@ class Viewer:
         blueprint: BlueprintLike | None = None,
         recording: RecordingStream | None = None,
         use_global_recording: bool | None = None,
+        theme: Literal["dark", "light", "system"] | None = None,
     ) -> None:
         """
         Create a new Rerun viewer widget for use in a notebook.
@@ -86,7 +98,7 @@ class Viewer:
         Any data logged to the recording after initialization will be sent directly to the viewer.
 
         This widget can be displayed by returning it at the end of your cells execution, or immediately
-        by calling [`Viewer.display`][].
+        by calling [`rerun.notebook.Viewer.display`][].
 
         Parameters
         ----------
@@ -116,6 +128,10 @@ class Viewer:
             Settings this to `False` causes the Viewer to not pick up the global recording.
 
             Defaults to `False` if `url` is provided, and `True` otherwise.
+        theme:
+            The color theme to use. Either "dark", "light", or "system".
+
+            If not set, the viewer uses the previously persisted theme preference or defaults to "system".
 
         """
         if not HAS_NOTEBOOK:
@@ -137,6 +153,7 @@ class Viewer:
             height=height if height is not None else _default_height,
             url=url,
             fallback_token=fallback_token,
+            theme=theme,
         )
 
         # Set full credentials if we have them so the UI can show who's logged in
@@ -190,11 +207,11 @@ class Viewer:
 
         Parameters
         ----------
-        recording : RecordingStream
+        recording:
             Specifies the [`rerun.RecordingStream`][] to use.
             If left unspecified, defaults to the current active data recording, if there is one.
             See also: [`rerun.init`][], [`rerun.set_global_data_recording`][].
-        blueprint : BlueprintLike
+        blueprint:
             A blueprint object to send to the viewer.
             It will be made active and set as the default blueprint in the recording.
 
@@ -266,7 +283,7 @@ class Viewer:
     def send_table(
         self,
         id: str,
-        table: RecordBatch,
+        table: RecordBatch | list[RecordBatch] | datafusion.DataFrame,
     ) -> None:
         """
         Sends a table in the form of a dataframe to the viewer.
@@ -277,10 +294,13 @@ class Viewer:
             The name that uniquely identifies the table in the viewer.
             This name will also be shown in the recording panel.
         table:
-            The table as a single Arrow record batch.
+            The table data as an Arrow RecordBatch, list of RecordBatches, or a datafusion DataFrame.
 
         """
-        new_table = self._add_table_id(table, id)
+        from rerun._arrow import to_record_batch
+
+        record_batch = to_record_batch(table)
+        new_table = self._add_table_id(record_batch, id)
         sink = pyarrow.BufferOutputStream()
         writer = ipc.new_stream(sink, new_table.schema)
         writer.write_batch(new_table)
@@ -294,7 +314,7 @@ class Viewer:
 
         Parameters
         ----------
-        block_until_ready : bool
+        block_until_ready:
             Whether to block until the viewer is ready to receive data. If this is `False`, the viewer
             will still be displayed, but logged data will likely be queued until the viewer becomes ready
             at the end of cell execution.
@@ -454,10 +474,6 @@ class Viewer:
             Whether to start playing from the specified time point. Defaults to paused.
         timeline:
             The name of the timeline to switch to. If not provided, time will remain on the current timeline.
-        nanoseconds:
-            DEPRECATED: Use `duration` or 'timestamp` instead, with "seconds" as the unit.
-        seconds:
-            DEPRECATED: Use `duration` or 'timestamp` instead.
 
         """
         if sum(x is not None for x in (sequence, duration, timestamp)) > 1:
@@ -477,6 +493,20 @@ class Viewer:
         self._viewer.set_time_ctrl(timeline, time, play)
 
     def on_event(self, callback: Callable[[ViewerEvent], None]) -> None:
+        """
+        Register a callback to be called when a viewer event occurs.
+
+        The callback will receive a [`ViewerEvent`][rerun.notebook.ViewerEvent], which is one of:
+        [`PlayEvent`][rerun.notebook.PlayEvent], [`PauseEvent`][rerun.notebook.PauseEvent],
+        [`TimeUpdateEvent`][rerun.notebook.TimeUpdateEvent], [`TimelineChangeEvent`][rerun.notebook.TimelineChangeEvent],
+        [`SelectionChangeEvent`][rerun.notebook.SelectionChangeEvent], or [`RecordingOpenEvent`][rerun.notebook.RecordingOpenEvent].
+
+        Parameters
+        ----------
+        callback:
+            A function that takes a [`ViewerEvent`][rerun.notebook.ViewerEvent] as its only argument.
+
+        """
         self._event_callbacks.append(callback)
 
     def set_credentials(self, access_token: str, email: str) -> None:

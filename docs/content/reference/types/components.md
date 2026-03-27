@@ -10,7 +10,7 @@ An entity can only ever contain a single array of any given component type.
 If you log the same component several times on an entity, the last value (or array of values) will overwrite the previous.
 
 For more information on the relationship between **archetypes** and **components**, check out the concept page
-on [Entities and Components](../../concepts/entity-component.md).
+on [Entities and Components](../../concepts/logging-and-ingestion/entity-component.md).
 
 
 * [`AggregationPolicy`](components/aggregation_policy.md): Policy for aggregation of multiple scalar plot values.
@@ -41,6 +41,7 @@ on [Entities and Components](../../concepts/entity-component.md).
 * [`ImageFormat`](components/image_format.md): The metadata describing the contents of a [`components.ImageBuffer`](https://rerun.io/docs/reference/types/components/image_buffer).
 * [`ImagePlaneDistance`](components/image_plane_distance.md): The distance from the camera origin to the image plane when the projection is shown in a 3D viewer.
 * [`Interactive`](components/interactive.md): Whether the entity can be interacted with.
+* [`InterpolationMode`](components/interpolation_mode.md): Specifies how values between data points are interpolated in time series.
 * [`KeyValuePairs`](components/key_value_pairs.md): A map of string keys to string values.
 * [`KeypointId`](components/keypoint_id.md): A 16-bit ID representing a type of semantic keypoint within a class.
 * [`LatLon`](components/lat_lon.md): A geospatial position expressed in [EPSG:4326](https://epsg.io/4326) latitude and longitude (North/East-positive degrees).
@@ -48,10 +49,11 @@ on [Entities and Components](../../concepts/entity-component.md).
 * [`LineStrip2D`](components/line_strip2d.md): A line strip in 2D space.
 * [`LineStrip3D`](components/line_strip3d.md): A line strip in 3D space.
 * [`LinearSpeed`](components/linear_speed.md): Linear speed, used for translation speed for example.
-* [`MagnificationFilter`](components/magnification_filter.md): Filter used when magnifying an image/texture such that a single pixel/texel is displayed as multiple pixels on screen.
+* [`MagnificationFilter`](components/magnification_filter.md): Filter used when a single texel/pixel of an image is displayed larger than a single screen pixel.
 * [`MarkerShape`](components/marker_shape.md): The visual appearance of a point in e.g. a 2D plot.
 * [`MarkerSize`](components/marker_size.md): Radius of a marker of a point in e.g. a 2D plot, measured in UI points.
 * [`MediaType`](components/media_type.md): A standardized media type (RFC2046, formerly known as MIME types), encoded as a string.
+* [`MeshFaceRendering`](components/mesh_face_rendering.md): Determines which faces of a mesh are rendered.
 * [`Name`](components/name.md): A display name, typically for an entity or a item like a plot series.
 * [`Opacity`](components/opacity.md): Degree of transparency ranging from 0.0 (fully transparent) to 1.0 (fully opaque).
 * [`PinholeProjection`](components/pinhole_projection.md): Camera projection, from image coordinates to view coordinates.
@@ -66,7 +68,6 @@ on [Entities and Components](../../concepts/entity-component.md).
 * [`Scalar`](components/scalar.md): A scalar value, encoded as a 64-bit floating point.
 * [`Scale3D`](components/scale3d.md): A 3D scale factor.
 * [`SchemaId`](components/schema_id.md): A 16-bit unique identifier for a schema within the MCAP file.
-* [`SeriesVisible`](components/series_visible.md): Like [`components.Visible`](https://rerun.io/docs/reference/types/components/visible), but for time series.
 * [`ShowLabels`](components/show_labels.md): Whether the entity's [`components.Text`](https://rerun.io/docs/reference/types/components/text) label is shown.
 * [`StrokeWidth`](components/stroke_width.md): The width of a stroke specified in UI points.
 * [`TensorData`](components/tensor_data.md): An N-dimensional array of numbers.

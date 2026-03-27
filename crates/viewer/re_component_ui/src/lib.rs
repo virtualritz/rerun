@@ -6,6 +6,7 @@
 #![warn(clippy::iter_over_hash_type)] //  TODO(#6198): enable everywhere
 
 mod color;
+pub mod color_swatch;
 mod datatype_uis;
 mod entity_path;
 mod geo_line_string;
@@ -22,6 +23,7 @@ mod response_utils;
 mod text_log_columns;
 mod time_range;
 mod timeline_columns;
+mod transform_frame_id;
 mod transforms;
 mod variant_uis;
 mod video_timestamp;
@@ -33,9 +35,9 @@ mod zoom_level;
 use datatype_uis::{
     edit_bool, edit_f32_min_to_max_float, edit_f32_zero_to_max, edit_f32_zero_to_one,
     edit_f64_min_to_max_float, edit_f64_zero_to_max, edit_multiline_string, edit_or_view_vec2d,
-    edit_or_view_vec3d, edit_singleline_string, edit_u64_range, edit_ui_points, edit_view_enum,
-    edit_view_enum_with_variant_available, edit_view_range1d, view_timestamp, view_uuid,
-    view_view_id,
+    edit_or_view_vec3d, edit_or_view_vec3d_positive, edit_singleline_string, edit_u64_range,
+    edit_ui_points, edit_view_enum, edit_view_enum_with_variant_available, edit_view_range1d,
+    view_timestamp, view_uuid, view_view_id,
 };
 use re_sdk_types::blueprint::components::{
     AngularSpeed, BackgroundKind, Corner2D, Enabled, Eye3DKind, ForceDistance, ForceIterations,
@@ -44,10 +46,10 @@ use re_sdk_types::blueprint::components::{
 };
 use re_sdk_types::components::{
     AggregationPolicy, AlbedoFactor, AxisLength, Color, DepthMeter, DrawOrder, FillMode, FillRatio,
-    GammaCorrection, GraphType, ImagePlaneDistance, LinearSpeed, MagnificationFilter, MarkerSize,
-    Name, Opacity, Position2D, Position3D, Range1D, Scale3D, SeriesVisible, ShowLabels,
-    StrokeWidth, Text, Timestamp, TransformFrameId, TransformRelation, Translation3D, ValueRange,
-    Vector3D, VideoCodec, Visible,
+    GammaCorrection, GraphType, HalfSize3D, ImagePlaneDistance, InterpolationMode, Length,
+    LinearSpeed, MagnificationFilter, MarkerSize, MeshFaceRendering, Name, Opacity, Position2D,
+    Position3D, Range1D, Scale3D, ShowLabels, StrokeWidth, Text, Timestamp, TransformRelation,
+    Translation3D, ValueRange, Vector3D, VideoCodec, Visible,
 };
 use re_viewer_context::gpu_bridge::colormap_edit_or_view_ui;
 
@@ -75,9 +77,11 @@ pub fn create_component_ui_registry() -> re_viewer_context::ComponentUiRegistry 
 
     // Color components:
     registry.add_singleline_edit_or_view::<Color>(color::edit_rgba32);
+    registry.add_singleline_array_edit_or_view::<Color>(color::edit_rgba32_array);
     registry.add_singleline_edit_or_view::<AlbedoFactor>(color::edit_rgba32);
 
     // 0-inf float components:
+    registry.add_singleline_edit_or_view::<AngularSpeed>(edit_f64_min_to_max_float);
     registry.add_singleline_edit_or_view::<AxisLength>(edit_f32_zero_to_max);
     registry.add_singleline_edit_or_view::<DepthMeter>(edit_f32_zero_to_max);
     registry.add_singleline_edit_or_view::<FillRatio>(edit_f32_zero_to_max);
@@ -85,8 +89,8 @@ pub fn create_component_ui_registry() -> re_viewer_context::ComponentUiRegistry 
     registry.add_singleline_edit_or_view::<GammaCorrection>(edit_f32_zero_to_max);
     registry.add_singleline_edit_or_view::<GridSpacing>(edit_f32_zero_to_max);
     registry.add_singleline_edit_or_view::<ImagePlaneDistance>(edit_f32_zero_to_max);
+    registry.add_singleline_edit_or_view::<Length>(edit_f32_zero_to_max);
     registry.add_singleline_edit_or_view::<LinearSpeed>(edit_f64_zero_to_max);
-    registry.add_singleline_edit_or_view::<AngularSpeed>(edit_f64_min_to_max_float);
     registry.add_singleline_edit_or_view::<MarkerSize>(edit_ui_points);
     registry.add_singleline_edit_or_view::<NearClipPlane>(edit_f32_zero_to_max);
     registry.add_singleline_edit_or_view::<StrokeWidth>(edit_ui_points);
@@ -108,7 +112,6 @@ pub fn create_component_ui_registry() -> re_viewer_context::ComponentUiRegistry 
     registry.add_singleline_edit_or_view::<LockRangeDuringZoom>(edit_bool);
     registry.add_singleline_edit_or_view::<ShowLabels>(edit_bool);
     registry.add_singleline_edit_or_view::<Visible>(edit_bool);
-    registry.add_singleline_edit_or_view::<SeriesVisible>(edit_bool);
 
     // Date components:
     registry.add_singleline_edit_or_view::<Timestamp>(view_timestamp);
@@ -118,16 +121,18 @@ pub fn create_component_ui_registry() -> re_viewer_context::ComponentUiRegistry 
     registry.add_multiline_edit_or_view::<Text>(edit_multiline_string);
     registry.add_singleline_edit_or_view::<Name>(edit_singleline_string);
     registry.add_multiline_edit_or_view::<Name>(edit_multiline_string);
-    registry.add_singleline_edit_or_view::<TransformFrameId>(edit_singleline_string);
+    registry.add_singleline_edit_or_view(transform_frame_id::edit_or_view_transform_frame_id);
 
     // Enums:
     // TODO(#6974): Enums editors trivial and always the same, provide them automatically!
     registry.add_singleline_edit_or_view::<AggregationPolicy>(edit_view_enum);
     registry.add_singleline_edit_or_view::<BackgroundKind>(edit_view_enum);
     registry.add_singleline_edit_or_view::<Corner2D>(edit_view_enum);
+    registry.add_singleline_edit_or_view::<MeshFaceRendering>(edit_view_enum);
     registry.add_singleline_edit_or_view::<Eye3DKind>(edit_view_enum);
     registry.add_singleline_edit_or_view::<FillMode>(edit_view_enum);
     registry.add_singleline_edit_or_view::<GraphType>(edit_view_enum);
+    registry.add_singleline_edit_or_view::<InterpolationMode>(edit_view_enum);
     registry.add_singleline_edit_or_view::<LinkAxis>(edit_view_enum);
     registry.add_singleline_edit_or_view::<MapProvider>(
         edit_view_enum_with_variant_available::<
@@ -154,9 +159,10 @@ pub fn create_component_ui_registry() -> re_viewer_context::ComponentUiRegistry 
     registry.add_singleline_edit_or_view::<Position2D>(edit_or_view_vec2d);
 
     // Vec3 components:
-    registry.add_singleline_edit_or_view::<Translation3D>(edit_or_view_vec3d);
-    registry.add_singleline_edit_or_view::<Scale3D>(edit_or_view_vec3d);
+    registry.add_singleline_edit_or_view::<HalfSize3D>(edit_or_view_vec3d_positive);
     registry.add_singleline_edit_or_view::<Position3D>(edit_or_view_vec3d);
+    registry.add_singleline_edit_or_view::<Scale3D>(edit_or_view_vec3d);
+    registry.add_singleline_edit_or_view::<Translation3D>(edit_or_view_vec3d);
     registry.add_singleline_edit_or_view::<Vector3D>(edit_or_view_vec3d);
 
     // Components that refer to views:

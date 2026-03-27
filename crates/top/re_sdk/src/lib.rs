@@ -21,6 +21,11 @@ mod log_sink;
 mod recording_stream;
 mod spawn;
 
+// ---------------
+// Public modules:
+
+pub mod blueprint;
+
 // -------------
 // Public items:
 
@@ -62,10 +67,6 @@ impl crate::sink::LogSink for re_log_encoding::FileSink {
             FileFlushError::Timeout => sink::SinkFlushError::Timeout,
         })
     }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 }
 
 // ---------------
@@ -99,6 +100,7 @@ pub mod log {
 pub mod time {
     pub use re_log_types::{Duration, TimeCell, TimeInt, TimePoint, TimeType, Timeline, Timestamp};
 }
+
 pub use re_sdk_types::{
     Archetype, ArchetypeName, AsComponents, Component, ComponentBatch, ComponentDescriptor,
     ComponentIdentifier, ComponentType, DatatypeName, DeserializationError, DeserializationResult,
@@ -134,9 +136,11 @@ pub mod external {
     pub use re_chunk::external::*;
     #[cfg(feature = "data_loaders")]
     pub use re_data_loader::{self, external::*};
+    #[cfg(feature = "server")]
+    pub use re_grpc_server;
     pub use re_log::external::*;
     pub use re_log_types::external::*;
-    pub use {re_grpc_client, re_grpc_server, re_log, re_log_encoding, re_log_types, re_uri};
+    pub use {re_grpc_client, re_log, re_log_encoding, re_log_types, re_uri};
 }
 
 #[cfg(feature = "web_viewer")]

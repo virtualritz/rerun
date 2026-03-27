@@ -90,12 +90,12 @@ The detections include the layout types and the text detections. Both of them ar
 rr.log(
     base_path,
     rr.Boxes2D(
-        array=record['bounding_box'],
+        array=record["bounding_box"],
         array_format=rr.Box2DFormat.XYXY,
         labels=[str(layout_type.type)],
-        class_ids=[str(layout_type.number)]
+        class_ids=[str(layout_type.number)],
     ),
-    rr.AnyValues(name=record_name)
+    rr.AnyValues(name=record_name),
 )
 ```
 
@@ -104,22 +104,14 @@ Additionally, in the detection of the text, the detection id and the confidence 
 ```python
 rr.log(
     f"{base_path}/Detections/{detection['id']}",
-    rr.Boxes2D(
-        array=detection['box'],
-        array_format=rr.Box2DFormat.XYXY,
-        class_ids=[str(layout_type.number)]
-    ),
-    rr.AnyValues(
-        DetectionID=detection['id'],
-        Text=detection['text'],
-        Confidence=detection['confidence']
-    )
+    rr.Boxes2D(array=detection["box"], array_format=rr.Box2DFormat.XYXY, class_ids=[str(layout_type.number)]),
+    rr.AnyValues(DetectionID=detection["id"], Text=detection["text"], Confidence=detection["confidence"]),
 )
 ```
 
 ### Setting up the blueprint
 
-[Blueprint](https://rerun.io/docs/concepts/blueprint) sets up the Rerun Viewer's layout. In this example, we set the layout for the layout classification, the Detections for the text detection and the Recovery for the restored detections, which includes both layout analysis and text detections.
+[Blueprint](https://rerun.io/docs/concepts/visualization/blueprints) sets up the Rerun Viewer's layout. In this example, we set the layout for the layout classification, the Detections for the text detection and the Recovery for the restored detections, which includes both layout analysis and text detections.
 We dynamically set the tabs, as there will be different tabs for figures, tables and text detection.
 
 The blueprint for this example is created by the following code:
@@ -144,10 +136,12 @@ page_tabs.append(
 
 # …
 
-rr.send_blueprint(rrb.Blueprint(
-    rrb.Tabs(*page_tabs),
-    collapse_panels=True,
-))
+rr.send_blueprint(
+    rrb.Blueprint(
+        rrb.Tabs(*page_tabs),
+        collapse_panels=True,
+    )
+)
 ```
 
 ## Run the code
@@ -181,8 +175,8 @@ python -m ocr --help
 
 Depending on your system, pip may grab suboptimal packages, causing slow runtimes.
 Installing with [Pixi](https://pixi.sh/) has been observed to run significantly faster in this case and it will automatically install `poppler` which is required to run the example on PDF files.
-To do so, simply run this command after checking out the repository and installing Pixi:
+To do so, simply run these commands after checking out the repository and installing Pixi:
 
 ```bash
-pixi run -e examples-ocr ocr
+pixi run py-build && pixi run uv run examples/python/ocr/ocr.py
 ```

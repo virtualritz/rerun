@@ -124,6 +124,7 @@ function startViewer(handle, parent, getProps) {
     manifest_url: props.manifest_url,
     render_backend: props.render_backend,
     hide_welcome_screen: props.hide_welcome_screen,
+    theme: props.theme,
 
     // NOTE: `width`, `height` intentionally ignored, they will
     //       instead be used on the parent `div` element
@@ -171,17 +172,18 @@ function diff(prev, current) {
 function keysChanged(prev, curr, keys) {
   for (const key of keys) {
     if (prev[key] !== curr[key]) {
-      return false;
+      return true;
     }
   }
-  return true;
+  return false;
 }
 
 /**
  * @template T
- * @param {T | T[]} a
+ * @param {T | T[] | undefined | null} a
  * @returns {T[]}
  */
 function toArray(a) {
+  if (a == null) return [];
   return Array.isArray(a) ? a : [a];
 }

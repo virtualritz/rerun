@@ -5,6 +5,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use crate::DataframeClientAPI;
+use crate::dataframe_query_common::{IndexValuesMap, group_chunk_infos_by_segment_id};
 use arrow::array::{Array, RecordBatch, RecordBatchOptions, StringArray};
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -21,20 +23,17 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures_util::{Stream, StreamExt as _};
 use re_dataframe::external::re_chunk_store::ChunkStore;
+use re_dataframe::utils::align_record_batch_to_schema;
 use re_dataframe::{
     ChunkStoreHandle, Index, QueryCache, QueryEngine, QueryExpression, QueryHandle, StorageEngine,
 };
 use re_log_types::{StoreId, StoreKind};
 use re_protos::cloud::v1alpha1::{FetchChunksRequest, ScanSegmentTableResponse};
-use re_redap_client::ConnectionClient;
 use tokio::runtime::Handle;
-
-use crate::dataframe_query_common::{
-    align_record_batch_to_schema, group_chunk_infos_by_segment_id,
-};
+use tonic::IntoRequest as _;
 
 #[derive(Debug)]
-pub(crate) struct SegmentStreamExec {
+pub(crate) struct SegmentStreamExec<T: DataframeClientAPI> {
     props: PlanProperties,
     chunk_info_batches: Arc<Vec<RecordBatch>>,
 
@@ -47,19 +46,19 @@ pub(crate) struct SegmentStreamExec {
     query_expression: QueryExpression,
     projected_schema: Arc<Schema>,
     target_partitions: usize,
-    client: ConnectionClient,
+    client: T,
 }
 
-pub struct DataframeSegmentStream {
+pub struct DataframeSegmentStream<T: DataframeClientAPI> {
     projected_schema: SchemaRef,
-    client: ConnectionClient,
+    client: T,
     chunk_infos: Vec<RecordBatch>,
     current_query: Option<(String, QueryHandle<StorageEngine>)>,
     query_expression: QueryExpression,
     remaining_segment_ids: Vec<String>,
 }
 
-impl DataframeSegmentStream {
+impl<T: DataframeClientAPI> DataframeSegmentStream<T> {
     async fn get_chunk_store_for_single_rerun_segment(
         &mut self,
         segment_id: &str,
@@ -69,8 +68,7 @@ impl DataframeSegmentStream {
 
         let fetch_chunks_response_stream = self
             .client
-            .inner()
-            .fetch_chunks(fetch_chunks_request)
+            .fetch_chunks(fetch_chunks_request.into_request())
             .await
             .map_err(|err| exec_datafusion_err!("{err}"))?
             .into_inner();
@@ -116,7 +114,7 @@ impl DataframeSegmentStream {
     }
 }
 
-impl Stream for DataframeSegmentStream {
+impl<T: DataframeClientAPI> Stream for DataframeSegmentStream<T> {
     type Item = Result<RecordBatch, DataFusionError>;
 
     #[tracing::instrument(level = "info", skip_all)]
@@ -160,7 +158,7 @@ impl Stream for DataframeSegmentStream {
     }
 }
 
-impl RecordBatchStream for DataframeSegmentStream {
+impl<T: DataframeClientAPI> RecordBatchStream for DataframeSegmentStream<T> {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.projected_schema)
     }
@@ -173,8 +171,9 @@ fn prepend_string_column_schema(schema: &Schema, column_name: &str) -> Schema {
     Schema::new_with_metadata(fields, schema.metadata.clone())
 }
 
-impl SegmentStreamExec {
+impl<T: DataframeClientAPI> SegmentStreamExec<T> {
     #[tracing::instrument(level = "info", skip_all)]
+    #[expect(clippy::too_many_arguments)]
     pub fn try_new(
         table_schema: &SchemaRef,
         sort_index: Option<Index>,
@@ -182,7 +181,8 @@ impl SegmentStreamExec {
         num_partitions: usize,
         chunk_info_batches: Arc<Vec<RecordBatch>>,
         query_expression: QueryExpression,
-        client: ConnectionClient,
+        _index_values: IndexValuesMap,
+        client: T,
     ) -> datafusion::common::Result<Self> {
         let projected_schema = match projection {
             Some(p) => Arc::new(table_schema.project(p)?),
@@ -302,7 +302,7 @@ fn create_next_row(
     Ok(Some(output_batch))
 }
 
-impl ExecutionPlan for SegmentStreamExec {
+impl<T: DataframeClientAPI> ExecutionPlan for SegmentStreamExec<T> {
     fn name(&self) -> &'static str {
         "SegmentStreamExec"
     }
@@ -403,7 +403,7 @@ impl ExecutionPlan for SegmentStreamExec {
     }
 }
 
-impl DisplayAs for SegmentStreamExec {
+impl<T: DataframeClientAPI> DisplayAs for SegmentStreamExec<T> {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,

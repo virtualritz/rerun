@@ -1,5 +1,5 @@
 mod column_projection;
-mod common;
+pub mod common;
 mod create_dataset;
 mod create_table;
 mod dataset_schema;
@@ -7,8 +7,11 @@ mod entries_table;
 mod fetch_chunks;
 mod indexes;
 mod query_dataset;
+mod query_filter;
+mod query_index_values;
 mod register_segment;
 mod rrd_manifest;
+mod unregister_segment;
 mod update_entry;
 mod write_table;
 
@@ -55,6 +58,8 @@ define_redap_tests! {
     column_projection::test_segment_table_column_projections,
     create_dataset::create_dataset_tests,
     create_table::create_table_entry,
+    create_table::create_table_entry_duplicate_url,
+    create_table::create_table_entry_failed_does_not_leak_name,
     dataset_schema::empty_dataset_schema,
     dataset_schema::simple_dataset_schema,
     entries_table::entries_table_with_empty_dataset,
@@ -63,21 +68,47 @@ define_redap_tests! {
     fetch_chunks::simple_dataset_fetch_chunk_snapshot,
     indexes::column_doesnt_exist,
     indexes::dataset_doesnt_exist,
+    indexes::index_incremental,
     indexes::index_lifecycle,
     query_dataset::query_dataset_should_fail,
+    query_dataset::query_dataset_with_various_queries,
     query_dataset::query_empty_dataset,
     query_dataset::query_simple_dataset,
     query_dataset::query_simple_dataset_with_layers,
+    query_filter::query_dataset_simple_filter,
+    query_index_values::query_dataset_index_values,
     register_segment::register_and_scan_blueprint_dataset,
     register_segment::register_and_scan_empty_dataset,
     register_segment::register_and_scan_simple_dataset,
+    register_segment::register_and_scan_simple_dataset_multiple_timelines,
     register_segment::register_and_scan_simple_dataset_with_layers,
     register_segment::register_and_scan_simple_dataset_with_properties,
     register_segment::register_and_scan_simple_dataset_with_properties_out_of_order,
+    register_segment::register_bad_file_uri_should_error,
+    register_segment::register_conflicting_property_schema,
+    register_segment::register_conflicting_schema,
+    register_segment::register_conflicting_schema_filters_segment_table,
+    register_segment::register_conflicting_schema_same_segment_filters_layer,
+    register_segment::register_empty_request,
+    register_segment::register_fully_skipped,
+    register_segment::register_intra_request_duplicates,
     register_segment::register_segment_bumps_timestamp,
+    register_segment::register_with_dataset_if_duplicate_behavior_error,
+    register_segment::register_with_dataset_if_duplicate_behavior_overwrite,
+    register_segment::register_with_dataset_if_duplicate_behavior_skip,
     register_segment::register_with_prefix,
+    rrd_manifest::segment_id_not_found,
     rrd_manifest::simple_dataset_rrd_manifest,
+    rrd_manifest::unregistered_segment,
+    rrd_manifest::layered_segment,
+    rrd_manifest::layered_segment_stress,
+    unregister_segment::unregister_invalid_args,
+    unregister_segment::unregister_missing_dataset,
+    unregister_segment::unregister_missing_segment,
+    unregister_segment::unregister_products,
+    unregister_segment::unregister_simple,
+    unregister_segment::unregister_then_query,
     update_entry::update_entry_bumps_timestamp,
     update_entry::update_entry_tests,
-    write_table::write_table
+    write_table::write_table,
 }

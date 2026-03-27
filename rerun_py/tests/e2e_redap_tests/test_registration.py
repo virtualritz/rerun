@@ -6,13 +6,14 @@ from typing import TYPE_CHECKING
 
 import pytest
 import rerun as rr
-from rerun.catalog import SegmentRegistrationResult
+from inline_snapshot import snapshot as inline_snapshot
+from rerun.catalog import AlreadyExistsError, OnDuplicateSegmentLayer, SegmentRegistrationResult
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
     from pathlib import Path
 
-    from rerun.catalog import CatalogClient
+    from rerun.catalog import CatalogClient, DatasetEntry
 
     from e2e_redap_tests.conftest import EntryFactory
 
@@ -55,6 +56,7 @@ def recording_factory(tmp_path: Path) -> Callable[[Sequence[str]], list[str]]:
     return create_recordings
 
 
+@pytest.mark.local_only
 def test_registration_invalidargs(
     catalog_client: CatalogClient, temp_empty_file: str, temp_empty_directory: str
 ) -> None:
@@ -137,6 +139,88 @@ def test_register_batch(
 
     assert len(result.segment_ids) == 3
     assert sorted(result.segment_ids) == sorted(recording_ids)
+
+
+@pytest.mark.local_only
+def test_register_unregister_batch(
+    entry_factory: EntryFactory,
+    recording_factory: Callable[[Sequence[str]], list[str]],
+) -> None:
+    """Test registering multiple recordings in a single call, then unregistering some of them."""
+    recording_ids = [
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "cccccccc-cccc-cccc-cccc-cccccccccccc",
+    ]
+    uris = recording_factory(recording_ids)
+
+    ds = entry_factory.create_dataset("test_register_unregister_batch")
+
+    handle = ds.register(uris)
+    result = handle.wait()
+
+    assert len(result.segment_ids) == 3
+    assert sorted(result.segment_ids) == sorted(recording_ids)
+
+    df = ds.segment_table()
+    assert df.count() == 3
+    table = df.to_arrow_table()
+    segment_ids = table.column("rerun_segment_id").to_pylist()
+    assert sorted(segment_ids) == sorted(recording_ids)
+
+    df = ds.filter_contents("/points").reader(index="log_time").sort("rerun_segment_id").drop("log_time")
+    assert str(df) == inline_snapshot("""\
+┌───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ METADATA:                                                                                                         │
+│ * version: 0.1.3                                                                                                  │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ ┌──────────────────────────────────────┬──────────────────────┬─────────────────────────────────────────────────┐ │
+│ │ rerun_segment_id                     ┆ log_tick             ┆ /points:Points2D:positions                      │ │
+│ │ ---                                  ┆ ---                  ┆ ---                                             │ │
+│ │ type: non-null Utf8                  ┆ type: Int64          ┆ type: List(FixedSizeList(2 x non-null Float32)) │ │
+│ │                                      ┆ index_name: log_tick ┆ archetype: Points2D                             │ │
+│ │                                      ┆ kind: index          ┆ component: Points2D:positions                   │ │
+│ │                                      ┆                      ┆ component_type: Position2D                      │ │
+│ │                                      ┆                      ┆ entity_path: /points                            │ │
+│ │                                      ┆                      ┆ kind: data                                      │ │
+│ ╞══════════════════════════════════════╪══════════════════════╪═════════════════════════════════════════════════╡ │
+│ │ aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa ┆ 0                    ┆ [[0.0, 0.0]]                                    │ │
+│ ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤ │
+│ │ bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb ┆ 0                    ┆ [[1.0, 1.0]]                                    │ │
+│ ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤ │
+│ │ cccccccc-cccc-cccc-cccc-cccccccccccc ┆ 0                    ┆ [[2.0, 2.0]]                                    │ │
+│ └──────────────────────────────────────┴──────────────────────┴─────────────────────────────────────────────────┘ │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘\
+""")
+
+    ds.unregister(segments_to_drop=[recording_ids[0], recording_ids[2]], layers_to_drop=[])
+
+    df = ds.segment_table()
+    assert df.count() == 1
+    table = df.to_arrow_table()
+    segment_ids = table.column("rerun_segment_id").to_pylist()
+    assert segment_ids == [recording_ids[1]]
+
+    df = ds.filter_contents("/points").reader(index="log_time").sort("rerun_segment_id").drop("log_time")
+    assert str(df) == inline_snapshot("""\
+┌───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ METADATA:                                                                                                         │
+│ * version: 0.1.3                                                                                                  │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ ┌──────────────────────────────────────┬──────────────────────┬─────────────────────────────────────────────────┐ │
+│ │ rerun_segment_id                     ┆ log_tick             ┆ /points:Points2D:positions                      │ │
+│ │ ---                                  ┆ ---                  ┆ ---                                             │ │
+│ │ type: non-null Utf8                  ┆ type: Int64          ┆ type: List(FixedSizeList(2 x non-null Float32)) │ │
+│ │                                      ┆ index_name: log_tick ┆ archetype: Points2D                             │ │
+│ │                                      ┆ kind: index          ┆ component: Points2D:positions                   │ │
+│ │                                      ┆                      ┆ component_type: Position2D                      │ │
+│ │                                      ┆                      ┆ entity_path: /points                            │ │
+│ │                                      ┆                      ┆ kind: data                                      │ │
+│ ╞══════════════════════════════════════╪══════════════════════╪═════════════════════════════════════════════════╡ │
+│ │ bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb ┆ 0                    ┆ [[1.0, 1.0]]                                    │ │
+│ └──────────────────────────────────────┴──────────────────────┴─────────────────────────────────────────────────┘ │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘\
+""")
 
 
 @pytest.mark.local_only
@@ -257,3 +341,306 @@ def test_register_same_segment_id(
     # TODO(RR-3177): we need to extend the APIs for this
     # assert result.failed_uris == [uris[2]]
     # assert "duplicate segment id" in result.something_something_error_message
+
+
+@pytest.mark.local_only
+def test_register_conflicting_schema(entry_factory: EntryFactory, tmp_path: Path) -> None:
+    """Test that two RRDs with conflicting schemas are not allowed to be registered to a dataset."""
+
+    import pyarrow as pa
+
+    seg_1_path = tmp_path / "segment1.rrd"
+    seg_2_path = tmp_path / "segment2.rrd"
+
+    with rr.RecordingStream("rerun_example_conflicting_schema", recording_id="segment1") as rec:
+        rec.save(seg_1_path)
+        rec.log("/data", rr.AnyValues(test=pa.array([1.0, 2.0, 3.0], type=pa.float64())))
+
+    with rr.RecordingStream("rerun_example_conflicting_schema", recording_id="segment2") as rec:
+        rec.save(seg_2_path)
+        rec.log("/data", rr.AnyValues(test=pa.array([1.0, 2.0, 3.0], type=pa.float32())))
+
+    dataset = entry_factory.create_dataset("test_conflicting_schema")
+
+    with pytest.raises(ValueError, match="schema"):
+        dataset.register([seg_1_path.as_uri(), seg_2_path.as_uri()]).wait()
+
+
+@pytest.mark.local_only
+def test_register_conflicting_property_schema(entry_factory: EntryFactory, tmp_path: Path) -> None:
+    """Test that two RRDs with conflicting schemas are not allowed to be registered to a dataset."""
+
+    import pyarrow as pa
+
+    seg_1_path = tmp_path / "segment1.rrd"
+    seg_2_path = tmp_path / "segment2.rrd"
+
+    with rr.RecordingStream("rerun_example_conflicting_schema", recording_id="segment1") as rec:
+        rec.save(seg_1_path)
+        rec.send_property("prop", rr.AnyValues(test=pa.array([1.0, 2.0, 3.0], type=pa.float64())))
+
+    with rr.RecordingStream("rerun_example_conflicting_schema", recording_id="segment2") as rec:
+        rec.save(seg_2_path)
+        rec.send_property("prop", rr.AnyValues(test=pa.array([1.0, 2.0, 3.0], type=pa.float32())))
+
+    dataset = entry_factory.create_dataset("test_conflicting_property_schema")
+
+    with pytest.raises(ValueError, match="schema"):
+        dataset.register([seg_1_path.as_uri(), seg_2_path.as_uri()]).wait()
+
+
+@pytest.mark.local_only
+def test_failed_registration_not_in_segment_table(entry_factory: EntryFactory, tmp_path: Path) -> None:
+    """Test that a failed segment registration does not show up in the segment table (separate segment id)."""
+
+    import pyarrow as pa
+
+    seg_1_path = tmp_path / "segment1.rrd"
+    seg_2_path = tmp_path / "segment2.rrd"
+
+    with rr.RecordingStream("rerun_example_conflicting_schema", recording_id="segment1") as rec:
+        rec.save(seg_1_path)
+        rec.send_property("prop", rr.AnyValues(test=pa.array([1.0, 2.0, 3.0], type=pa.float64())))
+
+    with rr.RecordingStream("rerun_example_conflicting_schema", recording_id="segment2") as rec:
+        rec.save(seg_2_path)
+        rec.send_property("prop", rr.AnyValues(test=pa.array([1.0, 2.0, 3.0], type=pa.float32())))
+
+    dataset = entry_factory.create_dataset("test_conflicting_property_schema")
+
+    dataset.register(seg_1_path.as_uri()).wait()
+
+    with pytest.raises(ValueError, match="schema"):
+        dataset.register(seg_2_path.as_uri()).wait()
+
+    # Verify it's segment1 (the successful one), not segment2 (the failed one)
+    segment_ids = dataset.segment_ids()
+    assert segment_ids == ["segment1"], f"Expected only segment1, got {segment_ids}"
+
+
+@pytest.mark.local_only
+def test_failed_layer_registration_not_in_segment_table(entry_factory: EntryFactory, tmp_path: Path) -> None:
+    """Test that a failed segment registration does not show up in the segment table (same segment id, different layers)."""
+
+    import pyarrow as pa
+
+    base_path = tmp_path / "base.rrd"
+    extra_path = tmp_path / "extra.rrd"
+
+    # Both use the same recording_id (segment1) but different layer names
+    with rr.RecordingStream("rerun_example_conflicting_schema", recording_id="segment1") as rec:
+        rec.save(base_path)
+        rec.send_property("prop", rr.AnyValues(test=pa.array([1.0, 2.0, 3.0], type=pa.float64())))
+
+    with rr.RecordingStream("rerun_example_conflicting_schema", recording_id="segment1") as rec:
+        rec.save(extra_path)
+        rec.send_property("prop", rr.AnyValues(test=pa.array([1.0, 2.0, 3.0], type=pa.float32())))
+
+    dataset = entry_factory.create_dataset("test_failed_layer_not_in_segment_table")
+
+    # Register base layer - should succeed
+    dataset.register(base_path.as_uri(), layer_name="base").wait()
+
+    # Register extra layer with conflicting schema - should fail
+    with pytest.raises(ValueError, match="schema"):
+        dataset.register(extra_path.as_uri(), layer_name="extra").wait()
+
+    # The segment table should still show the segment (because the base layer succeeded)
+    df = dataset.segment_table()
+    assert df.count() == 1
+
+    # Verify segment_id and layer_names columns
+    table = df.to_arrow_table()
+    segment_ids = table.column("rerun_segment_id").to_pylist()
+    layer_names = table.column("rerun_layer_names").to_pylist()
+
+    assert segment_ids == ["segment1"], f"Expected segment1, got {segment_ids}"
+    # Only the successful "base" layer should appear, not the failed "extra" layer
+    assert layer_names == [["base"]], f"Expected [['base']], got {layer_names}"
+
+
+@pytest.mark.local_only
+def test_register_duplicate_error_behavior(
+    entry_factory: EntryFactory,
+    recording_factory: Callable[[Sequence[str]], list[str]],
+) -> None:
+    """Test that registering duplicate segments with on_duplicate='error' (default) raises an error."""
+    recording_id = "88888888-8888-8888-8888-888888888888"
+    uris = recording_factory([recording_id])
+
+    ds = entry_factory.create_dataset("test_dup_error")
+
+    # First registration should succeed
+    handle = ds.register(uris[0], on_duplicate=OnDuplicateSegmentLayer.ERROR)
+    result = handle.wait()
+    assert len(result.segment_ids) == 1
+    assert result.segment_ids[0] == recording_id
+
+    # Second registration of the same segment should fail
+    with pytest.raises(AlreadyExistsError, match="already exists"):
+        ds.register(uris[0], on_duplicate=OnDuplicateSegmentLayer.ERROR).wait()
+
+
+@pytest.mark.local_only
+def test_register_duplicate_ignore_behavior(
+    entry_factory: EntryFactory,
+    recording_factory: Callable[[Sequence[str]], list[str]],
+) -> None:
+    """Test that registering duplicate segments with on_duplicate='ignore' keeps the original data."""
+    recording_id = "99999999-9999-9999-9999-999999999999"
+    # Create two recordings with the same ID but different data
+    # uris[0] has points [[0, 0]], uris[1] has points [[1, 1]]
+    uris = recording_factory([recording_id, recording_id])
+
+    ds = entry_factory.create_dataset("test_dup_ignore")
+
+    # First registration
+    handle = ds.register(uris[0], on_duplicate=OnDuplicateSegmentLayer.SKIP)
+    result = handle.wait()
+    assert len(result.segment_ids) == 1
+    assert result.segment_ids[0] == recording_id
+
+    # Verify the first recording's data is present (points [[0, 0]])
+    points = _get_points_data(ds)
+    assert points == [[0.0, 0.0]], f"Expected [[0.0, 0.0]] but got {points}"
+
+    # Second registration should succeed but not replace the data
+    handle = ds.register(uris[1], on_duplicate=OnDuplicateSegmentLayer.SKIP)
+    result = handle.wait()
+    # The result still contains the segment_id even though it was skipped
+    assert len(result.segment_ids) == 1
+
+    # Verify only one segment exists
+    segment_ids = ds.segment_ids()
+    assert len(segment_ids) == 1
+    assert segment_ids[0] == recording_id
+
+    # Verify the data is still from the first registration (points [[0, 0]])
+    points = _get_points_data(ds)
+    assert points == [[0.0, 0.0]], f"Expected [[0.0, 0.0]] (original data) but got {points}"
+
+
+@pytest.mark.local_only
+def test_register_duplicate_replace_behavior(
+    entry_factory: EntryFactory,
+    recording_factory: Callable[[Sequence[str]], list[str]],
+) -> None:
+    """Test that registering duplicate segments with on_duplicate='replace' replaces the original data."""
+    recording_id = "aaaabbbb-aaaa-bbbb-aaaa-bbbbaaaabbbb"
+    # Create two recordings with the same ID but different data
+    # uris[0] has points [[0, 0]], uris[1] has points [[1, 1]]
+    uris = recording_factory([recording_id, recording_id])
+
+    ds = entry_factory.create_dataset("test_dup_replace")
+
+    # First registration
+    handle = ds.register(uris[0], on_duplicate=OnDuplicateSegmentLayer.REPLACE)
+    result = handle.wait()
+    assert len(result.segment_ids) == 1
+    assert result.segment_ids[0] == recording_id
+
+    # Verify the first recording's data is present (points [[0, 0]])
+    points = _get_points_data(ds)
+    assert points == [[0.0, 0.0]], f"Expected [[0.0, 0.0]] but got {points}"
+
+    # Second registration should succeed and replace the data
+    handle = ds.register(uris[1], on_duplicate=OnDuplicateSegmentLayer.REPLACE)
+    result = handle.wait()
+    assert len(result.segment_ids) == 1
+
+    # Verify only one segment exists (not duplicated)
+    segment_ids = ds.segment_ids()
+    assert len(segment_ids) == 1
+    assert segment_ids[0] == recording_id
+
+    # Verify the data is now from the second registration (points [[1, 1]])
+    points = _get_points_data(ds)
+    assert points == [[1.0, 1.0]], f"Expected [[1.0, 1.0]] (replaced data) but got {points}"
+
+
+@pytest.mark.local_only
+def test_register_intra_request_duplicates(
+    entry_factory: EntryFactory,
+    recording_factory: Callable[[Sequence[str]], list[str]],
+) -> None:
+    """Test that intra-request duplicates (same segment in one call) always fail, regardless of on_duplicate mode."""
+    recording_id = "ccccdddd-cccc-dddd-cccc-ddddccccdddd"
+    uris = recording_factory([recording_id, recording_id])
+
+    for on_duplicate in OnDuplicateSegmentLayer:
+        ds = entry_factory.create_dataset(f"test_intra_dup_{on_duplicate.value}")
+
+        with pytest.raises(ValueError, match="duplicate segment layers in request") as exc_info:
+            ds.register(uris, on_duplicate=on_duplicate)
+
+        error_message = str(exc_info.value)
+        for uri in uris:
+            assert uri in error_message, f"Expected URI {uri} in error message: {error_message}"
+
+
+@pytest.mark.aws_only
+def test_registration_crossregion(catalog_client: CatalogClient) -> None:
+    """Tests whether stacks can access S3 buckets cross region when config'd to do so."""
+
+    # known dataset prefixes
+    usw2 = "s3://rerun-redap-datasets-pdx/test-resources/dataset/"
+    use1 = "s3://rerun-redap-datasets/test-resources/dataset/"
+
+    ds = catalog_client.create_dataset(
+        name="test_registration_crossregion_usw2",
+    )
+    try:
+        handle = ds.register_prefix(usw2).wait()
+        assert len(handle.segment_ids) == 20, (
+            f"Expected 20 segments to be registered from {usw2} , got {len(handle.segment_ids)}"
+        )
+    finally:
+        ds.delete()
+
+    ds = catalog_client.create_dataset(
+        name="test_registration_crossregion_use1",
+    )
+    try:
+        handle = ds.register_prefix(use1).wait()
+        assert len(handle.segment_ids) == 20, (
+            f"Expected 20 segments to be registered from {use1} , got {len(handle.segment_ids)}"
+        )
+    finally:
+        ds.delete()
+
+
+@pytest.mark.aws_only
+def test_registration_footerless(catalog_client: CatalogClient) -> None:
+    """Tests whether registration of footerless datasets fails as expected on Rerun Cloud."""
+
+    dataset_url = "s3://rerun-redap-datasets-pdx/test-resources/dataset-footerless/"
+    expected_msg = "try running `rerun rrd migrate`"
+
+    ds = catalog_client.create_dataset(
+        name="test_registration_footerless",
+    )
+
+    try:
+        import re
+
+        with pytest.raises(ValueError, match=re.escape(expected_msg)):
+            ds.register_prefix(dataset_url).wait()
+    finally:
+        ds.delete()
+
+
+def _get_points_data(ds: DatasetEntry) -> list[list[float]]:
+    """Helper to extract points data from a dataset."""
+    import pyarrow as pa
+
+    batches = ds.reader(index="log_time").select("/points:Points2D:positions").collect()
+    table = pa.Table.from_batches(batches)
+    positions_column = table.column("/points:Points2D:positions")
+    # Extract all point coordinates from the nested list structure
+    # The structure is: list of rows, each row is a list of points, each point is [x, y]
+    points = []
+    for chunk in positions_column.chunks:
+        for row in chunk:
+            if row is not None:
+                points.extend(row.as_py())
+    return points

@@ -28,10 +28,10 @@ const DEFAULT_TIMEOUT_SECS: u64 = 60 * 60;
 ///
 /// Tuple of (uri, `segment_id` or None, error or None). This is exposed as a
 /// `SegmentRegistrationResult` dataclass on the Python side.
-type RegistrationResult = (String, Option<String>, Option<String>);
+type RegistrationResult = (String, String, Option<String>);
 
 /// Internal handle exposed to Python for tracking registration tasks.
-#[pyclass( // NOLINT: ignore[py-cls-eq]
+#[pyclass(
     name = "RegistrationHandleInternal",
     module = "rerun_bindings.rerun_bindings"
 )]
@@ -39,7 +39,7 @@ pub struct PyRegistrationHandleInternal {
     client: Py<PyCatalogClientInternal>,
     descriptors: Vec<RegisterWithDatasetTaskDescriptor>,
 
-    /// Map task_id -> indices in descriptors (multiple descriptors can share a task_id)
+    /// Map `task_id` -> indices in descriptors (multiple descriptors can share a `task_id`)
     ///
     /// Note: using vec index here is ok because this struct is essentially immutable, so
     /// out-of-bound errors are unlikely.
@@ -75,7 +75,7 @@ impl PyRegistrationHandleInternal {
     }
 }
 
-#[pymethods] // NOLINT: ignore[py-mthd-str]
+#[pymethods]
 impl PyRegistrationHandleInternal {
     /// Returns a streaming iterator that yields (uri, segment_id, error) tuples
     /// as tasks complete.
@@ -86,7 +86,7 @@ impl PyRegistrationHandleInternal {
         let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
 
         // Spawn a task that queries the completion state and channels it to the iterator object.
-        let (tx, rx) = mpsc::unbounded_channel::<PyResult<Vec<RegistrationResult>>>();
+        let (tx, rx) = mpsc::channel::<PyResult<Vec<RegistrationResult>>>(32 * 1024);
         let descriptors = self.descriptors.clone();
         let task_id_to_indices = self.task_id_to_indices.clone();
         let runtime = get_tokio_runtime();
@@ -95,8 +95,7 @@ impl PyRegistrationHandleInternal {
                 let mut client = match connection.client().await {
                     Ok(c) => c,
                     Err(err) => {
-                        #[expect(clippy::let_underscore_must_use)]
-                        let _ = tx.send(Err(err));
+                        tx.send(Err(err)).await.ok();
                         return;
                     }
                 };
@@ -105,8 +104,7 @@ impl PyRegistrationHandleInternal {
                     match client.query_tasks_on_completion(task_ids, timeout).await {
                         Ok(stream) => stream,
                         Err(err) => {
-                            #[expect(clippy::let_underscore_must_use)]
-                            let _ = tx.send(Err(to_py_err(err)));
+                            tx.send(Err(to_py_err(err))).await.ok();
                             return;
                         }
                     };
@@ -119,7 +117,7 @@ impl PyRegistrationHandleInternal {
 
                     match result {
                         Ok(results) if !results.is_empty() => {
-                            if tx.send(Ok(results)).is_err() {
+                            if tx.send(Ok(results)).await.is_err() {
                                 // Receiver dropped, stop processing
                                 break;
                             }
@@ -130,7 +128,7 @@ impl PyRegistrationHandleInternal {
                         }
 
                         Err(err) => {
-                            let _ = tx.send(Err(err)).ok();
+                            tx.send(Err(err)).await.ok();
                             break;
                         }
                     }
@@ -145,7 +143,7 @@ impl PyRegistrationHandleInternal {
         }
     }
 
-    /// Wait for all tasks to complete and return segment_ids in descriptor order.
+    /// Wait for all tasks to complete and return `segment_ids` in descriptor order.
     /// Raises an error if any registration fails.
     #[pyo3(signature = (timeout_secs=None))]
     fn wait(&self, py: Python<'_>, timeout_secs: Option<u64>) -> PyResult<Vec<String>> {
@@ -167,9 +165,9 @@ impl PyRegistrationHandleInternal {
                     .await
                     .map_err(to_py_err)?;
 
-                // Track errors by descriptor index
-                let mut errors: HashMap<&RegisterWithDatasetTaskDescriptor, String> =
-                    HashMap::new();
+                // Collect unique error messages (deduplicated across descriptors
+                // that share the same task).
+                let mut unique_errors: Vec<String> = Vec::new();
 
                 while let Some(response) = response_stream.next().await {
                     let response = response.map_err(to_py_err)?.try_into().map_err(to_py_err)?;
@@ -177,27 +175,20 @@ impl PyRegistrationHandleInternal {
                     let results =
                         process_task_response(response, &descriptors, &task_id_to_indices)?;
 
-                    for (uri, _segment_id, error) in results {
-                        if let Some(err) = error {
-                            // Lookup the descriptor index for this URI
-                            for desc in &descriptors {
-                                if desc.storage_url.to_string() == uri {
-                                    errors.insert(desc, err.clone());
-                                }
-                            }
+                    for (_uri, _segment_id, error) in results {
+                        if let Some(err) = error
+                            && !unique_errors.contains(&err)
+                        {
+                            unique_errors.push(err);
                         }
                     }
                 }
 
                 // Check for any errors
-                if !errors.is_empty() {
-                    let error_msgs: Vec<String> = errors
-                        .iter()
-                        .map(|(desc, err)| format!("{}: {err}", desc.storage_url))
-                        .collect();
+                if !unique_errors.is_empty() {
                     return Err(PyValueError::new_err(format!(
-                        "Registration failed for the following URIs:\n{}",
-                        error_msgs.join("\n")
+                        "Registration failed while processing the following segments:\n{}",
+                        unique_errors.join("\n")
                     )));
                 }
 
@@ -256,7 +247,7 @@ fn process_task_response(
             for &idx in indices {
                 let desc = &descriptors[idx];
 
-                let segment_id = Some(desc.segment_id.id.clone());
+                let segment_id = desc.segment_id.id.clone();
                 let error = (status != "success").then(|| msg.to_owned());
 
                 results.push((desc.storage_url.to_string(), segment_id, error));
@@ -276,7 +267,7 @@ pub struct PyRegistrationIterator {
     /// Channel to receive results from the async stream.
     ///
     /// The arc-mutex here is needed because we release the GIL while polling the stream.
-    rx: Arc<Mutex<mpsc::UnboundedReceiver<PyResult<Vec<RegistrationResult>>>>>,
+    rx: Arc<Mutex<mpsc::Receiver<PyResult<Vec<RegistrationResult>>>>>,
 
     /// Results are received in batches from gRPC, so we buffer them for the subsequent iterations.
     buffer: Vec<RegistrationResult>,
@@ -298,7 +289,7 @@ impl PyRegistrationIterator {
         let rx = slf.rx.clone();
 
         // Release the GIL while waiting for data
-        let batch_result = py.allow_threads(|| {
+        let batch_result = py.detach(|| {
             let mut rx_guard = rx.lock();
             rx_guard.blocking_recv()
         });

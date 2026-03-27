@@ -4,6 +4,7 @@ use std::rc::Rc;
 use re_auth::oauth::Credentials;
 use re_auth::oauth::api::{AuthenticateWithCode, Pkce, authorization_url, send_async};
 use re_log::ResultExt as _;
+use re_ui::UiExt as _;
 use re_viewer_context::AsyncRuntimeHandle;
 use url::Url;
 use uuid::Uuid;
@@ -43,15 +44,15 @@ impl Drop for State {
         if let Some(child_window) = &self.child_window {
             child_window.close().ok();
         }
-        if let Some(window) = web_sys::window() {
-            if let Some(on_storage_event) = &self.on_storage_event {
-                window
-                    .remove_event_listener_with_callback(
-                        "storage",
-                        on_storage_event.as_ref().unchecked_ref(),
-                    )
-                    .ok();
-            }
+        if let Some(window) = web_sys::window()
+            && let Some(on_storage_event) = &self.on_storage_event
+        {
+            window
+                .remove_event_listener_with_callback(
+                    "storage",
+                    on_storage_event.as_ref().unchecked_ref(),
+                )
+                .ok();
         }
     }
 }
@@ -106,7 +107,7 @@ impl State {
     #[expect(clippy::unused_self)] // compat with native api
     pub fn ui(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.spinner();
+            ui.loading_indicator("Waiting for web login");
             ui.label("Waiting for login…");
         });
     }
@@ -134,8 +135,8 @@ impl State {
         Ok(None)
     }
 
-    #[expect(clippy::needless_pass_by_ref_mut, clippy::unnecessary_wraps)]
-    pub fn open(ui: &mut egui::Ui) -> Result<Self, String> {
+    #[expect(clippy::unnecessary_wraps)]
+    pub fn open(egui_ctx: &egui::Context) -> Result<Self, String> {
         let parent_window = web_sys::window().expect("no window available");
         let pkce = Rc::new(Pkce::new());
         let state = Uuid::new_v4().to_string();
@@ -151,7 +152,7 @@ impl State {
             let result = Rc::clone(&result);
             let pkce = pkce.clone();
             let stored_state = state.clone();
-            let egui_ctx = ui.ctx().clone();
+            let egui_ctx = egui_ctx.clone();
             move |e: web_sys::StorageEvent| {
                 AsyncRuntimeHandle::new_web().spawn_future(try_handle_storage_event(
                     e,

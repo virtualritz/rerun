@@ -92,6 +92,13 @@ impl BinaryStreamSink {
             storage,
         )
     }
+
+    /// Create a [`BinaryStreamSink`] that shares the storage's buffer.
+    pub fn with_shared_storage(storage: &BinaryStreamStorage) -> Self {
+        Self {
+            buffer: storage.inner.clone(),
+        }
+    }
 }
 
 impl LogSink for BinaryStreamSink {
@@ -103,9 +110,5 @@ impl LogSink for BinaryStreamSink {
     #[inline]
     fn flush_blocking(&self, _timeout: std::time::Duration) -> Result<(), SinkFlushError> {
         Ok(())
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }

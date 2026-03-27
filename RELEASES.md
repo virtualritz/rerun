@@ -10,6 +10,10 @@ This document describes the current release and versioning strategy. This strate
 -   [`CODE_STYLE.md`](CODE_STYLE.md)
 -   [`CONTRIBUTING.md`](CONTRIBUTING.md)
 
+## Repository
+
+:warning: The steps & workflows in this document are targeting the open-source Rerun repository (https://github.com/rerun-io/rerun), not our internal monorepo.
+
 ## Release cadence
 
 New Rerun versions are released approximately once every month. Sometimes we do out-of-schedule patch releases.
@@ -71,7 +75,7 @@ Note that `prepare-release-0.x` is _invalid_. Always specify the `y`, even if it
 The _base_ of the branch should depends on what kind of release it is:
 
 - For a _minor_ release, the branch is created from `main`.
-- For a _patch_ release, the branch is created from the previous release tag.
+- For a _patch_ release, the branch is created from `docs-latest` ( :warning: branching off `docs-latest` instead of the latest release tag ensures that documentation patches will be included)
 - For an _alpha_ release, the branch is created from `main`.
 
 You can do this either using `git` on your command line, or through the UI:
@@ -80,26 +84,26 @@ You can do this either using `git` on your command line, or through the UI:
 
 Once the branch has been created, push it to the remote repository.
 
-**NOTE (for patch releases)**: upon creation of the branch, the version is set to the final version of the previous release. This can create issues when testing the patch release, since it has a non-"+dev" version identical to/conflicting with an existing release. Because of that, an RC should preferably be created before testing.
+**NOTE (for patch releases)**: upon creation of the branch, the version is set to the final version of the previous release. This can create issues when testing the patch release, since it has a non-"+dev" version identical to/conflicting with an existing release. Because of that, an RC (release candidate) should preferably be created before testing.
+The release workflow section below explains how you can create an RC.
+Do this once you have prepared your patch-release branch and it's ready for testing.
 
 ### 3. If this is a patch release, cherry-pick commits for inclusion in the release into the branch
 
+In GitHub we have a `consider-patch` label that we put on PRs that we might want to include in the release.
+The fastest way to get an overview of all the patch candidate PRs from both repositories and their corresponding commit hashes is to run this script:
+
+```
+uv run scripts/fetch_patch_candidates.py
+```
+
 When done, run [`cargo semver-checks`](https://github.com/obi1kenobi/cargo-semver-checks) to check that we haven't introduced any semver breaking changes.
 
-:warning: Any commits between the last release's tag and the `docs-latest` branch should also be cherry-picked,
-otherwise these changes will be lost when `docs-latest` is updated.
-
-```
-# On branch `prepare-release-0.x.y`
-git fetch origin docs-latest:docs-latest
-git cherry-pick 0.x.z..docs-latest
-```
-
-Where `z` is the previous patch number.
-
-Note that the `cherry-pick` will fail if there are no additional `docs-latest` commits to include, which is fine.
+After cherry-picking a commit into the patch, please make sure to remove the `consider-patch` label.
 
 ### 4. Update [`CHANGELOG.md`](./CHANGELOG.md)
+
+⚠️ Skip this step when preparing an alpha release.
 
 Update the change log. It should include:
 
@@ -109,13 +113,15 @@ Update the change log. It should include:
 -   A gif or screenshot showing one or more major new features
     - Try to avoid `mp4`s, gifs have a better experience on GitHub
     - You can upload images to a PR, use the link it generates to use GitHub as an image hosting service.
--   Run `pixi run -e py python scripts/generate_changelog.py > new_changelog.md`
+-   Run `pixi run uvpy scripts/generate_changelog.py > new_changelog.md`
 -   Edit PR descriptions/labels to improve the generated changelog
 -   Copy-paste the results into `CHANGELOG.md`.
 -   Editorialize the changelog if necessary
 -   Make sure the changelog includes instructions for handling any breaking changes
 
 ### 5. Clean up documentation links
+
+⚠️ Skip this step when preparing an alpha release.
 
 Remove all the `attr.docs.unreleased` attributes in all `.fbs` files, followed by `pixi run codegen`.
 
@@ -147,7 +153,7 @@ Once the release workflow is started, it will create a pull request for the rele
 The pull request description will tell you what to do next.
 
 [The `Release` workflow](https://github.com/rerun-io/rerun/actions/workflows/release.yml) will build artifacts and run PR checks.
-Additionally, it will spawn a second workflow (when the release artifacts have been published to PyPI, crates.io etc.) called [`GitHub Release`](https://github.com/rerun-io/rerun/actions/workflows/on_gh_release.yml).
+Additionally, if the release type is set to `final` or `rc`, it will spawn a second workflow (when the release artifacts have been published to PyPI, crates.io etc.) called [`GitHub Release`](https://github.com/rerun-io/rerun/actions/workflows/on_gh_release.yml).
 This workflow is responsible for creating [the GitHub release draft](https://github.com/rerun-io/rerun/releases) and to publish the artifacts to it.
 **Make sure this workflow also finishes!**.
 Only after it finishes successfully should you un-draft [the GitHub release](https://github.com/rerun-io/rerun/releases).
@@ -168,8 +174,15 @@ first place.
   Otherwise, do not merge, as this could introduce breakage across the repository, such as in documentation links.
   If needed, cherry-pick any additional commits made back to `main`.
 
+Make sure the `consider-patch` label on GitHub is up-to-date. For a full release, this usually means removing it from all PRs.
+
 ### 9. Optional: write a post mortem about the release
 
 Summarize your experience with the release process to our [Release Postmortems](https://www.notion.so/rerunio/Release-Postmortems-271b24554b1980589770df810d2e4ed5) Notion page.
 
 Create tickets if you think we can improve the process, put them into the `Actionable items` section.
+
+### 10. Clean up PR labels
+
+`uv run scripts/fetch_patch_candidates.py` will show a warning for `consider-patch`-labeled PRs that have been merged before a release.
+Make sure to remove the label from PRs that are already part of a release.

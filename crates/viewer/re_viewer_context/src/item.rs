@@ -1,13 +1,53 @@
 use re_entity_db::{EntityDb, InstancePath};
 use re_log_types::{ComponentPath, DataPath, EntityPath, TableId};
+use re_sdk_types::blueprint::components::VisualizerInstructionId;
 
-use crate::blueprint_id::ViewIdRegistry;
 use crate::{BlueprintId, ContainerId, Contents, ViewId};
+use crate::{blueprint_id::ViewIdRegistry, open_url::EXAMPLES_ORIGIN};
+
+/// `Item` state for a dataresult interaction, i.e. when hovering or selecting an item in a view's data results.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DataResultInteractionAddress {
+    /// The view in which the interaction happened.
+    pub view_id: ViewId,
+
+    /// The instance path of the entity or instance that is being interacted with.
+    ///
+    /// Note that this may be an individual instance or the entire entity if the instance index is [`re_log_types::Instance::ALL`].
+    pub instance_path: InstancePath,
+
+    /// Optional visualizer instruction id through which we're interacting with this data-result.
+    ///
+    /// This can be used for more fine grained highlights.
+    /// If not present, we generally assume we're interacting with the dataresult as a whole.
+    pub visualizer: Option<VisualizerInstructionId>,
+}
+
+impl DataResultInteractionAddress {
+    /// Creates a new address for an entity path (all instances, no visualizer).
+    pub fn from_entity_path(view_id: ViewId, entity_path: EntityPath) -> Self {
+        Self {
+            view_id,
+            instance_path: InstancePath::entity_all(entity_path),
+            visualizer: None,
+        }
+    }
+
+    /// Returns a new address that refers to the entire entity (all instances),
+    /// preserving the view and visualizer.
+    pub fn as_entity_all(&self) -> Self {
+        Self {
+            view_id: self.view_id,
+            instance_path: InstancePath::entity_all(self.instance_path.entity_path.clone()),
+            visualizer: self.visualizer,
+        }
+    }
+}
 
 /// One "thing" in the UI.
 ///
 /// This is the granularity of what is selectable and hoverable.
-#[derive(Clone, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Item {
     /// Select a specific application, to see which recordings and blueprints are loaded for it.
     AppId(re_log_types::ApplicationId),
@@ -34,7 +74,7 @@ pub enum Item {
     View(ViewId),
 
     /// An entity or instance in the context of a view's data results.
-    DataResult(ViewId, InstancePath),
+    DataResult(DataResultInteractionAddress),
 
     /// A table or dataset entry stored in a Redap server.
     // TODO(ab): this should probably be split into separate variant, and made more consistent with
@@ -46,6 +86,19 @@ pub enum Item {
 }
 
 impl Item {
+    /// The example page / welcome screen
+    pub fn welcome_page() -> Self {
+        Self::RedapServer(EXAMPLES_ORIGIN.clone())
+    }
+
+    pub fn redap_origin(&self) -> Option<&re_uri::Origin> {
+        match self {
+            Self::RedapServer(origin) => Some(origin),
+            Self::RedapEntry(entry_uri) => Some(&entry_uri.origin),
+            _ => None,
+        }
+    }
+
     pub fn view_id(&self) -> Option<BlueprintId<ViewIdRegistry>> {
         match self {
             Self::AppId(_)
@@ -57,7 +110,8 @@ impl Item {
             | Self::Container(_)
             | Self::RedapEntry(_)
             | Self::RedapServer(_) => None,
-            Self::View(view_id) | Self::DataResult(view_id, _) => Some(*view_id),
+            Self::View(view_id) => Some(*view_id),
+            Self::DataResult(data_result) => Some(data_result.view_id),
         }
     }
 
@@ -74,10 +128,31 @@ impl Item {
 
             Self::ComponentPath(component_path) => Some(&component_path.entity_path),
 
-            Self::InstancePath(instance_path) | Self::DataResult(_, instance_path) => {
-                Some(&instance_path.entity_path)
-            }
+            Self::InstancePath(instance_path) => Some(&instance_path.entity_path),
+            Self::DataResult(data_result) => Some(&data_result.instance_path.entity_path),
         }
+    }
+
+    /// Is this item compatible with the given [`crate::Route`]?
+    ///
+    /// For example, a recording or redap entry that belongs to a different
+    /// route than the currently active one is incompatible.
+    pub fn is_compatible_with_route(&self, route: &crate::Route) -> bool {
+        if let Self::StoreId(store_id) = self
+            && let Some(route_recording_id) = route.recording_id()
+            && store_id != route_recording_id
+        {
+            return false;
+        }
+
+        if let Some(origin) = self.redap_origin()
+            && let Some(route_origin) = route.item().as_ref().and_then(|item| item.redap_origin())
+            && origin != route_origin
+        {
+            return false;
+        }
+
+        true
     }
 
     /// Converts this item to a data path if possible.
@@ -98,13 +173,16 @@ impl Item {
                 component: Some(component_path.component),
             }),
 
-            Self::InstancePath(instance_path) | Self::DataResult(_, instance_path) => {
-                Some(DataPath {
-                    entity_path: instance_path.entity_path.clone(),
-                    instance: Some(instance_path.instance),
-                    component: None,
-                })
-            }
+            Self::InstancePath(instance_path) => Some(DataPath {
+                entity_path: instance_path.entity_path.clone(),
+                instance: Some(instance_path.instance),
+                component: None,
+            }),
+            Self::DataResult(data_result) => Some(DataPath {
+                entity_path: data_result.instance_path.entity_path.clone(),
+                instance: Some(data_result.instance_path.instance),
+                component: None,
+            }),
         }
     }
 }
@@ -185,8 +263,12 @@ impl std::fmt::Debug for Item {
             Self::ComponentPath(s) => s.fmt(f),
             Self::View(s) => write!(f, "{s:?}"),
             Self::InstancePath(path) => write!(f, "{path}"),
-            Self::DataResult(view_id, instance_path) => {
-                write!(f, "({view_id:?}, {instance_path}")
+            Self::DataResult(data_result) => {
+                write!(
+                    f,
+                    "({:?}, {})",
+                    data_result.view_id, data_result.instance_path
+                )
             }
             Self::Container(tile_id) => write!(f, "(tile: {tile_id:?})"),
             Self::RedapEntry(entry) => {
@@ -211,8 +293,8 @@ impl Item {
             Self::ComponentPath(_) => "Entity component",
             Self::View(_) => "View",
             Self::Container(_) => "Container",
-            Self::DataResult(_, instance_path) => {
-                if instance_path.instance.is_specific() {
+            Self::DataResult(data_result) => {
+                if data_result.instance_path.instance.is_specific() {
                     "Data result instance"
                 } else {
                     "Data result entity"
@@ -235,10 +317,10 @@ pub fn resolve_mono_instance_path_item(
         Item::InstancePath(instance_path) => {
             Item::InstancePath(resolve_mono_instance_path(entity_db, query, instance_path))
         }
-        Item::DataResult(view_id, instance_path) => Item::DataResult(
-            *view_id,
-            resolve_mono_instance_path(entity_db, query, instance_path),
-        ),
+        Item::DataResult(data_result) => Item::DataResult(DataResultInteractionAddress {
+            instance_path: resolve_mono_instance_path(entity_db, query, &data_result.instance_path),
+            ..data_result.clone()
+        }),
         Item::AppId(_)
         | Item::TableId(_)
         | Item::DataSource(_)

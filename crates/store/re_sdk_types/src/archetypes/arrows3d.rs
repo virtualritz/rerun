@@ -318,6 +318,13 @@ impl ::re_types_core::AsComponents for Arrows3D {
 
 impl ::re_types_core::ArchetypeReflectionMarker for Arrows3D {}
 
+impl crate::VisualizableArchetype for Arrows3D {
+    #[inline]
+    fn visualizer(&self) -> crate::Visualizer {
+        crate::Visualizer::new("Arrows3D").with_overrides(self)
+    }
+}
+
 impl Arrows3D {
     /// Create a new `Arrows3D`.
     #[inline]

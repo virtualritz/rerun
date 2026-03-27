@@ -23,9 +23,10 @@ pub fn visible_time_range_ui_for_view(
         return;
     }
 
+    let engine = ctx.store_context.blueprint.storage_engine();
     let property_path = entity_path_for_view_property(
         view.id,
-        ctx.store_context.blueprint.tree(),
+        engine.store().entity_tree(),
         re_sdk_types::blueprint::archetypes::VisibleTimeRanges::name(),
     );
 
@@ -46,9 +47,15 @@ pub fn visible_time_range_ui_for_data_result(
     ui: &mut Ui,
     data_result: &re_viewer_context::DataResult,
 ) {
-    let query_range = data_result.property_overrides.query_range.clone();
+    let query_range = data_result.query_range;
     let is_view = false;
-    visible_time_range_ui(ctx, ui, query_range, data_result.override_path(), is_view);
+    visible_time_range_ui(
+        ctx,
+        ui,
+        query_range,
+        data_result.override_base_path(),
+        is_view,
+    );
 }
 
 /// Draws ui for a visible time range from a given override path and a resulting query range.
@@ -77,11 +84,11 @@ fn visible_time_range_ui(
         .any(|range| range.timeline.as_str() == timeline_name.as_str());
 
     let has_individual_range_before = has_individual_range;
-    let query_range_before = resolved_query_range.clone();
+    let query_range_before = resolved_query_range;
 
     ui.scope(|ui| {
         // TODO(#6075): Because `list_item_scope` changes it. Temporary until everything is `ListItem`.
-        ui.spacing_mut().item_spacing.y = ui.ctx().style().spacing.item_spacing.y;
+        ui.spacing_mut().item_spacing.y = ui.global_style().spacing.item_spacing.y;
         query_range_ui(
             ctx,
             ui,
@@ -295,13 +302,9 @@ fn show_visual_time_range(
     let time_type = timeline.typ();
 
     // Show the resolved visible range as labels (user can't edit them):
-    if resolved_range.start == TimeRangeBoundary::Infinite
-        && resolved_range.end == TimeRangeBoundary::Infinite
-    {
-        ui.label("Entire timeline");
-    } else if resolved_range.start == TimeRangeBoundary::AT_CURSOR
-        && resolved_range.end == TimeRangeBoundary::AT_CURSOR
-    {
+    if resolved_range == &TimeRange::EVERYTHING {
+        ui.label("Entire timeline").on_hover_text("The full timeline of the recording, which may be bigger than the data range of this plot");
+    } else if resolved_range == &TimeRange::AT_CURSOR {
         let current_time = time_type.format(current_time, ctx.app_options().timestamp_format);
         ui.label(format!("At {} = {current_time}", timeline.name())).on_hover_text("Does not perform a latest-at query, shows only data logged at exactly the current time cursor position.");
     } else {
@@ -384,8 +387,8 @@ fn resolved_visible_history_boundary_ui(
                     }
                     TimeType::Sequence => {
                         label += &format!(
-                            " with {offset} frame{} offset",
-                            if offset.abs() > 1 { "s" } else { "" }
+                            " with {} offset",
+                            re_format::format_plural_signed_s(offset, "frame")
                         );
                     }
                 }

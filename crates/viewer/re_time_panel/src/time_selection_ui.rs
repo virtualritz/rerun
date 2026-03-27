@@ -182,7 +182,7 @@ pub fn loop_selection_ui(
                 on_drag_loop_selection(ui, &middle_response, time_ranges_ui, &mut selected_range);
 
                 if middle_response.clicked() {
-                    if ui.ctx().input(|i| i.modifiers.alt) {
+                    if ui.input(|i| i.modifiers.alt) {
                         time_commands.push(TimeControlCommand::RemoveTimeSelection);
                     } else {
                         let new_loop_mode = if time_ctrl.loop_mode() == LoopMode::Selection {
@@ -196,7 +196,7 @@ pub fn loop_selection_ui(
             }
         }
 
-        if selected_range.is_empty() && ui.ctx().dragged_id().is_none() {
+        if selected_range.is_empty() && ui.dragged_id().is_none() {
             // A zero-sized loop selection is confusing (and invisible), so remove it
             // (unless we are in the process of dragging right now):
             time_commands.push(TimeControlCommand::RemoveTimeSelection);
@@ -212,6 +212,11 @@ pub fn loop_selection_ui(
         let is_on_selection = false;
         selection_context_menu(ui, ctx, time_commands, is_on_selection);
     });
+
+    // Click outside the selection to remove it:
+    if timeline_response.clicked() && time_ctrl.time_selection().is_some() {
+        time_commands.push(TimeControlCommand::RemoveTimeSelection);
+    }
 
     // Start new selection?
     if !timeline_response.context_menu_opened()
@@ -234,7 +239,7 @@ pub fn loop_selection_ui(
                 AbsoluteTimeRangeF::point(time).to_int(),
             ));
             time_commands.push(TimeControlCommand::SetLoopMode(LoopMode::Selection));
-            ui.ctx().set_dragged_id(right_edge_id);
+            ui.set_dragged_id(right_edge_id);
         }
     }
 
@@ -242,6 +247,7 @@ pub fn loop_selection_ui(
         time_ctrl,
         time_ranges_ui,
         ui,
+        time_area_painter,
         timeline_rect.y_range(),
         Rangef::new(timeline_rect.top(), time_area_painter.clip_rect().bottom()),
         time_commands,
@@ -252,6 +258,7 @@ fn paint_loop_selection(
     time_ctrl: &TimeControl,
     time_ranges_ui: &TimeRangesUi,
     ui: &egui::Ui,
+    time_area_painter: &egui::Painter,
     top_y_range: Rangef,
     full_y_range: Rangef,
     time_commands: &[TimeControlCommand],
@@ -298,13 +305,11 @@ fn paint_loop_selection(
 
     let is_active = time_ctrl.loop_mode() == LoopMode::Selection;
     if is_active {
-        ui.painter()
-            .rect_filled(full_rect, corner_radius, full_color);
+        time_area_painter.rect_filled(full_rect, corner_radius, full_color);
     } else {
-        ui.painter()
-            .rect_filled(top_rect, corner_radius, full_color);
+        time_area_painter.rect_filled(top_rect, corner_radius, full_color);
 
-        ui.painter().rect_filled(bottom_rect, 0.0, inactive_color);
+        time_area_painter.rect_filled(bottom_rect, 0.0, inactive_color);
     }
 
     None
@@ -316,7 +321,7 @@ fn selection_context_menu(
     time_commands: &mut Vec<TimeControlCommand>,
     is_on_selection: bool,
 ) {
-    let modifier = ui.ctx().format_modifiers(egui::Modifiers::ALT);
+    let modifier = ui.format_modifiers(egui::Modifiers::ALT);
     if ui
         .add_enabled(
             is_on_selection,
@@ -341,7 +346,7 @@ fn selection_context_menu(
             .send_ui(UICommand::SaveRecordingSelection);
     }
 
-    let mut url = ViewerOpenUrl::from_context(ctx);
+    let mut url = ViewerOpenUrl::from_context(&ctx.app_ctx);
     let has_time_range = url.as_mut().is_ok_and(|url| url.fragment_mut().is_some());
     let copy_command = url.and_then(|url| url.copy_url_command());
     if ui
@@ -459,7 +464,7 @@ fn drag_right_loop_selection_edge(
 
     if selected_range.min > selected_range.max {
         std::mem::swap(&mut selected_range.min, &mut selected_range.max);
-        ui.ctx().set_dragged_id(right_edge_id);
+        ui.set_dragged_id(right_edge_id);
     }
 
     Some(())
@@ -477,7 +482,7 @@ fn drag_left_loop_selection_edge(
 
     if selected_range.min > selected_range.max {
         std::mem::swap(&mut selected_range.min, &mut selected_range.max);
-        ui.ctx().set_dragged_id(left_edge_id);
+        ui.set_dragged_id(left_edge_id);
     }
 
     Some(())

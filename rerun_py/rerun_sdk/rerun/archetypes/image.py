@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, ClassVar
+
 import numpy as np
 import pyarrow as pa
 from attrs import define, field
@@ -13,15 +15,20 @@ from .. import components, datatypes
 from .._baseclasses import (
     Archetype,
     ComponentColumnList,
+    ComponentDescriptor,
 )
+from ..blueprint import VisualizableArchetype, Visualizer
 from ..error_utils import catch_and_log_exceptions
 from .image_ext import ImageExt
+
+if TYPE_CHECKING:
+    from ..blueprint.datatypes import VisualizerComponentMappingLike
 
 __all__ = ["Image"]
 
 
 @define(str=False, repr=False, init=False)
-class Image(ImageExt, Archetype):
+class Image(ImageExt, Archetype, VisualizableArchetype):
     """
     **Archetype**: A monochrome or color image.
 
@@ -43,6 +50,7 @@ class Image(ImageExt, Archetype):
     ### `image_simple`:
     ```python
     import numpy as np
+
     import rerun as rr
 
     # Create an image with numpy
@@ -67,6 +75,7 @@ class Image(ImageExt, Archetype):
     ### Logging images with various formats:
     ```python
     import numpy as np
+
     import rerun as rr
 
     rr.init("rerun_example_image_formats", spawn=True)
@@ -95,6 +104,8 @@ class Image(ImageExt, Archetype):
 
     """
 
+    NAME: ClassVar[str] = "rerun.archetypes.Image"
+
     # __init__ can be found in image_ext.py
 
     def __attrs_clear__(self) -> None:
@@ -104,6 +115,7 @@ class Image(ImageExt, Archetype):
             format=None,
             opacity=None,
             draw_order=None,
+            magnification_filter=None,
         )
 
     @classmethod
@@ -122,6 +134,7 @@ class Image(ImageExt, Archetype):
         format: datatypes.ImageFormatLike | None = None,
         opacity: datatypes.Float32Like | None = None,
         draw_order: datatypes.Float32Like | None = None,
+        magnification_filter: components.MagnificationFilterLike | None = None,
     ) -> Image:
         """
         Update only some specific fields of a `Image`.
@@ -143,6 +156,8 @@ class Image(ImageExt, Archetype):
 
             Objects with higher values are drawn on top of those with lower values.
             Defaults to `-10.0`.
+        magnification_filter:
+            Optional filter used when a texel is magnified (displayed larger than a screen pixel).
 
         """
 
@@ -153,6 +168,7 @@ class Image(ImageExt, Archetype):
                 "format": format,
                 "opacity": opacity,
                 "draw_order": draw_order,
+                "magnification_filter": magnification_filter,
             }
 
             if clear_unset:
@@ -169,6 +185,46 @@ class Image(ImageExt, Archetype):
         """Clear all the fields of a `Image`."""
         return cls.from_fields(clear_unset=True)
 
+    @staticmethod
+    def descriptor_buffer() -> ComponentDescriptor:
+        return ComponentDescriptor(
+            "Image:buffer",
+            archetype=Image.NAME,
+            component_type=components.ImageBufferBatch._COMPONENT_TYPE,
+        )
+
+    @staticmethod
+    def descriptor_format() -> ComponentDescriptor:
+        return ComponentDescriptor(
+            "Image:format",
+            archetype=Image.NAME,
+            component_type=components.ImageFormatBatch._COMPONENT_TYPE,
+        )
+
+    @staticmethod
+    def descriptor_opacity() -> ComponentDescriptor:
+        return ComponentDescriptor(
+            "Image:opacity",
+            archetype=Image.NAME,
+            component_type=components.OpacityBatch._COMPONENT_TYPE,
+        )
+
+    @staticmethod
+    def descriptor_draw_order() -> ComponentDescriptor:
+        return ComponentDescriptor(
+            "Image:draw_order",
+            archetype=Image.NAME,
+            component_type=components.DrawOrderBatch._COMPONENT_TYPE,
+        )
+
+    @staticmethod
+    def descriptor_magnification_filter() -> ComponentDescriptor:
+        return ComponentDescriptor(
+            "Image:magnification_filter",
+            archetype=Image.NAME,
+            component_type=components.MagnificationFilterBatch._COMPONENT_TYPE,
+        )
+
     @classmethod
     def columns(
         cls,
@@ -177,6 +233,7 @@ class Image(ImageExt, Archetype):
         format: datatypes.ImageFormatArrayLike | None = None,
         opacity: datatypes.Float32ArrayLike | None = None,
         draw_order: datatypes.Float32ArrayLike | None = None,
+        magnification_filter: components.MagnificationFilterArrayLike | None = None,
     ) -> ComponentColumnList:
         """
         Construct a new column-oriented component bundle.
@@ -201,6 +258,8 @@ class Image(ImageExt, Archetype):
 
             Objects with higher values are drawn on top of those with lower values.
             Defaults to `-10.0`.
+        magnification_filter:
+            Optional filter used when a texel is magnified (displayed larger than a screen pixel).
 
         """
 
@@ -211,6 +270,7 @@ class Image(ImageExt, Archetype):
                 format=format,
                 opacity=opacity,
                 draw_order=draw_order,
+                magnification_filter=magnification_filter,
             )
 
         batches = inst.as_component_batches()
@@ -222,6 +282,7 @@ class Image(ImageExt, Archetype):
             "Image:format": format,
             "Image:opacity": opacity,
             "Image:draw_order": draw_order,
+            "Image:magnification_filter": magnification_filter,
         }
         columns = []
 
@@ -232,17 +293,21 @@ class Image(ImageExt, Archetype):
             if pa.types.is_primitive(arrow_array.type) or pa.types.is_fixed_size_list(arrow_array.type):
                 param = kwargs[batch.component_descriptor().component]  # type: ignore[index]
                 shape = np.shape(param)  # type: ignore[arg-type]
-                elem_flat_len = int(np.prod(shape[1:])) if len(shape) > 1 else 1  # type: ignore[redundant-expr,misc]
-
-                if pa.types.is_fixed_size_list(arrow_array.type) and arrow_array.type.list_size == elem_flat_len:
-                    # If the product of the last dimensions of the shape are equal to the size of the fixed size list array,
-                    # we have `num_rows` single element batches (each element is a fixed sized list).
-                    # (This should have been already validated by conversion to the arrow_array)
-                    batch_length = 1
-                else:
-                    batch_length = shape[1] if len(shape) > 1 else 1  # type: ignore[redundant-expr,misc]
-
                 num_rows = shape[0] if len(shape) >= 1 else 1  # type: ignore[redundant-expr,misc]
+
+                if pa.types.is_fixed_size_list(arrow_array.type):
+                    elem_flat_len = int(np.prod(shape[1:])) if len(shape) > 1 else 1  # type: ignore[redundant-expr,misc]
+                    if arrow_array.type.list_size == elem_flat_len:
+                        # The product of the last dimensions of the shape are equal to the size of the fixed size list array,
+                        # so we have `num_rows` single element batches (each element is a fixed sized list).
+                        batch_length = 1
+                    else:
+                        batch_length = shape[1] if len(shape) > 1 else 1  # type: ignore[redundant-expr,misc]
+                else:
+                    # For primitive types, derive batch_length from the actual arrow array length
+                    # since the input shape can be misleading (e.g. colors [R,G,B] -> single uint32).
+                    batch_length = len(arrow_array) // num_rows if num_rows > 0 else 1
+
                 sizes = batch_length * np.ones(num_rows)
             else:
                 # For non-primitive types, default to partitioning each element separately.
@@ -293,5 +358,31 @@ class Image(ImageExt, Archetype):
     #
     # (Docstring intentionally commented out to hide this field from the docs)
 
+    magnification_filter: components.MagnificationFilterBatch | None = field(
+        metadata={"component": True},
+        default=None,
+        converter=components.MagnificationFilterBatch._converter,  # type: ignore[misc]
+    )
+    # Optional filter used when a texel is magnified (displayed larger than a screen pixel).
+    #
+    # (Docstring intentionally commented out to hide this field from the docs)
+
     __str__ = Archetype.__str__
     __repr__ = Archetype.__repr__  # type: ignore[assignment]
+
+    def visualizer(self, *, mappings: list[VisualizerComponentMappingLike] | None = None) -> Visualizer:
+        """
+        Creates a visualizer for this archetype, using all currently set values as overrides.
+
+        Parameters
+        ----------
+        mappings:
+            Optional component mappings to control how the visualizer sources its data.
+
+            ⚠️ **Experimental**: Component mappings are an experimental feature and may change.
+            See https://github.com/rerun-io/rerun/issues/10631 for more information.
+
+        """
+        return Visualizer("Image", overrides=self.as_component_batches(), mappings=mappings)
+
+    # __array__ can be found in image_ext.py

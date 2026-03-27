@@ -129,6 +129,7 @@ pub const ARROW_LEFT: Icon = icon_from_path!("../data/icons/arrow_left.svg");
 pub const ARROW_RIGHT: Icon = icon_from_path!("../data/icons/arrow_right.svg");
 pub const ARROW_UP: Icon = icon_from_path!("../data/icons/arrow_up.svg");
 pub const ARROW_DOWN: Icon = icon_from_path!("../data/icons/arrow_down.svg");
+pub const COMBO_ARROW: Icon = icon_from_path!("../data/icons/combo_arrow.svg");
 pub const LOOP: Icon = icon_from_path!("../data/icons/loop.svg");
 pub const FILTER: Icon = icon_from_path!("../data/icons/filter.svg");
 
@@ -199,6 +200,7 @@ pub const COMPONENT_STATIC: Icon = icon_from_path!("../data/icons/component_stat
 
 pub const APPLICATION: Icon = icon_from_path!("../data/icons/application.svg");
 pub const DATA_SOURCE: Icon = icon_from_path!("../data/icons/data_source.svg");
+pub const HOME: Icon = icon_from_path!("../data/icons/home.svg");
 pub const TABLE: Icon = icon_from_path!("../data/icons/table.svg");
 pub const DATASET: Icon = icon_from_path!("../data/icons/dataset.svg");
 pub const RECORDING: Icon = icon_from_path!("../data/icons/recording.svg");
@@ -238,3 +240,7 @@ pub const OPTION: Icon = icon_from_path!("../data/icons/option.svg");
 // Action buttons:
 pub const COPY: Icon = icon_from_path!("../data/icons/copy.svg");
 pub const DOWNLOAD: Icon = icon_from_path!("../data/icons/download.svg");
+
+// Other non-icon-sized images:
+pub const DROPDOWN_ARROW: Icon = icon_from_path!("../data/icons/dropdown_arrow.svg");
+pub const CHECKED: Icon = icon_from_path!("../data/icons/checked.svg");

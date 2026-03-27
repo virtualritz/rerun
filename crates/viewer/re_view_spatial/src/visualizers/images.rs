@@ -1,17 +1,16 @@
 use re_sdk_types::Archetype as _;
 use re_sdk_types::archetypes::Image;
-use re_sdk_types::components::{ImageFormat, Opacity};
+use re_sdk_types::components::{ImageBuffer, ImageFormat, MagnificationFilter, Opacity};
 use re_sdk_types::image::ImageKind;
-use re_view::HybridResults;
 use re_viewer_context::{
     IdentifiedViewSystem, ImageInfo, QueryContext, ViewContext, ViewContextCollection, ViewQuery,
-    ViewSystemExecutionError, VisualizerExecutionOutput, VisualizerQueryInfo, VisualizerSystem,
-    typed_fallback_for,
+    ViewSystemExecutionError, VisualizerExecutionOutput, VisualizerQueryInfo,
+    VisualizerReportSeverity, VisualizerSystem, typed_fallback_for,
 };
 
 use super::SpatialViewVisualizerData;
 use super::entity_iterator::process_archetype;
-use crate::contexts::SpatialSceneEntityContext;
+use crate::contexts::SpatialSceneVisualizerInstructionContext;
 use crate::view_kind::SpatialViewKind;
 use crate::visualizers::{first_copied, textured_rect_from_image};
 use crate::{PickableRectSourceData, PickableTexturedRect};
@@ -31,6 +30,7 @@ impl Default for ImageVisualizer {
 struct ImageComponentData {
     image: ImageInfo,
     opacity: Option<Opacity>,
+    magnification_filter: MagnificationFilter,
 }
 
 impl IdentifiedViewSystem for ImageVisualizer {
@@ -40,8 +40,15 @@ impl IdentifiedViewSystem for ImageVisualizer {
 }
 
 impl VisualizerSystem for ImageVisualizer {
-    fn visualizer_query_info(&self) -> VisualizerQueryInfo {
-        VisualizerQueryInfo::from_archetype::<Image>()
+    fn visualizer_query_info(
+        &self,
+        _app_options: &re_viewer_context::AppOptions,
+    ) -> VisualizerQueryInfo {
+        VisualizerQueryInfo::buffer_and_format::<ImageBuffer, ImageFormat>(
+            &Image::descriptor_buffer(),
+            &Image::descriptor_format(),
+            &Image::all_components(),
+        )
     }
 
     fn execute(
@@ -50,13 +57,15 @@ impl VisualizerSystem for ImageVisualizer {
         view_query: &ViewQuery<'_>,
         context_systems: &ViewContextCollection,
     ) -> Result<VisualizerExecutionOutput, ViewSystemExecutionError> {
-        let mut output = VisualizerExecutionOutput::default();
+        re_tracing::profile_function!();
+
+        let output = VisualizerExecutionOutput::default();
 
         process_archetype::<Self, Image, _>(
             ctx,
             view_query,
             context_systems,
-            &mut output,
+            &output,
             self.data.preferred_view_kind,
             |ctx, spatial_ctx, results| {
                 self.process_image(ctx, results, spatial_ctx);
@@ -73,62 +82,63 @@ impl VisualizerSystem for ImageVisualizer {
     fn data(&self) -> Option<&dyn std::any::Any> {
         Some(self.data.as_any())
     }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 }
 
 impl ImageVisualizer {
     fn process_image(
         &mut self,
         ctx: &QueryContext<'_>,
-        results: &HybridResults<'_>,
-        spatial_ctx: &mut SpatialSceneEntityContext<'_>,
+        results: &re_view::VisualizerInstructionQueryResults<'_>,
+        spatial_ctx: &SpatialSceneVisualizerInstructionContext<'_>,
     ) {
-        use re_view::RangeResultsExt as _;
-
-        use super::entity_iterator::{iter_component, iter_slices};
+        re_tracing::profile_function!();
 
         let entity_path = ctx.target_entity_path;
 
-        let Some(all_buffer_chunks) =
-            results.get_required_chunks(Image::descriptor_buffer().component)
-        else {
+        let all_buffers = results.iter_required(Image::descriptor_buffer().component);
+        if all_buffers.is_empty() {
             return;
-        };
-        let Some(all_formats_chunks) =
-            results.get_required_chunks(Image::descriptor_format().component)
-        else {
+        }
+        let all_formats = results.iter_required(Image::descriptor_format().component);
+        if all_formats.is_empty() {
             return;
-        };
+        }
+        let all_opacities = results.iter_optional(Image::descriptor_opacity().component);
+        let all_magnification_filters =
+            results.iter_optional(Image::descriptor_magnification_filter().component);
 
-        let timeline = ctx.query.timeline();
-        let all_buffers_indexed = iter_slices::<&[u8]>(&all_buffer_chunks, timeline);
-        let all_formats_indexed = iter_component::<ImageFormat>(&all_formats_chunks, timeline);
-        let all_opacities = results.iter_as(timeline, Image::descriptor_opacity().component);
-
-        let data = re_query::range_zip_1x2(
-            all_buffers_indexed,
-            all_formats_indexed,
+        let data = re_query::range_zip_1x3(
+            all_buffers.slice::<&[u8]>(),
+            all_formats.component_slow::<ImageFormat>(),
             all_opacities.slice::<f32>(),
+            all_magnification_filters.slice::<u8>(),
         )
-        .filter_map(|((_time, row_id), buffers, formats, opacities)| {
-            let buffer = buffers.first()?;
+        .filter_map(
+            |((_time, row_id), buffers, formats, opacities, magnification_filters)| {
+                let buffer = buffers.first()?;
 
-            Some(ImageComponentData {
-                image: ImageInfo::from_stored_blob(
-                    row_id,
-                    Image::descriptor_buffer().component,
-                    buffer.clone().into(),
-                    first_copied(formats.as_deref())?.0,
-                    ImageKind::Color,
-                ),
-                opacity: first_copied(opacities).map(Into::into),
-            })
-        });
+                Some(ImageComponentData {
+                    image: ImageInfo::from_stored_blob(
+                        row_id,
+                        Image::descriptor_buffer().component,
+                        buffer.clone().into(),
+                        first_copied(formats.as_deref())?.0,
+                        ImageKind::Color,
+                    ),
+                    opacity: first_copied(opacities).map(Into::into),
+                    magnification_filter: first_copied(magnification_filters)
+                        .and_then(MagnificationFilter::from_u8)
+                        .unwrap_or_default(),
+                })
+            },
+        );
 
-        for ImageComponentData { image, opacity } in data {
+        for ImageComponentData {
+            image,
+            opacity,
+            magnification_filter,
+        } in data
+        {
             let opacity = opacity
                 .unwrap_or_else(|| typed_fallback_for(ctx, Image::descriptor_opacity().component));
             #[expect(clippy::disallowed_methods)] // This is not a hard-coded color.
@@ -143,6 +153,7 @@ impl ImageVisualizer {
                 &image,
                 colormap,
                 multiplicative_tint,
+                magnification_filter,
                 Image::name(),
             ) {
                 Ok(textured_rect) => {
@@ -159,9 +170,11 @@ impl ImageVisualizer {
                     );
                 }
                 Err(err) => {
-                    spatial_ctx
-                        .output
-                        .report_error_for(entity_path.clone(), re_error::format(err));
+                    results.report_for_component(
+                        Image::descriptor_buffer().component,
+                        VisualizerReportSeverity::Error,
+                        re_error::format(err),
+                    );
                 }
             }
         }

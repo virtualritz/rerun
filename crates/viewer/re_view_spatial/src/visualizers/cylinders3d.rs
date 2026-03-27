@@ -3,16 +3,18 @@ use std::iter;
 use re_chunk_store::external::re_chunk::ChunkComponentIterItem;
 use re_sdk_types::archetypes::Cylinders3D;
 use re_sdk_types::components::{ClassId, Color, FillMode, HalfSize3D, Length, Radius, ShowLabels};
-use re_sdk_types::{ArrowString, components};
-use re_view::clamped_or_nothing;
+use re_sdk_types::reflection::Enum as _;
+use re_sdk_types::{Archetype as _, ArrowString, components};
+use re_view::clamped_or_else;
 use re_viewer_context::{
     IdentifiedViewSystem, QueryContext, ViewContext, ViewContextCollection, ViewQuery,
     ViewSystemExecutionError, VisualizerExecutionOutput, VisualizerQueryInfo, VisualizerSystem,
+    typed_fallback_for,
 };
 
 use super::SpatialViewVisualizerData;
 use super::utilities::{ProcMeshBatch, ProcMeshDrawableBuilder};
-use crate::contexts::SpatialSceneEntityContext;
+use crate::contexts::SpatialSceneVisualizerInstructionContext;
 use crate::proc_mesh;
 use crate::view_kind::SpatialViewKind;
 
@@ -33,19 +35,31 @@ impl Cylinders3DVisualizer {
     fn process_data<'a>(
         builder: &mut ProcMeshDrawableBuilder<'_>,
         query_context: &QueryContext<'_>,
-        ent_context: &SpatialSceneEntityContext<'_>,
+        ent_context: &SpatialSceneVisualizerInstructionContext<'_>,
         batches: impl Iterator<Item = Cylinders3DComponentData<'a>>,
     ) -> Result<(), ViewSystemExecutionError> {
         for batch in batches {
             // Number of instances is determined by whichever is *longer* of `lengths` and `radii`.
             // The other component is clamped (last value repeated) to match.
             let num_instances = batch.radii.len().max(batch.lengths.len());
-            let lengths_iter = clamped_or_nothing(batch.lengths, num_instances);
-            let radii_iter = clamped_or_nothing(batch.radii, num_instances);
+            let lengths_iter = clamped_or_else(batch.lengths, || {
+                typed_fallback_for::<Length>(
+                    query_context,
+                    Cylinders3D::descriptor_lengths().component,
+                )
+            })
+            .take(num_instances);
+            let radii_iter = clamped_or_else(batch.radii, || {
+                typed_fallback_for::<Radius>(
+                    query_context,
+                    Cylinders3D::descriptor_radii().component,
+                )
+            })
+            .take(num_instances);
 
             let half_sizes: Vec<HalfSize3D> = lengths_iter
                 .zip(radii_iter)
-                .map(|(&Length(length), &Radius(radius))| {
+                .map(|(Length(length), Radius(radius))| {
                     let radius = clean_length(radius.0);
                     // Cylinder radius is already half the diameter, so we can use it directly.
                     // Length is the full length, so we divide by 2 to get the half size.
@@ -55,14 +69,11 @@ impl Cylinders3DVisualizer {
 
             let subdivisions = match batch.fill_mode {
                 FillMode::DenseWireframe => 3, // Don't make it too crowded - let the user see inside the mesh.
-                FillMode::Solid => 4,          // Smooth, but not too CPU/GPU intensive
+                FillMode::Solid | FillMode::TransparentFillMajorWireframe => 4, // Smooth, but not too CPU/GPU intensive
                 FillMode::MajorWireframe => 10,
             };
 
-            let axes_only = match batch.fill_mode {
-                FillMode::MajorWireframe => true,
-                FillMode::DenseWireframe | FillMode::Solid => false,
-            };
+            let axes_only = batch.fill_mode.axes_only();
 
             let proc_mesh_key = proc_mesh::ProcMeshKey::Cylinder {
                 subdivisions,
@@ -73,6 +84,7 @@ impl Cylinders3DVisualizer {
                 query_context,
                 ent_context,
                 Cylinders3D::descriptor_colors().component,
+                Cylinders3D::descriptor_line_radii().component,
                 Cylinders3D::descriptor_show_labels().component,
                 glam::Affine3A::IDENTITY,
                 ProcMeshBatch {
@@ -100,9 +112,9 @@ impl Cylinders3DVisualizer {
 struct Cylinders3DComponentData<'a> {
     // Point of views
     lengths: &'a [Length],
-    radii: &'a [Radius],
 
     // Clamped to edge
+    radii: &'a [Radius],
     centers: &'a [components::Translation3D],
     rotation_axis_angles: ChunkComponentIterItem<components::RotationAxisAngle>,
     quaternions: &'a [components::RotationQuat],
@@ -123,8 +135,18 @@ impl IdentifiedViewSystem for Cylinders3DVisualizer {
 }
 
 impl VisualizerSystem for Cylinders3DVisualizer {
-    fn visualizer_query_info(&self) -> VisualizerQueryInfo {
-        VisualizerQueryInfo::from_archetype::<Cylinders3D>()
+    fn visualizer_query_info(
+        &self,
+        _app_options: &re_viewer_context::AppOptions,
+    ) -> VisualizerQueryInfo {
+        // The required component of the archetype is actually both lengths and radii,
+        // But while that makes sense for the user-facing API, we can just use lengths as the required component for visualizability purposes.
+        // This makes the requirements easier, and also means that if a user only provides length,
+        // they will still get a visualizer with (editable) default radii instead of no visualizer at all.
+        VisualizerQueryInfo::single_required_component::<Length>(
+            &Cylinders3D::descriptor_lengths(),
+            &Cylinders3D::all_components(),
+        )
     }
 
     fn execute(
@@ -133,7 +155,7 @@ impl VisualizerSystem for Cylinders3DVisualizer {
         view_query: &ViewQuery<'_>,
         context_systems: &ViewContextCollection,
     ) -> Result<VisualizerExecutionOutput, ViewSystemExecutionError> {
-        let mut output = VisualizerExecutionOutput::default();
+        let output = VisualizerExecutionOutput::default();
         let preferred_view_kind = self.0.preferred_view_kind;
         let mut builder = ProcMeshDrawableBuilder::new(
             &mut self.0,
@@ -142,68 +164,40 @@ impl VisualizerSystem for Cylinders3DVisualizer {
             "cylinders3d",
         );
 
-        use super::entity_iterator::{iter_slices, process_archetype};
+        use super::entity_iterator::process_archetype;
         process_archetype::<Self, Cylinders3D, _>(
             ctx,
             view_query,
             context_systems,
-            &mut output,
+            &output,
             preferred_view_kind,
             |ctx, spatial_ctx, results| {
-                use re_view::RangeResultsExt as _;
+                // See comment on `visualizer_query_info` for the rationale of treating only lengths as required.
+                // (instead of lengths and radii as noted in the archetype definition).
+                let all_lengths =
+                    results.iter_required(Cylinders3D::descriptor_lengths().component);
 
-                let Some(all_length_chunks) =
-                    results.get_required_chunks(Cylinders3D::descriptor_lengths().component)
-                else {
-                    return Ok(());
-                };
-                let Some(all_radius_chunks) =
-                    results.get_required_chunks(Cylinders3D::descriptor_radii().component)
-                else {
-                    return Ok(());
-                };
-                let num_lengths: usize = all_length_chunks
-                    .iter()
-                    .flat_map(|chunk| chunk.iter_slices::<f32>())
-                    .map(|lengths| lengths.len())
-                    .sum();
-                let num_radii: usize = all_radius_chunks
-                    .iter()
-                    .flat_map(|chunk| chunk.iter_slices::<f32>())
-                    .map(|radii| radii.len())
-                    .sum();
-                let num_instances = num_lengths.max(num_radii);
-                if num_instances == 0 {
-                    return Ok(());
-                }
-
-                let timeline = ctx.query.timeline();
-                let all_lengths_indexed = iter_slices::<f32>(&all_length_chunks, timeline);
-                let all_radii_indexed = iter_slices::<f32>(&all_radius_chunks, timeline);
+                let all_radii = results.iter_optional(Cylinders3D::descriptor_radii().component);
                 let all_centers =
-                    results.iter_as(timeline, Cylinders3D::descriptor_centers().component);
-                let all_rotation_axis_angles = results.iter_as(
-                    timeline,
-                    Cylinders3D::descriptor_rotation_axis_angles().component,
-                );
+                    results.iter_optional(Cylinders3D::descriptor_centers().component);
+                let all_rotation_axis_angles =
+                    results.iter_optional(Cylinders3D::descriptor_rotation_axis_angles().component);
                 let all_quaternions =
-                    results.iter_as(timeline, Cylinders3D::descriptor_quaternions().component);
-                let all_colors =
-                    results.iter_as(timeline, Cylinders3D::descriptor_colors().component);
-                let all_labels =
-                    results.iter_as(timeline, Cylinders3D::descriptor_labels().component);
+                    results.iter_optional(Cylinders3D::descriptor_quaternions().component);
+                let all_colors = results.iter_optional(Cylinders3D::descriptor_colors().component);
+                let all_labels = results.iter_optional(Cylinders3D::descriptor_labels().component);
                 let all_fill_modes =
-                    results.iter_as(timeline, Cylinders3D::descriptor_fill_mode().component);
+                    results.iter_optional(Cylinders3D::descriptor_fill_mode().component);
                 let all_line_radii =
-                    results.iter_as(timeline, Cylinders3D::descriptor_line_radii().component);
+                    results.iter_optional(Cylinders3D::descriptor_line_radii().component);
                 let all_show_labels =
-                    results.iter_as(timeline, Cylinders3D::descriptor_show_labels().component);
+                    results.iter_optional(Cylinders3D::descriptor_show_labels().component);
                 let all_class_ids =
-                    results.iter_as(timeline, Cylinders3D::descriptor_class_ids().component);
+                    results.iter_optional(Cylinders3D::descriptor_class_ids().component);
 
-                let data = re_query::range_zip_2x9(
-                    all_lengths_indexed,
-                    all_radii_indexed,
+                let data = re_query::range_zip_1x10(
+                    all_lengths.slice::<f32>(),
+                    all_radii.slice::<f32>(),
                     all_centers.slice::<[f32; 3]>(),
                     all_rotation_axis_angles.component_slow::<components::RotationAxisAngle>(),
                     all_quaternions.slice::<[f32; 4]>(),
@@ -231,7 +225,7 @@ impl VisualizerSystem for Cylinders3DVisualizer {
                     )| {
                         Cylinders3DComponentData {
                             lengths: bytemuck::cast_slice(lengths),
-                            radii: bytemuck::cast_slice(radii),
+                            radii: radii.map_or(&[], bytemuck::cast_slice),
                             centers: centers.map_or(&[], bytemuck::cast_slice),
                             rotation_axis_angles: rotation_axis_angles.unwrap_or_default(),
                             quaternions: quaternions.map_or(&[], bytemuck::cast_slice),
@@ -240,10 +234,7 @@ impl VisualizerSystem for Cylinders3DVisualizer {
                             line_radii: line_radii
                                 .map_or(&[], |line_radii| bytemuck::cast_slice(line_radii)),
                             fill_mode: fill_modes
-                                .unwrap_or_default()
-                                .first()
-                                .copied()
-                                .and_then(FillMode::from_u8)
+                                .and_then(|s| FillMode::from_integer_slice(s).next()?)
                                 .unwrap_or_default(),
                             class_ids: class_ids
                                 .map_or(&[], |class_ids| bytemuck::cast_slice(class_ids)),
@@ -265,10 +256,6 @@ impl VisualizerSystem for Cylinders3DVisualizer {
 
     fn data(&self) -> Option<&dyn std::any::Any> {
         Some(self.0.as_any())
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 

@@ -66,6 +66,11 @@ impl<B> tower_http::trace::MakeSpan<B> for GrpcMakeSpan {
         let _guard = parent_ctx.attach();
 
         let endpoint = request.uri().path().to_owned();
+        // Split "/package.Service/Method" into rpc.service and rpc.method per OTel conventions.
+        let (rpc_service, rpc_method) = endpoint
+            .strip_prefix('/')
+            .and_then(|s| s.split_once('/'))
+            .unwrap_or(("", ""));
         let url = request
             .uri()
             .to_string()
@@ -119,18 +124,28 @@ impl<B> tower_http::trace::MakeSpan<B> for GrpcMakeSpan {
             otel.name = %endpoint,
             url,
             method = %request.method(),
-            // Record trace_id and benchmark_id as top level span fields.
+
+            // OTel semantic conventions for gRPC (https://opentelemetry.io/docs/specs/semconv/rpc/grpc/):
+            rpc.system = "grpc",
+            rpc.service = %rpc_service,
+            rpc.method = %rpc_method,
+
+            // Record benchmark_id as a top level span field.
             //
-            // At this stage we may not know yet the actual trace_id (depending on whether
+            // At this stage we may not know yet the actual value (depending on whether
             // we're generating a new trace or continuing an existing one). However,
-            // we need to pre-declare these fields if we want to record values for them later.
+            // we need to pre-declare the field if we want to record a value for it later.
             //
-            // The fields will be filled in by a separate [`tracing_subscriber::Layer`] (see
-            // [`TraceIdLayer`]).
-            trace_id = tracing::field::Empty,
+            // The field will be filled in by a separate [`tracing_subscriber::Layer`] (see
+            // [`BenchmarkIdLayer`]).
+            //
             // This will only be filled if we have a benchmark_id in the tracestate.
             // That's OK, it won't be printed if empty.
             benchmark_id = tracing::field::Empty,
+
+            // The gRPC status code (e.g. "Ok", "AlreadyExists", "DeadlineExceeded").
+            // Filled in later by `GrpcOnResponse` or `GrpcOnEos`, depending on the endpoint type (unary vs streaming).
+            grpc_status = tracing::field::Empty,
         );
 
         let size = SpanMetadata::insert_opt(
@@ -277,6 +292,16 @@ impl SpanMetadata {
     fn remove_opt(span_id: Option<&tracing::span::Id>) -> Option<Self> {
         span_id.and_then(Self::remove)
     }
+
+    /// Silently removes metadata for a span, returning `Some` if it existed.
+    ///
+    /// Unlike [`Self::remove`], this does NOT warn when the metadata is missing.
+    /// Used by [`SpanMetadataCleanupLayer::on_close`] where the metadata has typically
+    /// already been removed by [`GrpcOnEos`] or [`GrpcOnResponse`].
+    fn remove_silent(span_id: &tracing::span::Id) -> Option<Self> {
+        let spans = SPAN_METADATA.get()?;
+        spans.write().remove(span_id)
+    }
 }
 
 // ---
@@ -362,7 +387,6 @@ impl GrpcOnResponse {
                         client_version: None,
                         server_version: None,
                         email: None,
-                        dataset_id: None,
                     }
                     .otel_kvs(),
                 );
@@ -381,7 +405,6 @@ struct GrpcEosMetadata {
     client_version: Option<String>,
     server_version: Option<String>,
     email: Option<String>,
-    dataset_id: Option<String>,
 }
 
 impl GrpcEosMetadata {
@@ -406,10 +429,6 @@ impl GrpcEosMetadata {
             opentelemetry::KeyValue::new(
                 "email",
                 self.email.as_deref().unwrap_or("undefined").to_owned(),
-            ),
-            opentelemetry::KeyValue::new(
-                "dataset_id",
-                self.dataset_id.as_deref().unwrap_or("undefined").to_owned(),
             ),
         ]
     }
@@ -436,8 +455,16 @@ impl<B> tower_http::trace::OnResponse<B> for GrpcOnResponse {
             grpc_eos_classifier: _,
         } = span_metadata.clone();
 
-        let record = |grpc_code: tonic::Code| {
-            let grpc_status = format!("{grpc_code:?}"); // NOTE: The debug repr is the enum variant name (e.g. DeadlineExceeded).
+        // Record response metrics and optionally set the final `grpc_status` span attribute.
+        // Pass `Some(code)` when the final gRPC status is known, `None` when it will be
+        // determined later by `GrpcOnEos` (streaming responses).
+        let record = |span: &tracing::Span, grpc_code: Option<tonic::Code>| {
+            let grpc_status = if let Some(grpc_code) = grpc_code {
+                format!("{grpc_code:?}")
+            } else {
+                "<pending>".to_owned()
+            };
+            span.record("grpc_status", grpc_status.as_str());
             let http_status = response.status().as_str().to_owned();
 
             let client_version = client_version.as_deref().unwrap_or("undefined");
@@ -462,7 +489,6 @@ impl<B> tower_http::trace::OnResponse<B> for GrpcOnResponse {
                     opentelemetry::KeyValue::new("client_version", client_version.to_owned()),
                     opentelemetry::KeyValue::new("server_version", server_version.to_owned()),
                     opentelemetry::KeyValue::new("email", email.to_owned()),
-                    opentelemetry::KeyValue::new("dataset_id", dataset_id.to_owned()),
                 ],
             );
         };
@@ -480,7 +506,7 @@ impl<B> tower_http::trace::OnResponse<B> for GrpcOnResponse {
                         tonic::Status::from_error(err.into()).code()
                     }
                 };
-                record(grpc_code);
+                record(span, Some(grpc_code));
 
                 // For immediate errors, emit grpc_on_eos counter here since on_eos won't be called
                 let grpc_status = format!("{grpc_code:?}"); // NOTE: The debug repr is the enum variant name (e.g. DeadlineExceeded).
@@ -493,7 +519,6 @@ impl<B> tower_http::trace::OnResponse<B> for GrpcOnResponse {
                         client_version,
                         server_version,
                         email,
-                        dataset_id,
                     }
                     .otel_kvs(),
                 );
@@ -503,11 +528,12 @@ impl<B> tower_http::trace::OnResponse<B> for GrpcOnResponse {
             }
 
             tower_http::classify::ClassifiedResponse::Ready(Ok(_)) => {
-                record(tonic::Code::Ok);
+                record(span, Some(tonic::Code::Ok));
             }
 
             tower_http::classify::ClassifiedResponse::RequiresEos(eos) => {
-                record(tonic::Code::Ok);
+                // Final gRPC status is unknown until end-of-stream; `GrpcOnEos` will set it.
+                record(span, None);
                 SpanMetadata::insert_opt(
                     span.id(),
                     SpanMetadata {
@@ -577,7 +603,6 @@ impl<B> tower_http::trace::OnBodyChunk<B> for GrpcOnFirstBodyChunk {
                     opentelemetry::KeyValue::new("client_version", client_version.to_owned()),
                     opentelemetry::KeyValue::new("server_version", server_version.to_owned()),
                     opentelemetry::KeyValue::new("email", email.to_owned()),
-                    opentelemetry::KeyValue::new("dataset_id", dataset_id.to_owned()),
                 ],
             );
 
@@ -661,6 +686,7 @@ impl tower_http::trace::OnEos for GrpcOnEos {
             tonic::Code::Unknown
         };
         let grpc_status = format!("{grpc_code:?}"); // NOTE: The debug repr is the enum variant name (e.g. DeadlineExceeded).
+        span.record("grpc_status", &grpc_status);
 
         let client_version = client_version.as_deref().unwrap_or("undefined");
         let server_version = server_version.as_deref().unwrap_or("undefined");
@@ -683,7 +709,6 @@ impl tower_http::trace::OnEos for GrpcOnEos {
                 opentelemetry::KeyValue::new("client_version", client_version.to_owned()),
                 opentelemetry::KeyValue::new("server_version", server_version.to_owned()),
                 opentelemetry::KeyValue::new("email", email.to_owned()),
-                opentelemetry::KeyValue::new("dataset_id", dataset_id.to_owned()),
             ],
         );
     }
@@ -742,8 +767,11 @@ pub type ClientTelemetryLayer = tower::layer::util::Stack<
 // TODO(cmc): at the moment there's little value to have anything beyond traces on the client, but
 // we ultimately can add all the same things that we have on the server as we need them.
 pub fn new_client_telemetry_layer() -> ClientTelemetryLayer {
-    let trace_layer =
-        tower_http::trace::TraceLayer::new_for_grpc().make_span_with(GrpcMakeSpan::new());
+    let trace_layer = tower_http::trace::TraceLayer::new_for_grpc()
+        // Note: we're actually disabling all DEBUG level logs for `tower` in re_log, so if you want to enable it
+        // you'll need to adjust that as well. See crates/utils/re_log/src/lib.rs
+        .on_failure(DefaultOnFailure::new().level(tracing::Level::DEBUG))
+        .make_span_with(GrpcMakeSpan::new());
 
     tower::ServiceBuilder::new()
         .layer(trace_layer)
@@ -802,31 +830,32 @@ impl tonic::service::Interceptor for TracingInjectorInterceptor {
 // ---
 
 use opentelemetry::trace::TraceContextExt as _;
+use tower_http::trace::DefaultOnFailure;
 use tracing::span::Id;
 use tracing::{Span, Subscriber};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 
-/// A `tracing_subscriber::Layer` that injects the opentelemetry `trace_id` as a `benchmark_id` field
-/// top level field on every span.
+/// A `tracing_subscriber::Layer` that injects the opentelemetry `benchmark_id` as a
+/// top level field on every span that pre-declares it.
 ///
-/// This allows us to use the upstream tooling to filter logs within a span by `trace_id`
+/// The `benchmark_id` is extracted from the W3C `tracestate` header.
 #[derive(Default)]
-pub struct TraceIdLayer {
+pub struct BenchmarkIdLayer {
     _private: (),
 }
 
 // Just a marker to avoid injecting multiple times per span.
-struct TraceIdInjected;
+struct BenchmarkIdInjected;
 
-impl<S> Layer<S> for TraceIdLayer
+impl<S> Layer<S> for BenchmarkIdLayer
 where
     S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
     fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
         if let Some(span_ref) = ctx.span(id) {
-            if span_ref.extensions().get::<TraceIdInjected>().is_some() {
+            if span_ref.extensions().get::<BenchmarkIdInjected>().is_some() {
                 return;
             }
 
@@ -836,14 +865,40 @@ where
             let span_cx = otel_span.span_context();
 
             if span_cx.is_valid() {
-                let trace_id = span_cx.trace_id();
                 let trace_state = span_cx.trace_state();
-                current_span.record("trace_id", trace_id.to_string());
                 if let Some(benchmark_id) = trace_state.get("benchmark_id") {
                     current_span.record("benchmark_id", benchmark_id.to_owned());
                 }
-                span_ref.extensions_mut().insert(TraceIdInjected);
+                span_ref.extensions_mut().insert(BenchmarkIdInjected);
             }
         }
+    }
+}
+
+// ---
+
+/// A [`tracing_subscriber::Layer`] that cleans up `SpanMetadata` entries when spans close.
+///
+/// In the normal flow, metadata is removed by [`GrpcOnEos`] `on_eos` (streaming responses)
+/// or [`GrpcOnResponse`] `on_response` (immediate errors). However, if the client disconnects
+/// or a transport error occurs, `on_eos` may never be called, leaving stale entries behind.
+///
+/// Because the `tracing` crate recycles span IDs after a span closes, stale entries cause
+/// "overwritten span metadata" warnings when the recycled ID is reused by a new request.
+///
+/// `on_close` is called when all clones of a span are dropped, and critically, **before** the
+/// span ID is recycled. This guarantees any leaked metadata is cleaned up before the ID can
+/// be reused.
+#[derive(Default)]
+pub struct SpanMetadataCleanupLayer {
+    _private: (),
+}
+
+impl<S> Layer<S> for SpanMetadataCleanupLayer
+where
+    S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_close(&self, id: Id, _ctx: Context<'_, S>) {
+        SpanMetadata::remove_silent(&id);
     }
 }

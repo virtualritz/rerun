@@ -9,7 +9,7 @@ use crate::{MAX_DECODING_MESSAGE_SIZE, StreamError, TonicStatusError};
 ///
 /// This is used by the viewer to _receive_ log messages.
 pub fn stream(uri: re_uri::ProxyUri) -> re_log_channel::LogReceiver {
-    re_log::debug!("Loading {uri} via gRPC…");
+    re_log::debug!(?uri, "Loading via gRPC…");
 
     let (tx, rx) =
         re_log_channel::log_channel(re_log_channel::LogSource::MessageProxy(uri.clone()));
@@ -50,7 +50,7 @@ async fn stream_async(
             .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE)
     };
 
-    re_log::debug!("Streaming messages from gRPC endpoint {uri}");
+    re_log::debug!(?uri, "Streaming messages from gRPC endpoint");
 
     let mut stream = client
         .read_messages(ReadMessagesRequest {})
@@ -66,11 +66,13 @@ async fn stream_async(
             })) => {
                 let mut log_msg = log_msg_proto.to_application((&mut app_id_cache, None))?;
 
-                // Insert the timestamp metadata into the Arrow message for accurate e2e latency measurements:
-                log_msg.insert_arrow_record_batch_metadata(
-                    re_sorbet::timestamp_metadata::KEY_TIMESTAMP_VIEWER_IPC_DECODED.to_owned(),
-                    re_sorbet::timestamp_metadata::now_timestamp(),
-                );
+                if let Some(metadata_key) = re_sorbet::TimestampLocation::IPCDecode.metadata_key() {
+                    // Insert the timestamp metadata into the Arrow message for accurate e2e latency measurements:
+                    log_msg.insert_arrow_record_batch_metadata(
+                        metadata_key.to_owned(),
+                        re_sorbet::timestamp_metadata::now_timestamp(),
+                    );
+                }
 
                 if tx.send(log_msg.into()).is_err() {
                     re_log::debug!("gRPC stream smart channel closed");

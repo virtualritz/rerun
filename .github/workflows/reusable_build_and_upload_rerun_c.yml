@@ -48,17 +48,6 @@ env:
   RUSTFLAGS: --deny warnings
   RUSTDOCFLAGS: --deny warnings
 
-  # Disable the GHA backend (Github's 10GB storage) since we use our own GCS backend.
-  # See: https://github.com/marketplace/actions/sccache-action
-  SCCACHE_GHA_ENABLED: "false"
-
-  # Wrap every `rustc` invocation in `sccache`.
-  RUSTC_WRAPPER: "sccache"
-
-  # Not only `sccache` cannot cache incremental builds, it's counter-productive to generate all
-  # these incremental artifacts when running on CI.
-  CARGO_INCREMENTAL: "0"
-
 defaults:
   run:
     shell: bash --noprofile --norc -euo pipefail {0}
@@ -85,13 +74,13 @@ jobs:
             linux-arm64)
               runner="ubuntu-arm-16-core"
               target="aarch64-unknown-linux-gnu"
-              container="'ghcr.io/rerun-io/ci_docker:0.16.0'"
+              container="'ghcr.io/rerun-io/ci_docker:0.17.0'"
               lib_name="librerun_c.a"
               ;;
             linux-x64)
               runner="ubuntu-latest-16-cores"
               target="x86_64-unknown-linux-gnu"
-              container="'ghcr.io/rerun-io/ci_docker:0.16.0'"
+              container="'ghcr.io/rerun-io/ci_docker:0.17.0'"
               lib_name="librerun_c.a"
               ;;
             windows-x64)
@@ -101,7 +90,7 @@ jobs:
               lib_name="rerun_c.lib"
               ;;
             macos-arm64)
-              runner="macos-15" # Small runners, because building rerun_c is fast
+              runner="macos-26" # Small runners, because building rerun_c is fast
               target="aarch64-apple-darwin"
               container="null"
               lib_name="librerun_c.a"
@@ -166,7 +155,7 @@ jobs:
           echo "sha=$(echo $full_commit | cut -c1-7)" >> "$GITHUB_OUTPUT"
 
       - name: "Upload rerun_c (commit)"
-        uses: google-github-actions/upload-cloud-storage@v2
+        uses: google-github-actions/upload-cloud-storage@v3
         with:
           path: "./target/${{ needs.set-config.outputs.TARGET }}/release/${{ needs.set-config.outputs.LIB_NAME }}"
           destination: "rerun-builds/commit/${{ steps.get-sha.outputs.sha }}/rerun_c/${{ inputs.PLATFORM }}"
@@ -175,7 +164,7 @@ jobs:
 
       - name: "Upload rerun_c (adhoc)"
         if: ${{ inputs.ADHOC_NAME != '' }}
-        uses: google-github-actions/upload-cloud-storage@v2
+        uses: google-github-actions/upload-cloud-storage@v3
         with:
           path: "./target/${{ needs.set-config.outputs.TARGET }}/release/${{ needs.set-config.outputs.LIB_NAME }}"
           destination: "rerun-builds/adhoc/${{inputs.ADHOC_NAME}}/rerun_c/${{ inputs.PLATFORM }}"

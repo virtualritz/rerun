@@ -186,6 +186,7 @@ impl ViewClass for GraphView {
     fn ui(
         &self,
         ctx: &ViewerContext<'_>,
+        _missing_chunk_reporter: &re_viewer_context::MissingChunkReporter,
         ui: &mut egui::Ui,
         state: &mut dyn ViewState,
         query: &ViewQuery<'_>,
@@ -246,7 +247,7 @@ impl ViewClass for GraphView {
                 for graph in &graphs {
                     draw_graph(
                         ui,
-                        ctx,
+                        &ctx.active_recording_store_view_context(),
                         graph,
                         layout,
                         query,
@@ -287,7 +288,7 @@ impl ViewClass for GraphView {
         state.visual_bounds = Some(updated_bounds);
 
         if state.layout_state.is_in_progress() {
-            ui.ctx().request_repaint();
+            ui.request_repaint();
         }
 
         Ok(())

@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use ahash::{HashMap, HashMapExt as _};
 use re_log_channel::LogSender;
-use re_log_types::{FileSource, LogMsg};
+use re_log_types::{ApplicationId, FileSource, LogMsg};
 
 use crate::{DataLoader as _, DataLoaderError, LoadedData, RrdLoader};
 
@@ -23,8 +23,6 @@ pub fn load_from_path(
     // NOTE: This channel must be unbounded since we serialize all operations when running on wasm.
     tx: &LogSender,
 ) -> Result<(), DataLoaderError> {
-    use re_log_types::ApplicationId;
-
     re_tracing::profile_function!(path.to_string_lossy());
 
     if !path.exists() {
@@ -43,16 +41,16 @@ pub fn load_from_path(
             .map(|f| f.to_string_lossy().to_string())
             .map(ApplicationId::from)
     });
-    let settings = &crate::DataLoaderSettings {
+    let settings = crate::DataLoaderSettings {
         // When loading a LeRobot dataset, avoid sending a `SetStoreInfo` message since the LeRobot loader handles this automatically.
         force_store_info: !crate::lerobot::is_lerobot_dataset(path),
         application_id,
         ..settings.clone()
     };
 
-    let rx = load(settings, path, None)?;
+    let rx = load(&settings, path, None)?;
 
-    send(settings.clone(), file_source, rx, tx);
+    send(settings, file_source, rx, tx);
 
     Ok(())
 }
@@ -77,9 +75,22 @@ pub fn load_from_file_contents(
 
     re_log::info!("Loading {filepath:?}…");
 
-    let data = load(settings, filepath, Some(contents))?;
+    // If no application ID was specified, we derive one from the filename.
+    let application_id = settings.application_id.clone().or_else(|| {
+        filepath
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .map(ApplicationId::from)
+    });
 
-    send(settings.clone(), file_source, data, tx);
+    let settings = crate::DataLoaderSettings {
+        application_id,
+        ..settings.clone()
+    };
+
+    let data = load(&settings, filepath, Some(contents))?;
+
+    send(settings, file_source, data, tx);
 
     Ok(())
 }
@@ -117,7 +128,7 @@ pub(crate) fn load(
     settings: &crate::DataLoaderSettings,
     path: &std::path::Path,
     contents: Option<std::borrow::Cow<'_, [u8]>>,
-) -> Result<std::sync::mpsc::Receiver<LoadedData>, DataLoaderError> {
+) -> Result<crossbeam::channel::Receiver<LoadedData>, DataLoaderError> {
     re_tracing::profile_function!(path.display().to_string());
 
     // On native we run loaders in parallel so this needs to become static.
@@ -125,12 +136,13 @@ pub(crate) fn load(
         contents.map(|contents| std::sync::Arc::new(Cow::Owned(contents.into_owned())));
 
     let rx_loader = {
-        let (tx_loader, rx_loader) = std::sync::mpsc::channel();
+        let (tx_loader, rx_loader) = crossbeam::channel::bounded(1024);
 
         let any_compatible_loader = {
-            #[derive(PartialEq, Eq)]
+            #[derive(Debug, PartialEq, Eq)]
             struct CompatibleLoaderFound;
-            let (tx_feedback, rx_feedback) = std::sync::mpsc::channel::<CompatibleLoaderFound>();
+            let (tx_feedback, rx_feedback) =
+                crossbeam::channel::bounded::<CompatibleLoaderFound>(128);
 
             // When loading a file type with native support (.rrd, .mcap, .png, …)
             // then we don't need the overhead and noise of external data loaders:
@@ -189,7 +201,7 @@ pub(crate) fn load(
                     }
 
                     re_log::debug!(loader = loader.name(), ?path, "compatible loader found");
-                    tx_feedback.send(CompatibleLoaderFound).ok();
+                    re_quota_channel::send_crossbeam(&tx_feedback, CompatibleLoaderFound).ok();
                 });
             }
 
@@ -225,13 +237,13 @@ pub(crate) fn load(
     settings: &crate::DataLoaderSettings,
     path: &std::path::Path,
     contents: Option<std::borrow::Cow<'_, [u8]>>,
-) -> Result<std::sync::mpsc::Receiver<LoadedData>, DataLoaderError> {
+) -> Result<crossbeam::channel::Receiver<LoadedData>, DataLoaderError> {
     re_tracing::profile_function!(path.display().to_string());
 
     let rx_loader = {
-        let (tx_loader, rx_loader) = std::sync::mpsc::channel();
+        let (tx_loader, rx_loader) = crossbeam::channel::unbounded();
 
-        let any_compatible_loader = crate::iter_loaders().map(|loader| {
+        let any_compatible_loader = crate::iter_loaders().any(|loader| {
             if let Some(contents) = contents.as_deref() {
                 let settings = settings.clone();
                 let tx_loader = tx_loader.clone();
@@ -249,9 +261,7 @@ pub(crate) fn load(
             } else {
                 false
             }
-        })
-            .reduce(|any_compatible, is_compatible| any_compatible || is_compatible)
-            .unwrap_or(false);
+        });
 
         // Implicitly closing `tx_loader`!
 
@@ -271,7 +281,7 @@ pub(crate) fn load(
 pub(crate) fn send(
     settings: crate::DataLoaderSettings,
     file_source: FileSource,
-    rx_loader: std::sync::mpsc::Receiver<LoadedData>,
+    rx_loader: crossbeam::channel::Receiver<LoadedData>,
     tx: &LogSender,
 ) {
     spawn({
@@ -354,7 +364,16 @@ fn spawn<F>(f: F)
 where
     F: FnOnce() + Send + 'static,
 {
-    rayon::spawn(f);
+    if 1 < rayon::current_num_threads() {
+        rayon::spawn(f);
+    } else {
+        // Avoids a deadlock when send-channel gets full.
+        // We usually only use `-j1` for profiling the main application; not data loading.
+        std::thread::Builder::new()
+            .name("data-loader".to_owned())
+            .spawn(f)
+            .expect("Failed to spawn a thread");
+    }
 }
 
 #[cfg(target_arch = "wasm32")]

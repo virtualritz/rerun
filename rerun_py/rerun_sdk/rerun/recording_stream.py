@@ -6,7 +6,7 @@ import inspect
 import math
 import uuid
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, TypeVar, overload
+from typing import TYPE_CHECKING, Any, Self, TypeVar, overload
 
 import rerun as rr
 from rerun import bindings
@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     import pyarrow as pa
 
     from rerun import AsComponents, BlueprintLike, ComponentColumn, DescribedComponentBatch as DescribedComponentBatch
-    from rerun.memory import MemoryRecording
+    from rerun._memory import MemoryRecording
     from rerun.sinks import LogSinkLike
 
     from ._send_columns import TimeColumnLike as TimeColumnLike
@@ -259,14 +259,14 @@ class RecordingStream:
 
         Parameters
         ----------
-        application_id : str
+        application_id:
             Your Rerun recordings will be categorized by this application id, so
             try to pick a unique one for each application that uses the Rerun SDK.
 
             For example, if you have one application doing object detection
             and another doing camera calibration, you could have
             `rerun.init("object_detector")` and `rerun.init("calibrator")`.
-        recording_id : Optional[str]
+        recording_id:
             Set the recording ID that this process is logging to, as a UUIDv4.
 
             The default recording_id is based on `multiprocessing.current_process().authkey`
@@ -277,13 +277,13 @@ class RecordingStream:
             processes to log to the same Rerun instance (and be part of the same recording),
             you will need to manually assign them all the same recording_id.
             Any random UUIDv4 will work, or copy the recording id for the parent process.
-        make_default : bool
+        make_default:
             If true (_not_ the default), the newly initialized recording will replace the current
             active one (if any) in the global scope.
-        make_thread_default : bool
+        make_thread_default:
             If true (_not_ the default), the newly initialized recording will replace the current
             active one (if any) in the thread-local scope.
-        default_enabled : bool
+        default_enabled:
             Should Rerun logging be on by default?
             Can be overridden with the RERUN env-var, e.g. `RERUN=on` or `RERUN=off`.
         send_properties
@@ -310,6 +310,12 @@ class RecordingStream:
 
         if recording_id is not None:
             recording_id = str(recording_id)
+        else:
+            # We must absolutely avoid passing a None value to the bindings, because this will trigger the behavior
+            # where it attempts to use the same recording id for parallel streams in the same process. When a
+            # `RecordingStream` is explicitly created, the reuse of a recording id is not at all expected, though.
+            # TODO(RR-1154): this is yet another consequence of stateless APIs not being first class
+            recording_id = uuid.uuid4().hex
 
         self.inner = bindings.new_recording(
             application_id=application_id,
@@ -324,15 +330,23 @@ class RecordingStream:
         self._prev: RecordingStream | None = None
         self.context_token: contextvars.Token[RecordingStream] | None = None
 
+        # Cache references to bindings functions for use in __del__.
+        # During interpreter shutdown, module-level bindings may be garbage collected
+        # before __del__ is called, but instance attributes remain available.
+        self._flush = bindings.flush
+        self._disconnect_orphaned_recordings = bindings.disconnect_orphaned_recordings
+
     @classmethod
     def _from_native(cls, native_recording: bindings.PyRecordingStream) -> RecordingStream:
         self = cls.__new__(cls)
         self.inner = native_recording
         self._prev = None
         self.context_token = None
+        self._flush = bindings.flush
+        self._disconnect_orphaned_recordings = bindings.disconnect_orphaned_recordings
         return self
 
-    def __enter__(self) -> RecordingStream:
+    def __enter__(self) -> Self:
         self.context_token = active_recording_stream.set(self)
         self._prev = set_thread_local_data_recording(self)
         return self
@@ -380,7 +394,6 @@ class RecordingStream:
         """
         bindings.flush(timeout_sec=timeout_sec, recording=self.to_native())
 
-    # TODO(RR-3065): SDK should flush both IO and app-level logic when a recording gets GC'd
     def __del__(self) -> None:  # type: ignore[no-untyped-def]
         recording = self.to_native()
         # It's definitely a problem if we are in a forked child process. The rerun SDK will still
@@ -388,8 +401,9 @@ class RecordingStream:
         #
         # See: https://github.com/rerun-io/rerun/issues/6223 for context on why this is necessary.
         if not recording.is_forked_child():
-            # Flush any pending data (non-blocking)
-            bindings.flush(timeout_sec=0.0, recording=recording)  # NOLINT
+            # Flush any pending data (non-blocking).
+            # Use cached references to avoid issues during interpreter shutdown.
+            self._flush(timeout_sec=0.0, recording=recording)  # NOLINT
 
             # Drop our references to the native recording to make sure things will clean up
             # properly.
@@ -398,7 +412,7 @@ class RecordingStream:
 
             # At this point if there aren't other references to this recording, it's considered
             # orphaned. Do a sweep to clean up any orphaned recordings.
-            bindings.disconnect_orphaned_recordings()  # NOLINT
+            self._disconnect_orphaned_recordings()  # NOLINT
 
     # any free function taking a `RecordingStream` as the first argument can also be a method
     binary_stream = binary_stream
@@ -564,7 +578,7 @@ class RecordingStream:
 
         """
 
-        from .memory import memory_recording
+        from ._memory import memory_recording
 
         return memory_recording(self)
 
@@ -586,7 +600,7 @@ class RecordingStream:
         *,
         grpc_port: int | None = None,
         default_blueprint: BlueprintLike | None = None,
-        server_memory_limit: str = "25%",
+        server_memory_limit: str = "1GiB",
         newest_first: bool = False,
     ) -> str:
         """
@@ -595,16 +609,15 @@ class RecordingStream:
         You can to this server with the native viewer using `rerun rerun+http://localhost:{grpc_port}/proxy`.
 
         The gRPC server will buffer all log data in memory so that late connecting viewers will get all the data.
-        You can limit the amount of data buffered by the gRPC server with the `server_memory_limit` argument.
+        You can control the amount of data buffered by the gRPC server with the `server_memory_limit` argument.
         Once reached, the earliest logged data will be dropped. Static data is never dropped.
-
-        If server & client are running on the same machine and all clients are expected to connect before
-        any data is sent, it is highly recommended that you set the memory limit to `0B`,
-        otherwise you're potentially doubling your memory usage!
 
         Returns the URI of the server so you can connect the viewer to it.
 
         This function returns immediately.
+
+        NOTE: When the `RecordingStream` is disconnected, or otherwise goes out of scope, it will shut down the
+        gRPC server.
 
         Parameters
         ----------
@@ -665,7 +678,7 @@ class RecordingStream:
 
         send_blueprint(blueprint=blueprint, make_active=make_active, make_default=make_default, recording=self)
 
-    def send_recording(self, recording: rr.dataframe.Recording) -> None:
+    def send_recording(self, recording: rr.recording.Recording) -> None:
         """
         Send a `Recording` loaded from a `.rrd` to the `RecordingStream`.
 
@@ -750,11 +763,11 @@ class RecordingStream:
 
         Parameters
         ----------
-        width : int
+        width:
             The width of the viewer in pixels.
-        height : int
+        height:
             The height of the viewer in pixels.
-        blueprint : BlueprintLike
+        blueprint:
             A blueprint object to send to the viewer.
             It will be made active and set as the default blueprint in the recording.
 
@@ -808,7 +821,7 @@ class RecordingStream:
 
         Parameters
         ----------
-        name : str
+        name:
             The name of the recording.
 
         """
@@ -825,7 +838,7 @@ class RecordingStream:
 
         Parameters
         ----------
-        nanos : int
+        nanos:
             The start time of the recording.
 
         """
@@ -870,7 +883,7 @@ class RecordingStream:
 
         Parameters
         ----------
-        timeline : str
+        timeline:
             The name of the timeline to set the time for.
         sequence:
             Used for sequential indices, like `frame_nr`.
@@ -903,7 +916,7 @@ class RecordingStream:
 
         Parameters
         ----------
-        timeline : str
+        timeline:
             The name of the timeline to clear the time for.
 
         """
@@ -939,7 +952,7 @@ class RecordingStream:
         This is the main entry point for logging data to rerun. It can be used to log anything
         that implements the [`rerun.AsComponents`][] interface, or a collection of [`rerun.ComponentBatchLike`][] objects.
 
-        When logging data, you must always provide an [entity_path](https://www.rerun.io/docs/concepts/entity-path)
+        When logging data, you must always provide an [entity_path](https://www.rerun.io/docs/concepts/logging-and-ingestion/entity-path)
         for identifying the data. Note that paths prefixed with "__" are considered reserved for use by the Rerun SDK
         itself and should not be used for logging user data. This is where Rerun will log additional information
         such as properties and warnings.
@@ -976,7 +989,7 @@ class RecordingStream:
             This means that logging to `"world/my\ image\!"` is the same as logging
             to ["world", "my image!"].
 
-            See <https://www.rerun.io/docs/concepts/entity-path> for more on entity paths.
+            See <https://www.rerun.io/docs/concepts/logging-and-ingestion/entity-path> for more on entity paths.
 
         entity:
             Anything that implements the [`rerun.AsComponents`][] interface, usually an archetype.
@@ -1125,7 +1138,7 @@ class RecordingStream:
         entity_path:
             Path to the entity in the space hierarchy.
 
-            See <https://www.rerun.io/docs/concepts/entity-path> for more on entity paths.
+            See <https://www.rerun.io/docs/concepts/logging-and-ingestion/entity-path> for more on entity paths.
         indexes:
             The time values of this batch of data. Each `TimeColumnLike` object represents a single column
             of timestamps. Generally, you should use one of the provided class [`TimeColumn`][rerun.TimeColumn].
@@ -1324,7 +1337,7 @@ def thread_local_stream(application_id: str) -> Callable[[_TFunc], _TFunc]:
 
     Parameters
     ----------
-    application_id : str
+    application_id:
         The application ID that this recording is associated with.
 
     """

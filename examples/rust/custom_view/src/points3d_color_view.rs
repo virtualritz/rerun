@@ -7,11 +7,11 @@ use rerun::external::re_log_types::EntityPath;
 use rerun::external::re_sdk_types::ViewClassIdentifier;
 use rerun::external::re_ui::{self, Help};
 use rerun::external::re_viewer_context::{
-    HoverHighlight, IdentifiedViewSystem as _, IndicatedEntities, Item, PerVisualizer,
-    PerVisualizerInViewClass, SelectionHighlight, SmallVisualizerSet, SystemExecutionOutput,
-    UiLayout, ViewClass, ViewClassLayoutPriority, ViewClassRegistryError, ViewId, ViewQuery,
-    ViewSpawnHeuristics, ViewState, ViewStateExt as _, ViewSystemExecutionError,
-    ViewSystemRegistrator, ViewerContext, VisualizableEntities,
+    DataResultInteractionAddress, HoverHighlight, IdentifiedViewSystem as _, IndicatedEntities,
+    Item, MissingChunkReporter, PerVisualizerType, RecommendedVisualizers, SelectionHighlight,
+    SystemExecutionOutput, UiLayout, ViewClass, ViewClassLayoutPriority, ViewClassRegistryError,
+    ViewId, ViewQuery, ViewSpawnHeuristics, ViewState, ViewStateExt as _, ViewSystemExecutionError,
+    ViewSystemIdentifier, ViewSystemRegistrator, ViewerContext, VisualizableReason,
 };
 
 use crate::points3d_color_visualizer::{ColorWithInstance, Points3DColorVisualizer};
@@ -129,19 +129,19 @@ impl ViewClass for ColorCoordinatesView {
     /// The default implementation of `choose_default_visualizers` activates visualizers only
     /// if the respective indicator is present.
     /// We want to enable the visualizer here though for any visualizable entity instead!
-    fn choose_default_visualizers(
+    fn recommended_visualizers_for_entity(
         &self,
-        entity_path: &EntityPath,
-        visualizable_entities_per_visualizer: &PerVisualizerInViewClass<VisualizableEntities>,
-        _indicated_entities_per_visualizer: &PerVisualizer<IndicatedEntities>,
-    ) -> SmallVisualizerSet {
-        if visualizable_entities_per_visualizer
-            .get(&Points3DColorVisualizer::identifier())
-            .is_some_and(|entities| entities.contains_key(entity_path))
+        _entity_path: &EntityPath,
+        visualizers: &[(ViewSystemIdentifier, &VisualizableReason)],
+        _indicated_entities_per_visualizer: &PerVisualizerType<&IndicatedEntities>,
+    ) -> RecommendedVisualizers {
+        if visualizers
+            .iter()
+            .any(|(viz, _)| *viz == Points3DColorVisualizer::identifier())
         {
-            SmallVisualizerSet::from_slice(&[Points3DColorVisualizer::identifier()])
+            RecommendedVisualizers::default(Points3DColorVisualizer::identifier())
         } else {
-            SmallVisualizerSet::new()
+            RecommendedVisualizers::empty()
         }
     }
 
@@ -178,9 +178,9 @@ impl ViewClass for ColorCoordinatesView {
     fn ui(
         &self,
         ctx: &ViewerContext<'_>,
+        _missing_chunk_reporter: &MissingChunkReporter,
         ui: &mut egui::Ui,
         state: &mut dyn ViewState,
-
         query: &ViewQuery<'_>,
         system_output: SystemExecutionOutput,
     ) -> Result<(), ViewSystemExecutionError> {
@@ -259,10 +259,10 @@ fn color_space_ui(
 
     // Circles for the colors in the scene.
     let mut hovering_any_point = false;
-    for (ent_path, colors) in &colors.colors {
+    for (ent_path, visualizer_instruction_id, colors) in &colors.colors {
         let ent_highlight = query.highlights.entity_highlight(ent_path.hash());
         for ColorWithInstance { instance, color } in colors {
-            let highlight = ent_highlight.index_highlight(*instance);
+            let highlight = ent_highlight.index_highlight(*instance, *visualizer_instruction_id);
 
             let (x, y) = position_at(*color);
             let center = egui::pos2(
@@ -292,27 +292,19 @@ fn color_space_ui(
             // Update the global selection state if the user interacts with a point and show hover ui for the entire keypoint.
             let instance = InstancePath::instance(ent_path.clone(), *instance);
             let interact = interact.on_hover_ui_at_pointer(|ui| {
-                item_ui::instance_path_button(
-                    ctx,
-                    &ctx.current_query(),
-                    ctx.recording(),
-                    ui,
-                    Some(query.view_id),
-                    &instance,
-                );
-                instance.data_ui(
-                    ctx,
-                    ui,
-                    UiLayout::Tooltip,
-                    &ctx.current_query(),
-                    ctx.recording(),
-                );
+                let store_view_ctx = ctx.active_recording_store_view_context();
+                item_ui::instance_path_button(&store_view_ctx, ui, Some(query.view_id), &instance);
+                instance.data_ui(&store_view_ctx, ui, UiLayout::Tooltip);
 
                 hovering_any_point = true;
             });
             ctx.handle_select_hover_drag_interactions(
                 &interact,
-                Item::DataResult(query.view_id, instance),
+                Item::DataResult(DataResultInteractionAddress {
+                    view_id: query.view_id,
+                    instance_path: instance,
+                    visualizer: Some(*visualizer_instruction_id),
+                }),
                 false,
             );
         }

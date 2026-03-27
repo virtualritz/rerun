@@ -25,6 +25,15 @@ if TYPE_CHECKING:
     from rerun.catalog import DatasetEntry
     from syrupy import SnapshotAssertion
 
+# Marker expressions for test profiles. Each profile defines a `-m`-style expression
+# that is AND-combined with user-supplied `-m` flag (if any). Local is the default profile
+# if nothing's specified
+PROFILES: dict[str, str] = {
+    "local": "",
+    "dpf-docker": "not local_only",
+    "dpf-stack": "not local_only or cloud_only",
+}
+
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     """Add custom command-line options for configuring the test server."""
@@ -47,6 +56,22 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="URI prefix for test resources (e.g., 's3://bucket/path/' for remote resources). "
         "If not provided, local file:// URIs to the resources directory will be used.",
     )
+    parser.addoption(
+        "--profile",
+        action="store",
+        default="local",
+        choices=PROFILES.keys(),
+        help="Test profile controlling which marker categories are auto-skipped. "
+        "Choices: 'local' (default), 'dpf-docker' (skip local_only), "
+        "'dpf-stack' (skip local_only), 'all' (skip nothing).",
+    )
+    parser.addoption(
+        "--cloud",
+        action="store",
+        default=None,
+        help="Cloud provider the tests are running against (e.g., 'aws', 'azure'). "
+        "Used to skip cloud-specific tests like aws_only.",
+    )
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -57,21 +82,27 @@ def pytest_configure(config: pytest.Config) -> None:
         "local_only: mark test as requiring local resources (e.g., uses RecordingStream to generate .rrd files on-the-fly)",
     )
 
-    # TODO(RR-2969): these tests needs to be identified because we must currently provide an URI for the created table
-    # which, in general, is not possible for arbitrary server URLs.
     config.addinivalue_line(
         "markers",
-        "creates_table: mark test as creating a table (which requires providing a server-accessible path)",
+        "aws_only: mark test as requiring AWS (e.g., uses S3 buckets directly)",
     )
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Skip local-only tests when using remote resource prefix."""
-    resource_prefix = config.getoption("--resource-prefix")
+    """Auto-skip tests based on the active profile and remote resource prefix."""
+
+    # Profile-based filtering: AND-combine the profile expression with any user-supplied `-m`.
+    profile_name = config.getoption("--profile")
+    profile_expr = PROFILES[profile_name]
+    if profile_expr:
+        user_expr = config.option.markexpr
+        if user_expr:
+            config.option.markexpr = f"({profile_expr}) and ({user_expr})"
+        else:
+            config.option.markexpr = profile_expr
 
     # Automatically skip local-only tests when resource prefix is remote (not local file://)
-    #
-    # Note: you can force skip `local_only` test using `-m "not local_only"`.
+    resource_prefix = config.getoption("--resource-prefix")
     is_local = resource_prefix is None or resource_prefix.startswith("file://")
 
     if not is_local:
@@ -79,6 +110,15 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         for item in items:
             if "local_only" in item.keywords:
                 item.add_marker(skip_marker)
+
+    # Skip aws_only tests when not running on AWS
+    cloud = config.getoption("--cloud")
+    if cloud != "aws":
+        reason = f"AWS-only test skipped on {cloud}" if cloud else "AWS-only test skipped (no --cloud specified)"
+        skip_aws = pytest.mark.skip(reason=reason)
+        for item in items:
+            if "aws_only" in item.keywords:
+                item.add_marker(skip_aws)
 
 
 DATASET_NAME = "dataset"
@@ -153,7 +193,7 @@ def catalog_client(request: pytest.FixtureRequest) -> Generator[CatalogClient, N
 
     if redap_url:
         # Connect to an external redap server
-        client = CatalogClient(address=redap_url, token=redap_token)
+        client = CatalogClient(url=redap_url, token=redap_token)
         yield client
         # No cleanup needed for external server
     else:
@@ -268,10 +308,10 @@ def readonly_test_dataset(catalog_client: CatalogClient, resource_prefix: str) -
 
     try:
         handle.wait(timeout_secs=50)
-    except Exception as exc:
+    except Exception:
         # Attempt a cleanup just in case
         ds.delete()
-        raise exc
+        raise
 
     yield ds
 

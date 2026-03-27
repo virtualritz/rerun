@@ -4,11 +4,12 @@ use re_log_types::EntityPathHash;
 use re_sdk_types::{
     Archetype as _,
     archetypes::EncodedDepthImage,
-    components::{Colormap, MediaType},
+    components::{Blob, Colormap, MagnificationFilter, MediaType},
 };
 use re_viewer_context::{
     IdentifiedViewSystem, ImageDecodeCache, ViewContext, ViewContextCollection, ViewQuery,
-    ViewSystemExecutionError, VisualizerExecutionOutput, VisualizerQueryInfo, VisualizerSystem,
+    ViewSystemExecutionError, VisualizerExecutionOutput, VisualizerQueryInfo,
+    VisualizerReportSeverity, VisualizerSystem,
 };
 
 use super::entity_iterator::process_archetype;
@@ -24,6 +25,7 @@ use crate::{
         first_copied,
     },
 };
+use re_sdk_types::reflection::Enum as _;
 
 pub struct EncodedDepthImageVisualizer {
     pub data: SpatialViewVisualizerData,
@@ -48,8 +50,14 @@ impl IdentifiedViewSystem for EncodedDepthImageVisualizer {
 }
 
 impl VisualizerSystem for EncodedDepthImageVisualizer {
-    fn visualizer_query_info(&self) -> VisualizerQueryInfo {
-        VisualizerQueryInfo::from_archetype::<EncodedDepthImage>()
+    fn visualizer_query_info(
+        &self,
+        _app_options: &re_viewer_context::AppOptions,
+    ) -> VisualizerQueryInfo {
+        VisualizerQueryInfo::single_required_component::<Blob>(
+            &EncodedDepthImage::descriptor_blob(),
+            &EncodedDepthImage::all_components(),
+        )
     }
 
     fn execute(
@@ -59,47 +67,35 @@ impl VisualizerSystem for EncodedDepthImageVisualizer {
         context_systems: &ViewContextCollection,
     ) -> Result<VisualizerExecutionOutput, ViewSystemExecutionError> {
         let preferred_view_kind = self.data.preferred_view_kind;
-        let mut output = VisualizerExecutionOutput::default();
+        let output = VisualizerExecutionOutput::default();
         let mut depth_clouds = Vec::new();
 
-        let transforms = context_systems.get::<TransformTreeContext>()?;
+        let transforms = context_systems.get::<TransformTreeContext>(&output)?;
 
         process_archetype::<Self, EncodedDepthImage, _>(
             ctx,
             view_query,
             context_systems,
-            &mut output,
+            &output,
             preferred_view_kind,
             |ctx, spatial_ctx, results| {
-                use super::entity_iterator::iter_slices;
-                use re_view::RangeResultsExt as _;
-
-                let Some(all_blob_chunks) =
-                    results.get_required_chunks(EncodedDepthImage::descriptor_blob().component)
-                else {
+                let all_blobs =
+                    results.iter_required(EncodedDepthImage::descriptor_blob().component);
+                if all_blobs.is_empty() {
                     return Ok(());
-                };
-
-                let timeline = ctx.query.timeline();
-                let all_blobs_indexed = iter_slices::<&[u8]>(&all_blob_chunks, timeline);
-                let all_media_types = results.iter_as(
-                    timeline,
-                    EncodedDepthImage::descriptor_media_type().component,
-                );
+                }
+                let all_media_types =
+                    results.iter_optional(EncodedDepthImage::descriptor_media_type().component);
                 let all_colormaps =
-                    results.iter_as(timeline, EncodedDepthImage::descriptor_colormap().component);
-                let all_value_ranges = results.iter_as(
-                    timeline,
-                    EncodedDepthImage::descriptor_depth_range().component,
-                );
+                    results.iter_optional(EncodedDepthImage::descriptor_colormap().component);
+                let all_value_ranges =
+                    results.iter_optional(EncodedDepthImage::descriptor_depth_range().component);
                 let all_depth_meters =
-                    results.iter_as(timeline, EncodedDepthImage::descriptor_meter().component);
-                let all_fill_ratios = results.iter_as(
-                    timeline,
-                    EncodedDepthImage::descriptor_point_fill_ratio().component,
-                );
-
-                let entity_path = ctx.target_entity_path;
+                    results.iter_optional(EncodedDepthImage::descriptor_meter().component);
+                let all_fill_ratios = results
+                    .iter_optional(EncodedDepthImage::descriptor_point_fill_ratio().component);
+                let all_magnification_filters = results
+                    .iter_optional(EncodedDepthImage::descriptor_magnification_filter().component);
 
                 for (
                     (_time, row_id),
@@ -109,19 +105,18 @@ impl VisualizerSystem for EncodedDepthImageVisualizer {
                     value_range,
                     depth_meter,
                     fill_ratio,
-                ) in re_query::range_zip_1x5(
-                    all_blobs_indexed,
+                    magnification_filter,
+                ) in re_query::range_zip_1x6(
+                    all_blobs.slice::<&[u8]>(),
                     all_media_types.slice::<String>(),
                     all_colormaps.slice::<u8>(),
                     all_value_ranges.slice::<[f64; 2]>(),
                     all_depth_meters.slice::<f32>(),
                     all_fill_ratios.slice::<f32>(),
+                    all_magnification_filters.slice::<u8>(),
                 ) {
                     let Some(blob) = blobs.first() else {
-                        spatial_ctx.output.report_error_for(
-                            entity_path.clone(),
-                            "EncodedDepthImage blob is empty.".to_owned(),
-                        );
+                        // If missing we already reported an error.
                         continue;
                     };
 
@@ -129,7 +124,7 @@ impl VisualizerSystem for EncodedDepthImageVisualizer {
                         .and_then(|types| types.first().cloned())
                         .map(|mt| MediaType(mt.into()));
 
-                    let image = match ctx.store_ctx().caches.entry(|c: &mut ImageDecodeCache| {
+                    let image = match ctx.store_ctx().memoizer(|c: &mut ImageDecodeCache| {
                         c.entry_encoded_depth(
                             row_id,
                             EncodedDepthImage::descriptor_blob().component,
@@ -139,8 +134,9 @@ impl VisualizerSystem for EncodedDepthImageVisualizer {
                     }) {
                         Ok(image) => image,
                         Err(err) => {
-                            spatial_ctx.output.report_error_for(
-                                entity_path.clone(),
+                            results.report_for_component(
+                                EncodedDepthImage::descriptor_blob().component,
+                                VisualizerReportSeverity::Error,
                                 format!("Failed to decode EncodedDepthImage blob: {err}"),
                             );
                             continue;
@@ -151,8 +147,15 @@ impl VisualizerSystem for EncodedDepthImageVisualizer {
                         image,
                         depth_meter: first_copied(depth_meter).map(Into::into),
                         fill_ratio: first_copied(fill_ratio).map(Into::into),
-                        colormap: first_copied(colormap).and_then(Colormap::from_u8),
+                        colormap: colormap.and_then(|s| Colormap::from_integer_slice(s).next()?),
                         value_range: first_copied(value_range),
+                        magnification_filter: first_copied(magnification_filter)
+                            .and_then(MagnificationFilter::from_u8)
+                            .unwrap_or_default(),
+                    };
+
+                    let mut report_error = |error: String| {
+                        results.report_unspecified_source(VisualizerReportSeverity::Error, error);
                     };
 
                     process_depth_image_data(
@@ -166,6 +169,7 @@ impl VisualizerSystem for EncodedDepthImageVisualizer {
                         EncodedDepthImage::name(),
                         EncodedDepthImage::descriptor_meter().component,
                         EncodedDepthImage::descriptor_colormap().component,
+                        &mut report_error,
                     );
                 }
 
@@ -178,9 +182,5 @@ impl VisualizerSystem for EncodedDepthImageVisualizer {
 
     fn data(&self) -> Option<&dyn std::any::Any> {
         Some(self.data.as_any())
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }

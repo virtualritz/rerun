@@ -5,7 +5,7 @@ use anyhow::Context as _;
 use arrow::array::ArrayRef;
 use egui::{NumExt as _, RichText};
 use itertools::Itertools as _;
-use re_chunk_store::{ColumnDescriptor, LatestAtQuery};
+use re_chunk_store::ColumnDescriptor;
 use re_dataframe::QueryHandle;
 use re_dataframe::external::re_query::StorageEngineArcReadGuard;
 use re_dataframe_ui::re_table_utils::{apply_table_style_fixes, cell_ui, header_ui};
@@ -14,7 +14,7 @@ use re_log_types::{EntityPath, TimeInt, TimelineName};
 use re_sdk_types::ComponentDescriptor;
 use re_sdk_types::reflection::ComponentDescriptorExt as _;
 use re_ui::UiExt as _;
-use re_viewer_context::{TimeControlCommand, ViewId, ViewerContext};
+use re_viewer_context::{StoreViewContext, TimeControlCommand, ViewId};
 
 use crate::expanded_rows::{ExpandedRows, ExpandedRowsCache};
 
@@ -34,11 +34,13 @@ pub(crate) enum HideColumnAction {
 
 /// Display a dataframe table for the provided query.
 pub(crate) fn dataframe_ui(
-    ctx: &ViewerContext<'_>,
+    ctx: &StoreViewContext<'_>,
     ui: &mut egui::Ui,
     query_handle: &re_dataframe::QueryHandle<StorageEngineArcReadGuard>,
     expanded_rows_cache: &mut ExpandedRowsCache,
     view_id: &ViewId,
+    time_cursor_row: Option<u64>,
+    scroll_to_time_cursor_row: bool,
 ) -> Vec<HideColumnAction> {
     re_tracing::profile_function!();
 
@@ -85,6 +87,7 @@ pub(crate) fn dataframe_ui(
             tokens.table_row_height(table_style),
         ),
         hide_column_actions: vec![],
+        time_cursor_row,
     };
 
     let num_sticky_cols = selected_columns
@@ -94,7 +97,7 @@ pub(crate) fn dataframe_ui(
 
     ui.scope(|ui| {
         apply_table_style_fixes(ui.style_mut());
-        egui_table::Table::new()
+        let mut table = egui_table::Table::new()
             .id_salt(table_id_salt)
             .columns(
                 selected_columns
@@ -115,8 +118,15 @@ pub(crate) fn dataframe_ui(
                 // This one has extra space for the archetype name
                 egui_table::HeaderRow::new(tokens.table_header_height() + 8.0),
             ])
-            .num_rows(num_rows)
-            .show(ui, &mut table_delegate);
+            .num_rows(num_rows);
+
+        if let Some(row) = time_cursor_row
+            && scroll_to_time_cursor_row
+        {
+            table = table.scroll_to_row(row, None);
+        }
+
+        table.show(ui, &mut table_delegate);
     });
 
     table_delegate.hide_column_actions
@@ -200,7 +210,7 @@ impl RowsDisplayData {
 
 /// [`egui_table::TableDelegate`] implementation for displaying a [`QueryHandle`] in a table.
 struct DataframeTableDelegate<'a> {
-    ctx: &'a ViewerContext<'a>,
+    ctx: &'a StoreViewContext<'a>,
     table_style: re_ui::TableStyle,
     query_handle: &'a QueryHandle<StorageEngineArcReadGuard>,
     selected_columns: &'a [ColumnDescriptor],
@@ -211,6 +221,10 @@ struct DataframeTableDelegate<'a> {
 
     num_rows: u64,
     hide_column_actions: Vec<HideColumnAction>,
+
+    /// Row index of the time cursor position (last row with timestamp <= current time).
+    /// Used to draw a highlighted horizontal line indicator.
+    time_cursor_row: Option<u64>,
 }
 
 impl DataframeTableDelegate<'_> {
@@ -252,7 +266,7 @@ impl egui_table::TableDelegate for DataframeTableDelegate<'_> {
             header_ui(ui, table_style, false, |ui| {
                 if let Some(entity_path) = &self.header_entity_paths[cell.group_index] {
                     //TODO(ab): factor this into a helper as soon as we use it elsewhere
-                    let text = entity_path.to_string();
+                    let text = entity_path.ui_string();
                     let font_id = egui::TextStyle::Body.resolve(ui.style());
                     let text_color = ui.visuals().text_color();
                     let galley = ui
@@ -371,7 +385,7 @@ impl egui_table::TableDelegate for DataframeTableDelegate<'_> {
                         ColumnDescriptor::RowId(_) => {}
                         ColumnDescriptor::Time(descr) => {
                             if response.clicked() {
-                                self.ctx.send_time_commands([
+                                self.ctx.send_time_commands_to_active_recording([
                                     TimeControlCommand::SetActiveTimeline(*descr.timeline().name()),
                                 ]);
                             }
@@ -414,7 +428,7 @@ impl egui_table::TableDelegate for DataframeTableDelegate<'_> {
 
         let table_style = self.table_style;
 
-        debug_assert!(cell.row_nr < self.num_rows, "Bug in egui_table");
+        re_log::debug_assert!(cell.row_nr < self.num_rows, "Bug in egui_table");
 
         let display_data = match &self.display_data {
             Ok(display_data) => display_data,
@@ -460,7 +474,10 @@ impl egui_table::TableDelegate for DataframeTableDelegate<'_> {
             .query()
             .filtered_index
             .unwrap_or_else(|| TimelineName::new(""));
-        let latest_at_query = LatestAtQuery::new(filtered_index, timestamp);
+
+        let mut time_ctrl_at_time = self.ctx.time_ctrl.clone();
+        time_ctrl_at_time.set_time_cursor_ad_hoc(filtered_index, timestamp.into());
+        let ctx_at_time = self.ctx.with_time_ctrl(&time_ctrl_at_time);
 
         ui.set_truncate_style();
 
@@ -492,13 +509,7 @@ impl egui_table::TableDelegate for DataframeTableDelegate<'_> {
                 // This is called when data actually needs to be drawn (as opposed to summaries like
                 // "N instances" or "N more…").
                 let data_content = |ui: &mut egui::Ui| {
-                    column.data_ui(
-                        self.ctx,
-                        ui,
-                        &latest_at_query,
-                        batch_row_idx,
-                        instance_index,
-                    );
+                    column.data_ui(&ctx_at_time, ui, batch_row_idx, instance_index);
                 };
 
                 // Draw the cell content with some margin.
@@ -521,6 +532,17 @@ impl egui_table::TableDelegate for DataframeTableDelegate<'_> {
                 table_style,
                 instance_indices,
                 row_content,
+            );
+        }
+
+        // Draw a highlighted horizontal line at the bottom of the time cursor row.
+        if Some(cell.row_nr) == self.time_cursor_row {
+            let rect = ui.max_rect();
+            let stroke = ui.visuals().widgets.inactive.fg_stroke;
+            ui.painter().hline(
+                rect.x_range(),
+                rect.max.y - re_dataframe_ui::re_table_utils::CELL_SEPARATOR_STROKE_OFFSET,
+                egui::Stroke::new(2.0, stroke.color),
             );
         }
     }
@@ -613,10 +635,7 @@ fn line_ui(
                 &re_ui::icons::EXPAND,
                 CellStyle::InstanceData,
                 |ui| {
-                    ui.label(format!(
-                        "{} instances",
-                        re_format::format_uint(instance_count)
-                    ));
+                    ui.label(re_format::format_plural_s(instance_count, "instance"));
                 },
             );
 

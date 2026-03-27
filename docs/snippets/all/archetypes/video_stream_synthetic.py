@@ -3,6 +3,7 @@
 import av
 import numpy as np
 import numpy.typing as npt
+
 import rerun as rr
 
 fps = 30
@@ -30,7 +31,7 @@ def create_example_video_frame(frame_i: int) -> npt.NDArray[np.uint8]:
     return img
 
 
-rr.init("rerun_example_video_stream_synthetic", spawn=True)
+rr.init("rerun_example_video_stream_synthetic")
 
 # Setup encoding pipeline.
 av.logging.set_level(av.logging.VERBOSE)

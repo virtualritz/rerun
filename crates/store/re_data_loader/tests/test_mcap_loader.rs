@@ -7,28 +7,28 @@ mod tests {
     use re_data_loader::loader_mcap::load_mcap;
     use re_data_loader::{DataLoaderSettings, LoadedData};
     use re_log_types::StoreId;
-    use re_mcap::layers::SelectedLayers;
+    use re_mcap::decoders::SelectedDecoders;
 
     // Load an MCAP file into a list of chunks.
     fn load_mcap_chunks(path: impl AsRef<std::path::Path>) -> Vec<Chunk> {
         let path = path.as_ref();
         println!("Loading MCAP file: {}", path.display());
         let mcap_data = std::fs::read(path).unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = crossbeam::channel::bounded(1024);
         let settings = DataLoaderSettings::recommended("test");
-        load_mcap(&mcap_data, &settings, &tx, &SelectedLayers::All, false).unwrap();
+        load_mcap(
+            &mcap_data,
+            &settings,
+            &tx,
+            &SelectedDecoders::All,
+            false,
+            None,
+        )
+        .unwrap();
         drop(tx);
 
         // Collect chunks
-        rx.iter()
-            .filter_map(|res| {
-                if let LoadedData::Chunk(_, _, chunk) = res {
-                    Some(chunk)
-                } else {
-                    None
-                }
-            })
-            .collect()
+        rx.iter().filter_map(LoadedData::into_chunk).collect()
     }
 
     // TODO(grtlr): This should be something like a snippet / backwards-compatibility test, but
@@ -54,7 +54,7 @@ mod tests {
         }
 
         // Extract and snapshot the schema
-        let schema = store_handle.read().schema();
+        let schema = store_handle.read().schema().chunk_column_descriptors();
         insta::assert_debug_snapshot!("ros2", schema);
     }
 }

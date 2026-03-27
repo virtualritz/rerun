@@ -66,14 +66,18 @@ impl FrameIdRegistry {
     /// Having the registration of frame ids separate from other frame id related bookkeeping makes things more modular
     /// at the price of additional overhead. However, we generally assume that retrieving `TransformFrameId`/`TransformFrameIdHash` from a string is fast.
     pub fn register_all_frames_in_chunk(&mut self, chunk: &re_chunk_store::Chunk) {
+        re_tracing::profile_function!(chunk.entity_path().to_string());
+
         self.register_frame_id_from_entity_path(chunk.entity_path());
 
         let identifier_child_frame = archetypes::Transform3D::descriptor_child_frame().component;
+        let identifier_pinhole_child_frame =
+            archetypes::Pinhole::descriptor_child_frame().component;
 
         let frame_components = [
             identifier_child_frame,
+            identifier_pinhole_child_frame,
             archetypes::Transform3D::descriptor_parent_frame().component,
-            archetypes::Pinhole::descriptor_child_frame().component,
             archetypes::Pinhole::descriptor_parent_frame().component,
             archetypes::CoordinateFrame::descriptor_frame().component,
         ];
@@ -87,7 +91,9 @@ impl FrameIdRegistry {
                         );
 
                     // Keep track of child frames and which entities they belong to.
-                    if component == identifier_child_frame {
+                    if component == identifier_child_frame
+                        || component == identifier_pinhole_child_frame
+                    {
                         self.child_frames_per_entity
                             .entry(chunk.entity_path().hash())
                             .or_default()
@@ -109,7 +115,7 @@ impl FrameIdRegistry {
     }
 
     /// Registers entity path derived frame id and all its parents.
-    fn register_frame_id_from_entity_path(&mut self, entity_path: &EntityPath) {
+    pub fn register_frame_id_from_entity_path(&mut self, entity_path: &EntityPath) {
         // Ensure all implicit frames from this entity all the way up to the root are known.
         // Note that in-between entities may never be mentioned in any chunk, but we want to make sure they're known to the system.
         let mut entity_path = entity_path; // Have to redeclare to make borrow-checker happy.

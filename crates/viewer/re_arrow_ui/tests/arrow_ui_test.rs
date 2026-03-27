@@ -48,6 +48,14 @@ fn arrow_list_ui(ui: &mut egui::Ui) {
             "Two strings",
             [Utf8::from("Hello"), Utf8::from("world")].to_arrow(),
         ),
+        (
+            "Long string",
+            [Utf8::from("This is a long root-level string that should not be truncated even though it is over 100 characters long, because it is the root element being displayed.")].to_arrow(),
+        ),
+        (
+            "Two long strings",
+            [Utf8::from("This is a long nested string that should be truncated because it is inside a list and over 100 characters long. Truncate me please!"), Utf8::from("Short string.")].to_arrow(),
+        ),
         ("String with URL", Utf8::from("https://rerun.io").to_arrow()),
         (
             "Two URLs in strings",
@@ -85,13 +93,15 @@ fn arrow_tree_ui() {
     let mut results = SnapshotResults::new();
 
     for (array_name, arrow) in arrays {
-        let mut harness = egui_kittest::Harness::builder()
-            .with_size((300.0, 500.0))
-            .build_ui(|ui| {
-                re_ui::apply_style_and_install_loaders(ui.ctx());
+        let mut harness = re_ui::testing::new_harness(
+            re_ui::testing::TestOptions::Gui,
+            egui::Vec2::new(300.0, 500.0),
+        )
+        .build_ui(|ui| {
+            re_ui::apply_style_and_install_loaders(ui.ctx());
 
-                re_arrow_ui::arrow_ui(ui, UiLayout::SelectionPanel, Default::default(), &arrow);
-            });
+            re_arrow_ui::arrow_ui(ui, UiLayout::SelectionPanel, Default::default(), &arrow);
+        });
 
         harness.run();
 

@@ -213,10 +213,10 @@ For best practices & unexpected sources of image differences refer to the [egui_
 
 Just like for drawing the viewer itself, drawing for comparison tests requires a `wgpu` compatible driver.
 As of writing comparison tests are only run via Vulkan & Metal.
-For CI / headless environments we a recent version `llvmpipe` for software rendering on Linux & Windows.
-On MacOS we currently always use hardware rendering.
-For details on how to set this up refer to the [CI setup](./.github/workflows/reusable_checks_rust.yml).
+For CI / headless environments we use lavapipe (`llvmpipe`) for software rendering on all platforms.
+On macOS, we use a custom static build from [`rerun-io/lavapipe-build`](https://github.com/rerun-io/lavapipe-build).
 
+For details on how to set this up refer to the [CI setup](./.github/workflows/reusable_checks_rust.yml).
 
 
 ### Python tests
@@ -241,7 +241,7 @@ Tests are located in the [./rerun_cpp/tests/](./rerun_cpp/tests/) folder.
 ### Snippet comparison tests
 
 ```sh
-pixi run -e py docs/snippets/compare_snippet_output.py
+pixi run uvpy docs/snippets/compare_snippet_output.py
 ```
 
 More details in the [README.md](./docs/snippets/README.md).
@@ -251,7 +251,7 @@ Makes sure all of the snippets in the [snippets/](./docs/snippets/) folder are w
 ### Release checklists
 
 ```sh
-pixi run -e examples python tests/python/release_checklist/main.py
+pixi run uv run tests/python/release_checklist/main.py
 ```
 
 More details in the [README.md](./tests/python/release_checklist/README.md).

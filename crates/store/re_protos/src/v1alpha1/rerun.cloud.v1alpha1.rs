@@ -15,6 +15,15 @@ impl ::prost::Name for VersionRequest {
 pub struct VersionResponse {
     #[prost(message, optional, tag = "1")]
     pub build_info: ::core::option::Option<super::super::common::v1alpha1::BuildInfo>,
+    /// A single version string representing the version of the whole stack.
+    #[prost(string, tag = "2")]
+    pub version: ::prost::alloc::string::String,
+    /// Cloud provider hosting this instance (e.g. "aws", "azure"). Null if not deployed on cloud.
+    #[prost(string, optional, tag = "3")]
+    pub cloud_provider: ::core::option::Option<::prost::alloc::string::String>,
+    /// Cloud region where this instance is deployed (e.g. "us-west-2", "eastus"). Null if not deployed on cloud.
+    #[prost(string, optional, tag = "4")]
+    pub cloud_region: ::core::option::Option<::prost::alloc::string::String>,
 }
 impl ::prost::Name for VersionResponse {
     const NAME: &'static str = "VersionResponse";
@@ -24,6 +33,40 @@ impl ::prost::Name for VersionResponse {
     }
     fn type_url() -> ::prost::alloc::string::String {
         "/rerun.cloud.v1alpha1.VersionResponse".into()
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WhoAmIRequest {}
+impl ::prost::Name for WhoAmIRequest {
+    const NAME: &'static str = "WhoAmIRequest";
+    const PACKAGE: &'static str = "rerun.cloud.v1alpha1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "rerun.cloud.v1alpha1.WhoAmIRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/rerun.cloud.v1alpha1.WhoAmIRequest".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WhoAmIResponse {
+    /// The user ID of the authenticated user, if any.
+    #[prost(string, optional, tag = "1")]
+    pub user_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// Whether the user has read access.
+    #[prost(bool, tag = "2")]
+    pub can_read: bool,
+    /// Whether the user has write access.
+    #[prost(bool, tag = "3")]
+    pub can_write: bool,
+}
+impl ::prost::Name for WhoAmIResponse {
+    const NAME: &'static str = "WhoAmIResponse";
+    const PACKAGE: &'static str = "rerun.cloud.v1alpha1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "rerun.cloud.v1alpha1.WhoAmIResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/rerun.cloud.v1alpha1.WhoAmIResponse".into()
     }
 }
 /// Application level error - used as `details` in the `google.rpc.Status` message
@@ -111,6 +154,61 @@ impl ::prost::Name for RegisterWithDatasetResponse {
     }
     fn type_url() -> ::prost::alloc::string::String {
         "/rerun.cloud.v1alpha1.RegisterWithDatasetResponse".into()
+    }
+}
+/// This request acts as a *product* filter:
+/// * empty `segments_to_drop` + empty `layers_to_drop`: invalid argument error
+/// * empty `segments_to_drop` + non-empty `layers_to_drop`: remove specified layers for *all* segments
+/// * non-empty `segments_to_drop` + empty `layers_to_drop`: remove *all* layers for specified segments
+/// * non-empty `segments_to_drop` + non-empty `layers_to_drop`: delete *all* specified layers for *all* specified segments
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UnregisterFromDatasetRequest {
+    /// The segment IDs to drop. All of them if empty.
+    ///
+    /// The final filter will be the *outer product* of this and `layers_to_drop`.
+    #[prost(message, repeated, tag = "1")]
+    pub segments_to_drop: ::prost::alloc::vec::Vec<super::super::common::v1alpha1::SegmentId>,
+    /// The layer names to drop. All of them if empty.
+    ///
+    /// The final filter will be the *outer product* of this and `segments_to_drop`.
+    #[prost(string, repeated, tag = "2")]
+    pub layers_to_drop: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// If true, deletion will go through regardless of the segments/layers' current statuses.
+    ///
+    /// This is only useful in the very specific, catatrophic scenario where the contents of the
+    /// task queue were lost and some tasks are now stuck in `status=pending` forever.
+    ///
+    /// Do not use this unless you know exactly what you're doing.
+    #[prost(bool, tag = "3")]
+    pub force: bool,
+}
+impl ::prost::Name for UnregisterFromDatasetRequest {
+    const NAME: &'static str = "UnregisterFromDatasetRequest";
+    const PACKAGE: &'static str = "rerun.cloud.v1alpha1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "rerun.cloud.v1alpha1.UnregisterFromDatasetRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/rerun.cloud.v1alpha1.UnregisterFromDatasetRequest".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UnregisterFromDatasetResponse {
+    /// This contains all the information about the segments and layers that were actually removed.
+    ///
+    /// This dataframe is always guaranteed to be a subset of the one found in `ScanDatasetManifestResponse`.
+    /// They share the same semantics, schemas, etc.
+    #[prost(message, optional, tag = "1")]
+    pub data: ::core::option::Option<super::super::common::v1alpha1::DataframePart>,
+}
+impl ::prost::Name for UnregisterFromDatasetResponse {
+    const NAME: &'static str = "UnregisterFromDatasetResponse";
+    const PACKAGE: &'static str = "rerun.cloud.v1alpha1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "rerun.cloud.v1alpha1.UnregisterFromDatasetResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/rerun.cloud.v1alpha1.UnregisterFromDatasetResponse".into()
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -791,9 +889,6 @@ pub struct Query {
     /// If true, `columns` will contain the entire schema.
     #[prost(bool, tag = "3")]
     pub columns_always_include_everything: bool,
-    /// If true, `columns` always includes `chunk_id`,
-    #[prost(bool, tag = "4")]
-    pub columns_always_include_chunk_ids: bool,
     /// If true, `columns` always includes `byte_offset` and `byte_size`.
     #[prost(bool, tag = "5")]
     pub columns_always_include_byte_offsets: bool,
@@ -1297,8 +1392,11 @@ pub struct CreateTableEntryRequest {
     pub name: ::prost::alloc::string::String,
     /// Information about the table to register.
     ///
-    /// This must be encoded message of one of the following supported types:
-    /// - LanceTable
+    /// If not provided, a Lance-backed table will be created using at an auto-generated URL based on the server's
+    /// configuration.
+    ///
+    /// If provided, it must be an encoded message of the `LanceTable` type, which contains the intended storage URL. The
+    /// caller is responsible for ensuring that the storage is writable and free to use.
     #[prost(message, optional, tag = "2")]
     pub provider_details: ::core::option::Option<::prost_types::Any>,
     /// Schema of the table to create
@@ -1962,6 +2060,28 @@ pub mod rerun_cloud_service_client {
             ));
             self.inner.unary(req, path, codec).await
         }
+        /// Returns information about the currently authenticated user.
+        ///
+        /// This is a lightweight endpoint that can be used to verify that authentication
+        /// is successful and to retrieve the user's identity.
+        pub async fn who_am_i(
+            &mut self,
+            request: impl tonic::IntoRequest<super::WhoAmIRequest>,
+        ) -> std::result::Result<tonic::Response<super::WhoAmIResponse>, tonic::Status> {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/rerun.cloud.v1alpha1.RerunCloudService/WhoAmI",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "rerun.cloud.v1alpha1.RerunCloudService",
+                "WhoAmI",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn find_entries(
             &mut self,
             request: impl tonic::IntoRequest<super::FindEntriesRequest>,
@@ -2139,6 +2259,36 @@ pub mod rerun_cloud_service_client {
             ));
             self.inner.unary(req, path, codec).await
         }
+        /// Unregisters segments and layers from the Dataset.
+        ///
+        /// Excluding IO errors, this will always succeed as long the target dataset exists.
+        /// Corollary: unregistering data that doesn't exist is a no-op.
+        ///
+        /// This always returns a subset of the data from `ScanDatasetManifest`, and therefore the data will
+        /// also follow the schema returned by `GetDatasetManifestSchema`.
+        ///
+        /// This endpoint requires the standard dataset headers.
+        pub async fn unregister_from_dataset(
+            &mut self,
+            request: impl tonic::IntoRequest<super::UnregisterFromDatasetRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::UnregisterFromDatasetResponse>>,
+            tonic::Status,
+        > {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/rerun.cloud.v1alpha1.RerunCloudService/UnregisterFromDataset",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "rerun.cloud.v1alpha1.RerunCloudService",
+                "UnregisterFromDataset",
+            ));
+            self.inner.server_streaming(req, path, codec).await
+        }
         /// Write chunks to one or more segments.
         ///
         /// The segment ID for each individual chunk is extracted from their metadata (`rerun:segment_id`).
@@ -2297,11 +2447,18 @@ pub mod rerun_cloud_service_client {
         /// Get the RRD Footer manifest.
         ///
         /// This includes details about what chunks there are, and what kind of data they contain.
+        ///
+        /// The manifest might be returned in multiple parts, at the discretion of the server.
+        /// When that happens, it is guaranteed that all parts have the same exact Sorbet schemas (and therefore
+        /// identical Sorbet schema hashes too).
+        /// That means it is always semantically valid to concatenate the data from these RRD manifests.
         pub async fn get_rrd_manifest(
             &mut self,
             request: impl tonic::IntoRequest<super::GetRrdManifestRequest>,
-        ) -> std::result::Result<tonic::Response<super::GetRrdManifestResponse>, tonic::Status>
-        {
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::GetRrdManifestResponse>>,
+            tonic::Status,
+        > {
             self.inner.ready().await.map_err(|e| {
                 tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
             })?;
@@ -2314,7 +2471,7 @@ pub mod rerun_cloud_service_client {
                 "rerun.cloud.v1alpha1.RerunCloudService",
                 "GetRrdManifest",
             ));
-            self.inner.unary(req, path, codec).await
+            self.inner.server_streaming(req, path, codec).await
         }
         /// Creates a custom index for a specific column (vector search, full-text search, etc).
         ///
@@ -2658,6 +2815,14 @@ pub mod rerun_cloud_service_server {
             &self,
             request: tonic::Request<super::VersionRequest>,
         ) -> std::result::Result<tonic::Response<super::VersionResponse>, tonic::Status>;
+        /// Returns information about the currently authenticated user.
+        ///
+        /// This is a lightweight endpoint that can be used to verify that authentication
+        /// is successful and to retrieve the user's identity.
+        async fn who_am_i(
+            &self,
+            request: tonic::Request<super::WhoAmIRequest>,
+        ) -> std::result::Result<tonic::Response<super::WhoAmIResponse>, tonic::Status>;
         async fn find_entries(
             &self,
             request: tonic::Request<super::FindEntriesRequest>,
@@ -2700,6 +2865,24 @@ pub mod rerun_cloud_service_server {
             &self,
             request: tonic::Request<super::RegisterWithDatasetRequest>,
         ) -> std::result::Result<tonic::Response<super::RegisterWithDatasetResponse>, tonic::Status>;
+        /// Server streaming response type for the UnregisterFromDataset method.
+        type UnregisterFromDatasetStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::UnregisterFromDatasetResponse, tonic::Status>,
+            > + std::marker::Send
+            + 'static;
+        /// Unregisters segments and layers from the Dataset.
+        ///
+        /// Excluding IO errors, this will always succeed as long the target dataset exists.
+        /// Corollary: unregistering data that doesn't exist is a no-op.
+        ///
+        /// This always returns a subset of the data from `ScanDatasetManifest`, and therefore the data will
+        /// also follow the schema returned by `GetDatasetManifestSchema`.
+        ///
+        /// This endpoint requires the standard dataset headers.
+        async fn unregister_from_dataset(
+            &self,
+            request: tonic::Request<super::UnregisterFromDatasetRequest>,
+        ) -> std::result::Result<tonic::Response<Self::UnregisterFromDatasetStream>, tonic::Status>;
         /// Write chunks to one or more segments.
         ///
         /// The segment ID for each individual chunk is extracted from their metadata (`rerun:segment_id`).
@@ -2772,13 +2955,23 @@ pub mod rerun_cloud_service_server {
             &self,
             request: tonic::Request<super::GetDatasetSchemaRequest>,
         ) -> std::result::Result<tonic::Response<super::GetDatasetSchemaResponse>, tonic::Status>;
+        /// Server streaming response type for the GetRrdManifest method.
+        type GetRrdManifestStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::GetRrdManifestResponse, tonic::Status>,
+            > + std::marker::Send
+            + 'static;
         /// Get the RRD Footer manifest.
         ///
         /// This includes details about what chunks there are, and what kind of data they contain.
+        ///
+        /// The manifest might be returned in multiple parts, at the discretion of the server.
+        /// When that happens, it is guaranteed that all parts have the same exact Sorbet schemas (and therefore
+        /// identical Sorbet schema hashes too).
+        /// That means it is always semantically valid to concatenate the data from these RRD manifests.
         async fn get_rrd_manifest(
             &self,
             request: tonic::Request<super::GetRrdManifestRequest>,
-        ) -> std::result::Result<tonic::Response<super::GetRrdManifestResponse>, tonic::Status>;
+        ) -> std::result::Result<tonic::Response<Self::GetRrdManifestStream>, tonic::Status>;
         /// Creates a custom index for a specific column (vector search, full-text search, etc).
         ///
         /// This endpoint requires the standard dataset headers.
@@ -3017,6 +3210,45 @@ pub mod rerun_cloud_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = VersionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/rerun.cloud.v1alpha1.RerunCloudService/WhoAmI" => {
+                    #[allow(non_camel_case_types)]
+                    struct WhoAmISvc<T: RerunCloudService>(pub Arc<T>);
+                    impl<T: RerunCloudService> tonic::server::UnaryService<super::WhoAmIRequest> for WhoAmISvc<T> {
+                        type Response = super::WhoAmIResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::WhoAmIRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as RerunCloudService>::who_am_i(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = WhoAmISvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
@@ -3413,6 +3645,51 @@ pub mod rerun_cloud_service_server {
                     };
                     Box::pin(fut)
                 }
+                "/rerun.cloud.v1alpha1.RerunCloudService/UnregisterFromDataset" => {
+                    #[allow(non_camel_case_types)]
+                    struct UnregisterFromDatasetSvc<T: RerunCloudService>(pub Arc<T>);
+                    impl<T: RerunCloudService>
+                        tonic::server::ServerStreamingService<super::UnregisterFromDatasetRequest>
+                        for UnregisterFromDatasetSvc<T>
+                    {
+                        type Response = super::UnregisterFromDatasetResponse;
+                        type ResponseStream = T::UnregisterFromDatasetStream;
+                        type Future =
+                            BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::UnregisterFromDatasetRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as RerunCloudService>::unregister_from_dataset(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UnregisterFromDatasetSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/rerun.cloud.v1alpha1.RerunCloudService/WriteChunks" => {
                     #[allow(non_camel_case_types)]
                     struct WriteChunksSvc<T: RerunCloudService>(pub Arc<T>);
@@ -3678,11 +3955,13 @@ pub mod rerun_cloud_service_server {
                     #[allow(non_camel_case_types)]
                     struct GetRrdManifestSvc<T: RerunCloudService>(pub Arc<T>);
                     impl<T: RerunCloudService>
-                        tonic::server::UnaryService<super::GetRrdManifestRequest>
+                        tonic::server::ServerStreamingService<super::GetRrdManifestRequest>
                         for GetRrdManifestSvc<T>
                     {
                         type Response = super::GetRrdManifestResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type ResponseStream = T::GetRrdManifestStream;
+                        type Future =
+                            BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::GetRrdManifestRequest>,
@@ -3711,7 +3990,7 @@ pub mod rerun_cloud_service_server {
                                 max_decoding_message_size,
                                 max_encoding_message_size,
                             );
-                        let res = grpc.unary(method, req).await;
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

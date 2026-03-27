@@ -1,6 +1,7 @@
 use egui::emath::RectTransform;
 use egui::{Align2, Pos2, Rect, Shape, Vec2, pos2, vec2};
 use macaw::IsoTransform;
+use re_chunk_store::MissingChunkReporter;
 use re_entity_db::EntityPath;
 use re_log::ResultExt as _;
 use re_renderer::ViewPickingConfiguration;
@@ -137,6 +138,7 @@ impl SpatialView2D {
     pub fn view_2d(
         &self,
         ctx: &ViewerContext<'_>,
+        missing_chunk_reporter: &MissingChunkReporter,
         ui: &mut egui::Ui,
         state: &mut SpatialViewState,
         query: &ViewQuery<'_>,
@@ -161,7 +163,7 @@ impl SpatialView2D {
         // TODO(emilk): some way to visualize the resolution rectangle of the pinhole camera (in case there is no image logged).
         let transforms = system_output
             .context_systems
-            .get::<TransformTreeContext>()?;
+            .get_and_report_missing::<TransformTreeContext>(missing_chunk_reporter)?;
         state.pinhole_at_origin = transforms
             .pinhole_tree_root_info(transforms.target_frame())
             .map(|pinhole_at_root| {
@@ -170,8 +172,9 @@ impl SpatialView2D {
                 let query_ctx = QueryContext {
                     view_ctx: &view_ctx,
                     target_entity_path: query.space_origin,
+                    instruction_id: None,
                     archetype_name: Some(archetypes::Pinhole::name()),
-                    query: &query.latest_at_query(),
+                    query: query.latest_at_query(),
                 };
                 Pinhole {
                     image_from_camera: pinhole.image_from_camera.0.into(),
@@ -233,7 +236,7 @@ impl SpatialView2D {
 
         // Create labels now since their shapes participate are added to scene.ui for picking.
         let (label_shapes, ui_rects) = create_labels(
-            collect_ui_labels(&system_output.view_systems),
+            &collect_ui_labels(&system_output.view_systems),
             ui_from_scene,
             &eye,
             ui,
@@ -245,11 +248,12 @@ impl SpatialView2D {
             let picking_context = crate::picking::PickingContext::new(
                 pointer_pos_ui,
                 scene_from_ui,
-                ui.ctx().pixels_per_point(),
+                ui.pixels_per_point(),
                 &eye,
             );
             let (_response, picking_config) = crate::picking_ui::picking(
                 ctx,
+                missing_chunk_reporter,
                 &picking_context,
                 ui,
                 response,
@@ -314,7 +318,7 @@ impl SpatialView2D {
                 query.space_origin,
                 &ui_from_scene,
                 selected_context,
-                ui.ctx().selection_stroke().color,
+                ui.selection_stroke().color,
             ));
         }
         if let Some(hovered_context) = ctx.selection_state().hovered_item_context() {
@@ -323,12 +327,12 @@ impl SpatialView2D {
                 query.space_origin,
                 &ui_from_scene,
                 hovered_context,
-                ui.ctx().hover_stroke().color,
+                ui.hover_stroke().color,
             ));
         }
 
-        // Add egui-rendered spinners/loaders on top of re_renderer content:
-        crate::ui::paint_loading_spinners(ui, ui_from_scene, &eye, &system_output.view_systems);
+        // Add egui-rendered loading indicators on top of re_renderer content:
+        crate::ui::paint_loading_indicators(ui, ui_from_scene, &eye, &system_output.view_systems);
 
         // Add egui-rendered labels on top of everything else:
         painter.extend(label_shapes);

@@ -5,7 +5,7 @@ use re_test_context::TestContext;
 use re_test_context::external::egui_kittest::SnapshotResults;
 use re_test_viewport::TestContextExt as _;
 use re_view_time_series::TimeSeriesView;
-use re_viewer_context::{BlueprintContext as _, TimeControlCommand, ViewClass as _, ViewId};
+use re_viewer_context::{BlueprintContext as _, ViewClass as _, ViewId};
 use re_viewport_blueprint::{ViewBlueprint, ViewContents};
 
 fn color_gradient0(step: i64) -> re_sdk_types::components::Color {
@@ -32,7 +32,6 @@ fn test_clear_series_points_and_line_impl(
 
     let timeline = Timeline::log_tick();
 
-    // TODO(#10512): Potentially fix up this after we have "markers".
     // There are some intricacies involved with this test. `SeriesLines` and
     // `SeriesPoints` can both be logged without any associated data (all
     // fields are optional). Now that indicators are gone, no data is logged
@@ -93,10 +92,7 @@ fn test_clear_series_points_and_line_impl(
         }
     }
 
-    test_context.send_time_commands(
-        test_context.active_store_id(),
-        [TimeControlCommand::SetActiveTimeline(*timeline.name())],
-    );
+    test_context.set_active_timeline(*timeline.name());
 
     let view_id = setup_blueprint(&mut test_context);
     snapshot_results.add(test_context.run_view_ui_and_save_snapshot(
@@ -149,6 +145,7 @@ fn test_line_properties() {
     }
 }
 
+#[expect(clippy::fn_params_excessive_bools)] // private function 🤷‍♂️
 fn test_line_properties_impl(
     multiple_properties: bool,
     multiple_scalars: bool,
@@ -203,10 +200,7 @@ fn test_line_properties_impl(
         });
     }
 
-    test_context.send_time_commands(
-        test_context.active_store_id(),
-        [TimeControlCommand::SetActiveTimeline(*timeline.name())],
-    );
+    test_context.set_active_timeline(*timeline.name());
 
     let view_id = setup_blueprint(&mut test_context);
     let mut name = "line_properties".to_owned();
@@ -253,10 +247,7 @@ fn test_per_series_visibility() {
             });
         }
 
-        test_context.send_time_commands(
-            test_context.active_store_id(),
-            [TimeControlCommand::SetActiveTimeline(*timeline.name())],
-        );
+        test_context.set_active_timeline(*timeline.name());
 
         let view_id = setup_blueprint(&mut test_context);
         snapshot_results.add(test_context.run_view_ui_and_save_snapshot(
@@ -290,6 +281,7 @@ fn test_point_properties() {
     }
 }
 
+#[expect(clippy::fn_params_excessive_bools)] // private function 🤷‍♂️
 fn test_point_properties_impl(
     multiple_properties: bool,
     multiple_scalars: bool,
@@ -354,10 +346,7 @@ fn test_point_properties_impl(
         });
     }
 
-    test_context.send_time_commands(
-        test_context.active_store_id(),
-        [TimeControlCommand::SetActiveTimeline(*timeline.name())],
-    );
+    test_context.set_active_timeline(*timeline.name());
 
     let view_id = setup_blueprint(&mut test_context);
     let mut name = "point_properties".to_owned();
@@ -381,6 +370,36 @@ fn setup_blueprint(test_context: &mut TestContext) -> ViewId {
             TimeSeriesView::identifier(),
         ))
     })
+}
+
+/// Entity paths with special characters (like colons) should display unescaped in the UI.
+#[test]
+fn test_special_characters_in_entity_path() {
+    let mut test_context = TestContext::new_with_view_class::<TimeSeriesView>();
+
+    let timeline = Timeline::log_tick();
+
+    for i in 0..32 {
+        let timepoint = TimePoint::from([(timeline, i)]);
+        test_context.log_entity("test::data", |builder| {
+            builder.with_archetype(
+                RowId::new(),
+                timepoint,
+                &re_sdk_types::archetypes::Scalars::single((i as f64 / 5.0).sin()),
+            )
+        });
+    }
+
+    test_context.set_active_timeline(*timeline.name());
+
+    let view_id = setup_blueprint(&mut test_context);
+    let mut snapshot_results = SnapshotResults::new();
+    snapshot_results.add(test_context.run_view_ui_and_save_snapshot(
+        view_id,
+        "special_characters_in_entity_path",
+        egui::vec2(300.0, 300.0),
+        None,
+    ));
 }
 
 #[test]
@@ -431,7 +450,7 @@ fn test_bootstrapped_secondaries_impl(partial_range: bool, snapshot_results: &mu
 
         if partial_range {
             let override_path =
-                ViewContents::override_path_for_entity(view.id, &EntityPath::from("scalars"));
+                ViewContents::base_override_path_for_entity(view.id, &EntityPath::from("scalars"));
             ctx.save_blueprint_archetype(
                 override_path.clone(),
                 &re_sdk_types::blueprint::archetypes::VisibleTimeRanges::new([
@@ -453,12 +472,7 @@ fn test_bootstrapped_secondaries_impl(partial_range: bool, snapshot_results: &mu
         blueprint.add_view_at_root(view)
     });
 
-    test_context.send_time_commands(
-        test_context.active_store_id(),
-        [TimeControlCommand::SetActiveTimeline(
-            *Timeline::log_tick().name(),
-        )],
-    );
+    test_context.set_active_timeline(*Timeline::log_tick().name());
 
     let name = if partial_range {
         "bootstrapped_secondaries_partial"

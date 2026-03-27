@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC
 from collections.abc import Sequence
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Generic, TypeAlias, TypeVar
 
 import pyarrow as pa
@@ -12,10 +13,10 @@ from rerun_bindings import (
     DatasetEntryInternal,
     DatasetViewInternal,
     TableEntryInternal,
-    TableInsertMode,
+    TableInsertModeInternal,
 )
 
-from . import EntryId
+from . import ContentFilter, EntryId
 
 #: Type alias for supported batch input types for TableEntry write methods.
 _BatchesType: TypeAlias = (
@@ -42,6 +43,23 @@ if TYPE_CHECKING:
         Schema,
         VectorDistanceMetric,
     )
+
+
+# TODO(#12612): switch to `StrEnum` when we drop Python 3.10
+class OnDuplicateSegmentLayer(str, Enum):
+    """
+    How to handle duplicate segment layers when registering recordings to a dataset.
+
+    Attributes:
+        ERROR: Raise an error if a segment layer with the same name already exists.
+        SKIP: Skip the duplicate segment layer.
+        REPLACE: Replace the existing segment layer with the new one.
+
+    """
+
+    ERROR = "error"
+    SKIP = "skip"
+    REPLACE = "replace"
 
 
 InternalEntryT = TypeVar("InternalEntryT", DatasetEntryInternal, TableEntryInternal)
@@ -99,18 +117,40 @@ class Entry(ABC, Generic[InternalEntryT]):
 
         self._internal.delete()
 
+    def set_name(self, name: str) -> None:
+        """
+        Change the name of this entry.
+
+        **Note**: entry names must be unique within the catalog. If the new name is not unique, an error will be raised.
+
+        Entry names may only contain ASCII alphanumeric characters, underscores, hyphens, dots, colons and spaces,
+        and must be at most 180 characters long.
+
+        Parameters
+        ----------
+        name:
+            New name for the entry
+
+        """
+        self._internal.set_name(name)
+
+    @deprecated("Entry.update() is deprecated. Use Entry.set_name() instead.")
     def update(self, *, name: str | None = None) -> None:
         """
         Update this entry's properties.
 
+        .. deprecated::
+            Use :meth:`set_name` instead.
+
         Parameters
         ----------
-        name : str | None
+        name:
             New name for the entry
 
         """
 
-        self._internal.update(name=name)
+        if name is not None:
+            self._internal.set_name(name)
 
     def __eq__(self, other: object) -> bool:
         """
@@ -165,7 +205,7 @@ class DatasetEntry(Entry[DatasetEntryInternal]):
         if blueprint_dataset is None:
             raise LookupError("a blueprint dataset is not configured for this dataset")
 
-        segment_id = blueprint_dataset.register(uri).wait().segment_ids[0]
+        segment_id = blueprint_dataset.register(uri, on_duplicate=OnDuplicateSegmentLayer.REPLACE).wait().segment_ids[0]
 
         if set_default:
             self.set_default_blueprint(segment_id)
@@ -195,16 +235,6 @@ class DatasetEntry(Entry[DatasetEntryInternal]):
         ds = self._internal.blueprint_dataset()
         return None if ds is None else DatasetEntry(ds)
 
-    @deprecated("Use default_blueprint_segment_id() instead")
-    def default_blueprint_partition_id(self) -> str | None:
-        """The default blueprint partition ID for this dataset, if any."""
-        return self.default_blueprint()
-
-    @deprecated("Use set_default_blueprint_segment_id() instead")
-    def set_default_blueprint_partition_id(self, partition_id: str | None) -> None:
-        """Set the default blueprint partition ID for this dataset."""
-        return self.set_default_blueprint(partition_id)
-
     def schema(self) -> Schema:
         """Return the schema of the data contained in the dataset."""
         from ._schema import Schema
@@ -215,11 +245,6 @@ class DatasetEntry(Entry[DatasetEntryInternal]):
         """Returns a list of segment IDs for the dataset."""
 
         return self._internal.segment_ids()
-
-    @deprecated("Use segment_ids() instead")
-    def partition_ids(self) -> list[str]:
-        """Returns a list of partition IDs for the dataset."""
-        return self.segment_ids()
 
     def segment_table(
         self,
@@ -271,10 +296,30 @@ class DatasetEntry(Entry[DatasetEntryInternal]):
 
         return segment_table_df
 
-    def manifest(self) -> datafusion.DataFrame:
-        """Return the dataset manifest as a DataFusion DataFrame."""
+    def manifest(self, include_diagnostic_data: bool = False) -> datafusion.DataFrame:
+        """
+        Return the dataset manifest as a DataFusion DataFrame.
 
-        return self._internal.manifest()
+        Parameters
+        ----------
+        include_diagnostic_data:
+            Include diagnostic data in the manifest. That may include rows that correspond to layers which failed
+            registration, were deleted, or are in pending states.
+
+            !!! note
+
+                Diagnostic data is subject to change in any release and should not be relied on for production.
+
+        """
+
+        from datafusion import col
+
+        df = self._internal.manifest()
+
+        if not include_diagnostic_data:
+            df = df.filter(col("rerun_registration_status") == "done").drop("rerun_registration_status")
+
+        return df
 
     def segment_url(  # noqa: PLR0917
         self,
@@ -321,22 +366,12 @@ class DatasetEntry(Entry[DatasetEntryInternal]):
 
         return self._internal.segment_url(segment_id, timeline, start, end)
 
-    @deprecated("Use segment_url() instead")
-    def partition_url(  # noqa: PLR0917
-        self,
-        partition_id: str,
-        timeline: str | None = None,
-        start: datetime | int | None = None,
-        end: datetime | int | None = None,
-    ) -> str:
-        """Return the URL for the given partition."""
-        return self.segment_url(partition_id, timeline, start, end)
-
     def register(
         self,
         recording_uri: str | Sequence[str],
         *,
         layer_name: str | Sequence[str] = "base",
+        on_duplicate: OnDuplicateSegmentLayer = OnDuplicateSegmentLayer.ERROR,
     ) -> RegistrationHandle:
         """
         Register RRD URIs to the dataset and return a handle to track progress.
@@ -346,14 +381,18 @@ class DatasetEntry(Entry[DatasetEntryInternal]):
 
         Parameters
         ----------
-        recording_uri
+        recording_uri:
             The URI(s) of the RRD(s) to register. Can be a single URI string or a sequence of URIs.
 
-        layer_name
+        layer_name:
             The layer(s) to which the recordings will be registered to.
             Can be a single layer name (applied to all recordings) or a sequence of layer names
             (must match the length of `recording_uri`).
             Defaults to `"base"`.
+
+        on_duplicate:
+            How to handle the cases where the segment id and layer name already exist in the dataset?
+            Defaults to `OnDuplicateSegmentLayer.ERROR`.
 
         Returns
         -------
@@ -375,9 +414,64 @@ class DatasetEntry(Entry[DatasetEntryInternal]):
             if len(layer_names) != len(recording_uris):
                 raise ValueError("`layer_name` must be the same length as `recording_uri`")
 
-        return RegistrationHandle(self._internal.register(recording_uris, recording_layers=layer_names))
+        return RegistrationHandle(
+            self._internal.register(recording_uris, recording_layers=layer_names, on_duplicate=on_duplicate)
+        )
 
-    def register_prefix(self, recordings_prefix: str, layer_name: str | None = None) -> RegistrationHandle:
+    def unregister(
+        self,
+        *,
+        segments_to_drop: str | Sequence[str],
+        layers_to_drop: str | Sequence[str],
+        force: bool = False,
+    ) -> None:
+        """
+        Unregisters segments and layers from the dataset.
+
+        Excluding IO errors, this will always succeed as long the target dataset exists.
+        Corollary: unregistering data that doesn't exist is a no-op.
+
+        This method acts as a *product* filter:
+        * empty `segments_to_drop` + empty `layers_to_drop`: invalid argument error
+        * empty `segments_to_drop` + non-empty `layers_to_drop`: remove specified layers for *all* segments
+        * non-empty `segments_to_drop` + empty `layers_to_drop`: remove *all* layers for specified segments
+        * non-empty `segments_to_drop` + non-empty `layers_to_drop`: delete *all* specified layers for *all* specified segments
+
+        Parameters
+        ----------
+        segments_to_drop: list[str]
+            The segment IDs to drop. All of them if empty.
+            The final filter will be the *outer product* of this and `layers_to_drop`.
+
+        layers_to_drop: list[str]
+            The layer names to drop. All of them if empty.
+            The final filter will be the *outer product* of this and `segments_to_drop`.
+
+        force: bool
+            If true, deletion will go through regardless of the segments/layers' current statuses.
+            This is only useful in the very specific, catatrophic scenario where the contents of the
+            task queue were lost and some tasks are now stuck in `status=pending` forever.
+            Do not use this unless you know exactly what you're doing.
+
+        """
+        if isinstance(segments_to_drop, str):
+            segments_to_drop = [segments_to_drop]
+        else:
+            segments_to_drop = list(segments_to_drop)
+
+        if isinstance(layers_to_drop, str):
+            layers_to_drop = [layers_to_drop]
+        else:
+            layers_to_drop = list(layers_to_drop)
+
+        self._internal.unregister(segments_to_drop=segments_to_drop, layers_to_drop=layers_to_drop, force=force)
+
+    def register_prefix(
+        self,
+        recordings_prefix: str,
+        layer_name: str | None = None,
+        on_duplicate: OnDuplicateSegmentLayer = OnDuplicateSegmentLayer.ERROR,
+    ) -> RegistrationHandle:
         """
         Register all RRDs under a given prefix to the dataset and return a handle to track progress.
 
@@ -396,6 +490,10 @@ class DatasetEntry(Entry[DatasetEntryInternal]):
             The layer to which the recordings will be registered to.
             If `None`, this defaults to `"base"`.
 
+        on_duplicate:
+            How to handle the cases where the segment id and layer name already exist in the dataset?
+            Defaults to `OnDuplicateSegmentLayer.ERROR`.
+
         Returns
         -------
         A handle to track and wait on the registration tasks.
@@ -403,17 +501,16 @@ class DatasetEntry(Entry[DatasetEntryInternal]):
         """
         from ._registration_handle import RegistrationHandle
 
-        return RegistrationHandle(self._internal.register_prefix(recordings_prefix, layer_name=layer_name))
+        if layer_name is None:
+            layer_name = "base"
+
+        return RegistrationHandle(self._internal.register_prefix(recordings_prefix, layer_name, on_duplicate))
 
     def download_segment(self, segment_id: str) -> Recording:
         """Download a segment from the dataset."""
+        from rerun.recording import Recording
 
-        return self._internal.download_segment(segment_id)
-
-    @deprecated("Use download_segment() instead")
-    def download_partition(self, partition_id: str) -> Recording:
-        """Download a partition from the dataset."""
-        return self.download_segment(partition_id)
+        return Recording(self._internal.download_segment(segment_id))
 
     def filter_segments(self, segment_ids: str | Sequence[str] | datafusion.DataFrame) -> DatasetView:
         """
@@ -459,7 +556,7 @@ class DatasetEntry(Entry[DatasetEntryInternal]):
 
         return DatasetView(self._internal.filter_segments(list(segment_ids)))
 
-    def filter_contents(self, exprs: str | Sequence[str]) -> DatasetView:
+    def filter_contents(self, exprs: ContentFilter | str | Sequence[str]) -> DatasetView:
         """
         Return a new DatasetView filtered to the given entity paths.
 
@@ -469,8 +566,9 @@ class DatasetEntry(Entry[DatasetEntryInternal]):
 
         Parameters
         ----------
-        exprs : str | Sequence[str]
-            Entity path expression or list of entity path expressions.
+        exprs:
+            A `ContentFilter` built with the fluent builder API, an entity path expression or list of entity
+            path expressions. Passing `[]` results in filtering out all contents.
 
         Returns
         -------
@@ -482,20 +580,30 @@ class DatasetEntry(Entry[DatasetEntryInternal]):
         ```python
         # Filter to a single entity path
         view = dataset.filter_contents("/points/**")
+        view = dataset.filter_contents(
+            ContentFilter.nothing()
+            .include("/points/**")
+        )
 
         # Filter to specific entity paths
         view = dataset.filter_contents(["/points/**"])
 
         # Exclude certain paths
         view = dataset.filter_contents(["/points/**", "-/text/**"])
+        view = dataset.filter_contents(
+            ContentFilter.nothing()
+            .include("/points", subtree=True)
+            .exclude("/text/**")
+        )
 
         # Chain with segment filters
         view = dataset.filter_segments(["recording_0"]).filter_contents("/points/**")
         ```
 
         """
-
-        if isinstance(exprs, str):
+        if isinstance(exprs, ContentFilter):
+            exprs = exprs.to_exprs()
+        elif isinstance(exprs, str):
             exprs = [exprs]
 
         return DatasetView(self._internal.filter_contents(list(exprs)))
@@ -507,7 +615,7 @@ class DatasetEntry(Entry[DatasetEntryInternal]):
         include_semantically_empty_columns: bool = False,
         include_tombstone_columns: bool = False,
         fill_latest_at: bool = False,
-        using_index_values: IndexValuesLike | None = None,
+        using_index_values: dict[str, IndexValuesLike] | datafusion.DataFrame | IndexValuesLike | None = None,
     ) -> datafusion.DataFrame:
         """
         Create a reader over this dataset.
@@ -531,17 +639,17 @@ class DatasetEntry(Entry[DatasetEntryInternal]):
 
         Parameters
         ----------
-        index : str | None
+        index
             The index (timeline) to use for the view.
             Pass `None` to read only static data.
-        include_semantically_empty_columns : bool
+        include_semantically_empty_columns
             Whether to include columns that are semantically empty.
-        include_tombstone_columns : bool
+        include_tombstone_columns
             Whether to include tombstone columns.
-        fill_latest_at : bool
+        fill_latest_at
             Whether to fill null values with the latest valid data.
-        using_index_values : IndexValuesLike | None
-            If provided, specifies the exact index values to sample for all segments.
+        using_index_values
+            If provided, specifies the exact index values to sample per segment.
             Can be a numpy array (datetime64[ns] or int64), a pyarrow Array, or a sequence.
             Use with `fill_latest_at=True` to populate rows with the most recent data.
 
@@ -560,6 +668,9 @@ class DatasetEntry(Entry[DatasetEntryInternal]):
             using_index_values=using_index_values,
         )
 
+    @deprecated(
+        "Index creation is currently not supported. Contact Rerun if this is a feature you would like us to support."
+    )
     def create_fts_search_index(
         self,
         *,
@@ -568,31 +679,29 @@ class DatasetEntry(Entry[DatasetEntryInternal]):
         store_position: bool = False,
         base_tokenizer: str = "simple",
     ) -> None:
-        """Create a full-text search index on the given column."""
+        """
+        Create a full-text search index on the given column.
 
-        return self._internal.create_fts_search_index(
-            column=column,
-            time_index=time_index,
-            store_position=store_position,
-            base_tokenizer=base_tokenizer,
-        )
+        .. deprecated::
+            Index creation is currently not supported.
+            Contact Rerun if this is a feature you would like us to support.
+        """
 
-    @deprecated("use create_fts_search_index")
-    def create_fts_index(
-        self,
-        *,
-        column: str | ComponentColumnSelector | ComponentColumnDescriptor,
-        time_index: IndexColumnSelector,
-        store_position: bool = False,
-        base_tokenizer: str = "simple",
-    ) -> None:
-        return self.create_fts_search_index(
-            column=column,
-            time_index=time_index,
-            store_position=store_position,
-            base_tokenizer=base_tokenizer,
-        )
+        try:
+            return self._internal.create_fts_search_index(  # ty: ignore[deprecated]
+                column=column,
+                time_index=time_index,
+                store_position=store_position,
+                base_tokenizer=base_tokenizer,
+            )
+        except Exception as err:
+            raise NotImplementedError(
+                "Index creation is currently not supported. Contact Rerun if this is a feature you would like us to support."
+            ) from err
 
+    @deprecated(
+        "Index creation is currently not supported. Contact Rerun if this is a feature you would like us to support."
+    )
     def create_vector_search_index(
         self,
         *,
@@ -604,6 +713,10 @@ class DatasetEntry(Entry[DatasetEntryInternal]):
     ) -> IndexingResult:
         """
         Create a vector index on the given column.
+
+        .. deprecated::
+            Index creation is currently not supported.
+            Contact Rerun if this is a feature you would like us to support.
 
         This will enable indexing and build the vector index over all existing values
         in the specified component column.
@@ -633,40 +746,23 @@ class DatasetEntry(Entry[DatasetEntryInternal]):
 
         """
 
-        return self._internal.create_vector_search_index(
-            column=column,
-            time_index=time_index,
-            target_partition_num_rows=target_partition_num_rows,
-            num_sub_vectors=num_sub_vectors,
-            distance_metric=distance_metric,
-        )
-
-    @deprecated("use create_vector_search_index instead")
-    def create_vector_index(
-        self,
-        *,
-        column: str | ComponentColumnSelector | ComponentColumnDescriptor,
-        time_index: IndexColumnSelector,
-        target_partition_num_rows: int | None = None,
-        num_sub_vectors: int = 16,
-        distance_metric: VectorDistanceMetric | str = "Cosine",
-    ) -> IndexingResult:
-        return self.create_vector_search_index(
-            column=column,
-            time_index=time_index,
-            target_partition_num_rows=target_partition_num_rows,
-            num_sub_vectors=num_sub_vectors,
-            distance_metric=distance_metric,
-        )
+        try:
+            return self._internal.create_vector_search_index(  # ty: ignore[deprecated]
+                column=column,
+                time_index=time_index,
+                target_partition_num_rows=target_partition_num_rows,
+                num_sub_vectors=num_sub_vectors,
+                distance_metric=distance_metric,
+            )
+        except Exception as err:
+            raise NotImplementedError(
+                "Index creation is currently not supported. Contact Rerun if this is a feature you would like us to support."
+            ) from err
 
     def list_search_indexes(self) -> list[IndexingResult]:
         """List all user-defined indexes in this dataset."""
 
         return self._internal.list_search_indexes()
-
-    @deprecated("use list_search_indexes instead")
-    def list_indexes(self) -> list[IndexingResult]:
-        return self.list_search_indexes()
 
     def delete_search_indexes(
         self,
@@ -676,31 +772,52 @@ class DatasetEntry(Entry[DatasetEntryInternal]):
 
         return self._internal.delete_search_indexes(column)
 
-    @deprecated("use delete_search_indexes instead")
-    def delete_indexes(
-        self,
-        column: str | ComponentColumnSelector | ComponentColumnDescriptor,
-    ) -> list[IndexConfig]:
-        return self.delete_search_indexes(column)
-
+    @deprecated(
+        "Index search is currently not supported. Contact Rerun if this is a feature you would like us to support."
+    )
     def search_fts(
         self,
         query: str,
         column: str | ComponentColumnSelector | ComponentColumnDescriptor,
     ) -> datafusion.DataFrame:
-        """Search the dataset using a full-text search query."""
+        """
+        Search the dataset using a full-text search query.
 
-        return self._internal.search_fts(query, column)
+        .. deprecated::
+            Index search is currently not supported.
+            Contact Rerun if this is a feature you would like us to support.
+        """
 
+        try:
+            return self._internal.search_fts(query, column)  # ty: ignore[deprecated]
+        except Exception as err:
+            raise NotImplementedError(
+                "Index search is currently not supported. Contact Rerun if this is a feature you would like us to support."
+            ) from err
+
+    @deprecated(
+        "Index search is currently not supported. Contact Rerun if this is a feature you would like us to support."
+    )
     def search_vector(
         self,
         query: Any,  # VectorLike
         column: str | ComponentColumnSelector | ComponentColumnDescriptor,
         top_k: int,
     ) -> datafusion.DataFrame:
-        """Search the dataset using a vector search query."""
+        """
+        Search the dataset using a vector search query.
 
-        return self._internal.search_vector(query, column, top_k)
+        .. deprecated::
+            Index search is currently not supported.
+            Contact Rerun if this is a feature you would like us to support.
+        """
+
+        try:
+            return self._internal.search_vector(query, column, top_k)  # ty: ignore[deprecated]
+        except Exception as err:
+            raise NotImplementedError(
+                "Index search is currently not supported. Contact Rerun if this is a feature you would like us to support."
+            ) from err
 
     def do_maintenance(  # noqa: PLR0917
         self,
@@ -715,6 +832,11 @@ class DatasetEntry(Entry[DatasetEntryInternal]):
         return self._internal.do_maintenance(
             optimize_indexes, retrain_indexes, compact_fragments, cleanup_before, unsafe_allow_recent_cleanup
         )
+
+    def get_index_ranges(self) -> datafusion.DataFrame:
+        """Returns the range bounds of all indexes per segment."""
+        view = self.filter_contents(["/**"])
+        return view.get_index_ranges()
 
 
 class DatasetView:
@@ -751,7 +873,7 @@ class DatasetView:
 
         Parameters
         ----------
-        internal : DatasetViewInternal
+        internal:
             The internal Rust-side DatasetView object.
 
         """
@@ -844,33 +966,14 @@ class DatasetView:
 
         return segment_table_df
 
-    @deprecated("This method is deprecated and will be removed in a future release")
-    def download_segment(self, segment_id: str) -> Recording:
-        """
-        Download a specific segment from the dataset.
-
-        Parameters
-        ----------
-        segment_id : str
-            The ID of the segment to download.
-
-        Returns
-        -------
-        Recording
-            The downloaded recording.
-
-        """
-
-        return self.dataset.download_segment(segment_id)
-
     def reader(
         self,
         index: str | None,
         *,
         include_semantically_empty_columns: bool = False,
         include_tombstone_columns: bool = False,
+        using_index_values: dict[str, IndexValuesLike] | datafusion.DataFrame | IndexValuesLike | None = None,
         fill_latest_at: bool = False,
-        using_index_values: IndexValuesLike | None = None,
     ) -> datafusion.DataFrame:
         """
         Create a reader over this DatasetView.
@@ -901,45 +1004,98 @@ class DatasetView:
             Whether to include columns that are semantically empty.
         include_tombstone_columns
             Whether to include tombstone columns.
+        using_index_values
+            If a dict is provided, keys are segment IDs and values are the index values
+            to sample for that segment (per-segment semantics).
+            If a DataFrame is provided, it must have 'rerun_segment_id' and index columns.
+            Use with `fill_latest_at=True` to populate rows with the most recent data.
         fill_latest_at
             Whether to fill null values with the latest valid data.
-        using_index_values
-            If provided, specifies the exact index values to sample for all segments.
-            Can be a numpy array (datetime64[ns] or int64), a pyarrow Array, or a sequence.
-            Use with `fill_latest_at=True` to populate rows with the most recent data.
 
         Returns
         -------
         A DataFusion DataFrame.
 
         """
-        return self._internal.reader(
+        import logging
+
+        import datafusion
+
+        available_segments = set() if using_index_values is None else set(self._internal.segment_ids())
+
+        index_values_dict = None
+        match using_index_values:
+            case None:
+                pass
+
+            case df if isinstance(df, datafusion.DataFrame):
+                index_values_dict = self._dataframe_to_index_values_dict(df, index)
+
+            case dict() as d:
+                index_values_dict = d
+
+            case _ as index_vals:
+                # Scalar IndexValuesLike: apply the same indices to all segments
+                index_values_dict = dict.fromkeys(available_segments, index_vals)
+
+        if index_values_dict is not None:
+            requested_segments = set(index_values_dict.keys())
+            missing_segments = requested_segments - available_segments
+
+            if missing_segments:
+                logging.warning(
+                    f"Index values for the following inexistent or filtered segments "
+                    f"were ignored: {', '.join(sorted(missing_segments))}"
+                )
+
+            valid_segments = requested_segments - missing_segments
+            view = self._internal.filter_segments([*valid_segments])
+        else:
+            view = self._internal
+
+        return view.reader(
             index=index,
             include_semantically_empty_columns=include_semantically_empty_columns,
             include_tombstone_columns=include_tombstone_columns,
             fill_latest_at=fill_latest_at,
-            using_index_values=using_index_values,
+            using_index_values=index_values_dict,
         )
 
     def filter_segments(self, segment_ids: str | Sequence[str] | datafusion.DataFrame) -> DatasetView:
         """
         Return a new DatasetView filtered to the given segment IDs.
 
-        Filters are composed: if this view already has a segment filter,
-        the result is the intersection of both filters.
-
         Parameters
         ----------
-        segment_ids : str | Sequence[str] | datafusion.DataFrame
+        segment_ids
             A segment ID string, a list of segment ID strings, or a DataFusion DataFrame
-            with a column named 'rerun_segment_id'.
+            with a column named 'rerun_segment_id'. When passing a DataFrame,
+            if there are additional columns, they will be ignored.
 
         Returns
         -------
         DatasetView
             A new view filtered to the given segments.
 
+        Examples
+        --------
+        ```python
+        # Filter to a single segment
+        view = dataset.filter_segments("recording_0")
+
+        # Filter to specific segments
+        view = dataset.filter_segments(["recording_0", "recording_1"])
+
+        # Filter using a DataFrame
+        good_segments = segment_table.filter(col("success"))
+        view = dataset.filter_segments(good_segments)
+
+        # Read data from the filtered view
+        df = view.reader(index="timeline")
+        ```
+
         """
+
         import datafusion
 
         if isinstance(segment_ids, str):
@@ -949,7 +1105,7 @@ class DatasetView:
 
         return DatasetView(self._internal.filter_segments(list(segment_ids)))
 
-    def filter_contents(self, exprs: str | Sequence[str]) -> DatasetView:
+    def filter_contents(self, exprs: ContentFilter | str | Sequence[str]) -> DatasetView:
         """
         Return a new DatasetView filtered to the given entity paths.
 
@@ -959,16 +1115,42 @@ class DatasetView:
 
         Parameters
         ----------
-        exprs : str | Sequence[str]
-            Entity path expression or list of entity path expressions.
+        exprs:
+            A `ContentFilter` built with the fluent builder API, an entity path expression or list of entity
+            path expressions. Passing `[]` results in filtering out all contents.
 
         Returns
         -------
         DatasetView
             A new view filtered to the matching entity paths.
 
+        Examples
+        --------
+        ```python
+        # Filter to a single entity path
+        view = dataset.filter_contents("/points/**")
+
+        # Filter to specific entity paths
+        view = dataset.filter_contents(["/points/**"])
+
+        # Exclude certain paths
+        view = dataset.filter_contents(["/points/**", "-/text/**"])
+
+        # Using ContentFilter builder
+        view = dataset.filter_contents(
+            ContentFilter.everything()
+            .exclude("/robot/raw/**")
+            .include("/robot/raw/i_need_this")
+        )
+
+        # Chain with segment filters
+        view = dataset.filter_segments(["recording_0"]).filter_contents("/points/**")
+        ```
+
         """
-        if isinstance(exprs, str):
+        if isinstance(exprs, ContentFilter):
+            exprs = exprs.to_exprs()
+        elif isinstance(exprs, str):
             exprs = [exprs]
 
         return DatasetView(self._internal.filter_contents(list(exprs)))
@@ -992,6 +1174,43 @@ class DatasetView:
 
         return f"DatasetView({dataset_str}, {segment_str}, {content_str})"
 
+    def get_index_ranges(self) -> datafusion.DataFrame:
+        """Returns the range bounds of all indexes per segment."""
+        exprs = ["rerun_segment_id"]
+        for index_col in self.schema().index_columns():
+            exprs.append(f"{index_col.name}:start")
+            exprs.append(f"{index_col.name}:end")
+
+        return self.segment_table().select(*exprs)
+
+    def _dataframe_to_index_values_dict(
+        self, df: datafusion.DataFrame, index: str | None
+    ) -> dict[str, IndexValuesLike]:
+        """Convert a DataFrame with segment_id + index columns to a dict."""
+
+        import datafusion as dfn
+
+        if "rerun_segment_id" not in df.schema().names:
+            raise ValueError("using_index_values DataFrame must have a 'rerun_segment_id' column")
+
+        if index is None:
+            raise ValueError("index must be provided when using_index_values is a DataFrame")
+
+        if index not in df.schema().names:
+            raise ValueError(f"using_index_values DataFrame must have an '{index}' column")
+
+        table = pa.table(
+            df.aggregate(
+                ["rerun_segment_id"], [dfn.functions.array_agg(dfn.col(index), order_by=dfn.col(index)).alias(index)]
+            )
+        )
+
+        # Group by segment_id
+        segment_id_col = table.column("rerun_segment_id")
+        index_col = table.column(index)
+
+        return {segment_id_col[i].as_py(): index_col[i].values.to_numpy() for i in range(table.num_rows)}
+
 
 class TableEntry(Entry[TableEntryInternal]):
     """
@@ -1000,10 +1219,10 @@ class TableEntry(Entry[TableEntryInternal]):
     Note: this object acts as a table provider for DataFusion.
     """
 
-    def __datafusion_table_provider__(self) -> Any:
+    def __datafusion_table_provider__(self, session: Any) -> Any:
         """Returns a DataFusion table provider capsule."""
 
-        return self._internal.__datafusion_table_provider__()
+        return self._internal.__datafusion_table_provider__(session)
 
     def reader(self) -> datafusion.DataFrame:
         """Registers the table with the DataFusion context and return a DataFrame."""
@@ -1045,7 +1264,7 @@ class TableEntry(Entry[TableEntryInternal]):
             Each named parameter corresponds to a column in the table.
 
         """
-        self._write(batches, named_params, TableInsertMode.APPEND)
+        self._write(batches, named_params, TableInsertModeInternal.APPEND)
 
     def overwrite(
         self,
@@ -1065,7 +1284,7 @@ class TableEntry(Entry[TableEntryInternal]):
             Each named parameter corresponds to a column in the table.
 
         """
-        self._write(batches, named_params, TableInsertMode.OVERWRITE)
+        self._write(batches, named_params, TableInsertModeInternal.OVERWRITE)
 
     def upsert(
         self,
@@ -1092,13 +1311,13 @@ class TableEntry(Entry[TableEntryInternal]):
             Each named parameter corresponds to a column in the table
 
         """
-        self._write(batches, named_params, TableInsertMode.REPLACE)
+        self._write(batches, named_params, TableInsertModeInternal.REPLACE)
 
     def _write(
         self,
         batches: _BatchesType | None,
         named_params: dict[str, Any],
-        insert_mode: TableInsertMode,
+        insert_mode: TableInsertModeInternal,
     ) -> None:
         """Internal helper that implements append/overwrite/upsert."""
         if batches is not None and len(named_params) > 0:
@@ -1112,7 +1331,7 @@ class TableEntry(Entry[TableEntryInternal]):
     def _write_batches(
         self,
         batches: _BatchesType,
-        insert_mode: TableInsertMode,
+        insert_mode: TableInsertModeInternal,
     ) -> None:
         """Internal helper to write batches to the table."""
         # If already a RecordBatchReader, pass it directly
@@ -1148,47 +1367,59 @@ class TableEntry(Entry[TableEntryInternal]):
     def _write_named_params(
         self,
         named_params: dict[str, Any],
-        insert_mode: TableInsertMode,
+        insert_mode: TableInsertModeInternal,
     ) -> None:
         """Internal helper to write named parameters to the table."""
-        batch = self._python_objects_to_record_batch(self.arrow_schema(), named_params)
+        batch = _python_objects_to_record_batch(self.arrow_schema(), named_params)
         if batch is not None:
             reader = RecordBatchReader.from_batches(batch.schema, [batch])
             self._internal.write_batches(reader, insert_mode=insert_mode)
 
-    def _python_objects_to_record_batch(self, schema: pa.Schema, named_params: dict[str, Any]) -> pa.RecordBatch:
-        cast_params = {}
-        expected_len = None
 
-        for name, value in named_params.items():
-            field = schema.field(name)
-            if field is None:
-                raise ValueError(f"Column {name} does not exist in table")
+def _python_objects_to_record_batch(schema: pa.Schema, named_params: dict[str, Any]) -> pa.RecordBatch:
+    cast_params = {}
+    expected_len = None
 
-            if isinstance(value, str):
-                value = [value]
+    for name, value in named_params.items():
+        field = schema.field(name)
+        if field is None:
+            raise ValueError(f"Column {name} does not exist in table")
 
-            try:
-                cast_value = pa.array(value, type=field.type)
-            except TypeError:
-                cast_value = pa.array([value], type=field.type)
+        if isinstance(value, str):
+            value = [value]
 
-            cast_params[name] = cast_value
+        try:
+            cast_value = pa.array(value, type=field.type)
+        except TypeError:
+            cast_value = pa.array([value], type=field.type)
 
-            if expected_len is None:
-                expected_len = len(cast_value)
-            else:
-                if len(cast_value) != expected_len:
-                    raise ValueError("Columns have mismatched number of rows")
+        cast_params[name] = cast_value
 
-        if expected_len is None or expected_len == 0:
-            return
+        if expected_len is None:
+            expected_len = len(cast_value)
+        else:
+            if len(cast_value) != expected_len:
+                error = (
+                    f"Columns have mismatched number of rows. "
+                    f"Column '{name}' has {len(cast_value)} rows but expected {expected_len}."
+                )
 
-        columns = []
-        for field in schema:
-            if field.name in cast_params:
-                columns.append(cast_params[field.name])
-            else:
-                columns.append(pa.array([None] * expected_len, type=field.type))
+                if pa.types.is_list(field.type) or pa.types.is_large_list(field.type):
+                    error += (
+                        f" Hint: For single-row list-typed columns, wrap your list in another list: "
+                        f"{name}=[[...]] instead of {name}=[...]"  # NOLINT
+                    )
 
-        return pa.RecordBatch.from_arrays(columns, schema=schema)
+                raise ValueError(error)
+
+    if expected_len is None or expected_len == 0:
+        return
+
+    columns = []
+    for field in schema:
+        if field.name in cast_params:
+            columns.append(cast_params[field.name])
+        else:
+            columns.append(pa.array([None] * expected_len, type=field.type))
+
+    return pa.RecordBatch.from_arrays(columns, schema=schema)

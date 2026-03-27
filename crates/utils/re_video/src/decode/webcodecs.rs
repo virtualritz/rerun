@@ -2,7 +2,6 @@ use std::collections::hash_map::Entry;
 use std::sync::LazyLock;
 
 use ahash::HashMap;
-use crossbeam::channel::Sender;
 use js_sys::{Function, Uint8Array};
 use re_mp4::StsdBoxContent;
 use smallvec::SmallVec;
@@ -15,8 +14,8 @@ use web_sys::{
 
 use super::{AsyncDecoder, Chunk, DecodeHardwareAcceleration, Frame, FrameInfo, Result};
 use crate::{
-    DecodeError, FrameResult, Time, Timescale, VideoCodec, VideoDataDescription,
-    VideoEncodingDetails,
+    DecodeError, FrameResult, Sender, Time, Timescale, TryRecvError, VideoCodec,
+    VideoDataDescription, VideoEncodingDetails, player::VideoPlaybackIssueSeverity,
 };
 
 #[derive(Clone)]
@@ -53,6 +52,12 @@ enum OutputCallbackMessage {
     },
 }
 
+impl re_byte_size::SizeBytes for OutputCallbackMessage {
+    fn heap_size_bytes(&self) -> u64 {
+        0
+    }
+}
+
 pub struct WebVideoDecoder {
     codec: VideoCodec,
 
@@ -61,7 +66,7 @@ pub struct WebVideoDecoder {
 
     decoder: web_sys::VideoDecoder,
     hw_acceleration: DecodeHardwareAcceleration,
-    output_sender: crossbeam::channel::Sender<FrameResult>,
+    output_sender: Sender<FrameResult>,
 
     output_callback_tx: Sender<OutputCallbackMessage>,
 }
@@ -95,12 +100,20 @@ pub enum WebError {
     NotEnoughCodecInformation,
 }
 
+impl WebError {
+    pub fn severity(&self) -> VideoPlaybackIssueSeverity {
+        match self {
+            Self::NotEnoughCodecInformation => VideoPlaybackIssueSeverity::Loading,
+            _ => VideoPlaybackIssueSeverity::Error,
+        }
+    }
+}
+
 // SAFETY: There is no way to access the same JS object from different OS threads
 //         in a way that could result in a data race.
 
 #[expect(unsafe_code)]
-// Clippy did not recognize a safety comment on these impls no matter what I tried:
-#[expect(clippy::undocumented_unsafe_blocks)]
+#[expect(clippy::undocumented_unsafe_blocks)] // false positive
 unsafe impl Send for WebVideoDecoder {}
 
 #[expect(unsafe_code)]
@@ -114,10 +127,6 @@ unsafe impl Send for WebVideoFrame {}
 #[expect(unsafe_code)]
 #[expect(clippy::undocumented_unsafe_blocks)]
 unsafe impl Sync for WebVideoFrame {}
-
-static IS_SAFARI: LazyLock<bool> = LazyLock::new(|| {
-    web_sys::window().is_some_and(|w| w.has_own_property(&wasm_bindgen::JsValue::from("safari")))
-});
 
 static IS_FIREFOX: LazyLock<bool> = LazyLock::new(|| {
     web_sys::window()
@@ -136,12 +145,12 @@ impl Drop for WebVideoDecoder {
         }
 
         if let Err(err) = self.decoder.close() {
-            if let Some(dom_exception) = err.dyn_ref::<web_sys::DomException>() {
-                if dom_exception.code() == web_sys::DomException::INVALID_STATE_ERR {
-                    // Invalid state error after a decode error may happen, ignore it!
-                    // TODO(andreas): we used to do so only if there was a non-flushed error. Are we ignoring this too eagerly?
-                    return;
-                }
+            if let Some(dom_exception) = err.dyn_ref::<web_sys::DomException>()
+                && dom_exception.code() == web_sys::DomException::INVALID_STATE_ERR
+            {
+                // Invalid state error after a decode error may happen, ignore it!
+                // TODO(andreas): we used to do so only if there was a non-flushed error. Are we ignoring this too eagerly?
+                return;
             }
 
             re_log::warn!(
@@ -156,7 +165,7 @@ impl WebVideoDecoder {
     pub fn new(
         video_descr: &VideoDataDescription,
         hw_acceleration: DecodeHardwareAcceleration,
-        output_sender: crossbeam::channel::Sender<FrameResult>,
+        output_sender: Sender<FrameResult>,
     ) -> Result<Self, WebError> {
         // Web APIs insist on microsecond timestamps throughout.
         // If we don't have a timescale, assume a 30fps video where time units are frames.
@@ -168,7 +177,8 @@ impl WebVideoDecoder {
 
         let first_frame_pts = video_descr
             .samples
-            .front()
+            .iter()
+            .find_map(|s| s.sample())
             .map_or(Time::ZERO, |s| s.presentation_timestamp);
 
         Ok(Self {
@@ -283,7 +293,8 @@ impl AsyncDecoder for WebVideoDecoder {
         // For all we know, the first frame timestamp may have changed.
         self.first_frame_pts = video_descr
             .samples
-            .front()
+            .iter()
+            .find_map(|s| s.sample())
             .map_or(Time::ZERO, |s| s.presentation_timestamp);
 
         let encoding_details = video_descr
@@ -325,11 +336,11 @@ impl AsyncDecoder for WebVideoDecoder {
         wasm_bindgen_futures::spawn_local(async move {
             let flush_result = wasm_bindgen_futures::JsFuture::from(flush_promise).await;
             if let Err(flush_error) = flush_result {
-                if let Some(dom_exception) = flush_error.dyn_ref::<web_sys::DomException>() {
-                    if dom_exception.code() == web_sys::DomException::ABORT_ERR {
-                        // Video decoder got closed, that's fine.
-                        return;
-                    }
+                if let Some(dom_exception) = flush_error.dyn_ref::<web_sys::DomException>()
+                    && dom_exception.code() == web_sys::DomException::ABORT_ERR
+                {
+                    // Video decoder got closed, that's fine.
+                    return;
                 }
 
                 re_log::debug!(
@@ -343,10 +354,17 @@ impl AsyncDecoder for WebVideoDecoder {
     }
 
     fn min_num_samples_to_enqueue_ahead(&self) -> usize {
-        // TODO(#8848): For some h264 videos (which??) we need to enqueue more samples, otherwise Safari will not provide us with any frames.
+        // TODO(#8848): For some h264 videos we need to enqueue more samples. For example videos in
+        // `s3://rerun-redap-datasets-pdx/larger-than-ram-demo/very-large.rrd`. (requires rerun login)
+        //
+        // This fixes it for Safari and Chrome on mac, while firefox still has issues.
+        //
+        // Another defense against this we could consider is if we aren't getting frames back from the
+        // decoder, continue trying to give it more.
+        //
         // (The same happens with FFmpeg-cli decoder for the affected videos)
-        if self.codec == VideoCodec::H264 && *IS_SAFARI {
-            16 // Safari needs more samples queued for h264
+        if self.codec == VideoCodec::H264 {
+            16 // enqueue more samples for h264
         } else {
             // No such workaround are needed anywhere else,
             // GOP boundaries as handled by the video player are enough.
@@ -356,9 +374,10 @@ impl AsyncDecoder for WebVideoDecoder {
 }
 
 fn init_video_decoder(
-    output_sender: crossbeam::channel::Sender<FrameResult>,
+    output_sender: Sender<FrameResult>,
 ) -> Result<(web_sys::VideoDecoder, Sender<OutputCallbackMessage>), WebError> {
-    let (output_callback_tx, output_callback_rx) = crossbeam::channel::unbounded();
+    let (output_callback_tx, output_callback_rx) =
+        re_quota_channel::channel("web_callbacks", 1024 * 1024);
 
     let on_output = {
         let output_sender = output_sender.clone();
@@ -394,12 +413,12 @@ fn init_video_decoder(
                         pending_frame_infos.clear();
                     }
 
-                    Err(crossbeam::channel::TryRecvError::Empty) => {
+                    Err(TryRecvError::Empty) => {
                         // Done, received all messages.
                         break;
                     }
 
-                    Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                    Err(TryRecvError::Disconnected) => {
                         // We're probably shutting down.
                         return;
                     }
@@ -537,7 +556,7 @@ fn js_error_to_string(v: &wasm_bindgen::JsValue) -> String {
         let error = std::string::ToString::to_string(&v.to_string());
         return error
             .strip_prefix("EncodingError: ")
-            .map_or(error.clone(), |s| s.to_owned());
+            .map_or_else(|| error.clone(), |s| s.to_owned());
     }
 
     format!("{v:#?}")

@@ -6,7 +6,7 @@ use crate::allocator::{CpuWriteGpuReadError, DataTextureSource, DataTextureSourc
 use crate::renderer::gpu_data::{LineStripInfo, LineVertex};
 use crate::renderer::{LineBatchInfo, LineDrawData, LineDrawDataError, LineStripFlags};
 use crate::{
-    Color32, DebugLabel, DepthOffset, OutlineMaskPreference, PickingLayerInstanceId,
+    Color32, DepthOffset, Label, OutlineMaskPreference, PickingLayerInstanceId,
     PickingLayerObjectId, RenderContext, Size,
 };
 
@@ -63,7 +63,7 @@ impl<'ctx> LineDrawableBuilder<'ctx> {
     }
 
     /// Start of a new batch.
-    pub fn batch(&mut self, label: impl Into<DebugLabel>) -> LineBatchBuilder<'_, 'ctx> {
+    pub fn batch(&mut self, label: impl Into<Label>) -> LineBatchBuilder<'_, 'ctx> {
         self.batches.push(LineBatchInfo {
             label: label.into(),
             ..LineBatchInfo::default()
@@ -558,7 +558,7 @@ impl Drop for LineStripBuilder<'_, '_> {
             .add_n(self.strip, self.num_strips_added)
             .ok_or_log_error_once();
 
-        debug_assert!(
+        re_log::debug_assert!(
             self.builder.strips_buffer.len() == self.builder.picking_instance_ids_buffer.len()
         );
     }

@@ -19,7 +19,7 @@ To run the example from the repository, run `cargo run -p dna`.
 
 ## Prerequisites
 
-We assume you have a working Rust environment and have started a new project with the `rerun` dependency. If not, check out the [setup page](rust.md).
+We assume you have a working Rust environment and have started a new project with the `rerun` dependency. If not, check out the [installing rust](../../overview/installing-rerun/rust.md).
 
 For this example in particular, we're going to need all of these:
 
@@ -74,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Among other things, a stable [`ApplicationId`](https://docs.rs/rerun/latest/rerun/struct.ApplicationId.html) will make it so the [Rerun Viewer](../../reference/viewer/overview.md) retains its UI state across runs for this specific dataset, which will make our lives much easier as we iterate.
 
-Check out the reference to learn more about how Rerun deals with [applications and recordings](../../concepts/apps-and-recordings.md).
+Check out the reference to learn more about how Rerun deals with [recordings and datasets](../../concepts/logging-and-ingestion/recordings.md).
 
 ## Logging our first points
 
@@ -131,26 +131,26 @@ Under the hood, the Rerun [Rust SDK](https://docs.rs/rerun) logs individual _com
 and radii. Archetypes are just one high-level, convenient way of building such collections of components. For advanced use
 cases, it's possible to add custom components to archetypes, or even log entirely custom sets of components, bypassing
 archetypes altogether.
-For more information on how the Rerun data model works, refer to our section on [Entities and Components](../../concepts/entity-component.md).
+For more information on how the Rerun data model works, refer to our section on [Entities and Components](../../concepts/logging-and-ingestion/entity-component.md).
 
 Notably, the [`RecordingStream::log`](https://docs.rs/rerun/latest/rerun/struct.RecordingStream.html#method.log) method
 
 <!-- TODO(andreas): UPDATE DOC LINKS -->
 
 will handle any data type that implements the [`AsComponents`](https://docs.rs/rerun/latest/rerun/trait.AsComponents.html) trait, making it easy to add your own data.
-For more information on how to supply your own components see [Use custom data](../../howto/extend/custom-data.md).
+For more information on how to supply your own components see [Use custom data](../../howto/logging-and-ingestion/custom-data.md).
 
 ### Entities & hierarchies
 
 Note the two strings we're passing in: `"dna/structure/left"` and `"dna/structure/right"`.
 
-These are [_entity paths_](../../concepts/entity-component.md), which uniquely identify each entity in our scene. Every entity is made up of a path and one or more components.
-[Entity paths typically form a hierarchy](../../concepts/entity-path.md) which plays an important role in how data is visualized and transformed (as we shall soon see).
+These are [_entity paths_](../../concepts/logging-and-ingestion/entity-component.md), which uniquely identify each entity in our scene. Every entity is made up of a path and one or more components.
+[Entity paths typically form a hierarchy](../../concepts/logging-and-ingestion/entity-path.md) which plays an important role in how data is visualized and transformed (as we shall soon see).
 
 ### Component batches
 
 One final observation: notice how we're logging a whole batch of points and colors all at once here.
-[Component batches](../../concepts/batches.md) are first-class citizens in Rerun and come with all sorts of performance benefits and dedicated features.
+[Component batches](../../concepts/logging-and-ingestion/batches.md) are first-class citizens in Rerun and come with all sorts of performance benefits and dedicated features.
 You're looking at one of these dedicated features right now in fact: notice how we're only logging a single radius for all these points, yet somehow it applies to all of them. We call this _clamping_.
 
 ---
@@ -215,7 +215,7 @@ Once again, although we are getting fancier and fancier with our iterator mappin
 
 ### Introducing time
 
-Up until this point, we've completely set aside one of the core concepts of Rerun: [Time and Timelines](../../concepts/timelines.md).
+Up until this point, we've completely set aside one of the core concepts of Rerun: [Time and Timelines](../../concepts/logging-and-ingestion/timelines.md).
 
 Even so, if you look at your [Timeline View](../../reference/viewer/timeline.md) right now, you'll notice that Rerun has kept track of time on your behalf anyway by memorizing when each log call occurred.
 
@@ -346,7 +346,7 @@ For more details and potential limitations, please refer to [our blog post](http
 
 ### Spawning the Viewer from your process
 
-If the Rerun Viewer is [installed](../../overview/installing-viewer.md) and available in your `PATH`, you can use [`RecordingStream::spawn`](https://docs.rs/rerun/latest/rerun/struct.RecordingStream.html#method.spawn) to automatically start a Viewer in a new process and connect to it over gRPC.
+If the Rerun Viewer is [installed](../../overview/installing-rerun.md) and available in your `PATH`, you can use [`RecordingStream::spawn`](https://docs.rs/rerun/latest/rerun/struct.RecordingStream.html#method.spawn) to automatically start a Viewer in a new process and connect to it over gRPC.
 If an external Viewer was already running, `spawn` will connect to that one instead of spawning a new one.
 
 ```rust
@@ -391,4 +391,4 @@ The Viewer will block the main thread until it is closed.
 
 This closes our whirlwind tour of Rerun. We've barely scratched the surface of what's possible, but this should have hopefully given you plenty pointers to start experimenting.
 
-As a next step, browse through our [example gallery](/examples) for some more realistic example use-cases, or browse the [Types](../../reference/types.md) section for more simple examples of how to use the main data types.
+As a next step, browse through our [example gallery](https://rerun.io/examples) for some more realistic example use-cases, browse the [Types](../../reference/types.md) section for more simple examples of how to use the main data types, or dig deeper into [querying your logged data](../data-out.md).

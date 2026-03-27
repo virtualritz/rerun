@@ -1,3 +1,4 @@
+use std::hash::{Hash as _, Hasher as _};
 use std::sync::Arc;
 
 use ahash::{HashMap, HashSet};
@@ -78,7 +79,7 @@ impl std::fmt::Debug for EntityPathHash {
 /// When written as a string, some characters in the parts need to be escaped with a `\`
 /// (only character, numbers, `.`, `-`, `_` does not need escaping).
 ///
-/// See <https://www.rerun.io/docs/concepts/entity-path> for more on entity paths.
+/// See <https://www.rerun.io/docs/concepts/logging-and-ingestion/entity-path> for more on entity paths.
 ///
 /// This is basically implemented as a list of strings, but is reference-counted internally, so it is cheap to clone.
 /// It also has a precomputed hash and implemented [`nohash_hasher::IsEnabled`],
@@ -161,6 +162,24 @@ impl EntityPath {
         )
     }
 
+    /// The full, unescaped path string for display purposes in the UI.
+    ///
+    /// Like [`std::fmt::Display`] but uses [`EntityPathPart::ui_string`] for each part,
+    /// producing a human-friendly representation without backslash escaping
+    /// (e.g. `/foo::bar` instead of `/foo\:\:bar`).
+    pub fn ui_string(&self) -> String {
+        if self.is_root() {
+            "/".to_owned()
+        } else {
+            let mut s = String::new();
+            for part in self.iter() {
+                s.push('/');
+                s.push_str(&part.ui_string());
+            }
+            s
+        }
+    }
+
     /// Treat the string as one opaque string, NOT splitting on any slashes.
     ///
     /// The given string is expected to be unescaped, i.e. any `\` is treated as a normal character.
@@ -195,7 +214,8 @@ impl EntityPath {
 
     #[inline]
     pub fn is_property(&self) -> bool {
-        self.is_descendant_of(&Self::properties())
+        // `RecordingInfo` is logged directly under `__properties`, so this cannot be `is_descendant_of`
+        self.starts_with(&Self::properties())
     }
 
     /// Is this equals to, or a descendant of, the given path.
@@ -248,6 +268,16 @@ impl EntityPath {
     #[inline]
     pub fn hash64(&self) -> u64 {
         self.hash.hash64()
+    }
+
+    /// Calculates a deterministic hash of the entity path.
+    ///
+    /// This is useful for generating deterministic IDs for visualizer instructions. By default,
+    /// self.hash is generated using ahash, which works differently on web and native.
+    pub fn calculate_deterministic_hash(&self) -> u64 {
+        let mut hasher = xxhash_rust::xxh64::Xxh64::new(0);
+        self.parts.hash(&mut hasher);
+        hasher.finish()
     }
 
     /// Return [`None`] if root.

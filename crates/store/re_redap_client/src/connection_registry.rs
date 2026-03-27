@@ -3,16 +3,29 @@ use std::collections::hash_map::Entry;
 use std::error::Error as _;
 use std::sync::Arc;
 
-use itertools::Itertools as _;
 use re_auth::Jwt;
 use re_auth::credentials::CredentialsProviderError;
-use re_protos::cloud::v1alpha1::{EntryFilter, FindEntriesRequest};
+use re_protos::cloud::v1alpha1::{EntryFilter, FindEntriesRequest, WhoAmIRequest};
+use re_uri::Origin;
 use tokio::sync::RwLock;
 use tonic::Code;
 
 use crate::connection_client::GenericConnectionClient;
 use crate::grpc::{RedapClient, RedapClientInner};
 use crate::{ApiError, ApiResult, TonicStatusError};
+
+/// Returns a suggested host if the user likely forgot the "api." prefix.
+///
+/// This detects the common mistake of connecting to `xxx.cloud.rerun.io` instead of
+/// `api.xxx.cloud.rerun.io`.
+fn suggest_api_prefix(origin: &Origin) -> Option<String> {
+    let host = origin.format_host();
+    if !host.starts_with("api.") && host.ends_with(".cloud.rerun.io") {
+        Some(format!("api.{host}"))
+    } else {
+        None
+    }
+}
 
 /// This is the type of `ConnectionClient` used throughout the viewer, where the
 /// `ConnectionRegistry` is used.
@@ -39,9 +52,6 @@ pub struct ConnectionRegistry {
     /// Clients are much cheaper to clone than create (since the latter involves establishing an
     /// actual TCP connection), so we keep them around once created.
     clients: HashMap<re_uri::Origin, RedapClient>,
-
-    /// Whether to use credentials stored on the host machine by default.
-    use_stored_credentials: bool,
 }
 
 impl ConnectionRegistry {
@@ -56,8 +66,8 @@ impl ConnectionRegistry {
                 saved_credentials: HashMap::new(),
                 fallback_token: None,
                 clients: HashMap::new(),
-                use_stored_credentials: true,
             })),
+            use_stored_credentials: true,
         }
     }
 
@@ -72,8 +82,8 @@ impl ConnectionRegistry {
                 saved_credentials: HashMap::new(),
                 fallback_token: None,
                 clients: HashMap::new(),
-                use_stored_credentials: false,
             })),
+            use_stored_credentials: false,
         }
     }
 }
@@ -81,29 +91,23 @@ impl ConnectionRegistry {
 /// Possible errors when creating a connection.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientCredentialsError {
-    #[error("error when refreshing credentials\nDetails:{0}")]
+    #[error("error when refreshing credentials\nDetails: {0}")]
     RefreshError(TonicStatusError),
 
     #[error("the credentials are expired")]
     SessionExpired,
 
-    #[error("the server requires an authentication token but none was provided\nDetails:{0}")]
+    #[error("the server requires an authentication token but none was provided\nDetails: {0}")]
     UnauthenticatedMissingToken(TonicStatusError),
 
-    #[error("the server rejected the provided authentication token\nDetails:{0}")]
-    UnauthenticatedBadToken(TonicStatusError),
-}
+    #[error("the server rejected the provided authentication token\nDetails: {status}")]
+    UnauthenticatedBadToken {
+        status: TonicStatusError,
+        credentials: SourcedCredentials,
+    },
 
-impl ClientCredentialsError {
-    #[inline]
-    pub fn is_missing_token(&self) -> bool {
-        matches!(self, Self::UnauthenticatedMissingToken(_))
-    }
-
-    #[inline]
-    pub fn is_wrong_token(&self) -> bool {
-        matches!(self, Self::UnauthenticatedBadToken(_))
-    }
+    #[error("{0}")]
+    HostMismatch(re_auth::HostMismatchError),
 }
 
 /// Registry of all tokens and connections to the redap servers.
@@ -112,15 +116,43 @@ impl ClientCredentialsError {
 #[derive(Clone)]
 pub struct ConnectionRegistryHandle {
     inner: Arc<RwLock<ConnectionRegistry>>,
+
+    /// Whether to use credentials stored on the host machine by default.
+    /// Since some tests run on a single-threaded tokio runtime and this is never updated,
+    /// it lives outside the `RwLock`.
+    use_stored_credentials: bool,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Credentials {
     /// Explicit token
     Token(Jwt),
 
     /// Credentials from local storage
     Stored,
+}
+
+#[derive(Clone, Debug)]
+pub enum CredentialSource {
+    PerOrigin,
+    Fallback,
+    EnvVar,
+}
+
+impl std::fmt::Display for CredentialSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PerOrigin => f.write_str("per-origin"),
+            Self::Fallback => f.write_str("fallback"),
+            Self::EnvVar => f.write_str("env-var"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SourcedCredentials {
+    pub source: CredentialSource,
+    pub credentials: Credentials,
 }
 
 impl ConnectionRegistryHandle {
@@ -155,10 +187,7 @@ impl ConnectionRegistryHandle {
     }
 
     pub fn should_use_stored_credentials(&self) -> bool {
-        wrap_blocking_lock(|| {
-            let inner = self.inner.blocking_read();
-            inner.use_stored_credentials
-        })
+        self.use_stored_credentials
     }
 
     /// Get a client for the given origin, creating one if it doesn't exist yet.
@@ -193,33 +222,39 @@ impl ConnectionRegistryHandle {
             )
         };
 
-        let credentials_to_try = [
-            saved_credentials.clone(),
-            fallback_token.map(Credentials::Token),
-            get_token_from_env().map(Credentials::Token),
+        let mut credentials_to_try = vec![];
+
+        let add_cred = |creds: &mut Vec<SourcedCredentials>, cred: SourcedCredentials| {
+            if !creds.iter().any(|c| c.credentials == cred.credentials) {
+                creds.push(cred);
+            }
+        };
+
+        for cred in [
+            saved_credentials
+                .clone()
+                .map(|credentials| SourcedCredentials {
+                    source: CredentialSource::PerOrigin,
+                    credentials,
+                }),
+            fallback_token.clone().map(|token| SourcedCredentials {
+                source: CredentialSource::Fallback,
+                credentials: Credentials::Token(token),
+            }),
+            get_token_from_env().map(|token| SourcedCredentials {
+                source: CredentialSource::EnvVar,
+                credentials: Credentials::Token(token),
+            }),
         ]
         .into_iter()
         .flatten()
-        .unique();
+        {
+            add_cred(&mut credentials_to_try, cred);
+        }
 
-        let (raw_client, successful_token) =
-            match Self::try_create_raw_client(origin.clone(), credentials_to_try).await {
-                Ok(res) => res,
-                Err(err) => {
-                    // if we had a saved token, it doesn't work, so we forget about it
-                    if err.is_client_credentials_error() {
-                        let mut inner = self.inner.write().await;
+        let (raw_client, successful_credentials) =
+            Self::try_create_raw_client(origin.clone(), credentials_to_try.into_iter()).await?;
 
-                        // make sure that we're not deleting some token that another thread might
-                        // have just set
-                        if inner.saved_credentials.get(&origin) == saved_credentials.as_ref() {
-                            inner.saved_credentials.remove(&origin);
-                        }
-                    }
-
-                    return Err(err);
-                }
-            };
         let client = ConnectionClient::new(raw_client.clone());
 
         // We have a successful client, so we cache it and remember about the successful token.
@@ -232,8 +267,10 @@ impl ConnectionRegistryHandle {
             let mut inner = self.inner.write().await;
             inner.clients.insert(origin.clone(), raw_client.clone());
 
-            if successful_token != saved_credentials {
-                if let Some(successful_token) = successful_token {
+            let successful_credentials = successful_credentials.map(|c| c.credentials);
+
+            if successful_credentials != saved_credentials {
+                if let Some(successful_token) = successful_credentials {
                     inner
                         .saved_credentials
                         .insert(origin.clone(), successful_token);
@@ -251,8 +288,8 @@ impl ConnectionRegistryHandle {
     /// If successful, returns both the client and the working token.
     async fn try_create_raw_client(
         origin: re_uri::Origin,
-        possible_credentials: impl Iterator<Item = Credentials>,
-    ) -> ApiResult<(RedapClient, Option<Credentials>)> {
+        possible_credentials: impl Iterator<Item = SourcedCredentials>,
+    ) -> ApiResult<(RedapClient, Option<SourcedCredentials>)> {
         let mut first_failed_attempt = None;
 
         for credentials in possible_credentials {
@@ -296,14 +333,37 @@ impl ConnectionRegistryHandle {
 
     async fn create_and_validate_raw_client_with_token(
         origin: re_uri::Origin,
-        credentials: Option<Credentials>,
+        credentials: Option<SourcedCredentials>,
     ) -> ApiResult<RedapClient> {
+        // Check the token's allowed hosts before wrapping it in a provider that
+        // would blindly attach it to every outgoing request. If the host
+        // doesn't match, return a credentials error so the caller can skip
+        // this credential and try the next one.
+        let host = origin.host.to_string();
         let provider: Option<Arc<dyn re_auth::credentials::CredentialsProvider + Send + Sync>> =
-            match &credentials {
-                Some(Credentials::Token(token)) => Some(Arc::new(
-                    re_auth::credentials::StaticCredentialsProvider::new(token.clone()),
-                )),
+            match credentials.as_ref().map(|c| &c.credentials) {
+                Some(Credentials::Token(token)) => {
+                    token.for_host(&host).map_err(|err| {
+                        ApiError::credentials_with_source(
+                            ClientCredentialsError::HostMismatch(err),
+                            format!("token not allowed for host '{host}'"),
+                        )
+                    })?;
+                    Some(Arc::new(
+                        re_auth::credentials::StaticCredentialsProvider::new(token.clone()),
+                    ))
+                }
                 Some(Credentials::Stored) => {
+                    // For stored credentials, load the token to check its allowed hosts
+                    // before committing to using it.
+                    if let Ok(Some(c)) = re_auth::oauth::load_credentials() {
+                        c.access_token().jwt().for_host(&host).map_err(|err| {
+                            ApiError::credentials_with_source(
+                                ClientCredentialsError::HostMismatch(err),
+                                format!("stored token not allowed for host '{host}'"),
+                            )
+                        })?;
+                    }
                     Some(Arc::new(re_auth::credentials::CliCredentialsProvider::new()))
                 }
                 None => None,
@@ -313,51 +373,96 @@ impl ConnectionRegistryHandle {
         // so if what we're trying to connect to is not a valid Rerun server, then cut out
         // a layer of noise:
         {
-            let res = match ehttp::fetch_async(ehttp::Request::get(format!(
-                "{}/version",
-                origin.as_url()
-            )))
-            .await
-            {
-                Ok(res) => res,
-                Err(err) => {
-                    return Err(ApiError::connection_simple(format!(
-                        "failed to connect to server '{origin}': {err}"
-                    )));
+            let res = crate::with_retry("http_version_fetch", || async {
+                match ehttp::fetch_async(ehttp::Request::get(format!(
+                    "{}/version",
+                    origin.as_url()
+                )))
+                .await
+                {
+                    Ok(res) => Ok(res),
+                    Err(err) => {
+                        let mut msg = format!("failed to connect to server '{origin}': {err}");
+                        if let Some(suggested) = suggest_api_prefix(&origin) {
+                            msg.push_str(&format!(". Did you mean '{suggested}'?"));
+                        }
+                        Err(ApiError::connection(msg))
+                    }
                 }
-            };
+            })
+            .await?;
+
             if !res.ok {
-                return Err(ApiError::invalid_server(origin));
+                let hint = suggest_api_prefix(&origin).map(|suggested| {
+                    format!(
+                        "Did you mean '{suggested}'? Rerun Cloud endpoints require the 'api.' prefix"
+                    )
+                });
+                return Err(ApiError::invalid_server(origin.clone(), hint.as_deref()));
             }
         }
 
         let mut raw_client = crate::grpc::client(origin.clone(), provider).await?;
 
-        // Call the version endpoint to check that authentication is successful. It's ok to do this
-        // since we're caching the client, so we're not spamming such a request unnecessarily.
-        // TODO(rerun-io/dataplatform#1069): use the `whoami` endpoint instead when it exists.
-        let request_result = raw_client
-            .find_entries(FindEntriesRequest {
-                filter: Some(EntryFilter {
-                    id: None,
-                    name: None,
-                    entry_kind: None,
-                }),
-            })
-            .await;
+        // Call the WhoAmI endpoint to check that authentication is successful. It's ok to do
+        // this since we're caching the client, so we're not spamming such a request unnecessarily.
+        let request_result = raw_client.who_am_i(WhoAmIRequest {}).await;
+
+        // TODO(rerun-io/dataplatform#1069): remove the `FindEntries` fallback once all servers
+        // have been updated to support the `WhoAmI` endpoint.
+        let request_result = match request_result {
+            Err(err) if err.code() == Code::Unimplemented => {
+                re_log::debug_once!(
+                    "Server at {origin} does not support WhoAmI, falling back to FindEntries"
+                );
+                raw_client
+                    .find_entries(FindEntriesRequest {
+                        filter: Some(EntryFilter {
+                            id: None,
+                            name: None,
+                            entry_kind: None,
+                        }),
+                    })
+                    .await
+                    .map(drop)
+            }
+            Ok(resp) => {
+                let re_protos::cloud::v1alpha1::WhoAmIResponse {
+                    user_id,
+                    can_read,
+                    can_write,
+                } = resp.into_inner();
+                let user_id = user_id.as_deref().unwrap_or("<anonymous>");
+                re_log::debug_once!(
+                    "Connected to {origin}: {user_id}, can_read={can_read}, can_write={can_write}",
+                );
+                if !can_read {
+                    return Err(ApiError::permission_denied(
+                        "the server reports that you do not have read access",
+                    ));
+                }
+                Ok(())
+            }
+            Err(err) => Err(err),
+        };
 
         match request_result {
+            Ok(_) => Ok(raw_client),
+
             // catch unauthenticated errors and forget the token if they happen
             Err(err) if err.code() == Code::Unauthenticated => {
-                if credentials.is_none() {
-                    Err(ApiError::credentials(
-                        ClientCredentialsError::UnauthenticatedMissingToken(err.into()),
-                        "verifying connection to server",
+                if let Some(credentials) = credentials {
+                    Err(ApiError::credentials_with_source(
+                        ClientCredentialsError::UnauthenticatedBadToken {
+                            status: err.into(),
+                            credentials,
+                        },
+                        "unauthenticated: bad token",
                     ))
                 } else {
-                    Err(ApiError::credentials(
-                        ClientCredentialsError::UnauthenticatedBadToken(err.into()),
-                        "verifying connection to server",
+                    Err(ApiError::credentials_with_source(
+                        ClientCredentialsError::UnauthenticatedMissingToken(err.into()),
+                        "unauthenticated: missing token",
                     ))
                 }
             }
@@ -367,21 +472,23 @@ impl ConnectionRegistryHandle {
                     s.downcast_ref::<re_auth::credentials::CredentialsProviderError>()
                 }) {
                     match cred_error {
-                        CredentialsProviderError::SessionExpired => Err(ApiError::credentials(
-                            ClientCredentialsError::SessionExpired,
-                            "session expired",
-                        )),
-                        CredentialsProviderError::Custom(_) => Err(ApiError::credentials(
-                            ClientCredentialsError::RefreshError(err.into()),
-                            "refreshing credentials",
-                        )),
+                        CredentialsProviderError::SessionExpired => {
+                            Err(ApiError::credentials_with_source(
+                                ClientCredentialsError::SessionExpired,
+                                "session expired",
+                            ))
+                        }
+                        CredentialsProviderError::Custom(_) => {
+                            Err(ApiError::credentials_with_source(
+                                ClientCredentialsError::RefreshError(err.into()),
+                                "refreshing credentials",
+                            ))
+                        }
                     }
                 } else {
                     Err(ApiError::tonic(err, "verifying connection to server"))
                 }
             }
-
-            Ok(_) => Ok(raw_client),
         }
     }
 

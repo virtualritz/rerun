@@ -1,11 +1,12 @@
 use re_log_types::EntityPath;
 use re_renderer::PickingLayerInstanceId;
 use re_renderer::renderer::PointCloudDrawDataError;
+use re_sdk_types::Archetype as _;
 use re_sdk_types::archetypes::GeoPoints;
-use re_sdk_types::components::Radius;
+use re_sdk_types::components::{LatLon, Radius};
 use re_view::{
-    AnnotationSceneContext, DataResultQuery as _, RangeResultsExt as _, process_annotation_slices,
-    process_color_slice,
+    AnnotationSceneContext, DataResultQuery as _, VisualizerInstructionQueryResults,
+    process_annotation_slices, process_color_slice,
 };
 use re_viewer_context::{
     IdentifiedViewSystem, ViewContext, ViewContextCollection, ViewHighlights, ViewQuery,
@@ -34,8 +35,14 @@ impl IdentifiedViewSystem for GeoPointsVisualizer {
 }
 
 impl VisualizerSystem for GeoPointsVisualizer {
-    fn visualizer_query_info(&self) -> VisualizerQueryInfo {
-        VisualizerQueryInfo::from_archetype::<GeoPoints>()
+    fn visualizer_query_info(
+        &self,
+        _app_options: &re_viewer_context::AppOptions,
+    ) -> VisualizerQueryInfo {
+        VisualizerQueryInfo::single_required_component::<LatLon>(
+            &GeoPoints::descriptor_positions(),
+            &GeoPoints::all_components(),
+        )
     }
 
     fn execute(
@@ -44,30 +51,32 @@ impl VisualizerSystem for GeoPointsVisualizer {
         view_query: &ViewQuery<'_>,
         context_systems: &ViewContextCollection,
     ) -> Result<VisualizerExecutionOutput, ViewSystemExecutionError> {
-        let annotation_scene_context = context_systems.get::<AnnotationSceneContext>()?;
+        let output = VisualizerExecutionOutput::default();
+        let annotation_scene_context = context_systems.get::<AnnotationSceneContext>(&output)?;
         let latest_at_query = view_query.latest_at_query();
 
-        for data_result in view_query.iter_visible_data_results(Self::identifier()) {
-            let results = data_result.query_archetype_with_history::<GeoPoints>(ctx, view_query);
+        for (data_result, instruction) in
+            view_query.iter_visualizer_instruction_for(Self::identifier())
+        {
+            let results =
+                data_result.query_archetype_with_history::<GeoPoints>(ctx, view_query, instruction);
+            let results = VisualizerInstructionQueryResults::new(instruction, &results, &output);
+
             let annotation_context = annotation_scene_context.0.find(&data_result.entity_path);
 
             let mut batch_data = GeoPointBatch::default();
 
             // gather all relevant chunks
-            let timeline = view_query.timeline;
-            let all_positions =
-                results.iter_as(timeline, GeoPoints::descriptor_positions().component);
-            let all_colors = results.iter_as(timeline, GeoPoints::descriptor_colors().component);
-            let all_radii = results.iter_as(timeline, GeoPoints::descriptor_radii().component);
-            let all_class_ids =
-                results.iter_as(timeline, GeoPoints::descriptor_class_ids().component);
+            let all_positions = results.iter_required(GeoPoints::descriptor_positions().component);
+            let all_colors = results.iter_optional(GeoPoints::descriptor_colors().component);
+            let all_radii = results.iter_optional(GeoPoints::descriptor_radii().component);
+            let all_class_ids = results.iter_optional(GeoPoints::descriptor_class_ids().component);
 
             // fallback component values
-            let query_context = ctx.query_context(data_result, &latest_at_query);
-            let fallback_radius: Radius = typed_fallback_for(
-                &ctx.query_context(data_result, &latest_at_query),
-                GeoPoints::descriptor_radii().component,
-            );
+            let query_context =
+                ctx.query_context(data_result, latest_at_query.clone(), instruction.id);
+            let fallback_radius: Radius =
+                typed_fallback_for(&query_context, GeoPoints::descriptor_radii().component);
 
             // iterate over each chunk and find all relevant component slices
             for (_index, positions, colors, radii, class_ids) in re_query::range_zip_1x3(
@@ -123,11 +132,7 @@ impl VisualizerSystem for GeoPointsVisualizer {
                 .push((data_result.entity_path.clone(), batch_data));
         }
 
-        Ok(VisualizerExecutionOutput::default())
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+        Ok(output)
     }
 }
 

@@ -38,6 +38,7 @@ fn colormap_preview_ui(
             data: data.into(),
             format: wgpu::TextureFormat::R16Float.into(),
             width_height: [width, height],
+            alpha_channel_usage: re_renderer::AlphaChannelUsage::Opaque,
         }
     })
     .map_err(|err| anyhow::anyhow!("Failed to create horizontal gradient texture: {err}"))?;
@@ -97,7 +98,7 @@ fn colormap_variant_ui(
 }
 
 fn colormap_category_ui(
-    ctx: &crate::ViewerContext<'_>,
+    ctx: &crate::StoreViewContext<'_>,
     ui: &mut egui::Ui,
     category: ColormapCategory,
     selected: &mut re_sdk_types::components::Colormap,
@@ -129,7 +130,7 @@ fn colormap_category_ui(
 }
 
 pub fn colormap_edit_or_view_ui(
-    ctx: &crate::ViewerContext<'_>,
+    ctx: &crate::StoreViewContext<'_>,
     ui: &mut egui::Ui,
     map: &mut MaybeMutRef<'_, re_sdk_types::components::Colormap>,
 ) -> egui::Response {

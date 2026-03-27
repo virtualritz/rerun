@@ -1,20 +1,31 @@
-use std::collections::HashMap;
-
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow::error::ArrowError;
 use re_byte_size::SizeBytes as _;
 use re_chunk_store::ChunkStoreHandle;
+use re_log_types::{AbsoluteTimeRange, Timeline};
+use std::collections::{BTreeMap, HashMap};
+
+use super::StoreSlotId;
 
 #[derive(Clone)]
 pub struct Layer {
+    store_slot_id: StoreSlotId,
     store_handle: ChunkStoreHandle,
     registration_time: jiff::Timestamp,
 }
 
 impl Layer {
-    pub fn new(store_handle: ChunkStoreHandle) -> Self {
-        store_handle.into()
+    pub fn new(store_slot_id: StoreSlotId, store_handle: ChunkStoreHandle) -> Self {
+        Self {
+            store_slot_id,
+            store_handle,
+            registration_time: jiff::Timestamp::now(),
+        }
+    }
+
+    pub fn store_slot_id(&self) -> StoreSlotId {
+        self.store_slot_id
     }
 
     pub fn store_handle(&self) -> &ChunkStoreHandle {
@@ -37,24 +48,29 @@ impl Layer {
     }
 
     pub fn num_chunks(&self) -> u64 {
-        self.store_handle.read().num_chunks() as u64
+        self.store_handle.read().num_physical_chunks() as u64
     }
 
     pub fn size_bytes(&self) -> u64 {
         self.store_handle
             .read()
-            .iter_chunks()
+            .iter_physical_chunks()
             .map(|chunk| chunk.heap_size_bytes())
             .sum()
     }
 
     pub fn schema(&self) -> Schema {
-        let fields = self.store_handle.read().schema().arrow_fields();
+        let fields = self
+            .store_handle
+            .read()
+            .schema()
+            .chunk_column_descriptors()
+            .arrow_fields();
         Schema::new_with_metadata(fields, HashMap::default())
     }
 
     pub fn schema_sha256(&self) -> Result<[u8; 32], ArrowError> {
-        re_log_encoding::RrdManifest::compute_sorbet_schema_sha256(&self.schema())
+        re_log_encoding::RawRrdManifest::compute_sorbet_schema_sha256(&self.schema())
     }
 
     pub fn compute_properties(
@@ -62,13 +78,19 @@ impl Layer {
     ) -> Result<RecordBatch, re_chunk_store::ExtractPropertiesError> {
         self.store_handle.read().extract_properties()
     }
-}
 
-impl From<ChunkStoreHandle> for Layer {
-    fn from(value: ChunkStoreHandle) -> Self {
-        Self {
-            store_handle: value,
-            registration_time: jiff::Timestamp::now(),
+    pub fn index_ranges(&self) -> BTreeMap<Timeline, AbsoluteTimeRange> {
+        let mut ranges = BTreeMap::new();
+        for chunk in self.store_handle.read().iter_physical_chunks() {
+            for time_col in chunk.timelines().values() {
+                let timeline = time_col.timeline().to_owned();
+                let range = time_col.time_range();
+
+                let entry = ranges.entry(timeline).or_insert(range);
+                *entry = entry.union(range);
+            }
         }
+
+        ranges
     }
 }

@@ -19,6 +19,7 @@
 
 pub mod arrow_msg;
 mod entry_id;
+mod entry_name;
 pub mod example_components;
 pub mod hash;
 mod index;
@@ -40,9 +41,11 @@ pub use re_types_core::TimelineName;
 
 pub use self::arrow_msg::{ArrowMsg, ArrowRecordBatchReleaseCallback};
 pub use self::entry_id::{EntryId, EntryIdOrName};
+pub use self::entry_name::{EntryName, InvalidEntryNameError};
 pub use self::index::{
     AbsoluteTimeRange, AbsoluteTimeRangeF, Duration, NonMinI64, TimeCell, TimeInt, TimePoint,
-    TimeReal, TimeType, Timeline, Timestamp, TimestampFormat, TimestampFormatKind, TryFromIntError,
+    TimeReal, TimeType, Timeline, TimelinePoint, Timestamp, TimestampFormat, TimestampFormatKind,
+    TryFromIntError,
 };
 pub use self::instance::Instance;
 pub use self::path::*;
@@ -269,8 +272,12 @@ impl StoreId {
 
 // ----------------------------------------------------------------------------
 
-/// The user-chosen name of the application doing the logging. In the context of a remote recording,
-/// this is the dataset entry id.
+/// The user-chosen name of the application doing the logging.
+///
+/// Application IDs are really schema names.
+/// Every recording using the same schema (approximately!) could share the same blueprint.
+///
+/// In the context of a remote recording, this is the dataset entry id.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct ApplicationId(Arc<String>);
@@ -867,6 +874,15 @@ pub struct TableMsg {
     pub data: ArrowRecordBatch,
 }
 
+impl re_byte_size::SizeBytes for TableMsg {
+    #[inline]
+    fn heap_size_bytes(&self) -> u64 {
+        let Self { id: _, data } = self;
+
+        data.heap_size_bytes()
+    }
+}
+
 impl TableMsg {
     pub fn insert_arrow_record_batch_metadata(&mut self, key: String, value: String) {
         self.data.schema_metadata_mut().insert(key, value);
@@ -890,6 +906,20 @@ pub fn build_frame_nr(frame_nr: impl TryInto<TimeInt>) -> (Timeline, TimeInt) {
     (
         Timeline::new("frame_nr", TimeType::Sequence),
         TimeInt::saturated_temporal(frame_nr),
+    )
+}
+
+#[inline]
+pub fn build_index_value(value: impl TryInto<TimeInt>, time_type: TimeType) -> (Timeline, TimeInt) {
+    let timeline_name = match time_type {
+        TimeType::Sequence => "frame_nr",
+        TimeType::DurationNs => "duration",
+        TimeType::TimestampNs => "timestamp",
+    };
+
+    (
+        Timeline::new(timeline_name, time_type),
+        TimeInt::saturated_temporal(value),
     )
 }
 

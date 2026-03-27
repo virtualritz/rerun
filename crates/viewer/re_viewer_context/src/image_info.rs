@@ -15,6 +15,8 @@ pub fn resolution_of_image_at(
     query: &re_chunk_store::LatestAtQuery,
     entity_path: &re_log_types::EntityPath,
 ) -> Option<components::Resolution> {
+    re_tracing::profile_function!();
+
     let entity_db = ctx.recording();
     let storage_engine = entity_db.storage_engine();
 
@@ -22,7 +24,7 @@ pub fn resolution_of_image_at(
     // TODO(andreas): can we do this more efficiently?
     // TODO(andreas): doesn't take blueprint into account!
     let all_components = storage_engine
-        .store()
+        .schema()
         .all_components_for_entity(entity_path)?;
     let image_format_descr = all_components
         .get(&archetypes::Image::descriptor_format().component)
@@ -59,8 +61,7 @@ pub fn resolution_of_image_at(
 
         let image = ctx
             .store_context
-            .caches
-            .entry(|c: &mut crate::ImageDecodeCache| {
+            .memoizer(|c: &mut crate::ImageDecodeCache| {
                 c.entry_encoded_color(
                     row_id,
                     archetypes::EncodedImage::descriptor_blob().component,
@@ -92,8 +93,7 @@ pub fn resolution_of_image_at(
 
         let depth_image = ctx
             .store_context
-            .caches
-            .entry(|c: &mut crate::ImageDecodeCache| {
+            .memoizer(|c: &mut crate::ImageDecodeCache| {
                 c.entry_encoded_depth(
                     row_id,
                     archetypes::EncodedDepthImage::descriptor_blob().component,
@@ -262,7 +262,7 @@ impl ImageInfo {
         } else {
             let num_channels = self.format.color_model().num_channels();
 
-            debug_assert!(channel < num_channels as u32);
+            re_log::debug_assert!(channel < num_channels as u32);
             if num_channels as u32 <= channel {
                 return None;
             }
@@ -309,12 +309,10 @@ impl ImageInfo {
             // But it can happen, e.g. when logging a `1x1xu8` image followed by a `1x1xf32` image
             // to the same entity path, and they are put in the same chunk.
 
-            if cfg!(debug_assertions) {
-                re_log::warn_once!(
-                    "The image buffer was not aligned to the element type {}",
-                    std::any::type_name::<T>()
-                );
-            }
+            re_log::debug_warn_once!(
+                "The image buffer was not aligned to the element type {}",
+                std::any::type_name::<T>()
+            );
             re_tracing::profile_scope!("copy_image_buffer");
 
             let mut dest = vec![T::zeroed(); num_elements];

@@ -9,7 +9,7 @@ __all__ = ["TimeSeriesView"]
 
 
 from .. import archetypes as blueprint_archetypes, components as blueprint_components
-from ..api import View, ViewContentsLike
+from ..api import View, ViewContentsLike, VisualizerLike
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
@@ -78,6 +78,13 @@ class TimeSeriesView(View):
                 ),
                 rrb.TimeSeriesView(
                     origin="/trig",
+                    axis_x=rrb.TimeAxis(
+                        view_range=rr.TimeRange(
+                            start=rrb.TimeRangeBoundary.cursor_relative(seconds=-100),
+                            end=rrb.TimeRangeBoundary.cursor_relative(seconds=100),
+                        ),
+                        zoom_lock=True,
+                    ),
                     # Configure the legend.
                     plot_legend=rrb.PlotLegend(visible=True),
                     background=rrb.archetypes.PlotBackground(color=[128, 128, 128], show_grid=False),
@@ -109,11 +116,7 @@ class TimeSeriesView(View):
         name: Utf8Like | None = None,
         visible: datatypes.BoolLike | None = None,
         defaults: Iterable[AsComponents | Iterable[DescribedComponentBatch]] | None = None,
-        overrides: Mapping[
-            EntityPathLike,
-            AsComponents | Iterable[DescribedComponentBatch | AsComponents | Iterable[DescribedComponentBatch]],
-        ]
-        | None = None,
+        overrides: Mapping[EntityPathLike, VisualizerLike | Iterable[VisualizerLike]] | None = None,
         axis_x: blueprint_archetypes.TimeAxis | None = None,
         axis_y: blueprint_archetypes.ScalarAxis | None = None,
         plot_legend: blueprint_archetypes.PlotLegend | blueprint_components.Corner2D | None = None,
@@ -149,10 +152,12 @@ class TimeSeriesView(View):
             Note that an archetype's required components typically don't have any effect.
             It is recommended to use the archetype's `from_fields` method instead and only specify the fields that you need.
         overrides:
-            Dictionary of overrides to apply to the view. The key is the path to the entity where the override
-            should be applied. The value is a list of archetypes or (described) component batches to apply to the entity.
+            Dictionary of visualizer overrides to apply to the view. The key is the path to the entity where the override
+            should be applied. The value is a list of visualizers which should be enabled for that entity, or a single visualizer.
 
-            It is recommended to use the archetype's `from_fields` method instead and only specify the fields that you need.
+            Each visualizer can be configured with arbitrary overrides and mappings.
+
+            For any entity mentioned in this map, visualizers are no longer added automatically based on the entity's components.
 
             Important note: the path must be a fully qualified entity path starting at the root. The override paths
             do not yet support `$origin` relative paths or glob expressions.

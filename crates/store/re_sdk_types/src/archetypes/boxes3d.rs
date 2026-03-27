@@ -398,6 +398,13 @@ impl ::re_types_core::AsComponents for Boxes3D {
 
 impl ::re_types_core::ArchetypeReflectionMarker for Boxes3D {}
 
+impl crate::VisualizableArchetype for Boxes3D {
+    #[inline]
+    fn visualizer(&self) -> crate::Visualizer {
+        crate::Visualizer::new("Boxes3D").with_overrides(self)
+    }
+}
+
 impl Boxes3D {
     /// Create a new `Boxes3D`.
     #[inline]

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use re_mutex::RwLock;
 
 use crate::allocator::{GpuReadbackIdentifier, create_and_fill_uniform_buffer};
 use crate::context::RenderContext;
@@ -13,7 +13,7 @@ use crate::queueable_draw_data::QueueableDrawData;
 use crate::renderer::{CompositorDrawData, DebugOverlayDrawData, DrawableCollectionViewInfo};
 use crate::transform::RectTransform;
 use crate::wgpu_resources::{GpuBindGroup, GpuTexture, PoolError, TextureDesc};
-use crate::{DebugLabel, DrawPhaseManager, MsaaMode, RectInt, RenderConfig, Rgba};
+use crate::{DrawPhaseManager, Label, MsaaMode, RectInt, RenderConfig, Rgba};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ViewBuilderError {
@@ -37,7 +37,7 @@ pub struct ViewBuilder {
 }
 
 struct ViewTargetSetup {
-    name: DebugLabel,
+    name: Label,
 
     camera_position: glam::Vec3A,
 
@@ -198,7 +198,7 @@ pub enum RenderMode {
 /// Basic configuration for a target view.
 #[derive(Debug)]
 pub struct TargetConfiguration {
-    pub name: DebugLabel,
+    pub name: Label,
 
     /// Aim for beauty or determinism?
     pub render_mode: RenderMode,
@@ -380,8 +380,8 @@ impl ViewBuilder {
         format: Self::MAIN_TARGET_DEPTH_FORMAT,
         // It's important to set the depth test to GreaterEqual, not to Greater.
         // This way, we ensure that objects that are drawn later with the exact same depth value, can overwrite earlier ones!
-        depth_compare: wgpu::CompareFunction::GreaterEqual,
-        depth_write_enabled: true,
+        depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+        depth_write_enabled: Some(true),
         stencil: wgpu::StencilState {
             front: wgpu::StencilFaceState::IGNORE,
             back: wgpu::StencilFaceState::IGNORE,
@@ -398,7 +398,7 @@ impl ViewBuilder {
     /// Default depth state for disabled depth write & read.
     pub const MAIN_TARGET_DEFAULT_DEPTH_STATE_NO_WRITE: wgpu::DepthStencilState =
         wgpu::DepthStencilState {
-            depth_write_enabled: false,
+            depth_write_enabled: Some(false),
             ..Self::MAIN_TARGET_DEFAULT_DEPTH_STATE
         };
 
@@ -551,7 +551,11 @@ impl ViewBuilder {
                 RenderMode::Beautiful => 0,
                 RenderMode::Deterministic => 1,
             },
-            padding: Default::default(),
+            framebuffer_resolution: glam::vec2(
+                config.resolution_in_pixel[0] as _,
+                config.resolution_in_pixel[1] as _,
+            )
+            .into(),
         };
         let frame_uniform_buffer = create_and_fill_uniform_buffer(
             ctx,
@@ -718,7 +722,7 @@ impl ViewBuilder {
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: setup.name.clone().get(),
+                label: Some(setup.name.clone().get()),
             });
 
         {
@@ -727,7 +731,7 @@ impl ViewBuilder {
             let needs_msaa_resolve = ctx.render_config().msaa_mode != MsaaMode::Off;
 
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: DebugLabel::from(format!("{} - main pass", setup.name)).get(),
+                label: Label::from(format!("{} - main pass", setup.name)).wgpu_label(),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &setup.main_target_msaa.default_view,
                     depth_slice: None,
@@ -760,6 +764,7 @@ impl ViewBuilder {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             pass.set_bind_group(0, &setup.bind_group_0, &[]);

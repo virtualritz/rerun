@@ -1,6 +1,6 @@
 use egui::WidgetText;
 use re_chunk::EntityPath;
-use re_data_ui::item_ui::{guess_instance_path_icon, guess_query_and_db_for_selected_entity};
+use re_data_ui::item_ui::guess_instance_path_icon;
 use re_entity_db::InstancePath;
 use re_log_types::{ComponentPath, TableId};
 use re_sdk_types::archetypes::RecordingInfo;
@@ -9,7 +9,10 @@ use re_ui::syntax_highlighting::{
     InstanceInBrackets as InstanceWithBrackets, SyntaxHighlightedBuilder,
 };
 use re_ui::{SyntaxHighlighting as _, icons};
-use re_viewer_context::{ContainerId, Contents, Item, ViewId, ViewerContext, contents_name_style};
+use re_viewer_context::{
+    ContainerId, Contents, DataResultInteractionAddress, Item, ViewId, ViewerContext,
+    contents_name_style,
+};
 use re_viewport_blueprint::ViewportBlueprint;
 
 pub fn is_component_static(ctx: &ViewerContext<'_>, component_path: &ComponentPath) -> bool {
@@ -17,8 +20,9 @@ pub fn is_component_static(ctx: &ViewerContext<'_>, component_path: &ComponentPa
         entity_path,
         component,
     } = component_path;
-    let (_query, db) = guess_query_and_db_for_selected_entity(ctx, entity_path);
-    db.storage_engine()
+    ctx.guess_store_view_context_for_entity(entity_path)
+        .db
+        .storage_engine()
         .store()
         .entity_has_static_component(entity_path, *component)
 }
@@ -58,7 +62,11 @@ impl ItemTitle {
 
             Item::View(view_id) => Self::from_view_id(ctx, viewport, view_id),
 
-            Item::DataResult(view_id, instance_path) => {
+            Item::DataResult(DataResultInteractionAddress {
+                view_id,
+                instance_path,
+                visualizer: _, // Can't distinguish visualizer here since we don't name them.
+            }) => {
                 let item_title = Self::from_instance_path(ctx, style, instance_path);
                 if let Some(view) = viewport.view(view_id) {
                     item_title.with_tooltip(
@@ -66,7 +74,7 @@ impl ItemTitle {
                             .with(instance_path)
                             .with_body(" in view ")
                             .with(&view.display_name_or_default())
-                            .into_widget_text(&ctx.egui_ctx().style()),
+                            .into_widget_text(&ctx.egui_ctx().global_style()),
                     )
                 } else {
                     item_title
@@ -86,7 +94,7 @@ impl ItemTitle {
     }
 
     pub fn from_store_id(ctx: &ViewerContext<'_>, store_id: &re_log_types::StoreId) -> Self {
-        let title = if let Some(entity_db) = ctx.storage_context.bundle.get(store_id) {
+        let title = if let Some(entity_db) = ctx.store_bundle().get(store_id) {
             if let Some(started) = entity_db.recording_info_property::<Timestamp>(
                 RecordingInfo::descriptor_start_time().component,
             ) {

@@ -16,25 +16,32 @@ mod hot_reload_design_tokens;
 mod icon_text;
 pub mod icons;
 pub mod list_item;
+pub mod loading_indicator;
 mod markdown_utils;
 pub mod menu;
 pub mod modal;
 pub mod notifications;
+pub mod plot_legend;
 mod relative_time_range;
 mod section_collapsing_header;
 pub mod syntax_highlighting;
+pub mod text_edit;
 pub mod time;
 mod time_drag_value;
 mod ui_ext;
 mod ui_layout;
 
 mod button;
+mod combo_item;
+pub mod re_form;
 #[cfg(feature = "testing")]
 pub mod testing;
 
 use egui::NumExt as _;
+use re_log::debug_assert;
 
 pub use self::button::*;
+pub use self::combo_item::*;
 pub use self::command::{UICommand, UICommandSender};
 pub use self::command_palette::{CommandPalette, CommandPaletteAction, CommandPaletteUrl};
 pub use self::context_ext::ContextExt;

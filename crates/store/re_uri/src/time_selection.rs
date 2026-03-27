@@ -9,6 +9,26 @@ pub struct TimeSelection {
     pub range: AbsoluteTimeRange,
 }
 
+impl std::cmp::PartialOrd for TimeSelection {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::cmp::Ord for TimeSelection {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let Self { timeline, range } = self;
+
+        timeline
+            .cmp(&other.timeline)
+            .then_with(|| range.min().cmp(&other.range.min()))
+            .then_with(|| range.max().cmp(&other.range.max()))
+    }
+}
+
+// We shouldn't implement display for this as it's too ambiguous, instead create specific functions.
+static_assertions::assert_not_impl_any!(TimeSelection: std::fmt::Display);
+
 impl TimeSelection {
     pub fn format(&self, timestamp_format: re_log_types::TimestampFormat) -> String {
         format!(
@@ -16,6 +36,21 @@ impl TimeSelection {
             TimeCell::new(self.timeline.typ(), self.range.min).format_compact(timestamp_format),
             TimeCell::new(self.timeline.typ(), self.range.max).format_compact(timestamp_format),
         )
+    }
+
+    /// Special format which avoids forbidden & special characters in a url.
+    pub fn format_url(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { timeline, range } = self;
+
+        let min = TimeCell::new(timeline.typ(), range.min());
+        let max = TimeCell::new(timeline.typ(), range.max());
+
+        let name = timeline.name();
+        write!(f, "{name}@")?;
+
+        min.format_url(f)?;
+        write!(f, "..")?;
+        max.format_url(f)
     }
 }
 
@@ -28,19 +63,6 @@ impl From<TimeSelection> for AbsoluteTimeRangeF {
 impl From<TimeSelection> for AbsoluteTimeRange {
     fn from(range: TimeSelection) -> Self {
         range.range
-    }
-}
-
-impl std::fmt::Display for TimeSelection {
-    /// Used for formatting time ranges in URLs
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self { timeline, range } = self;
-
-        let min = TimeCell::new(timeline.typ(), range.min());
-        let max = TimeCell::new(timeline.typ(), range.max());
-
-        let name = timeline.name();
-        write!(f, "{name}@{min}..{max}")
     }
 }
 
@@ -131,10 +153,18 @@ mod tests {
             ),
         ];
 
+        struct UrlFormat(TimeSelection);
+
+        impl std::fmt::Display for UrlFormat {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.format_url(f)
+            }
+        }
+
         for (string, selection) in test_cases {
             assert_eq!(TimeSelection::from_str(string), Ok(selection));
             assert_eq!(
-                TimeSelection::from_str(&selection.to_string()).unwrap(),
+                TimeSelection::from_str(&UrlFormat(selection).to_string()).unwrap(),
                 selection
             );
         }

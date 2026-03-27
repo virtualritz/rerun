@@ -63,14 +63,6 @@ impl SorbetBatch {
         &self.schema
     }
 
-    /// The heap size of this batch in bytes, if known.
-    #[inline]
-    pub fn heap_size_bytes(&self) -> Option<u64> {
-        // NOTE: This is *not* the size of the schema, it's the value carried in the
-        // `rerun:heap_size_bytes` key of the header metadata.
-        self.schema.heap_size_bytes
-    }
-
     #[inline]
     pub fn fields(&self) -> &ArrowFields {
         &self.schema_ref().fields
@@ -190,7 +182,7 @@ impl SorbetBatch {
             batch.columns()
         )
         .map(|(old_field, mut new_field, column)| {
-            debug_assert_eq!(new_field.data_type(), column.data_type());
+            re_log::debug_assert_eq!(new_field.data_type(), column.data_type());
 
             let mut metadata = old_field.metadata().clone();
             metadata.extend(new_field.metadata().clone()); // overwrite old with new

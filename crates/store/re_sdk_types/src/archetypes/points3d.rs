@@ -449,6 +449,13 @@ impl ::re_types_core::AsComponents for Points3D {
 
 impl ::re_types_core::ArchetypeReflectionMarker for Points3D {}
 
+impl crate::VisualizableArchetype for Points3D {
+    #[inline]
+    fn visualizer(&self) -> crate::Visualizer {
+        crate::Visualizer::new("Points3D").with_overrides(self)
+    }
+}
+
 impl Points3D {
     /// Create a new `Points3D`.
     #[inline]

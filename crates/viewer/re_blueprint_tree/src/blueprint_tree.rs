@@ -8,10 +8,10 @@ use re_ui::filter_widget::format_matching_text;
 use re_ui::list_item::ListItemContentButtonsExt as _;
 use re_ui::{ContextExt as _, DesignTokens, UiExt as _, filter_widget, list_item};
 use re_viewer_context::{
-    CollapseScope, ContainerId, Contents, DragAndDropFeedback, DragAndDropPayload, HoverHighlight,
-    Item, ItemCollection, ItemContext, PerVisualizer, SystemCommand, SystemCommandSender as _,
-    ViewId, ViewStates, ViewerContext, VisitorControlFlow, VisualizerExecutionErrorState,
-    contents_name_style, icon_for_container_kind,
+    CollapseScope, ContainerId, Contents, DataResultInteractionAddress, DragAndDropFeedback,
+    DragAndDropPayload, HoverHighlight, Item, ItemCollection, ItemContext, SystemCommand,
+    SystemCommandSender as _, ViewId, ViewStates, ViewerContext, VisitorControlFlow,
+    VisualizerReportSeverity, VisualizerViewReport, contents_name_style, icon_for_container_kind,
 };
 use re_viewport_blueprint::ViewportBlueprint;
 use re_viewport_blueprint::ui::show_add_view_or_container_modal;
@@ -143,9 +143,10 @@ impl BlueprintTree {
             .id_salt("blueprint_tree_scroll_area")
             .auto_shrink([true, false])
             .show(ui, |ui| {
+                re_tracing::profile_scope!("blueprint_tree_scroll_area");
                 ui.panel_content(|ui| {
                     self.blueprint_tree_scroll_to_item =
-                        ctx.focused_item.as_ref().and_then(|item| {
+                        ctx.focused_item().as_ref().and_then(|item| {
                             self.handle_focused_item(ctx, viewport_blueprint, ui, item)
                         });
 
@@ -199,6 +200,8 @@ impl BlueprintTree {
         container_data: &ContainerData,
         view_states: &ViewStates,
     ) {
+        re_tracing::profile_function!();
+
         let item = Item::Container(container_data.id);
 
         // It's possible that the root becomes technically collapsed (e.g. context menu or arrow
@@ -302,7 +305,7 @@ impl BlueprintTree {
                     ui,
                     view_data,
                     parent_visible,
-                    view_states.visualizer_errors(view_data.id),
+                    view_states.per_visualizer_type_reports(ctx.store_id(), view_data.id),
                 );
             }
         }
@@ -319,6 +322,8 @@ impl BlueprintTree {
         parent_visible: bool,
         view_states: &ViewStates,
     ) {
+        re_tracing::profile_function!();
+
         let item = Item::Container(container_data.id);
         let content = Contents::Container(container_data.id);
 
@@ -403,8 +408,10 @@ impl BlueprintTree {
         ui: &mut egui::Ui,
         view_data: &ViewData,
         container_visible: bool,
-        errors: Option<&PerVisualizer<VisualizerExecutionErrorState>>,
+        errors: Option<&VisualizerViewReport>,
     ) {
+        re_tracing::profile_function!();
+
         let mut visible = view_data.visible;
         let view_visible = visible && container_visible;
         let item = Item::View(view_data.id);
@@ -416,10 +423,7 @@ impl BlueprintTree {
         let is_item_hovered =
             ctx.selection_state().highlight_for_ui_element(&item) == HoverHighlight::Hovered;
 
-        let has_error =
-            errors.is_some_and(|errors| errors.values().any(|error| error.is_overall()));
-
-        let item_content = if has_error {
+        let item_content = if errors.is_some_and(|errors| !errors.is_empty()) {
             list_item::LabelContent::new(
                 egui::RichText::new(view_data.name.as_ref()).color(ui.visuals().error_fg_color),
             )
@@ -527,12 +531,12 @@ impl BlueprintTree {
         ui: &mut egui::Ui,
         data_result_data: &DataResultData,
         view_visible: bool,
-        errors: Option<&PerVisualizer<VisualizerExecutionErrorState>>,
+        visualizer_reports: Option<&VisualizerViewReport>,
     ) {
-        let item = Item::DataResult(
+        let item = Item::DataResult(DataResultInteractionAddress::from_entity_path(
             data_result_data.view_id,
-            data_result_data.entity_path.clone().into(),
-        );
+            data_result_data.entity_path.clone(),
+        ));
 
         let item_content = match data_result_data.kind {
             DataResultKind::EmptyOriginPlaceholder | DataResultKind::EntityPart => {
@@ -541,20 +545,34 @@ impl BlueprintTree {
                     DataResultKind::EmptyOriginPlaceholder
                 );
 
-                let has_error = errors.is_some_and(|errors| {
-                    errors.values().any(|err| {
-                        err.error_string_for(&data_result_data.entity_path)
-                            .is_some()
-                    })
-                });
+                let highest_report_severity: Option<VisualizerReportSeverity> = visualizer_reports
+                    .and_then(|visualizer_reports| {
+                        data_result_data
+                            .visualizer_instruction_ids
+                            .iter()
+                            .filter_map(|instruction_id| {
+                                visualizer_reports
+                                    .values()
+                                    .filter_map(|err| err.highest_severity_for(instruction_id))
+                                    .max()
+                            })
+                            .max()
+                    });
+
+                let format_color = match highest_report_severity {
+                    Some(
+                        VisualizerReportSeverity::Error
+                        | VisualizerReportSeverity::OverallVisualizerError,
+                    ) => Some(ui.visuals().error_fg_color),
+                    Some(VisualizerReportSeverity::Warning) => Some(ui.visuals().warn_fg_color),
+                    None => is_empty_origin_placeholder.then(|| ui.visuals().warn_fg_color),
+                };
 
                 let item_content = list_item::LabelContent::new(format_matching_text(
                     ctx.egui_ctx(),
                     &data_result_data.label,
                     data_result_data.highlight_sections.iter().cloned(),
-                    has_error.then(|| ui.visuals().error_fg_color).or_else(|| {
-                        is_empty_origin_placeholder.then(|| ui.visuals().warn_fg_color)
-                    }),
+                    format_color,
                 ))
                 .with_icon(guess_instance_path_icon(
                     ctx,
@@ -647,7 +665,7 @@ impl BlueprintTree {
                                 ui,
                                 child,
                                 view_visible,
-                                errors,
+                                visualizer_reports,
                             );
                         }
                     },
@@ -658,13 +676,10 @@ impl BlueprintTree {
         };
 
         let response = response.on_hover_ui(|ui| {
-            let query = ctx.current_query();
             let include_subtree = false;
             re_data_ui::item_ui::entity_hover_card_ui(
                 ui,
-                ctx,
-                &query,
-                ctx.recording(),
+                &ctx.active_recording_store_view_context(),
                 &data_result_data.entity_path,
                 include_subtree,
             );
@@ -673,7 +688,7 @@ impl BlueprintTree {
                 data_result_data.kind,
                 DataResultKind::EmptyOriginPlaceholder
             ) {
-                ui.label(ui.ctx().warning_text(
+                ui.label(ui.warning_text(
                     "This view's query did not match any data under the space origin",
                 ));
             }
@@ -1042,7 +1057,7 @@ impl BlueprintTree {
             false
         };
         if dragged_contents.iter().any(parent_contains_dragged_content) {
-            ctx.drag_and_drop_manager
+            ctx.drag_and_drop_manager()
                 .set_feedback(DragAndDropFeedback::Reject);
             return;
         }
@@ -1055,7 +1070,7 @@ impl BlueprintTree {
 
         let Contents::Container(target_container_id) = drop_target.target_parent_id else {
             // this shouldn't happen
-            ctx.drag_and_drop_manager
+            ctx.drag_and_drop_manager()
                 .set_feedback(DragAndDropFeedback::Reject);
             return;
         };
@@ -1069,7 +1084,7 @@ impl BlueprintTree {
 
             egui::DragAndDrop::clear_payload(ui.ctx());
         } else {
-            ctx.drag_and_drop_manager
+            ctx.drag_and_drop_manager()
                 .set_feedback(DragAndDropFeedback::Accept);
             self.next_candidate_drop_parent_container_id = Some(target_container_id);
         }
@@ -1118,27 +1133,35 @@ impl BlueprintTree {
             }
             Item::View(view_id) => {
                 self.expand_all_contents_until(viewport, ui.ctx(), &Contents::View(*view_id));
-                ctx.focused_item.clone()
+                ctx.focused_item().clone()
             }
-            Item::DataResult(view_id, instance_path) => {
-                self.expand_all_contents_until(viewport, ui.ctx(), &Contents::View(*view_id));
+            Item::DataResult(data_result) => {
+                self.expand_all_contents_until(
+                    viewport,
+                    ui.ctx(),
+                    &Contents::View(data_result.view_id),
+                );
                 self.expand_all_data_results_until(
                     ctx,
                     ui.ctx(),
-                    view_id,
-                    &instance_path.entity_path,
+                    &data_result.view_id,
+                    &data_result.instance_path.entity_path,
                 );
 
-                ctx.focused_item.clone()
+                ctx.focused_item().clone()
             }
             Item::InstancePath(instance_path) => {
                 let view_ids =
                     list_views_with_entity(ctx, viewport, instance_path.entity_path.hash());
 
                 // focus on the first matching data result
-                let res = view_ids
-                    .first()
-                    .map(|id| Item::DataResult(*id, instance_path.clone()));
+                let res = view_ids.first().map(|id| {
+                    Item::DataResult(DataResultInteractionAddress {
+                        view_id: *id,
+                        instance_path: instance_path.clone(),
+                        visualizer: None,
+                    })
+                });
 
                 for view_id in view_ids {
                     self.expand_all_contents_until(viewport, ui.ctx(), &Contents::View(view_id));
@@ -1241,11 +1264,10 @@ fn add_new_view_or_container_menu_button(
 
 fn set_blueprint_to_default_menu_buttons(ctx: &ViewerContext<'_>, ui: &mut egui::Ui) {
     let default_blueprint_id = ctx
-        .storage_context
-        .hub
+        .store_hub()
         .default_blueprint_id_for_app(ctx.store_context.application_id());
 
-    let default_blueprint = default_blueprint_id.and_then(|id| ctx.storage_context.bundle.get(id));
+    let default_blueprint = default_blueprint_id.and_then(|id| ctx.store_bundle().get(id));
 
     let disabled_reason = match default_blueprint {
         None => Some("No default blueprint is set for this app"),

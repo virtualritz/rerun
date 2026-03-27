@@ -111,7 +111,7 @@ impl UiLayout {
         ui: &mut egui::Ui,
         data: impl Into<SyntaxHighlightedBuilder>,
     ) -> egui::Response {
-        self.data_label_impl(ui, data.into().into_job(ui.style()))
+        self.data_label_impl(ui, data.into().to_job(ui.style()))
     }
 
     fn decorate_url(ui: &mut egui::Ui, mut galley: Arc<egui::Galley>) -> egui::Response {
@@ -123,9 +123,9 @@ impl UiLayout {
             // This will make the tooltip too wide.
             // TODO(#11211): do proper fix
 
-            debug_assert!(
+            re_log::debug_assert!(
                 galley.size().x < ui.spacing().tooltip_width + 1000.0,
-                "DEBUG ASSERT: adding huge galley with width: {} to a tooltip.",
+                "adding huge galley with width: {} to a tooltip.",
                 galley.size().x
             );
 

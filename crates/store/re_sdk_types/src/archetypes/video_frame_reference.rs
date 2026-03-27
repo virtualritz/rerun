@@ -324,6 +324,13 @@ impl ::re_types_core::AsComponents for VideoFrameReference {
 
 impl ::re_types_core::ArchetypeReflectionMarker for VideoFrameReference {}
 
+impl crate::VisualizableArchetype for VideoFrameReference {
+    #[inline]
+    fn visualizer(&self) -> crate::Visualizer {
+        crate::Visualizer::new("VideoFrameReference").with_overrides(self)
+    }
+}
+
 impl VideoFrameReference {
     /// Create a new `VideoFrameReference`.
     #[inline]

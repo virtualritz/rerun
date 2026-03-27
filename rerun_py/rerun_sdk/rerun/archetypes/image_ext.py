@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 import numpy as np
 import numpy.typing as npt
@@ -18,7 +18,24 @@ from ..datatypes import (
 )
 from ..error_utils import _send_warning_or_raise, catch_and_log_exceptions
 
+
+# Note: numpy._typing._SupportsArray exists but is private API.
+# We define our own for stability and to avoid depending on numpy internals.
+@runtime_checkable
+class SupportsDunderArray(Protocol):
+    """
+    An object that supports conversion to numpy array via __array__().
+
+    This includes torch.Tensor, JAX arrays, CuPy arrays, etc.
+    Unlike npt.ArrayLike, this excludes scalars, strings, and other non-array types.
+    """
+
+    def __array__(self) -> np.ndarray[Any, Any]: ...
+
+
 if TYPE_CHECKING:
+    from .. import components
+
     ImageLike = (
         npt.NDArray[np.float16]
         | npt.NDArray[np.float32]
@@ -35,6 +52,7 @@ if TYPE_CHECKING:
         | npt.NDArray[np.integer]
         | np.ndarray[Any, np.dtype[np.floating | np.integer]]
         | PILImage.Image
+        | SupportsDunderArray  # Includes torch.Tensor and other array protocol objects
     )
     from . import EncodedImage, Image
 
@@ -71,6 +89,7 @@ class ImageExt:
         # Any any of these:
         opacity: Float32Like | None = None,
         draw_order: Float32Like | None = None,
+        magnification_filter: components.MagnificationFilterLike | None = None,
     ) -> None:
         """
         Create a new image with a given format.
@@ -106,6 +125,8 @@ class ImageExt:
             An optional floating point value that specifies the 2D drawing
             order. Objects with higher values are drawn on top of those with
             lower values.
+        magnification_filter:
+            Optional filter used when a texel is magnified (displayed larger than a screen pixel).
 
         """
 
@@ -141,6 +162,7 @@ class ImageExt:
                     format=ImageFormat(width=width, height=height, pixel_format=pixel_format),
                     opacity=opacity,
                     draw_order=draw_order,
+                    magnification_filter=magnification_filter,
                 )
                 return
             else:
@@ -175,6 +197,7 @@ class ImageExt:
                     ),
                     opacity=opacity,
                     draw_order=draw_order,
+                    magnification_filter=magnification_filter,
                 )
                 return
 
@@ -246,6 +269,7 @@ class ImageExt:
             ),
             opacity=opacity,
             draw_order=draw_order,
+            magnification_filter=magnification_filter,
         )
 
     def image_format(self: Any) -> ImageFormat:

@@ -218,6 +218,13 @@ impl ::re_types_core::AsComponents for Asset3D {
 
 impl ::re_types_core::ArchetypeReflectionMarker for Asset3D {}
 
+impl crate::VisualizableArchetype for Asset3D {
+    #[inline]
+    fn visualizer(&self) -> crate::Visualizer {
+        crate::Visualizer::new("Asset3D").with_overrides(self)
+    }
+}
+
 impl Asset3D {
     /// Create a new `Asset3D`.
     #[inline]

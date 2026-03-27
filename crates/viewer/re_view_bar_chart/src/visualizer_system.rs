@@ -3,11 +3,15 @@ use std::collections::BTreeMap;
 use re_chunk_store::LatestAtQuery;
 use re_entity_db::EntityPath;
 use re_sdk_types::{
+    Archetype as _,
     archetypes::BarChart,
     components::{self, Length},
     datatypes,
 };
-use re_view::{DataResultQuery as _, RangeResultsExt as _, clamped_vec_or_else};
+use re_view::{
+    BlueprintResolvedResults, DataResultQuery as _, VisualizerInstructionQueryResults,
+    clamped_vec_or_else,
+};
 use re_viewer_context::{
     IdentifiedViewSystem, ViewContext, ViewContextCollection, ViewQuery, ViewSystemExecutionError,
     VisualizerExecutionOutput, VisualizerQueryInfo, VisualizerSystem, typed_fallback_for,
@@ -34,8 +38,14 @@ impl IdentifiedViewSystem for BarChartVisualizerSystem {
 }
 
 impl VisualizerSystem for BarChartVisualizerSystem {
-    fn visualizer_query_info(&self) -> VisualizerQueryInfo {
-        VisualizerQueryInfo::from_archetype::<BarChart>()
+    fn visualizer_query_info(
+        &self,
+        _app_options: &re_viewer_context::AppOptions,
+    ) -> VisualizerQueryInfo {
+        VisualizerQueryInfo::single_required_component::<components::TensorData>(
+            &BarChart::descriptor_values(),
+            &BarChart::all_components(),
+        )
     }
 
     fn execute(
@@ -46,24 +56,38 @@ impl VisualizerSystem for BarChartVisualizerSystem {
     ) -> Result<VisualizerExecutionOutput, ViewSystemExecutionError> {
         let timeline_query = LatestAtQuery::new(view_query.timeline, view_query.latest_at);
 
-        for data_result in view_query.iter_visible_data_results(Self::identifier()) {
-            let results = data_result
-                .latest_at_with_blueprint_resolved_data::<BarChart>(ctx, &timeline_query);
+        let output = VisualizerExecutionOutput::default();
 
-            let Some(tensor) = results.get_required_mono::<components::TensorData>(
-                BarChart::descriptor_values().component,
-            ) else {
+        for (data_result, instruction) in
+            view_query.iter_visualizer_instruction_for(Self::identifier())
+        {
+            let latest_at_results = data_result.latest_at_with_blueprint_resolved_data::<BarChart>(
+                ctx,
+                &timeline_query,
+                Some(instruction),
+            );
+
+            let Some(tensor) = latest_at_results
+                .get_mono::<components::TensorData>(BarChart::descriptor_values().component)
+            else {
                 continue;
             };
 
             if tensor.is_vector() {
                 let length: u64 = tensor.shape().iter().product();
 
-                let abscissa: components::TensorData =
-                    results.get_mono_with_fallback(BarChart::descriptor_abscissa().component);
-                let color = results.get_mono_with_fallback(BarChart::descriptor_color().component);
-                let widths =
-                    results.iter_as(view_query.timeline, BarChart::descriptor_widths().component);
+                let abscissa: components::TensorData = latest_at_results
+                    .get_mono_with_fallback(BarChart::descriptor_abscissa().component);
+                let color = latest_at_results
+                    .get_mono_with_fallback(BarChart::descriptor_color().component);
+
+                // TODO(andreas): use this all the way.
+                let results =
+                    BlueprintResolvedResults::LatestAt(timeline_query.clone(), latest_at_results);
+                let results =
+                    VisualizerInstructionQueryResults::new(instruction, &results, &output);
+
+                let widths = results.iter_optional(BarChart::descriptor_widths().component);
                 let widths: &[f32] = widths
                     .slice::<f32>()
                     .next()
@@ -71,7 +95,11 @@ impl VisualizerSystem for BarChartVisualizerSystem {
 
                 let widths = clamped_vec_or_else(widths, length as usize, || {
                     typed_fallback_for::<Length>(
-                        &ctx.query_context(data_result, &view_query.latest_at_query()),
+                        &ctx.query_context(
+                            data_result,
+                            view_query.latest_at_query(),
+                            instruction.id,
+                        ),
                         BarChart::descriptor_widths().component,
                     )
                     .0
@@ -89,10 +117,6 @@ impl VisualizerSystem for BarChartVisualizerSystem {
             }
         }
 
-        Ok(VisualizerExecutionOutput::default())
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+        Ok(output)
     }
 }

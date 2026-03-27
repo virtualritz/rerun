@@ -1,4 +1,4 @@
-use std::sync::{Arc, mpsc::Sender};
+use std::sync::Arc;
 
 use anyhow::{Context as _, anyhow};
 use arrow::{
@@ -6,12 +6,14 @@ use arrow::{
     compute::cast,
     datatypes::{DataType, Field},
 };
+use crossbeam::channel::Sender;
 use re_arrow_util::ArrowArrayDowncastRef as _;
 use re_chunk::{
     ArrowArray as _, Chunk, ChunkId, EntityPath, RowId, TimeColumn, TimePoint, TimelineName,
     external::nohash_hasher::IntMap,
 };
 use re_log_types::{ApplicationId, StoreId};
+use re_quota_channel::send_crossbeam;
 use re_sdk_types::archetypes;
 use re_sdk_types::archetypes::EncodedImage;
 
@@ -35,7 +37,7 @@ pub const LEROBOT_DATASET_IGNORED_COLUMNS: &[&str] =
 pub fn prepare_episode_chunks(
     episodes: impl IntoIterator<Item = EpisodeIndex>,
     application_id: &ApplicationId,
-    tx: &std::sync::mpsc::Sender<LoadedData>,
+    tx: &Sender<LoadedData>,
     loader_name: &str,
 ) -> Vec<(EpisodeIndex, StoreId)> {
     let mut store_ids = vec![];
@@ -47,7 +49,7 @@ pub fn prepare_episode_chunks(
             prepare_store_info(&store_id, re_log_types::FileSource::Sdk),
         );
 
-        if tx.send(set_store_info).is_err() {
+        if send_crossbeam(tx, set_store_info).is_err() {
             break;
         }
 
@@ -61,7 +63,7 @@ pub fn prepare_episode_chunks(
 pub fn load_and_stream_common<Dataset>(
     dataset: &Dataset,
     store_ids: &[(EpisodeIndex, StoreId)],
-    tx: &std::sync::mpsc::Sender<LoadedData>,
+    tx: &Sender<LoadedData>,
     loader_name: &str,
     load_episode: impl Fn(&Dataset, EpisodeIndex) -> Result<Vec<Chunk>, DataLoaderError>,
 ) {
@@ -83,10 +85,10 @@ pub fn load_and_stream_common<Dataset>(
                     return;
                 };
 
-                for chunk in std::iter::once(initial).chain(chunks.into_iter()) {
+                for chunk in std::iter::once(initial).chain(chunks) {
                     let data = LoadedData::Chunk(loader_name.to_owned(), store_id.clone(), chunk);
 
-                    if tx.send(data).is_err() {
+                    if send_crossbeam(tx, data).is_err() {
                         break; // The other end has decided to hang up, not our problem.
                     }
                 }
@@ -234,8 +236,12 @@ pub fn load_scalar(
                     ))
                 })?;
 
-            let batch_chunks =
-                make_scalar_batch_entity_chunks(entity_path, feature, timelines, fixed_size_array)?;
+            let batch_chunks = make_scalar_batch_entity_chunks(
+                &entity_path,
+                feature,
+                timelines,
+                fixed_size_array,
+            )?;
             Ok(ScalarChunkIterator::Batch(Box::new(batch_chunks)))
         }
         DataType::List(_field) => {
@@ -250,9 +256,17 @@ pub fn load_scalar(
                 format!("Failed to cast scalar feature {entity_path} to Float64")
             })?;
 
-            Ok(ScalarChunkIterator::Single(Box::new(std::iter::once(
-                make_scalar_entity_chunk(entity_path, timelines, &sliced)?,
-            ))))
+            let mut chunks = vec![make_scalar_entity_chunk(
+                entity_path.clone(),
+                timelines,
+                &sliced,
+            )?];
+
+            if let Some(names_chunk) = make_names_chunk(&entity_path, feature, sliced.len())? {
+                chunks.push(names_chunk);
+            }
+
+            Ok(ScalarChunkIterator::Batch(Box::new(chunks.into_iter())))
         }
         DataType::Float32 | DataType::Float64 => {
             let feature_data = data.column_by_name(feature_key).ok_or_else(|| {
@@ -282,7 +296,7 @@ pub fn load_scalar(
 }
 
 fn make_scalar_batch_entity_chunks(
-    entity_path: EntityPath,
+    entity_path: &EntityPath,
     feature: &Feature,
     timelines: &IntMap<TimelineName, TimeColumn>,
     data: &FixedSizeListArray,
@@ -300,27 +314,40 @@ fn make_scalar_batch_entity_chunks(
         &sliced,
     )?);
 
-    // If we have names for this feature, we insert a single static chunk containing the names.
-    if let Some(names) = feature.names.clone() {
-        let names: Vec<_> = (0..data.value_length() as usize)
-            .map(|idx| names.name_for_index(idx))
-            .collect();
-
-        chunks.push(
-            Chunk::builder(entity_path)
-                .with_row(
-                    RowId::new(),
-                    TimePoint::default(),
-                    std::iter::once((
-                        archetypes::SeriesLines::descriptor_names(),
-                        Arc::new(StringArray::from_iter(names)) as Arc<dyn re_chunk::ArrowArray>,
-                    )),
-                )
-                .build()?,
-        );
+    if let Some(names_chunk) = make_names_chunk(entity_path, feature, data.value_length() as usize)?
+    {
+        chunks.push(names_chunk);
     }
 
     Ok(chunks.into_iter())
+}
+
+/// If the feature has names, create a static chunk containing them.
+fn make_names_chunk(
+    entity_path: &EntityPath,
+    feature: &Feature,
+    num_elements: usize,
+) -> Result<Option<Chunk>, DataLoaderError> {
+    let Some(names) = feature.names.clone() else {
+        return Ok(None);
+    };
+
+    let names: Vec<_> = (0..num_elements)
+        .map(|idx| names.name_for_index(idx))
+        .collect();
+
+    Ok(Some(
+        Chunk::builder(entity_path.clone())
+            .with_row(
+                RowId::new(),
+                TimePoint::default(),
+                std::iter::once((
+                    archetypes::SeriesLines::descriptor_names(),
+                    Arc::new(StringArray::from_iter(names)) as Arc<dyn re_chunk::ArrowArray>,
+                )),
+            )
+            .build()?,
+    ))
 }
 
 fn make_scalar_entity_chunk(

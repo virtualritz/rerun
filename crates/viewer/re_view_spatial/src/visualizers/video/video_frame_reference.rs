@@ -7,19 +7,19 @@ use re_sdk_types::Archetype as _;
 use re_sdk_types::archetypes::{AssetVideo, VideoFrameReference};
 use re_sdk_types::components::{Blob, MediaType, Opacity, VideoTimestamp};
 use re_viewer_context::{
-    IdentifiedViewSystem, VideoAssetCache, ViewContext, ViewContextCollection, ViewId, ViewQuery,
+    IdentifiedViewSystem, VideoAssetCache, ViewContext, ViewContextCollection, ViewQuery,
     ViewSystemExecutionError, ViewerContext, VisualizerExecutionOutput, VisualizerQueryInfo,
     VisualizerSystem, typed_fallback_for,
 };
 
 use crate::PickableTexturedRect;
-use crate::contexts::SpatialSceneEntityContext;
+use crate::contexts::SpatialSceneVisualizerInstructionContext;
 use crate::view_kind::SpatialViewKind;
 use crate::visualizers::SpatialViewVisualizerData;
-use crate::visualizers::entity_iterator::{self, process_archetype};
+use crate::visualizers::entity_iterator::process_archetype;
 use crate::visualizers::video::{
-    VideoPlaybackIssueSeverity, show_video_playback_issue, video_stream_id,
-    visualize_video_frame_texture,
+    AT_TIME_CURSOR_SALT, VideoFrameRenderInfo, VideoPlaybackIssue, VideoPlaybackIssueSeverity,
+    show_video_frame, video_stream_id,
 };
 
 pub struct VideoFrameReferenceVisualizer {
@@ -41,8 +41,14 @@ impl IdentifiedViewSystem for VideoFrameReferenceVisualizer {
 }
 
 impl VisualizerSystem for VideoFrameReferenceVisualizer {
-    fn visualizer_query_info(&self) -> VisualizerQueryInfo {
-        VisualizerQueryInfo::from_archetype::<VideoFrameReference>()
+    fn visualizer_query_info(
+        &self,
+        _app_options: &re_viewer_context::AppOptions,
+    ) -> VisualizerQueryInfo {
+        VisualizerQueryInfo::single_required_component::<VideoTimestamp>(
+            &VideoFrameReference::descriptor_timestamp(),
+            &VideoFrameReference::all_components(),
+        )
     }
 
     fn execute(
@@ -51,40 +57,36 @@ impl VisualizerSystem for VideoFrameReferenceVisualizer {
         view_query: &ViewQuery<'_>,
         context_systems: &ViewContextCollection,
     ) -> Result<VisualizerExecutionOutput, ViewSystemExecutionError> {
-        let mut output = VisualizerExecutionOutput::default();
+        re_tracing::profile_function!();
+
+        let output = VisualizerExecutionOutput::default();
 
         process_archetype::<Self, VideoFrameReference, _>(
             ctx,
             view_query,
             context_systems,
-            &mut output,
+            &output,
             self.data.preferred_view_kind,
             |ctx, spatial_ctx, results| {
                 // TODO(andreas): Should ignore range queries here and only do latest-at.
                 // Not only would this simplify the code here quite a bit, it would also avoid lots of overhead.
                 // Same is true for the image visualizers in general - there seems to be no practical reason to do range queries
                 // for visualization here.
-                use re_view::RangeResultsExt as _;
 
-                let timeline = ctx.query.timeline();
                 let entity_path = ctx.target_entity_path;
 
-                let Some(all_video_timestamp_chunks) = results
-                    .get_required_chunks(VideoFrameReference::descriptor_timestamp().component)
-                else {
+                let all_video_timestamps =
+                    results.iter_required(VideoFrameReference::descriptor_timestamp().component);
+                if all_video_timestamps.is_empty() {
                     return Ok(());
-                };
-                let all_video_references = results.iter_as(
-                    timeline,
-                    VideoFrameReference::descriptor_video_reference().component,
-                );
-                let all_opacities = results.iter_as(
-                    timeline,
-                    VideoFrameReference::descriptor_opacity().component,
-                );
+                }
+                let all_video_references = results
+                    .iter_optional(VideoFrameReference::descriptor_video_reference().component);
+                let all_opacities =
+                    results.iter_optional(VideoFrameReference::descriptor_opacity().component);
 
                 for (_index, video_timestamps, video_references, opacity) in re_query::range_zip_1x2(
-                    entity_iterator::iter_component(&all_video_timestamp_chunks, timeline),
+                    all_video_timestamps.component_slow(),
                     all_video_references.slice::<String>(),
                     all_opacities.slice::<f32>(),
                 ) {
@@ -109,7 +111,6 @@ impl VisualizerSystem for VideoFrameReferenceVisualizer {
                                 )
                             }),
                         entity_path,
-                        view_query.view_id,
                     );
                 }
 
@@ -126,27 +127,25 @@ impl VisualizerSystem for VideoFrameReferenceVisualizer {
     fn data(&self) -> Option<&dyn std::any::Any> {
         Some(self.data.as_any())
     }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 }
 
 impl VideoFrameReferenceVisualizer {
-    #[expect(clippy::too_many_arguments)]
     fn process_video_frame(
         &mut self,
         ctx: &re_viewer_context::QueryContext<'_>,
-        spatial_ctx: &SpatialSceneEntityContext<'_>,
+        spatial_ctx: &SpatialSceneVisualizerInstructionContext<'_>,
         video_timestamp: &VideoTimestamp,
         video_references: Option<Vec<re_sdk_types::ArrowString>>,
         opacity: Opacity,
         entity_path: &EntityPath,
-        view_id: ViewId,
     ) {
         re_tracing::profile_function!();
 
-        let player_stream_id = video_stream_id(entity_path, view_id, Self::identifier());
+        let player_stream_id = video_stream_id(
+            entity_path,
+            VideoFrameReference::descriptor_video_reference().component,
+            AT_TIME_CURSOR_SALT,
+        );
 
         // Follow the reference to the video asset.
         let video_reference: EntityPath = video_references
@@ -170,15 +169,19 @@ impl VideoFrameReferenceVisualizer {
 
         match query_result {
             None => {
-                show_video_playback_issue(
+                show_video_frame(
                     ctx.view_ctx,
                     &mut self.data,
-                    spatial_ctx.highlight,
-                    world_from_entity,
-                    format!("No video asset at {video_reference:?}"),
-                    VideoPlaybackIssueSeverity::Informational,
-                    video_resolution,
                     entity_path,
+                    world_from_entity,
+                    spatial_ctx.highlight,
+                    video_resolution,
+                    spatial_ctx.visualizer_instruction,
+                    None,
+                    Some(VideoPlaybackIssue::custom(
+                        format!("No video asset at {video_reference:?}"),
+                        VideoPlaybackIssueSeverity::Informational,
+                    )),
                 );
             }
 
@@ -189,61 +192,50 @@ impl VideoFrameReferenceVisualizer {
                     }
 
                     let video_time = re_viewer_context::video_timestamp_component_to_video_time(
-                        ctx.viewer_ctx(),
+                        Some(ctx.viewer_ctx().time_ctrl),
                         *video_timestamp,
                         video.data_descr().timescale,
                     );
 
-                    match video.frame_at(
-                        ctx.render_ctx(),
-                        player_stream_id,
-                        video_time,
-                        &std::iter::once(video_buffer.as_ref()).collect(),
-                    ) {
-                        Ok(video_frame_reference) => {
-                            #[expect(clippy::disallowed_methods)] // This is not a hard-coded color.
-                            let multiplicative_tint =
-                                re_renderer::Rgba::from_white_alpha(opacity.0.clamp(0.0, 1.0));
-                            visualize_video_frame_texture(
-                                ctx.view_ctx,
-                                &mut self.data,
-                                video_frame_reference,
-                                entity_path,
-                                spatial_ctx.depth_offset,
-                                world_from_entity,
-                                spatial_ctx.highlight,
-                                video_resolution,
-                                multiplicative_tint,
-                            );
-                        }
+                    let frame_output =
+                        video.frame_at(ctx.render_ctx(), player_stream_id, video_time, &|_| {
+                            &video_buffer
+                        });
 
-                        Err(err) => {
-                            if err.should_request_more_frames() {
-                                ctx.view_ctx.egui_ctx().request_repaint();
-                            }
-                            show_video_playback_issue(
-                                ctx.view_ctx,
-                                &mut self.data,
-                                spatial_ctx.highlight,
-                                world_from_entity,
-                                err.to_string(),
-                                VideoPlaybackIssueSeverity::Error,
-                                video_resolution,
-                                entity_path,
-                            );
-                        }
-                    }
-                }
-                Err(err) => {
-                    show_video_playback_issue(
+                    #[expect(clippy::disallowed_methods)] // This is not a hard-coded color.
+                    let multiplicative_tint =
+                        re_renderer::Rgba::from_white_alpha(opacity.0.clamp(0.0, 1.0));
+
+                    show_video_frame(
                         ctx.view_ctx,
                         &mut self.data,
-                        spatial_ctx.highlight,
-                        world_from_entity,
-                        err.to_string(),
-                        VideoPlaybackIssueSeverity::Error,
-                        video_resolution,
                         entity_path,
+                        world_from_entity,
+                        spatial_ctx.highlight,
+                        video_resolution,
+                        spatial_ctx.visualizer_instruction,
+                        frame_output.output.map(|texture| VideoFrameRenderInfo {
+                            texture,
+                            depth_offset: spatial_ctx.depth_offset,
+                            multiplicative_tint,
+                        }),
+                        frame_output.error.map(VideoPlaybackIssue::from),
+                    );
+                }
+                Err(err) => {
+                    show_video_frame(
+                        ctx.view_ctx,
+                        &mut self.data,
+                        entity_path,
+                        world_from_entity,
+                        spatial_ctx.highlight,
+                        video_resolution,
+                        spatial_ctx.visualizer_instruction,
+                        None,
+                        Some(VideoPlaybackIssue::custom(
+                            err.to_string(),
+                            VideoPlaybackIssueSeverity::Error,
+                        )),
                     );
                 }
             },
@@ -276,7 +268,7 @@ fn latest_at_query_video_from_datastore(
     let media_type =
         results.component_instance::<MediaType>(0, AssetVideo::descriptor_media_type().component);
 
-    let video = ctx.store_context.caches.entry(|c: &mut VideoAssetCache| {
+    let video = ctx.store_context.memoizer(|c: &mut VideoAssetCache| {
         let debug_name = entity_path.to_string();
         c.entry(
             debug_name,

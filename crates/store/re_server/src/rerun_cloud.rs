@@ -1,27 +1,22 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::entrypoint::NamedPath;
-use crate::store::{ChunkKey, Dataset, InMemoryStore, Table};
-use ahash::HashMap;
 use arrow::array::BinaryArray;
 use arrow::record_batch::RecordBatch;
 use cfg_if::cfg_if;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::prelude::SessionContext;
 use nohash_hasher::IntSet;
+use tokio_stream::StreamExt as _;
+use tonic::{Code, Request, Response, Status};
+
 use re_arrow_util::RecordBatchExt as _;
-use re_chunk_store::{Chunk, ChunkStore, ChunkStoreHandle};
+use re_chunk_store::{
+    Chunk, ChunkStore, ChunkStoreHandle, ChunkTrackingMode, LatestAtQuery, RangeQuery,
+};
 use re_log_encoding::ToTransport as _;
 use re_log_types::{EntityPath, EntryId, StoreId, StoreKind};
-use re_protos::cloud::v1alpha1::ext::LanceTable;
-use re_protos::cloud::v1alpha1::ext::{
-    self, CreateDatasetEntryRequest, CreateDatasetEntryResponse, CreateTableEntryRequest,
-    CreateTableEntryResponse, DataSource, EntryDetailsUpdate, ProviderDetails, QueryDatasetRequest,
-    ReadDatasetEntryResponse, ReadTableEntryResponse, TableInsertMode, UpdateDatasetEntryRequest,
-    UpdateDatasetEntryResponse, UpdateEntryRequest, UpdateEntryResponse,
-};
 use re_protos::cloud::v1alpha1::rerun_cloud_service_server::RerunCloudService;
 use re_protos::cloud::v1alpha1::{
     DeleteEntryResponse, EntryDetails, EntryKind, FetchChunksRequest,
@@ -36,11 +31,23 @@ use re_protos::common::v1alpha1::TaskId;
 use re_protos::common::v1alpha1::ext::{IfDuplicateBehavior, SegmentId};
 use re_protos::headers::RerunHeadersExtractorExt as _;
 use re_protos::missing_field;
-use tokio_stream::StreamExt as _;
-use tonic::{Code, Request, Response, Status};
+use re_protos::{
+    EntryName,
+    cloud::v1alpha1::ext::{
+        self, CreateDatasetEntryRequest, CreateDatasetEntryResponse, CreateTableEntryRequest,
+        CreateTableEntryResponse, DataSource, EntryDetailsUpdate, LanceTable, ProviderDetails,
+        QueryDatasetRequest, ReadDatasetEntryResponse, ReadTableEntryResponse, TableInsertMode,
+        UpdateDatasetEntryRequest, UpdateDatasetEntryResponse, UpdateEntryRequest,
+        UpdateEntryResponse,
+    },
+};
+use re_tuid::Tuid;
 
 use crate::OnError;
-use re_tuid::Tuid;
+use crate::entrypoint::NamedPath;
+use crate::store::{
+    ChunkKey, Dataset, Error, InMemoryStore, StoreSlotId, TASK_ID_SUCCESS, Table, TaskResult,
+};
 
 #[derive(Debug)]
 pub struct RerunCloudHandlerSettings {
@@ -85,26 +92,34 @@ impl RerunCloudHandlerBuilder {
 
     pub async fn with_rrds_as_dataset(
         mut self,
-        dataset_name: String,
+        dataset_name: EntryName,
         rrd_paths: Vec<PathBuf>,
         on_duplicate: IfDuplicateBehavior,
         on_error: crate::OnError,
     ) -> Result<Self, crate::store::Error> {
-        let dataset = self.store.create_dataset(dataset_name, None)?;
+        let dataset_id = self.store.create_dataset(dataset_name, None)?;
 
         for rrd_path in rrd_paths {
-            if let Err(err) = dataset
-                .load_rrd(&rrd_path, None, on_duplicate, StoreKind::Recording)
-                .await
-            {
-                match on_error {
+            let load_result = self
+                .store
+                .register_rrd_to_dataset(
+                    dataset_id,
+                    &rrd_path,
+                    None,
+                    on_duplicate,
+                    StoreKind::Recording,
+                )
+                .await;
+            match load_result {
+                Ok(_segment_ids) => {}
+                Err(err) => match on_error {
                     OnError::Continue => {
                         re_log::warn!("Failed loading file {}: {err}", rrd_path.display());
                     }
                     OnError::Abort => {
                         return Err(err);
                     }
-                }
+                },
             }
         }
 
@@ -131,8 +146,6 @@ impl RerunCloudHandlerBuilder {
 
 // ---
 
-const DUMMY_TASK_ID: &str = "task_00000000DEADBEEF";
-
 pub struct RerunCloudHandler {
     settings: RerunCloudHandlerSettings,
 
@@ -155,7 +168,7 @@ impl RerunCloudHandler {
         &self,
         dataset_id: EntryId,
         segment_ids: &[SegmentId],
-    ) -> tonic::Result<Vec<(SegmentId, String, ChunkStoreHandle)>> {
+    ) -> tonic::Result<Vec<(SegmentId, String, StoreSlotId, ChunkStoreHandle)>> {
         let store = self.store.read().await;
         let dataset = store.dataset(dataset_id)?;
 
@@ -166,6 +179,7 @@ impl RerunCloudHandler {
                     (
                         segment_id.clone(),
                         layer_name.to_owned(),
+                        layer.store_slot_id(),
                         layer.store_handle().clone(),
                     )
                 })
@@ -177,6 +191,11 @@ impl RerunCloudHandler {
         let mut resolved = Vec::<DataSource>::with_capacity(data_sources.len());
         for source in data_sources {
             if source.is_prefix {
+                if source.storage_url.scheme() == "memory" {
+                    return Err(tonic::Status::invalid_argument(
+                        "memory:// URLs cannot be used as prefix data sources",
+                    ));
+                }
                 let path = source.storage_url.to_file_path().map_err(|_err| {
                     tonic::Status::invalid_argument(format!(
                         "getting file path from {:?}",
@@ -284,18 +303,20 @@ macro_rules! decl_stream {
 }
 
 decl_stream!(FetchChunksResponseStream<manifest:FetchChunksResponse>);
+decl_stream!(GetRrdManifestResponseStream<manifest:GetRrdManifestResponse>);
 decl_stream!(QueryDatasetResponseStream<manifest:QueryDatasetResponse>);
-decl_stream!(ScanSegmentTableResponseStream<manifest:ScanSegmentTableResponse>);
-decl_stream!(ScanDatasetManifestResponseStream<manifest:ScanDatasetManifestResponse>);
-decl_stream!(SearchDatasetResponseStream<manifest:SearchDatasetResponse>);
-decl_stream!(ScanTableResponseStream<rerun_cloud:ScanTableResponse>);
 decl_stream!(QueryTasksOnCompletionResponseStream<tasks:QueryTasksOnCompletionResponse>);
+decl_stream!(ScanDatasetManifestResponseStream<manifest:ScanDatasetManifestResponse>);
+decl_stream!(ScanSegmentTableResponseStream<manifest:ScanSegmentTableResponse>);
+decl_stream!(ScanTableResponseStream<rerun_cloud:ScanTableResponse>);
+decl_stream!(SearchDatasetResponseStream<manifest:SearchDatasetResponse>);
+decl_stream!(UnregisterFromDatasetResponseStream<manifest:UnregisterFromDatasetResponse>);
 
 impl RerunCloudHandler {
     async fn find_datasets(
         &self,
         entry_id: Option<EntryId>,
-        name: Option<String>,
+        name: Option<EntryName>,
         store_kind: Option<StoreKind>,
     ) -> Result<Vec<EntryDetails>, Status> {
         let store = self.store.read().await;
@@ -336,7 +357,7 @@ impl RerunCloudHandler {
     async fn find_tables(
         &self,
         entry_id: Option<EntryId>,
-        name: Option<String>,
+        name: Option<EntryName>,
     ) -> Result<Vec<EntryDetails>, Status> {
         let store = self.store.read().await;
 
@@ -403,6 +424,23 @@ impl RerunCloudService for RerunCloudHandler {
         Ok(tonic::Response::new(
             re_protos::cloud::v1alpha1::VersionResponse {
                 build_info: Some(build_info.into()),
+                version: re_build_info::exposed_version!().to_owned(),
+                cloud_provider: None,
+                cloud_region: None,
+            },
+        ))
+    }
+
+    async fn who_am_i(
+        &self,
+        _request: tonic::Request<re_protos::cloud::v1alpha1::WhoAmIRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::WhoAmIResponse>> {
+        // The local server has no authentication, so grant full access.
+        Ok(tonic::Response::new(
+            re_protos::cloud::v1alpha1::WhoAmIResponse {
+                user_id: None,
+                can_read: true,
+                can_write: true,
             },
         ))
     }
@@ -419,7 +457,12 @@ impl RerunCloudService for RerunCloudHandler {
             .and_then(|filter| filter.id)
             .map(TryInto::try_into)
             .transpose()?;
-        let name = filter.as_ref().and_then(|filter| filter.name.clone());
+        let name = filter
+            .as_ref()
+            .and_then(|filter| filter.name.clone())
+            .map(EntryName::new)
+            .transpose()
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
         let kind = filter
             .and_then(|filter| filter.entry_kind)
             .map(EntryKind::try_from)
@@ -495,7 +538,8 @@ impl RerunCloudService for RerunCloudHandler {
         } = request.into_inner().try_into()?;
 
         let mut store = self.store.write().await;
-        let dataset = store.create_dataset(dataset_name, dataset_id)?;
+        let dataset_id = store.create_dataset(dataset_name, dataset_id)?;
+        let dataset = store.dataset(dataset_id)?;
 
         Ok(tonic::Response::new(
             CreateDatasetEntryResponse {
@@ -608,18 +652,11 @@ impl RerunCloudService for RerunCloudHandler {
     {
         let mut store = self.store.write().await;
         let dataset_id = get_entry_id_from_headers(&store, &request)?;
-        let dataset = store.dataset_mut(dataset_id)?;
 
-        let re_protos::cloud::v1alpha1::ext::RegisterWithDatasetRequest {
+        let ext::RegisterWithDatasetRequest {
             data_sources,
             on_duplicate,
         } = request.into_inner().try_into()?;
-
-        let mut segment_ids: Vec<String> = vec![];
-        let mut segment_layers: Vec<String> = vec![];
-        let mut segment_types: Vec<String> = vec![];
-        let mut storage_urls: Vec<String> = vec![];
-        let mut task_ids: Vec<String> = vec![];
 
         let data_sources = Self::resolve_data_sources(&data_sources)?;
         if data_sources.is_empty() {
@@ -627,6 +664,33 @@ impl RerunCloudService for RerunCloudHandler {
                 "no data sources to register",
             ));
         }
+
+        // Phase 1: Extract store IDs cheaply and check for intra-request duplicates.
+        //
+        // We extract store IDs from the RRD footer (fast) or by scanning messages
+        // for SetStoreInfo (fallback for older files without footers). This avoids
+        // full chunk loading on the unhappy path (duplicates found).
+        //
+        // The `on_duplicate` flag only affects cross-request duplicates (conflicts with
+        // already-registered segments), not intra-request duplicates.
+        enum ValidatedSource {
+            File {
+                rrd_path: PathBuf,
+                layer_name: String,
+                storage_url: url::Url,
+            },
+            Memory {
+                store_slot_id: StoreSlotId,
+                store_handle: ChunkStoreHandle,
+                segment_id: SegmentId,
+                layer_name: String,
+            },
+        }
+
+        let mut seen: BTreeMap<(String, String), Vec<url::Url>> = BTreeMap::new();
+        let mut validated_sources: Vec<ValidatedSource> = Vec::new();
+
+        let store_kind = store.dataset(dataset_id)?.store_kind();
 
         for source in data_sources {
             let ext::DataSource {
@@ -636,6 +700,8 @@ impl RerunCloudService for RerunCloudHandler {
                 kind,
             } = source;
 
+            // TODO(ab): Should some or all of these errors be returned as task error instead?
+            // (No point in doing so unless this is tested in re_redap_tests.)
             if is_prefix {
                 return Err(tonic::Status::internal(
                     "register_with_dataset: prefix data sources should have been resolved already",
@@ -648,20 +714,217 @@ impl RerunCloudService for RerunCloudHandler {
                 ));
             }
 
-            if let Ok(rrd_path) = storage_url.to_file_path() {
-                let new_segment_ids = dataset
-                    .load_rrd(&rrd_path, Some(&layer), on_duplicate, dataset.store_kind())
-                    .await?;
+            let layer = if layer.is_empty() {
+                DataSource::DEFAULT_LAYER.to_owned()
+            } else {
+                layer
+            };
 
-                for segment_id in new_segment_ids {
-                    segment_ids.push(segment_id.to_string());
-                    segment_layers.push(layer.clone());
-                    segment_types.push("rrd".to_owned());
-                    // TODO(RR-2289): this should probably be a memory address
-                    storage_urls.push(storage_url.to_string());
-                    task_ids.push(DUMMY_TASK_ID.to_owned());
+            // Handle memory:// URLs (re-registration of existing stores)
+            if storage_url.scheme() == "memory" {
+                let store_slot_id = parse_memory_url(&storage_url)?;
+                let store_handle = store.resolve_store(&store_slot_id).ok_or_else(|| {
+                    tonic::Status::not_found(format!(
+                        "store not found for memory URL: {storage_url}"
+                    ))
+                })?;
+                let store_id = store_handle.read().id().clone();
+                if store_id.kind() != store_kind {
+                    continue;
+                }
+                let segment_id = SegmentId::new(store_id.recording_id().to_string());
+                let key = (segment_id.id.clone(), layer.clone());
+                seen.entry(key).or_default().push(storage_url.clone());
+                validated_sources.push(ValidatedSource::Memory {
+                    store_slot_id,
+                    store_handle,
+                    segment_id,
+                    layer_name: layer,
+                });
+                continue;
+            }
+
+            let Ok(rrd_path) = storage_url.to_file_path() else {
+                return if storage_url.scheme() == "file" && storage_url.host().is_some() {
+                    Err(tonic::Status::not_found(format!(
+                        "RRD file not found, file URI should not have a host: {storage_url} (this may be caused by invalid relative-path URI)"
+                    )))
+                } else {
+                    Err(tonic::Status::not_found(format!(
+                        "RRD file not found, could not load URI: {storage_url}"
+                    )))
+                };
+            };
+
+            if !rrd_path.exists() {
+                return Err(tonic::Status::not_found(format!(
+                    "RRD file not found, file does not exists: {rrd_path:?}"
+                )));
+            }
+
+            if !rrd_path.is_file() {
+                return Err(tonic::Status::not_found(format!(
+                    "RRD file not found, path is not a file: {rrd_path:?}"
+                )));
+            }
+
+            // Extract store IDs cheaply (footer or message scan, no chunk loading)
+            let store_ids = load_store_ids(&rrd_path)?;
+
+            for store_id in store_ids {
+                if store_id.kind() != store_kind {
+                    continue;
+                }
+
+                let segment_id_str = store_id.recording_id().to_string();
+                let key = (segment_id_str, layer.clone());
+
+                seen.entry(key).or_default().push(storage_url.clone());
+            }
+
+            validated_sources.push(ValidatedSource::File {
+                rrd_path,
+                layer_name: layer,
+                storage_url,
+            });
+        }
+
+        // Check for intra-request duplicates
+        let duplicates: Vec<_> = seen.iter().filter(|(_, urls)| urls.len() > 1).collect();
+
+        if !duplicates.is_empty() {
+            let details: Vec<String> = duplicates
+                .iter()
+                .map(|((segment_id, layer), urls)| {
+                    let uri_lines = urls
+                        .iter()
+                        .map(|u| format!("    {u}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("  segment id: {segment_id}, layer name: {layer}\n{uri_lines}")
+                })
+                .collect();
+            return Err(tonic::Status::invalid_argument(format!(
+                "duplicate segment layers in request:\n{}",
+                details.join("\n")
+            )));
+        }
+
+        // Phase 2: Load file sources and unify with memory sources into a common form.
+        struct ReadySource {
+            store_slot_id: StoreSlotId,
+            store_handle: ChunkStoreHandle,
+            segment_id: SegmentId,
+            layer_name: String,
+            storage_url: String,
+        }
+
+        let mut ready_sources: Vec<ReadySource> = Vec::new();
+
+        for source in validated_sources {
+            match source {
+                ValidatedSource::Memory {
+                    store_slot_id,
+                    store_handle,
+                    segment_id,
+                    layer_name,
+                } => {
+                    ready_sources.push(ReadySource {
+                        storage_url: format!("memory:///store/{store_slot_id}"),
+                        store_slot_id,
+                        store_handle,
+                        segment_id,
+                        layer_name,
+                    });
+                }
+
+                ValidatedSource::File {
+                    rrd_path,
+                    layer_name,
+                    storage_url,
+                } => {
+                    re_log::info!("Loading RRD: {}", rrd_path.display());
+                    let contents = ChunkStore::handle_from_rrd_filepath(
+                        &InMemoryStore::chunk_store_config(),
+                        &rrd_path,
+                    )
+                    .map_err(|err| {
+                        tonic::Status::internal(format!("Failed to load RRD: {err:#}"))
+                    })?;
+
+                    for (store_id, chunk_store) in contents {
+                        if store_id.kind() != store_kind {
+                            continue;
+                        }
+
+                        ready_sources.push(ReadySource {
+                            store_slot_id: StoreSlotId::new(),
+                            store_handle: chunk_store,
+                            segment_id: SegmentId::new(store_id.recording_id().to_string()),
+                            layer_name: layer_name.clone(),
+                            storage_url: storage_url.to_string(),
+                        });
+                    }
                 }
             }
+        }
+
+        // Phase 3: Register all stores in the pool, then add layers to dataset.
+        let mut segment_ids: Vec<String> = vec![];
+        let mut segment_layers: Vec<String> = vec![];
+        let mut segment_types: Vec<String> = vec![];
+        let mut storage_urls: Vec<String> = vec![];
+        let mut task_ids: Vec<String> = vec![];
+        let mut failed_task_results: Vec<(TaskId, TaskResult)> = vec![];
+
+        for source in &ready_sources {
+            store.register_store_with_id(source.store_slot_id, &source.store_handle);
+        }
+
+        {
+            let dataset = store.dataset_mut(dataset_id)?;
+
+            for source in ready_sources {
+                let add_result = dataset
+                    .add_layer(
+                        source.segment_id.clone(),
+                        source.layer_name.clone(),
+                        source.store_slot_id,
+                        source.store_handle,
+                        on_duplicate,
+                    )
+                    .await;
+
+                match add_result {
+                    Ok(()) => {
+                        segment_ids.push(source.segment_id.to_string());
+                        segment_layers.push(source.layer_name);
+                        segment_types.push("rrd".to_owned());
+                        storage_urls.push(source.storage_url);
+                        task_ids.push(TASK_ID_SUCCESS.to_owned());
+                    }
+
+                    Err(Error::SchemaConflict(msg)) => {
+                        segment_ids.push(String::new());
+                        segment_layers.push(source.layer_name);
+                        segment_types.push("rrd".to_owned());
+                        storage_urls.push(source.storage_url);
+
+                        let task_id = TaskId::new();
+                        task_ids.push(task_id.id.clone());
+                        failed_task_results.push((task_id, TaskResult::failed(&msg)));
+                    }
+
+                    Err(other_err) => {
+                        return Err(other_err.into());
+                    }
+                }
+            }
+        }
+
+        // Register all task results now that the mutable borrow of dataset is done
+        for (task_id, result) in failed_task_results {
+            store.task_registry().register_failure(task_id, result);
         }
 
         let record_batch = RegisterWithDatasetResponse::create_dataframe(
@@ -679,6 +942,48 @@ impl RerunCloudService for RerunCloudHandler {
         ))
     }
 
+    type UnregisterFromDatasetStream = UnregisterFromDatasetResponseStream;
+
+    async fn unregister_from_dataset(
+        &self,
+        request: tonic::Request<re_protos::cloud::v1alpha1::UnregisterFromDatasetRequest>,
+    ) -> tonic::Result<Response<Self::UnregisterFromDatasetStream>, Status> {
+        let mut store = self.store.write().await;
+
+        let entry_id = get_entry_id_from_headers(&store, &request)?;
+        request.get_ref().sanity_check()?;
+
+        let dataset = store.dataset_mut(entry_id)?;
+
+        let ext::UnregisterFromDatasetRequest {
+            segments_to_drop,
+            layers_to_drop,
+            force: _, // OSS doesn't even have statuses
+        } = request.into_inner().try_into()?;
+
+        let segments_to_drop = segments_to_drop.iter().collect();
+        let layers_to_drop = layers_to_drop.iter().map(|s| s.as_str()).collect();
+
+        let dataset_manifest_removed =
+            dataset.dataset_manifest_filtered(&segments_to_drop, &layers_to_drop)?;
+
+        _ = dataset
+            .remove_layers(&segments_to_drop, &layers_to_drop)
+            .await?;
+
+        store.cleanup_store_pool();
+
+        let stream = futures::stream::once(async move {
+            Ok(re_protos::cloud::v1alpha1::UnregisterFromDatasetResponse {
+                data: Some(dataset_manifest_removed.into()),
+            })
+        });
+
+        Ok(tonic::Response::new(
+            Box::pin(stream) as Self::UnregisterFromDatasetStream
+        ))
+    }
+
     // TODO(RR-2017): This endpoint is in need of a deep redesign. For now it defaults to
     // overwriting the "base" layer.
     async fn write_chunks(
@@ -689,7 +994,7 @@ impl RerunCloudService for RerunCloudHandler {
 
         let mut request = request.into_inner();
 
-        let mut chunk_stores = HashMap::default();
+        let mut chunk_stores: HashMap<_, _> = HashMap::default();
 
         while let Some(chunk_msg) = request.next().await {
             let chunk_msg = chunk_msg?;
@@ -739,15 +1044,26 @@ impl RerunCloudService for RerunCloudHandler {
         }
 
         let mut store = self.store.write().await;
+
+        // Build handles and register in pool first
+        let handles: Vec<_> = chunk_stores
+            .into_iter()
+            .map(|(segment_id, chunk_store)| {
+                let handle = ChunkStoreHandle::new(chunk_store);
+                let store_slot_id = store.register_store(&handle);
+                (segment_id, store_slot_id, handle)
+            })
+            .collect();
+
         let dataset = store.dataset_mut(entry_id)?;
 
-        #[expect(clippy::iter_over_hash_type)]
-        for (entity_path, chunk_store) in chunk_stores {
+        for (entity_path, store_slot_id, handle) in handles {
             dataset
                 .add_layer(
                     entity_path,
                     DataSource::DEFAULT_LAYER.to_owned(),
-                    ChunkStoreHandle::new(chunk_store),
+                    store_slot_id,
+                    handle,
                     IfDuplicateBehavior::Error,
                 )
                 .await?;
@@ -950,10 +1266,12 @@ impl RerunCloudService for RerunCloudHandler {
         }))
     }
 
+    type GetRrdManifestStream = GetRrdManifestResponseStream;
+
     async fn get_rrd_manifest(
         &self,
         request: tonic::Request<re_protos::cloud::v1alpha1::GetRrdManifestRequest>,
-    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::GetRrdManifestResponse>> {
+    ) -> tonic::Result<tonic::Response<Self::GetRrdManifestStream>> {
         let store = self.store.read().await;
         let entry_id = get_entry_id_from_headers(&store, &request)?;
 
@@ -971,11 +1289,16 @@ impl RerunCloudService for RerunCloudHandler {
         let dataset = store.dataset(entry_id)?;
         let rrd_manifest = dataset.rrd_manifest(&segment_id)?;
 
-        Ok(tonic::Response::new(GetRrdManifestResponse {
-            rrd_manifest: Some(rrd_manifest.to_transport(()).map_err(|err| {
-                tonic::Status::internal(format!("Unable to compute RRD manifest: {err:#}"))
-            })?),
-        }))
+        let rrd_manifest_stream =
+            futures::stream::once(futures::future::ok(GetRrdManifestResponse {
+                rrd_manifest: Some(rrd_manifest.to_transport(()).map_err(|err| {
+                    tonic::Status::internal(format!("Unable to compute RRD manifest: {err:#}"))
+                })?),
+            }));
+
+        Ok(tonic::Response::new(
+            Box::pin(rrd_manifest_stream) as Self::GetRrdManifestStream
+        ))
     }
 
     /* Indexing */
@@ -1086,13 +1409,12 @@ impl RerunCloudService for RerunCloudHandler {
             exclude_static_data,
             exclude_temporal_data,
             scan_parameters,
-            query: _,
+            query,
         } = request.into_inner().try_into()?;
 
         if scan_parameters.is_some() {
-            re_log::info_once!(
-                "query_dataset: scan_parameters are not yet implemented and will be ignored"
-            );
+            // Logged at a low debug-level, because of https://github.com/rerun-io/rerun/pull/12578
+            re_log::debug_once!("   scan_parameters are not yet implemented and will be ignored");
         }
 
         let entity_paths: IntSet<EntityPath> = entity_paths.into_iter().collect();
@@ -1117,8 +1439,8 @@ impl RerunCloudService for RerunCloudHandler {
         }
 
         let stream = futures::stream::iter(chunk_stores.into_iter().map(
-            move |(segment_id, layer_name, store_handle)| {
-                let num_chunks = store_handle.read().num_chunks();
+            move |(segment_id, layer_name, store_slot_id, store_handle)| {
+                let num_chunks = store_handle.read().num_physical_chunks();
 
                 let mut chunk_ids = Vec::with_capacity(num_chunks);
                 let mut chunk_segment_ids = Vec::with_capacity(num_chunks);
@@ -1129,7 +1451,17 @@ impl RerunCloudService for RerunCloudHandler {
 
                 let mut timelines = BTreeMap::new();
 
-                for chunk in store_handle.read().iter_chunks() {
+                let chunks = if let Some(query) = &query {
+                    get_chunks_for_query(&store_handle, &entity_paths, query)
+                } else {
+                    store_handle
+                        .read()
+                        .iter_physical_chunks()
+                        .map(Clone::clone)
+                        .collect()
+                };
+
+                for chunk in chunks {
                     if !entity_paths.is_empty() && !entity_paths.contains(chunk.entity_path()) {
                         continue;
                     }
@@ -1190,9 +1522,7 @@ impl RerunCloudService for RerunCloudHandler {
                     chunk_keys.push(
                         ChunkKey {
                             chunk_id: chunk.id(),
-                            segment_id: segment_id.clone(),
-                            layer_name: layer_name.clone(),
-                            dataset_id: entry_id,
+                            store_slot_id,
                         }
                         .encode()?,
                     );
@@ -1281,32 +1611,27 @@ impl RerunCloudService for RerunCloudHandler {
             .await
             .chunks_from_chunk_keys(&chunk_keys)?;
 
-        let compression = re_log_encoding::Compression::Off;
+        let stream = futures::stream::iter(chunks).map(|(store_id, chunk)| {
+            let arrow_msg = re_log_types::ArrowMsg {
+                chunk_id: *chunk.id(),
+                batch: chunk.to_record_batch().map_err(|err| {
+                    tonic::Status::internal(format!(
+                        "failed to convert chunk to record batch: {err:#}"
+                    ))
+                })?,
+                on_release: None,
+            };
 
-        let encoded_chunks = chunks
-            .into_iter()
-            .map(|(store_id, chunk)| {
-                let arrow_msg = re_log_types::ArrowMsg {
-                    chunk_id: *chunk.id(),
-                    batch: chunk.to_record_batch().map_err(|err| {
-                        tonic::Status::internal(format!(
-                            "failed to convert chunk to record batch: {err:#}"
-                        ))
-                    })?,
-                    on_release: None,
-                };
+            let compression = re_log_encoding::Compression::Off;
 
-                arrow_msg
-                    .to_transport((store_id, compression))
-                    .map_err(|err| tonic::Status::internal(format!("encoding failed: {err:#}")))
+            let encoded_chunk = arrow_msg
+                .to_transport((store_id, compression))
+                .map_err(|err| tonic::Status::internal(format!("encoding failed: {err:#}")))?;
+
+            Ok(re_protos::cloud::v1alpha1::FetchChunksResponse {
+                chunks: vec![encoded_chunk],
             })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let response = re_protos::cloud::v1alpha1::FetchChunksResponse {
-            chunks: encoded_chunks,
-        };
-
-        let stream = futures::stream::once(async move { Ok(response) });
+        });
 
         Ok(tonic::Response::new(
             Box::pin(stream) as Self::FetchChunksStream
@@ -1433,35 +1758,45 @@ impl RerunCloudService for RerunCloudHandler {
         &self,
         request: tonic::Request<QueryTasksRequest>,
     ) -> tonic::Result<tonic::Response<QueryTasksResponse>> {
-        let tasks_id = request.into_inner().ids;
+        let task_ids = request.into_inner().ids;
+        let store = self.store.read().await;
 
-        let dummy_task_id = TaskId {
-            id: DUMMY_TASK_ID.to_owned(),
-        };
+        let mut ids = Vec::with_capacity(task_ids.len());
+        let mut exec_statuses = Vec::with_capacity(task_ids.len());
+        let mut msgs = Vec::with_capacity(task_ids.len());
 
-        for task_id in &tasks_id {
-            if task_id != &dummy_task_id {
-                return Err(tonic::Status::not_found(format!(
-                    "task {} not found",
-                    task_id.id
-                )));
-            }
+        for task_id in task_ids {
+            // Look up the task in the registry, falling back to success for unknown IDs
+            // (including legacy dummy IDs and stale task IDs)
+            let result = store
+                .task_registry()
+                .get(&task_id)
+                .unwrap_or_else(TaskResult::success);
+
+            ids.push(task_id.id);
+            exec_statuses.push(result.exec_status);
+            msgs.push(if result.msgs.is_empty() {
+                None
+            } else {
+                Some(result.msgs)
+            });
         }
 
+        let num_tasks = ids.len();
         let rb = QueryTasksResponse::create_dataframe(
-            vec![DUMMY_TASK_ID.to_owned()],
-            vec![None],
-            vec![None],
-            vec!["success".to_owned()],
-            vec![None],
-            vec![None],
-            vec![None],
-            vec![None],
-            vec![1],
-            vec![None],
-            vec![None],
+            ids,
+            vec![None; num_tasks], // kind
+            vec![None; num_tasks], // data
+            exec_statuses,
+            msgs,
+            vec![None; num_tasks], // blob_len
+            vec![None; num_tasks], // lease_owner
+            vec![None; num_tasks], // lease_expiration
+            vec![1; num_tasks],    // attempts
+            vec![None; num_tasks], // creation_time
+            vec![None; num_tasks], // last_update_time
         )
-        .expect("constant content that should always succeed");
+        .map_err(|err| tonic::Status::internal(format!("Failed to create dataframe: {err:#}")))?;
 
         // All tasks finish immediately in the OSS server
         Ok(tonic::Response::new(QueryTasksResponse {
@@ -1519,7 +1854,7 @@ impl RerunCloudService for RerunCloudHandler {
         let mut store = self.store.write().await;
 
         let request: CreateTableEntryRequest = request.into_inner().try_into()?;
-        let table_name = &request.name;
+        let table_name = request.name;
 
         let schema = Arc::new(request.schema);
 
@@ -1562,6 +1897,45 @@ impl RerunCloudService for RerunCloudHandler {
     }
 }
 
+/// Extracts unique store IDs from an RRD file without loading chunk data.
+///
+/// Returns a deduplicated set because a single RRD can contain duplicate
+/// `SetStoreInfo` messages for the same store.
+fn load_store_ids(rrd_path: &std::path::Path) -> tonic::Result<BTreeSet<StoreId>> {
+    let reader = std::io::BufReader::new(
+        std::fs::File::open(rrd_path)
+            .map_err(|err| tonic::Status::internal(format!("Failed to open RRD file: {err:#}")))?,
+    );
+    let decoder = re_log_encoding::DecoderApp::decode_lazy(reader);
+
+    let mut store_ids = BTreeSet::new();
+    for msg_result in decoder {
+        let msg = msg_result.map_err(|err| {
+            tonic::Status::internal(format!("Failed to decode RRD message: {err:#}"))
+        })?;
+        if let re_log_types::LogMsg::SetStoreInfo(info) = msg {
+            store_ids.insert(info.info.store_id);
+        }
+    }
+
+    Ok(store_ids)
+}
+
+/// Parses a `memory:///store/{store_slot_id}` URL and returns the [`StoreSlotId`].
+fn parse_memory_url(url: &url::Url) -> tonic::Result<StoreSlotId> {
+    let path = url.path();
+    let slot_id_str = path.strip_prefix("/store/").ok_or_else(|| {
+        tonic::Status::invalid_argument(format!(
+            "invalid memory URL format, expected memory:///store/{{store_slot_id}}: {url}"
+        ))
+    })?;
+    slot_id_str.parse::<StoreSlotId>().map_err(|err| {
+        tonic::Status::invalid_argument(format!(
+            "invalid store slot ID in memory URL '{url}': {err}"
+        ))
+    })
+}
+
 /// Retrieves the entry ID based on HTTP headers.
 fn get_entry_id_from_headers<T>(
     store: &InMemoryStore,
@@ -1579,5 +1953,105 @@ fn get_entry_id_from_headers<T>(
         Err(tonic::Status::invalid_argument(format!(
             "missing mandatory {HEADERS:?} HTTP headers"
         )))
+    }
+}
+
+/// Return the equivalent latest at query
+fn latest_at_or_static(latest_at: &ext::QueryLatestAt) -> LatestAtQuery {
+    match &latest_at.index {
+        Some(index) => LatestAtQuery::new(index.clone().into(), latest_at.at),
+        None => {
+            // Static only data
+            LatestAtQuery::new("".into(), re_log_types::TimeInt::MIN)
+        }
+    }
+}
+
+/// Utility function to determine the chunks to return based on query parameters
+fn get_chunks_for_query(
+    store_handle: &ChunkStoreHandle,
+    entity_paths: &IntSet<EntityPath>,
+    query: &ext::Query,
+) -> Vec<Arc<Chunk>> {
+    let paths = if entity_paths.is_empty() {
+        store_handle.read().all_entities()
+    } else {
+        entity_paths.clone()
+    };
+    match (&query.latest_at, &query.range) {
+        (Some(latest_at), Some(range)) => {
+            let latest_at = latest_at_or_static(latest_at);
+            let range = RangeQuery::new(range.index.clone().into(), range.index_range);
+
+            // We have both a latest at and a range, so we need to combine
+            // chunks and ensure no duplicates
+            paths
+                .iter()
+                .flat_map(|entity_path| {
+                    let read_lock = store_handle.read();
+                    let mut latest_at = read_lock
+                        .latest_at_relevant_chunks_for_all_components(
+                            ChunkTrackingMode::Report,
+                            &latest_at,
+                            entity_path,
+                            true,
+                        )
+                        .chunks;
+                    let mut range = read_lock
+                        .range_relevant_chunks_for_all_components(
+                            ChunkTrackingMode::Report,
+                            &range.clone(),
+                            entity_path,
+                            true,
+                        )
+                        .chunks;
+
+                    range.retain(|chunk| !latest_at.contains(chunk));
+                    latest_at.extend(range);
+
+                    latest_at
+                })
+                .collect::<Vec<_>>()
+        }
+        (Some(latest_at), None) => {
+            let latest_at = latest_at_or_static(latest_at);
+
+            paths
+                .iter()
+                .flat_map(|entity_path| {
+                    store_handle
+                        .read()
+                        .latest_at_relevant_chunks_for_all_components(
+                            ChunkTrackingMode::Report,
+                            &latest_at.clone(),
+                            entity_path,
+                            true,
+                        )
+                        .chunks
+                })
+                .collect::<Vec<_>>()
+        }
+        (None, Some(range)) => {
+            let range = RangeQuery::new(range.index.clone().into(), range.index_range);
+            paths
+                .iter()
+                .flat_map(|entity_path| {
+                    store_handle
+                        .read()
+                        .range_relevant_chunks_for_all_components(
+                            ChunkTrackingMode::Report,
+                            &range.clone(),
+                            entity_path,
+                            true,
+                        )
+                        .chunks
+                })
+                .collect::<Vec<_>>()
+        }
+        (None, None) => store_handle
+            .read()
+            .iter_physical_chunks()
+            .map(Clone::clone)
+            .collect(),
     }
 }

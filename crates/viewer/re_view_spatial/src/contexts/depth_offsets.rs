@@ -28,9 +28,12 @@ impl ViewContextSystem for EntityDepthOffsets {
     fn execute(
         &mut self,
         ctx: &re_viewer_context::ViewContext<'_>,
+        _missing_chunk_reporter: &re_viewer_context::MissingChunkReporter,
         query: &re_viewer_context::ViewQuery<'_>,
         _once_per_frame_result: &re_viewer_context::ViewContextSystemOncePerFrameResult,
     ) {
+        re_tracing::profile_function!();
+
         let mut entities_per_draw_order = BTreeMap::new();
         for (visualizer, draw_order_descriptor) in visualizers_processing_draw_order() {
             collect_draw_order_per_visualizer(
@@ -67,10 +70,6 @@ impl ViewContextSystem for EntityDepthOffsets {
             })
             .collect();
     }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 }
 
 fn collect_draw_order_per_visualizer(
@@ -83,23 +82,24 @@ fn collect_draw_order_per_visualizer(
         BTreeSet<(ViewSystemIdentifier, EntityPathHash)>,
     >,
 ) {
+    re_tracing::profile_function!();
+
     let latest_at_query = ctx.current_query();
     let mut default_draw_order = None; // determined lazily
 
-    for data_result in query.iter_visible_data_results(visualizer_identifier) {
-        let query_shadowed_components = false;
+    for (data_result, instruction) in query.iter_visualizer_instruction_for(visualizer_identifier) {
         let draw_order = latest_at_with_blueprint_resolved_data(
             ctx,
             None,
             &latest_at_query,
             data_result,
             [draw_order_descriptor.component],
-            query_shadowed_components,
+            Some(instruction),
         )
         .get_mono::<DrawOrder>(draw_order_descriptor.component)
         .unwrap_or_else(|| {
             *default_draw_order.get_or_insert_with(|| {
-                let ctx = ctx.query_context(data_result, &latest_at_query);
+                let ctx = ctx.query_context(data_result, latest_at_query.clone(), instruction.id);
                 determine_default_draworder(&ctx, draw_order_descriptor.component)
             })
         });

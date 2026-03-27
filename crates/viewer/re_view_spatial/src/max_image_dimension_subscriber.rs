@@ -77,23 +77,28 @@ impl PerStoreChunkSubscriber for MaxImageDimensionsStoreSubscriber {
         re_tracing::profile_function!();
 
         for event in events {
-            if event.diff.kind != re_chunk_store::ChunkStoreDiffKind::Addition {
+            let Some(add) = event.to_addition() else {
                 // Max image dimensions are strictly additive
                 continue;
-            }
+            };
 
-            let chunk = &event.diff.chunk;
-            let components = chunk.components();
-            let entity_path = chunk.entity_path();
+            // This is a purely additive datastructure, and it doesn't keep track of actual chunks,
+            // just the bits of data that are of actual interest.
+            // Therefore, the delta chunk is all we need, always.
+            let delta_chunk = add.delta_chunk();
+
+            let components = delta_chunk.components();
+            let entity_path = delta_chunk.entity_path();
 
             // Handle new video codecs first since we do a lookup on this later.
             if components.contains_key(&archetypes::VideoStream::descriptor_codec().component) {
-                for codec in chunk.iter_component::<components::VideoCodec>(
+                for codec in delta_chunk.iter_component::<components::VideoCodec>(
                     archetypes::VideoStream::descriptor_codec().component,
                 ) {
                     let Some(codec) = codec.first() else {
                         continue;
                     }; // Ignore both empty arrays and multiple codecs per row.
+
                     if let Some(existing_codec) =
                         self.video_codecs.insert(entity_path.hash(), *codec)
                         && existing_codec != *codec
@@ -159,7 +164,7 @@ impl PerStoreChunkSubscriber for MaxImageDimensionsStoreSubscriber {
                         max_dim.height = max_dim.height.max(new_dim.height);
                     }
                 } else if descriptor.component_type == Some(components::Blob::name()) {
-                    let blobs = chunk.iter_slices::<&[u8]>(descriptor.component);
+                    let blobs = delta_chunk.iter_slices::<&[u8]>(descriptor.component);
 
                     // Is there a media type paired up with this blob?
                     let media_type_descr =
@@ -171,7 +176,7 @@ impl PerStoreChunkSubscriber for MaxImageDimensionsStoreSubscriber {
                                     && maybe_media_type_descr.archetype == descriptor.archetype
                             });
                     let media_types = media_type_descr.map_or(Vec::new(), |media_type_descr| {
-                        chunk
+                        delta_chunk
                             .iter_slices::<String>(media_type_descr.component)
                             .collect()
                     });
@@ -206,7 +211,7 @@ impl PerStoreChunkSubscriber for MaxImageDimensionsStoreSubscriber {
                         continue;
                     };
 
-                    for sample in chunk.iter_slices::<&[u8]>(descriptor.component) {
+                    for sample in delta_chunk.iter_slices::<&[u8]>(descriptor.component) {
                         let Some(sample) = sample.first() else {
                             continue;
                         };
@@ -253,10 +258,15 @@ fn try_size_from_blob(
         re_tracing::profile_scope!("video asset");
 
         let media_type = components::MediaType::or_guess_from_data(media_type, blob)?;
-        re_video::VideoDataDescription::load_from_bytes(blob, media_type.as_str(), debug_name)
-            .ok()
-            .and_then(|video| video.encoding_details.map(|e| e.coded_dimensions))
-            .map(|[w, h]| [w as _, h as _])
+        re_video::VideoDataDescription::load_from_bytes(
+            blob,
+            media_type.as_str(),
+            debug_name,
+            re_log_types::external::re_tuid::Tuid::new(),
+        )
+        .ok()
+        .and_then(|video| video.encoding_details.map(|e| e.coded_dimensions))
+        .map(|[w, h]| [w as _, h as _])
     } else {
         None
     }

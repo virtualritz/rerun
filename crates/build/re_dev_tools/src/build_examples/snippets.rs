@@ -17,8 +17,26 @@ pub struct Snippets {
     output_dir: PathBuf,
 }
 
+fn install_snippet_deps() {
+    // uv sync --inexact --no-install-package rerun-sdk --group snippets
+    let mut cmd = Command::new("uv");
+    cmd.arg("sync");
+    cmd.arg("--inexact");
+    cmd.arg("--no-install-package");
+    cmd.arg("rerun-sdk");
+    cmd.arg("--group");
+    cmd.arg("snippets");
+
+    let _ = cmd
+        .status()
+        .expect("failed to run `uv sync` to install snippet dependencies");
+}
+
 impl Snippets {
     pub fn run(self) -> anyhow::Result<()> {
+        // Install snippet dependencies by running:
+        install_snippet_deps();
+
         create_dir_all(&self.output_dir)?;
 
         let snippets_dir = re_build_tools::cargo_metadata()?
@@ -47,7 +65,7 @@ impl Snippets {
         let progress = MultiProgress::new();
 
         println!("Running {} snippets…", snippets.len());
-        let results: Vec<anyhow::Result<PathBuf>> = snippets
+        let results: Vec<anyhow::Result<Option<PathBuf>>> = snippets
             .into_par_iter()
             .map(|example| example.build(&progress, &self.output_dir))
             .collect();
@@ -55,7 +73,7 @@ impl Snippets {
         let mut num_failed = 0;
         for result in results {
             match result {
-                Ok(rrd_path) => {
+                Ok(Some(rrd_path)) => {
                     if let Ok(metadata) = std::fs::metadata(&rrd_path) {
                         println!(
                             "Output: {} ({})",
@@ -66,6 +84,10 @@ impl Snippets {
                         eprintln!("Missing rrd at {}", rrd_path.display());
                         num_failed += 1;
                     }
+                }
+                Ok(None) => {
+                    // Backwards check opted out - no RRD expected
+                    println!("Completed (no RRD output required)");
                 }
                 Err(err) => {
                     eprintln!("{err}");
@@ -110,28 +132,29 @@ fn collect_snippets_recursively(
             .to_string();
         let config_key = name.replace('\\', "/");
 
-        let is_opted_out = config
+        let is_opted_out_run = config
             .opt_out
             .run
             .get(&config_key)
             .is_some_and(|languages| languages.iter().any(|v| v == "py"));
-        if is_opted_out {
+        if is_opted_out_run {
             println!(
-                "Skipping {}: explicit opt-out in `snippets.toml`",
+                "Skipping {}: explicit opt-out from run in `snippets.toml`",
                 path.display()
             );
             continue;
         }
 
+        let is_opted_out_backwards_check = config.opt_out.backwards_check.contains(&config_key);
+
+        let backwards_check_opted_out = is_opted_out_backwards_check;
+
         if meta.is_dir() {
-            snippets.extend(
-                collect_snippets_recursively(
-                    Utf8Path::from_path(&path).unwrap(),
-                    config,
-                    snippet_root_path,
-                )?
-                .into_iter(),
-            );
+            snippets.extend(collect_snippets_recursively(
+                Utf8Path::from_path(&path).unwrap(),
+                config,
+                snippet_root_path,
+            )?);
             continue;
         }
 
@@ -156,6 +179,7 @@ fn collect_snippets_recursively(
             path,
             name,
             extra_args,
+            backwards_check_opted_out,
         });
     }
 
@@ -167,10 +191,11 @@ struct Snippet {
     path: PathBuf,
     name: String,
     extra_args: Vec<String>,
+    backwards_check_opted_out: bool,
 }
 
 impl Snippet {
-    fn build(self, progress: &MultiProgress, output_dir: &Path) -> anyhow::Result<PathBuf> {
+    fn build(self, progress: &MultiProgress, output_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
         let rrd_path = output_dir.join(&self.name).with_extension("rrd");
 
         if let Some(dir) = rrd_path.parent() {
@@ -186,15 +211,23 @@ impl Snippet {
             ("RERUN_FLUSH_NUM_ROWS", "0"),
             ("RERUN_STRICT", "1"),
             ("RERUN_PANIC_ON_WARN", "1"),
-            (
+        ]);
+
+        // Only set _RERUN_TEST_FORCE_SAVE if we expect an RRD output
+        if !self.backwards_check_opted_out {
+            cmd.env(
                 "_RERUN_TEST_FORCE_SAVE",
                 rrd_path.to_string_lossy().as_ref(),
-            ),
-        ]);
+            );
+        }
 
         wait_for_output(cmd, &self.name, progress)?;
 
-        Ok(rrd_path)
+        if self.backwards_check_opted_out {
+            Ok(None)
+        } else {
+            Ok(Some(rrd_path))
+        }
     }
 }
 
@@ -211,4 +244,7 @@ struct Config {
 struct OptOut {
     /// example name -> languages
     run: HashMap<String, Vec<String>>,
+
+    /// example name (for backwards compatibility check opt-out)
+    backwards_check: Vec<String>,
 }

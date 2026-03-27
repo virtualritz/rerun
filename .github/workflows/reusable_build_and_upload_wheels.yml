@@ -67,17 +67,6 @@ env:
   RUSTFLAGS: --deny warnings
   RUSTDOCFLAGS: --deny warnings
 
-  # Disable the GHA backend (Github's 10GB storage) since we use our own GCS backend.
-  # See: https://github.com/marketplace/actions/sccache-action
-  SCCACHE_GHA_ENABLED: "false"
-
-  # Wrap every `rustc` invocation in `sccache`.
-  RUSTC_WRAPPER: "sccache"
-
-  # Not only `sccache` cannot cache incremental builds, it's counter-productive to generate all
-  # these incremental artifacts when running on CI.
-  CARGO_INCREMENTAL: "0"
-
 defaults:
   run:
     shell: bash --noprofile --norc -euo pipefail {0}
@@ -114,14 +103,14 @@ jobs:
             linux-arm64)
                 runner="ubuntu-arm-16-core"
                 target="aarch64-unknown-linux-gnu"
-                container="'ghcr.io/rerun-io/ci_docker:0.16.0'" # Required to be manylinux compatible
+                container="'ghcr.io/rerun-io/ci_docker:0.17.0'" # Required to be manylinux compatible
                 compat="manylinux_2_28"
                 ;;
             linux-x64)
               runner="ubuntu-latest-16-cores"
               target="x86_64-unknown-linux-gnu"
               compat="manylinux_2_28"
-              container="'ghcr.io/rerun-io/ci_docker:0.16.0'" # Required to be manylinux compatible
+              container="'ghcr.io/rerun-io/ci_docker:0.17.0'" # Required to be manylinux compatible
               ;;
             windows-x64)
               runner="windows-latest-32-cores"
@@ -130,7 +119,7 @@ jobs:
               compat="manylinux_2_28"
               ;;
             macos-arm64)
-              runner="macos-15-xlarge" # See https://github.blog/2023-10-02-introducing-the-new-apple-silicon-powered-m1-macos-larger-runner-for-github-actions/
+              runner="macos-26-xlarge" # See https://github.blog/2023-10-02-introducing-the-new-apple-silicon-powered-m1-macos-larger-runner-for-github-actions/
               target="aarch64-apple-darwin"
               container="null"
               compat="manylinux_2_28"
@@ -204,7 +193,7 @@ jobs:
 
       - name: Build
         run: |
-          pixi run python scripts/ci/build_and_upload_wheels.py \
+          pixi run uvpy scripts/ci/build_and_upload_wheels.py \
             --mode ${{ inputs.MODE }} \
             --target ${{ needs.set-config.outputs.TARGET }} \
             --dir commit/${{ steps.get-sha.outputs.sha }}/wheels \
@@ -227,8 +216,9 @@ jobs:
         run: |
           rm -rf dist
           pixi run js-build-base
-          pixi run python scripts/ci/build_and_upload_rerun_notebook.py \
-            --dir commit/${{ steps.get-sha.outputs.sha }}/wheels
+          pixi run uvpy scripts/ci/build_and_upload_rerun_notebook.py \
+            --dir commit/${{ steps.get-sha.outputs.sha }}/wheels \
+            --notebook-dir commit/${{ steps.get-sha.outputs.sha }}/notebook
 
       - name: Save rerun_notebook wheel artifact
         if: ${{ (inputs.MODE == 'pypi' || inputs.MODE == 'extra') && inputs.PLATFORM == 'linux-x64' }}

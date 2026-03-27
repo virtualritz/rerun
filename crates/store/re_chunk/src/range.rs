@@ -75,25 +75,37 @@ impl Default for RangeQueryOptions {
 
 impl std::fmt::Debug for RangeQuery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            timeline,
+            range,
+            options,
+        } = self;
+
+        let RangeQueryOptions {
+            keep_extra_timelines,
+            keep_extra_components,
+            include_extended_bounds,
+        } = options;
+
         f.write_fmt(format_args!(
-            "<ranging {:?}..={:?} on {:?} ([{}]keep_timelines [{}]keep_components [{}]extended_bounds)>",
-            self.range.min(),
-            self.range.max(),
-            self.timeline,
-            if self.options.keep_extra_timelines {
-                "✓"
+            "<ranging {:?}..={:?} on {:?}{}{}{}",
+            range.min(),
+            range.max(),
+            timeline,
+            if *keep_extra_timelines {
+                " keep_extra_timelines"
             } else {
-                " "
+                ""
             },
-            if self.options.keep_extra_components {
-                "✓"
+            if *keep_extra_components {
+                " keep_extra_components"
             } else {
-                " "
+                ""
             },
-            if self.options.include_extended_bounds {
-                "✓"
+            if *include_extended_bounds {
+                " include_extended_bounds"
             } else {
-                " "
+                ""
             },
         ))
     }
@@ -191,8 +203,7 @@ impl Chunk {
     /// See [`Self::timeline_sliced`] and [`Self::component_sliced`] if you do want to filter this
     /// extra data.
     //
-    // TODO(apache/arrow-rs#5375): Since we don't have access to arrow's ListView yet, we must actually clone the
-    // data if the chunk requires sorting.
+    // TODO(RR-3865): Use arrow's `ListView` to avoid cloning data when the chunk requires sorting.
     pub fn range(&self, query: &RangeQuery, component: ComponentIdentifier) -> Self {
         if self.is_empty() {
             return self.clone();
@@ -237,7 +248,7 @@ impl Chunk {
                 return chunk.emptied();
             };
 
-            let chunk = chunk.densified(component);
+            let (chunk, _densified) = chunk.densified(component);
 
             let chunk = if is_sorted_by_time {
                 // Temporal, row-sorted, time-sorted chunk
@@ -265,7 +276,7 @@ impl Chunk {
                 end_index = usize::min(self.num_rows(), end_index.saturating_add(1));
             }
 
-            chunk.row_sliced(start_index, end_index.saturating_sub(start_index))
+            chunk.row_sliced_shallow(start_index, end_index.saturating_sub(start_index))
         }
     }
 }

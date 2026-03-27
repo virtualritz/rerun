@@ -1,6 +1,6 @@
 ---
-title: CLI manual
-order: 250
+title: ⌨️ CLI manual
+order: 1150
 ---
 
 ## rerun
@@ -18,6 +18,7 @@ The Rerun command-line interface:
 
 * `analytics`: Configure the behavior of our analytics.
 * `auth`: Authentication with the redap.
+* `download`: Download recordings and save them as .rrd files.
 * `man`: Generates the Rerun CLI manual (markdown).
 * `mcap`: Manipulate the contents of .mcap files.
 * `reset`: Reset the memory of the Rerun Viewer.
@@ -32,7 +33,7 @@ The Rerun command-line interface:
 > - A path to a Rerun .rrd recording
 > - A path to a Rerun .rbl blueprint
 > - An HTTP(S) URL to an .rrd or .rbl file to load
-> - A path to an image or mesh, or any other file that Rerun can load (see https://www.rerun.io/docs/reference/data-loaders/overview)
+> - A path to an image or mesh, or any other file that Rerun can load (see https://www.rerun.io/docs/concepts/logging-and-ingestion/data-loaders/overview)
 >
 > If no arguments are given, a server will be hosted which a Rerun SDK can connect to.
 
@@ -40,6 +41,8 @@ The Rerun command-line interface:
 
 * `--bind <BIND>`
 > What bind address IP to use.
+>
+> `::` will listen on all interfaces, IPv6 and IPv4.
 >
 > [Default: `0.0.0.0`]
 
@@ -55,7 +58,8 @@ The Rerun command-line interface:
 > The server buffers log messages for the benefit of late-arriving viewers.
 > When this limit is reached, Rerun will drop the oldest data.
 > Example: `16GB` or `50%` (of system total).
-> Default is `0B`, or `25%` if any of the `--serve-*` flags are set.
+>
+> [Default: `1GiB`]
 
 * `--newest-first <NEWEST_FIRST>`
 > If true, play back the most recent data first when new clients connect.
@@ -74,7 +78,16 @@ The Rerun command-line interface:
 * `--port <PORT>`
 > What port do we listen to for SDKs to connect to over gRPC.
 >
+> Use `auto` to always start a new viewer with a free port if the default is taken.
+>
 > [Default: `9876`]
+
+* `--new <NEW>`
+> Alias for `--port auto`. Always start a new viewer.
+>
+> If the port is already in use, a free port will be picked automatically.
+>
+> [Default: `false`]
 
 * `--profile <PROFILE>`
 > Start with the puffin profiler running.
@@ -92,16 +105,12 @@ The Rerun command-line interface:
 >
 > If started, the web server will act like a proxy, listening for incoming connections from logging SDKs, and forwarding it to Rerun viewers.
 >
-> Using this sets the default `--server-memory-limit` to 25% of available system memory.
->
 > [Default: `false`]
 
 * `--serve-grpc <SERVE_GRPC>`
 > This will host a gRPC server.
 >
 > The server will act like a proxy, listening for incoming connections from logging SDKs, and forwarding it to Rerun viewers.
->
-> Using this sets the default `--server-memory-limit` to 25% of available system memory.
 >
 > [Default: `false`]
 
@@ -120,6 +129,13 @@ The Rerun command-line interface:
 > This is set by the `spawn()` method in our logging SDK.
 >
 > The viewer will respond by fading in the welcome screen, instead of showing it directly. This ensures that it won't blink for a few frames before switching to the recording.
+>
+> [Default: `false`]
+
+* `--follow <FOLLOW>`
+> Tail .rrd files, waiting for new data to be appended after reaching EOF.
+>
+> Without this flag, .rrd files are read once and the viewer stops loading when EOF is reached. With this flag, the viewer will keep watching for new data, which is useful for live streaming from a writer process.
 >
 > [Default: `false`]
 
@@ -241,6 +257,7 @@ Authentication with the redap.
 **Commands**
 
 * `login`: Log into Rerun.
+* `logout`: Log out of Rerun.
 * `token`: Retrieve the stored access token.
 * `generate-token`: Generate a fresh access token.
 
@@ -248,7 +265,7 @@ Authentication with the redap.
 
 Log into Rerun.
 
-This command opens a page in your default browser, allowing you to log in to the Rerun data platform.
+This command opens a page in your default browser, allowing you to log in to the Rerun Data Platform.
 
 Once you've logged in, your credentials are stored on your machine.
 
@@ -268,15 +285,30 @@ To sign up, contact us through the form linked at <https://rerun.io/#open-source
 >
 > [Default: `false`]
 
+## rerun auth logout
+
+Log out of Rerun.
+
+This command clears the credentials stored on your machine and ends your session.
+
+**Usage**: `rerun auth logout [OPTIONS]`
+
+**Options**
+
+* `--no-open-browser <NO_OPEN_BROWSER>`
+> Post a link instead of directly opening in the browser.
+>
+> [Default: `false`]
+
 ## rerun auth generate-token
 
 Generate a fresh access token.
 
-You can use this token to authorize requests to the Rerun data platform.
+You can use this token to authorize requests to the Rerun Data Platform.
 
 It's closer to an API key than an access token, as it can be revoked before it expires.
 
-**Usage**: `rerun auth generate-token --server <SERVER> --expiration <EXPIRATION>`
+**Usage**: `rerun auth generate-token [OPTIONS] --server <SERVER> --expiration <EXPIRATION>`
 
 **Options**
 
@@ -285,6 +317,33 @@ It's closer to an API key than an access token, as it can be revoked before it e
 
 * `--expiration <EXPIRATION>`
 > Duration of the token, either in: - "human time", e.g. `1 day`, or - ISO 8601 duration format, e.g. `P1D`.
+
+* `--permission <PERMISSION>`
+> Which permission the token should have.
+>
+> [`read`, `read-write`]
+>
+> [Default: `read`]
+
+## rerun download
+
+Download recordings and save them as .rrd files.
+
+Supports downloading from Rerun Cloud as well as any other supported URI.
+
+**Usage**: `rerun download [OPTIONS] <URLS>…`
+
+**Arguments**
+
+* `<URLS>`
+> One or more URIs to download.
+
+**Options**
+
+* `-o, --output-dir <OUTPUT_DIR>`
+> Override the output directory for the downloaded `.rrd` files.
+>
+> Defaults to the current working directory.
 
 ## rerun mcap
 
@@ -315,11 +374,11 @@ Convert an .mcap file to an .rrd.
 * `--application-id <APPLICATION_ID>`
 > If set, specifies the application id of the output.
 
-* `-l, --layer <SELECTED_LAYERS>`
-> Specifies which layers to apply during conversion.
+* `-d, --decoder <SELECTED_DECODERS>`
+> Specifies which decoders to apply during conversion.
 
 * `--disable-raw-fallback <DISABLE_RAW_FALLBACK>`
-> Disable using the raw layer as a fallback for unsupported channels. By default, channels that cannot be handled by semantic layers (protobuf, ROS2) will be processed by the raw layer.
+> Disable using the raw decoder as a fallback for unsupported channels. By default, channels that cannot be handled by semantic decoders (protobuf, ROS2) will be processed by the raw decoder.
 >
 > [Default: `false`]
 
@@ -327,6 +386,20 @@ Convert an .mcap file to an .rrd.
 > If set, specifies the recording id of the output.
 >
 > When this flag is set and multiple input .rdd files are specified, blueprint activation commands will be dropped from the resulting output.
+
+* `--timestamp-offset-ns <TIMESTAMP_OFFSET_NS>`
+> If set, an offset in nanoseconds to add to all timestamp timelines.
+>
+> This can be used to shift all timestamps of the MCAP file if they are not yet relative to the UNIX epoch.
+>
+> Duration and sequence timelines are not affected by this offset.
+
+* `--timeline-type <TIMELINE_TYPE>`
+> The timeline type to use for timestamp timelines.
+>
+> "timestamp" (default) creates `TimestampNs` timelines (nanoseconds since Unix epoch). "duration" creates `DurationNs` timelines (nanosecond durations).
+>
+> [Default: `timestamp`]
 
 ## rerun rrd
 
@@ -339,6 +412,7 @@ Manipulate the contents of .rrd and .rbl files.
 * `compact`: Compacts the contents of one or more .rrd/.rbl files/streams and writes the result standard output.
 * `compare`: Compares the data between 2 .rrd files, returning a successful shell exit code if they match.
 * `filter`: Filters out data from .rrd/.rbl files/streams, and writes the result to standard output.
+* `split`: Optimally splits a recording on a specified timeline.
 * `merge`: Merges the contents of multiple .rrd/.rbl files/streams, and writes the result to standard output.
 * `migrate`: Migrate one or more .rrd files to the newest Rerun version.
 * `print`: Print the contents of one or more .rrd/.rbl files/streams.
@@ -475,6 +549,55 @@ Example: `rerun rrd filter --drop-timeline log_tick /my/recordings/*.rrd > outpu
 >
 > [Default: `false`]
 
+## rerun rrd split
+
+Optimally splits a recording on a specified timeline.
+
+The sum of the generated splits will always exactly match the original recording.
+
+Example: `rerun rrd split --output-dir ./splits --timeline log_tick --time 33 --time 66 ./my_video.rrd`
+
+**Usage**: `rerun rrd split [OPTIONS] --output-dir <output directory> --timeline <TIMELINE> <PATH_TO_INPUT_RRD>`
+
+**Arguments**
+
+* `<PATH_TO_INPUT_RRD>`
+> Path to read from.
+
+**Options**
+
+* `-o, --output-dir <output directory>`
+> Path to the output directory. All generated RRD files will end up there.
+
+* `--timeline <TIMELINE>`
+> The timeline used to compute the splits.
+>
+> The other timelines will be kept in the output, which might or might not make sense depending on the density of the dataset. Use `--drop-unused-timelines` to discard them.
+
+* `-t, --time <TIMES>`
+> The timestamps at which to perform the splits. Incompatible with `--num-parts`/`-n`.
+>
+> There are always `number_of_times + 1` resulting splits.
+>
+> For example, given `-t 10 -t 20 -t 30`, this command will output 4 splits: [-inf:10), [10:20), [20:30), [30:+inf).
+
+* `-n, --num-parts <NUM_PARTS>`
+> The number of parts to split the recording into. Incompatible with `--time`/`-t`.
+>
+> There will be exactly that number of resulting splits. Each split will cover an equal time span in the timeline.
+
+* `--recording-id <recording ID prefix>`
+> The recording ID prefix to be used for the output recordings.
+>
+> If left unspecified, the ID of the original recording, suffixed with a `-`, will be used as a prefix.
+>
+> Each split will use `<recording_id_prefix><i>` as their respective recording ID, where `i` is the index of the split.
+
+* `--drop-unused-timelines <DISCARD_UNUSED_TIMELINES>`
+> If true, timelines other than the one specified with `--timeline` will be discarded.
+>
+> [Default: `false`]
+
 ## rerun rrd merge
 
 Merges the contents of multiple .rrd/.rbl files/streams, and writes the result to standard output.
@@ -562,6 +685,17 @@ Example: `rerun rrd print /my/recordings/*.rrd`
 * `--footers <FOOTERS>`
 > If true, displays all the parsed footers at the end.
 
+* `--footers-lod <FOOTERS_LOD>`
+> The level of detail to use when printing footers. Higher is more detailed.
+>
+> * `0`: only chunk metadata columns
+>
+> * `1`: `0` + global timeline columns
+>
+> * `2`: `1` + everything else
+>
+> [Default: `0`]
+
 * `--transposed <TRANSPOSED>`
 > Transpose record batches before printing them?
 
@@ -598,13 +732,6 @@ Note: Because the payload of the messages is never decoded, no migration or veri
 >
 > When this flag is set and multiple input .rdd files are specified, blueprint activation commands will be dropped from the resulting output.
 
-* `--recompute-manifests <RECOMPUTE_MANIFESTS>`
-> If set, this will compute an RRD footer with the appropriate manifest for the routed data.
->
-> By default, `rerun rrd route` will always drop all existing RRD manifests when routing data, as doing so invalidates their contents. This flag makes it possible to recompute an RRD manifest for the routed data, but beware that it has to decode the data, which means it is A) much slower and B) will migrate the data to the latest Sorbet specification automatically.
->
-> [Default: `false`]
-
 ## rerun rrd stats
 
 Compute important statistics for one or more .rrd/.rbl files/streams.
@@ -640,12 +767,19 @@ Verify the that the .rrd file can be loaded and correctly interpreted.
 
 Can be used to ensure that the current Rerun version can load the data.
 
-**Usage**: `rerun rrd verify [PATH_TO_INPUT_RRDS]…`
+**Usage**: `rerun rrd verify [OPTIONS] [PATH_TO_INPUT_RRDS]…`
 
 **Arguments**
 
 * `<PATH_TO_INPUT_RRDS>`
 > Paths to read from. Reads from standard input if none are specified.
+
+**Options**
+
+* `--check-footers <CHECK_FOOTERS>`
+> If true, ensures that RRD footers are present and well formed.
+>
+> [Default: `true`]
 
 ## rerun server
 
@@ -655,8 +789,8 @@ In-memory Rerun data server.
 
 **Options**
 
-* `--addr <ADDR>`
-> Address to listen on.
+* `--host <HOST>`
+> IP address to listen on.
 >
 > [Default: `0.0.0.0`]
 
@@ -670,6 +804,14 @@ In-memory Rerun data server.
 
 * `-t, --table <[NAME=]TABLE_PATH>`
 > Load a lance file as a table (can be specified multiple times). You can specify only a path or provide a name such as `-t my_table=./path/to/table`.
+
+* `--latency-ms <LATENCY_MS>`
+> Artificial latency to add to each request (in milliseconds).
+>
+> [Default: `0`]
+
+* `--bandwidth-limit <BANDWIDTH_LIMIT>`
+> Artificial bandwidth limit for responses (e.g. '10MB' for 10 megabytes per second).
 
 * `-V, --version `
 > Print version.

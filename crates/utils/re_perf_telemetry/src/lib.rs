@@ -51,6 +51,7 @@ mod metrics_server;
 mod prometheus;
 mod shared_reader;
 mod telemetry;
+mod trace_id_format;
 mod tracestate;
 mod utils;
 
@@ -60,10 +61,10 @@ use opentelemetry_sdk::propagation::TraceContextPropagator;
 
 pub use self::args::{LogFormat, TelemetryArgs};
 pub use self::grpc::{
-    ClientTelemetryLayer, GrpcMakeSpan, GrpcOnEos, GrpcOnFirstBodyChunk, GrpcOnRequest,
-    GrpcOnResponse, GrpcOnResponseOptions, ServerTelemetryLayer, TelemetryLayerOptions,
-    TraceIdLayer, TracingInjectorInterceptor, new_client_telemetry_layer,
-    new_server_telemetry_layer,
+    BenchmarkIdLayer, ClientTelemetryLayer, GrpcMakeSpan, GrpcOnEos, GrpcOnFirstBodyChunk,
+    GrpcOnRequest, GrpcOnResponse, GrpcOnResponseOptions, ServerTelemetryLayer,
+    SpanMetadataCleanupLayer, TelemetryLayerOptions, TracingInjectorInterceptor,
+    new_client_telemetry_layer, new_server_telemetry_layer,
 };
 pub use self::telemetry::{Telemetry, TelemetryDropBehavior};
 pub use self::utils::to_short_str;
@@ -150,10 +151,8 @@ impl opentelemetry::propagation::Injector for TraceHeaders {
     fn set(&mut self, key: &str, value: String) {
         match key {
             Self::TRACEPARENT_KEY => self.traceparent = value,
-            Self::TRACESTATE_KEY => {
-                if !value.is_empty() {
-                    self.tracestate = Some(value);
-                }
+            Self::TRACESTATE_KEY if !value.is_empty() => {
+                self.tracestate = Some(value);
             }
             _ => {}
         }
@@ -253,7 +252,7 @@ pub fn extract_trace_context_from_contextvar(py: pyo3::Python<'_>) -> TraceHeade
     }
 
     try_extract(py).unwrap_or_else(|err| {
-        tracing::debug!("Failed to extract trace context: {}", err);
+        tracing::debug!("Failed to extract trace context: {err}");
         TraceHeaders::empty()
     })
 }

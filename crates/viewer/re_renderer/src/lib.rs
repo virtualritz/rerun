@@ -36,7 +36,7 @@ pub mod mesh;
 pub mod renderer;
 pub mod resource_managers;
 pub mod texture_info;
-#[cfg(feature = "video")]
+pub mod texture_readback;
 pub mod video;
 pub mod view_builder;
 pub mod wgpu_buffer_types;
@@ -44,7 +44,6 @@ pub mod wgpu_buffer_types;
 mod color;
 mod colormap;
 mod context;
-mod debug_label;
 mod depth_offset;
 mod draw_phases;
 mod error_handling;
@@ -52,12 +51,14 @@ mod file_resolver;
 mod file_server;
 mod file_system;
 mod global_bindings;
+mod label;
 mod line_drawable_builder;
 mod point_cloud_builder;
 mod queueable_draw_data;
 mod rect;
 mod size;
 mod transform;
+pub mod util;
 mod wgpu_resources;
 
 #[cfg(test)]
@@ -70,10 +71,10 @@ mod workspace_shaders;
 // ---------------------------------------------------------------------------
 // Exports
 
-use allocator::GpuReadbackBuffer;
 pub use allocator::{
-    CpuWriteGpuReadError, GpuReadbackIdentifier, create_and_fill_uniform_buffer,
-    create_and_fill_uniform_buffer_batch,
+    CpuWriteGpuReadBelt, CpuWriteGpuReadBuffer, CpuWriteGpuReadError, DataTextureSource,
+    DataTextureSourceWriteError, GpuReadbackBuffer, GpuReadbackError, GpuReadbackIdentifier,
+    create_and_fill_uniform_buffer, create_and_fill_uniform_buffer_batch,
 };
 pub use color::{Rgba32Unmul, UnalignedColor32};
 pub use colormap::{
@@ -84,21 +85,24 @@ pub use colormap::{
 pub use context::{
     MsaaMode, RenderConfig, RenderContext, RenderContextError, RendererTypeId, adapter_info_summary,
 };
-pub use debug_label::DebugLabel;
 pub use depth_offset::DepthOffset;
 pub use draw_phases::{
     DrawPhase, DrawPhaseManager, Drawable, DrawableCollector, OutlineConfig, OutlineMaskPreference,
     OutlineMaskProcessor, PickingLayerId, PickingLayerInstanceId, PickingLayerObjectId,
     PickingLayerProcessor, ScreenshotProcessor,
 };
+pub use label::Label;
+pub use resource_managers::AlphaChannelUsage;
+pub use texture_readback::{TextureReadback, poll_read_texture, schedule_read_texture};
 // Re-export used color types directly.
 pub use ecolor::{Color32, Hsva, Rgba};
 pub use global_bindings::GlobalBindings;
-pub use importer::{CpuMeshInstance, CpuModel, CpuModelMeshKey};
+pub use importer::{CpuModel, CpuModelMeshKey};
 pub use line_drawable_builder::{LineBatchBuilder, LineDrawableBuilder, LineStripBuilder};
 pub use point_cloud_builder::{PointCloudBatchBuilder, PointCloudBuilder};
 pub use queueable_draw_data::QueueableDrawData;
 pub use rect::{RectF32, RectInt};
+pub use renderer::gpu_data::PositionRadius;
 pub use size::Size;
 pub use texture_info::Texture2DBufferInfo;
 pub use transform::RectTransform;
@@ -106,8 +110,9 @@ pub use view_builder::{RenderMode, ViewBuilder, ViewPickingConfiguration};
 pub use wgpu_resources::{
     BindGroupDesc, BindGroupEntry, BindGroupLayoutDesc, GpuBindGroup, GpuBindGroupLayoutHandle,
     GpuPipelineLayoutPool, GpuRenderPipelineHandle, GpuRenderPipelinePool,
-    GpuRenderPipelinePoolAccessor, GpuShaderModuleHandle, GpuShaderModulePool, PipelineLayoutDesc,
-    RenderPipelineDesc, ShaderModuleDesc, VertexBufferLayout, WgpuResourcePoolStatistics,
+    GpuRenderPipelinePoolAccessor, GpuShaderModuleHandle, GpuShaderModulePool, GpuTexture,
+    GpuTextureHandle, PipelineLayoutDesc, RenderPipelineDesc, ShaderModuleDesc, VertexBufferLayout,
+    WgpuResourcePoolStatistics,
 };
 
 pub use self::file_resolver::{
@@ -115,15 +120,15 @@ pub use self::file_resolver::{
     new_recommended as new_recommended_file_resolver,
 };
 pub use self::file_server::FileServer;
+#[allow(clippy::allow_attributes, unused_imports)] // they can be handy from time to time
 use self::file_system::MemFileSystem;
-#[cfg(load_shaders_from_disk)]
-use self::file_system::OsFileSystem;
 pub use self::file_system::{FileSystem, get_filesystem};
 
+#[cfg(load_shaders_from_disk)]
+use self::file_system::OsFileSystem;
+
 pub mod external {
-    #[cfg(feature = "video")]
-    pub use re_video;
-    pub use {anyhow, bytemuck, smallvec, wgpu};
+    pub use {anyhow, bytemuck, re_video, smallvec, wgpu};
 }
 
 // ---------------------------------------------------------------------------

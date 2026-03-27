@@ -14,7 +14,10 @@ impl IdentifiedViewSystem for EmptySystem {
 }
 
 impl VisualizerSystem for EmptySystem {
-    fn visualizer_query_info(&self) -> VisualizerQueryInfo {
+    fn visualizer_query_info(
+        &self,
+        _app_options: &re_viewer_context::AppOptions,
+    ) -> VisualizerQueryInfo {
         VisualizerQueryInfo::empty()
     }
 
@@ -25,9 +28,5 @@ impl VisualizerSystem for EmptySystem {
         _context_systems: &ViewContextCollection,
     ) -> Result<VisualizerExecutionOutput, ViewSystemExecutionError> {
         Ok(VisualizerExecutionOutput::default())
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }

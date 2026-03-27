@@ -11,6 +11,8 @@ pub mod external {
 
 pub mod headers;
 
+pub use re_log_types::{EntryName, InvalidEntryNameError};
+
 // This extra module is needed, because of how imports from different packages are resolved.
 // For example, `rerun.remote_store.v1alpha1.EncoderVersion` is resolved to `super::super::remote_store::v1alpha1::EncoderVersion`.
 // We need an extra module in the path to `common` to make that work.
@@ -61,14 +63,10 @@ pub mod common {
 pub mod log_msg {
     pub mod v1alpha1 {
         pub use crate::v1alpha1::rerun_log_msg_v1alpha1::*;
-        pub mod ext {
-            pub use crate::v1alpha1::rerun_log_msg_v1alpha1_ext::*;
-        }
     }
 }
 
 pub mod cloud {
-    #[rustfmt::skip] // keep these constants single line for easy sorting
     pub mod v1alpha1 {
         pub use crate::v1alpha1::rerun_cloud_v1alpha1::*;
         pub mod ext {
@@ -114,6 +112,9 @@ pub enum TypeConversionError {
         package_name: &'static str,
         type_name: &'static str,
     },
+
+    #[error("invalid entry name: {0}")]
+    InvalidEntryName(#[from] InvalidEntryNameError),
 
     #[error("failed to parse timestamp: {0}")]
     InvalidTime(#[from] jiff::Error),
@@ -395,6 +396,8 @@ mod sizes {
             let Self {
                 encoder_version,
                 payload,
+                compression: _,
+                uncompressed_size: _,
             } = self;
 
             encoder_version.heap_size_bytes()

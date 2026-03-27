@@ -11,10 +11,6 @@ use super::super::definitions::sensor_msgs;
 use crate::Error;
 use crate::parsers::{MessageParser, ParserContext, cdr};
 
-/// Plugin that parses `sensor_msgs/msg/Imu` messages.
-#[derive(Default)]
-pub struct ImuSchemaPlugin;
-
 fn fixed_size_list_builder(
     value_length: i32,
     capacity: usize,
@@ -66,8 +62,9 @@ impl MessageParser for ImuMessageParser {
             .map_err(|err| Error::Other(anyhow::anyhow!(err)))?;
 
         // add the sensor timestamp to the context, `log_time` and `publish_time` are added automatically
-        ctx.add_timestamp_cell(crate::util::TimestampCell::guess_from_nanos_ros2(
+        ctx.add_timestamp_cell(crate::util::TimestampCell::from_nanos_ros2(
             imu.header.stamp.as_nanos() as u64,
+            ctx.time_type(),
         ));
 
         self.frame_ids.values().append_value(imu.header.frame_id);

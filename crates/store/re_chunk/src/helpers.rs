@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use arrow::array::{Array as _, ArrayRef as ArrowArrayRef};
+use re_log::debug_assert;
 use re_log_types::{TimeInt, TimelineName};
 use re_types_core::{Component, ComponentIdentifier};
 
@@ -168,7 +169,7 @@ impl Chunk {
 pub type ChunkShared = Arc<Chunk>;
 
 /// A [`ChunkShared`] that is guaranteed to always contain a single row's worth of data.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct UnitChunkShared(ChunkShared);
 
 impl std::ops::Deref for UnitChunkShared {
@@ -202,7 +203,7 @@ impl Chunk {
 }
 
 impl UnitChunkShared {
-    // Turns the unit chunk back into a standard [`Chunk`].
+    /// Turns the unit chunk back into a standard [`Chunk`].
     #[inline]
     pub fn into_chunk(self) -> ChunkShared {
         self.0
@@ -230,6 +231,7 @@ impl UnitChunkShared {
     /// Returns the [`RowId`] of the single row within, on the given timeline.
     ///
     /// Returns the single static `RowId` if the chunk is static.
+    // TODO(emilk): this is infallible, so remove the `Option` returntype
     #[inline]
     pub fn row_id(&self) -> Option<RowId> {
         debug_assert!(self.num_rows() == 1);

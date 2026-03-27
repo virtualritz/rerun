@@ -178,6 +178,13 @@ impl ::re_types_core::AsComponents for Tensor {
 
 impl ::re_types_core::ArchetypeReflectionMarker for Tensor {}
 
+impl crate::VisualizableArchetype for Tensor {
+    #[inline]
+    fn visualizer(&self) -> crate::Visualizer {
+        crate::Visualizer::new("Tensor").with_overrides(self)
+    }
+}
+
 impl Tensor {
     /// Create a new `Tensor`.
     #[inline]

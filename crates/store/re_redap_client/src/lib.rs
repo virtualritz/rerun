@@ -7,14 +7,17 @@ mod grpc;
 pub use self::connection_client::{GenericConnectionClient, SegmentQueryParams};
 pub use self::connection_registry::{
     ClientCredentialsError, ConnectionClient, ConnectionRegistry, ConnectionRegistryHandle,
-    Credentials,
+    CredentialSource, Credentials, SourcedCredentials,
 };
 pub use self::grpc::{
-    RedapClient, channel, fetch_chunks_response_to_chunk_and_segment_id,
+    RedapClient, StreamingOptions, channel, fetch_chunks_response_to_chunk_and_segment_id,
     stream_blueprint_and_segment_from_server,
 };
 
 const MAX_DECODING_MESSAGE_SIZE: usize = u32::MAX as usize;
+
+/// Responses from the Data Platform can optionally include this header to communicate back the trace id of the request.
+const GRPC_RESPONSE_TRACEID_HEADER: &str = "x-request-trace-id";
 
 /// Wrapper with a nicer error message
 #[derive(Debug)]
@@ -77,15 +80,21 @@ impl std::error::Error for TonicStatusError {
 
 #[derive(Debug)]
 pub struct ApiError {
+    /// A message that does NOT include the contents of [`Self::source`].
     pub message: String,
+
     pub kind: ApiErrorKind,
+
     pub source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    // when the error comes from the server returning a trace id, we include it in the client
+    // error for easier reporting.
+    trace_id: Option<String>,
 }
 
 /// Convenience for `Result<T, ApiError>`
 pub type ApiResult<T = ()> = Result<T, ApiError>;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ApiErrorKind {
     NotFound,
     AlreadyExists,
@@ -98,6 +107,7 @@ pub enum ApiErrorKind {
     Timeout,
     Internal,
     InvalidArguments,
+    ResourcesExhausted,
     Serialization,
     InvalidServer,
 }
@@ -108,12 +118,31 @@ impl From<tonic::Code> for ApiErrorKind {
             tonic::Code::NotFound => Self::NotFound,
             tonic::Code::AlreadyExists => Self::AlreadyExists,
             tonic::Code::PermissionDenied => Self::PermissionDenied,
+            tonic::Code::ResourceExhausted => Self::ResourcesExhausted,
             tonic::Code::Unauthenticated => Self::Unauthenticated,
             tonic::Code::Unimplemented => Self::Unimplemented,
             tonic::Code::Unavailable => Self::Connection,
             tonic::Code::InvalidArgument => Self::InvalidArguments,
             tonic::Code::DeadlineExceeded => Self::Timeout,
             _ => Self::Internal,
+        }
+    }
+}
+
+impl ApiErrorKind {
+    /// Transient errors that may succeed on retry (with backoff).
+    pub fn is_retryable(self) -> bool {
+        match self {
+            Self::Connection | Self::Timeout | Self::Internal | Self::ResourcesExhausted => true,
+
+            Self::NotFound
+            | Self::AlreadyExists
+            | Self::PermissionDenied
+            | Self::Unauthenticated
+            | Self::Unimplemented
+            | Self::InvalidArguments
+            | Self::Serialization
+            | Self::InvalidServer => false,
         }
     }
 }
@@ -129,6 +158,7 @@ impl std::fmt::Display for ApiErrorKind {
             Self::Connection => write!(f, "Connection"),
             Self::Internal => write!(f, "Internal"),
             Self::InvalidArguments => write!(f, "InvalidArguments"),
+            Self::ResourcesExhausted => write!(f, "ResourcesExhausted"),
             Self::Serialization => write!(f, "Serialization"),
             Self::Timeout => write!(f, "Timeout"),
             Self::InvalidServer => write!(f, "InvalidServer"),
@@ -137,81 +167,123 @@ impl std::fmt::Display for ApiErrorKind {
 }
 
 impl ApiError {
-    pub fn tonic(err: tonic::Status, message: impl Into<String>) -> Self {
+    #[inline]
+    fn new(kind: ApiErrorKind, message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            kind: ApiErrorKind::from(err.code()),
-            source: Some(Box::new(err)),
-        }
-    }
-
-    pub fn serialization(
-        err: impl std::error::Error + Send + Sync + 'static,
-        message: impl Into<String>,
-    ) -> Self {
-        Self {
-            message: message.into(),
-            kind: ApiErrorKind::Serialization,
-            source: Some(Box::new(err)),
-        }
-    }
-
-    pub fn invalid_arguments(
-        err: impl std::error::Error + Send + Sync + 'static,
-        message: impl Into<String>,
-    ) -> Self {
-        Self {
-            message: message.into(),
-            kind: ApiErrorKind::InvalidArguments,
-            source: Some(Box::new(err)),
-        }
-    }
-
-    pub fn internal(
-        err: impl std::error::Error + Send + Sync + 'static,
-        message: impl Into<String>,
-    ) -> Self {
-        Self {
-            message: message.into(),
-            kind: ApiErrorKind::Internal,
-            source: Some(Box::new(err)),
-        }
-    }
-
-    pub fn connection(
-        err: impl std::error::Error + Send + Sync + 'static,
-        message: impl Into<String>,
-    ) -> Self {
-        Self {
-            message: message.into(),
-            kind: ApiErrorKind::Connection,
-            source: Some(Box::new(err)),
-        }
-    }
-
-    pub fn connection_simple(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            kind: ApiErrorKind::Connection,
+            kind,
             source: None,
+            trace_id: None,
         }
     }
 
-    pub fn credentials(err: ClientCredentialsError, message: impl Into<String>) -> Self {
+    /// Do NOT include `err` in the `message` - it will be added for you.
+    #[inline]
+    fn new_with_source(
+        err: impl std::error::Error + Send + Sync + 'static,
+        kind: ApiErrorKind,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             message: message.into(),
-            kind: ApiErrorKind::Unauthenticated,
+            kind,
             source: Some(Box::new(err)),
+            trace_id: None,
         }
+    }
+
+    /// Do NOT include `err` in the `message` - it will be added for you.
+    #[inline]
+    fn new_with_source_and_trace(
+        err: impl std::error::Error + Send + Sync + 'static,
+        kind: ApiErrorKind,
+        message: impl Into<String>,
+        trace_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            kind,
+            source: Some(Box::new(err)),
+            trace_id: Some(trace_id.into()),
+        }
+    }
+
+    /// Do NOT include `err` in the `message` - it will be added for you.
+    pub fn tonic(err: tonic::Status, message: impl Into<String>) -> Self {
+        let message = message.into();
+        let kind = ApiErrorKind::from(err.code());
+        let trace_id = err
+            .metadata()
+            .get(GRPC_RESPONSE_TRACEID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_owned());
+        if let Some(trace_id) = trace_id {
+            Self::new_with_source_and_trace(err, kind, message, trace_id)
+        } else {
+            Self::new_with_source(err, kind, message)
+        }
+    }
+
+    pub fn serialization(message: impl Into<String>) -> Self {
+        Self::new(ApiErrorKind::Serialization, message)
+    }
+
+    /// Do NOT include `err` in the `message` - it will be added for you.
+    pub fn serialization_with_source(
+        err: impl std::error::Error + Send + Sync + 'static,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::new_with_source(err, ApiErrorKind::Serialization, message)
+    }
+
+    /// Do NOT include `err` in the `message` - it will be added for you.
+    pub fn invalid_arguments_with_source(
+        err: impl std::error::Error + Send + Sync + 'static,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::new_with_source(err, ApiErrorKind::InvalidArguments, message)
+    }
+
+    /// Do NOT include `err` in the `message` - it will be added for you.
+    pub fn internal_with_source(
+        err: impl std::error::Error + Send + Sync + 'static,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::new_with_source(err, ApiErrorKind::Internal, message)
+    }
+
+    /// Do NOT include `err` in the `message` - it will be added for you.
+    pub fn connection_with_source(
+        err: impl std::error::Error + Send + Sync + 'static,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::new_with_source(err, ApiErrorKind::Connection, message)
+    }
+
+    pub fn connection(message: impl Into<String>) -> Self {
+        Self::new(ApiErrorKind::Connection, message)
+    }
+
+    pub fn permission_denied(message: impl Into<String>) -> Self {
+        Self::new(ApiErrorKind::PermissionDenied, message)
+    }
+
+    /// Do NOT include `err` in the `message` - it will be added for you.
+    pub fn credentials_with_source(
+        err: ClientCredentialsError,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::new_with_source(err, ApiErrorKind::Unauthenticated, message)
     }
 
     #[expect(clippy::needless_pass_by_value)]
-    pub fn invalid_server(origin: re_uri::Origin) -> Self {
-        Self {
-            message: format!("{origin} is not a valid Rerun server"),
-            kind: ApiErrorKind::InvalidServer,
-            source: None,
+    pub fn invalid_server(origin: re_uri::Origin, hint: Option<&str>) -> Self {
+        let mut msg = format!("{origin} is not a valid Rerun server");
+        if let Some(hint) = hint {
+            msg.push_str(". ");
+            msg.push_str(hint);
         }
+        Self::new(ApiErrorKind::InvalidServer, msg)
     }
 
     /// Helper method to downcast the source error to a `ClientCredentialsError` if possible.
@@ -231,10 +303,23 @@ impl ApiError {
 
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.kind, self.message)?;
-        if let Some(source) = &self.source {
-            write!(f, ": {source}")?;
+        let Self {
+            message,
+            kind,
+            source,
+            trace_id,
+        } = self;
+
+        write!(f, "{message} ({kind})")?;
+
+        if let Some(trace_id) = trace_id {
+            write!(f, " (trace-id: {trace_id})")?;
         }
+
+        if let Some(err) = source {
+            write!(f, ", {err}")?;
+        }
+
         Ok(())
     }
 }
@@ -245,4 +330,68 @@ impl std::error::Error for ApiError {
             .as_deref()
             .map(|e| e as &(dyn std::error::Error + 'static))
     }
+}
+
+/// Helper function for executing requests or connection attempts with retries.
+#[tracing::instrument(skip(f), level = "trace")]
+pub async fn with_retry<T, F, Fut>(req_name: &str, f: F) -> ApiResult<T>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = ApiResult<T>>,
+{
+    // targeting to have all retries finish under ~5 seconds
+    const MAX_ATTEMPTS: usize = 5;
+
+    // 100 200 400 800 1600
+    let mut backoff_gen = re_backoff::BackoffGenerator::new(
+        std::time::Duration::from_millis(100),
+        std::time::Duration::from_secs(3),
+    )
+    .expect("base is less than max");
+
+    let mut attempts = 1;
+    let mut last_retryable_err = None;
+
+    while attempts <= MAX_ATTEMPTS {
+        let res = f().await;
+
+        match res {
+            Err(err) if err.kind.is_retryable() => {
+                last_retryable_err = Some(err);
+                let backoff = backoff_gen.gen_next();
+
+                tracing::trace!(
+                    attempts,
+                    max_attempts = MAX_ATTEMPTS,
+                    ?backoff,
+                    "{req_name} failed with retryable gRPC error, retrying after backoff"
+                );
+
+                backoff.sleep().await;
+            }
+            Err(err) => {
+                // logging at the trace level to avoid having these spam in debug builds of the viewer
+                tracing::trace!(
+                    attempts,
+                    "{req_name} failed with non-retryable error: {err}"
+                );
+                return Err(err);
+            }
+
+            Ok(value) => {
+                tracing::trace!(attempts, "{req_name} succeeded");
+                return Ok(value);
+            }
+        }
+
+        attempts += 1;
+    }
+
+    tracing::trace!(
+        attempts,
+        max_attempts = MAX_ATTEMPTS,
+        "{req_name} failed after max retries, giving up"
+    );
+
+    Err(last_retryable_err.expect("bug: this should not be None if we reach here"))
 }

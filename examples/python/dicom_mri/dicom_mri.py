@@ -15,6 +15,7 @@ import numpy as np
 import numpy.typing as npt
 import pydicom as dicom
 import requests
+
 import rerun as rr  # pip install rerun-sdk
 
 if TYPE_CHECKING:
@@ -40,11 +41,8 @@ DATASET_URL: Final = "https://storage.googleapis.com/rerun-example-datasets/dico
 def extract_voxel_data(
     dicom_files: Iterable[Path],
 ) -> tuple[npt.NDArray[np.int16], npt.NDArray[np.float32]]:
-    slices = [dicom.read_file(f) for f in dicom_files]
-    try:
-        voxel_ndarray, ijk_to_xyz = dicom_numpy.combine_slices(slices)
-    except dicom_numpy.DicomImportException:
-        raise  # invalid DICOM data
+    slices = [dicom.read_file(f) for f in dicom_files]  # type: ignore[misc]
+    voxel_ndarray, ijk_to_xyz = dicom_numpy.combine_slices(slices)
 
     return voxel_ndarray, ijk_to_xyz
 

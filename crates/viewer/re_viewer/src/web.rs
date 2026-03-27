@@ -191,14 +191,15 @@ impl WebHandle {
 
     /// Add a new receiver streaming data from the given url.
     ///
-    /// If `follow_if_http` is `true`, and the url is an HTTP source, the viewer will open the stream
+    /// If `follow` is `true`, and the url is an HTTP source or file path,
+    /// the viewer will open the stream
     /// in `Following` mode rather than `Playing` mode.
     ///
     /// Websocket streams are always opened in `Following` mode.
     ///
     /// It is an error to open a channel twice with the same id.
     #[wasm_bindgen]
-    pub fn add_receiver(&self, url: &str, follow_if_http: Option<bool>) {
+    pub fn add_receiver(&self, url: &str, follow: Option<bool>) {
         let Some(app) = self.runner.app_mut::<crate::App>() else {
             return;
         };
@@ -208,16 +209,16 @@ impl WebHandle {
                 url.open(
                     &app.egui_ctx,
                     &open_url::OpenUrlOptions {
-                        // TODO(andreas): should follow_if_http be part of the fragments?
-                        follow_if_http: follow_if_http.unwrap_or(false),
+                        // TODO(andreas): should follow be part of the fragments?
+                        follow: follow.unwrap_or(false),
                         select_redap_source_when_loaded: true,
-                        show_loader: false,
+                        show_loader: true,
                     },
                     &app.command_sender,
                 );
             }
             Err(err) => {
-                re_log::warn!("Failed to open URL {url:?}: {err}");
+                re_log::warn!(?url, "Failed to open URL: {err}");
             }
         }
     }
@@ -318,7 +319,7 @@ impl WebHandle {
                             HttpMessage::Success => ControlFlow::Continue(()),
                             HttpMessage::Failure(err) => {
                                 log_tx
-                                    .quit(Some(err))
+                                    .quit(Some(Box::new(err)))
                                     .warn_on_err_once("Failed to send quit marker");
                                 ControlFlow::Break(())
                             }
@@ -385,7 +386,8 @@ impl WebHandle {
     pub fn get_active_recording_id(&self) -> Option<String> {
         let app = self.runner.app_mut::<crate::App>()?;
         let hub = app.store_hub.as_ref()?;
-        let recording = hub.active_recording()?;
+        let recording_id = app.active_recording_id()?;
+        let recording = hub.entity_db(recording_id)?;
 
         Some(recording.store_id().recording_id().to_string())
     }
@@ -405,7 +407,13 @@ impl WebHandle {
             return;
         };
 
-        hub.set_active_recording(store_id);
+        if store_id.is_recording() {
+            app.command_sender.send_system(SystemCommand::SetRoute(
+                re_viewer_context::Route::LocalRecording {
+                    recording_id: store_id,
+                },
+            ));
+        }
 
         app.egui_ctx.request_repaint();
     }
@@ -660,6 +668,7 @@ pub struct AppOptions {
     // width: Option<String>, // Width & height aren't serialized and only used to configure the canvas.
     // height: Option<String>,
     fallback_token: Option<String>,
+    theme: Option<String>,
 
     // Hidden `WebViewerOptions`
     // ------------
@@ -727,6 +736,7 @@ fn create_app(
         notebook,
 
         fallback_token,
+        theme,
     } = app_options;
 
     if let Some(fallback_token) = fallback_token {
@@ -749,10 +759,8 @@ fn create_app(
     });
 
     let startup_options = crate::StartupOptions {
-        memory_limit: re_memory::MemoryLimit {
-            // On wasm32 we only have 4GB of memory to play around with.
-            max_bytes: Some(2_500_000_000),
-        },
+        // On wasm32 we only have 4GB of memory to play around with.
+        memory_limit: re_memory::MemoryLimit::from_bytes(2_500_000_000),
         location: Some(cc.integration_info.web_info.location.clone()),
         persist_state: true,
         is_in_notebook: notebook.unwrap_or(false),
@@ -780,6 +788,23 @@ fn create_app(
     };
     crate::customize_eframe_and_setup_renderer(cc)?;
 
+    if let Some(theme) = theme {
+        match theme.as_str() {
+            "dark" => cc
+                .egui_ctx
+                .options_mut(|o| o.theme_preference = egui::ThemePreference::Dark),
+            "light" => cc
+                .egui_ctx
+                .options_mut(|o| o.theme_preference = egui::ThemePreference::Light),
+            "system" => cc
+                .egui_ctx
+                .options_mut(|o| o.theme_preference = egui::ThemePreference::System),
+            _ => {
+                // Don't touch egui's settings, might be loaded from previous user interaction.
+            }
+        }
+    }
+
     let mut app = crate::App::new(
         main_thread_token,
         build_info,
@@ -805,7 +830,7 @@ fn create_app(
                     url.open(
                         &app.egui_ctx,
                         &open_url::OpenUrlOptions {
-                            follow_if_http: false,
+                            follow: false,
                             select_redap_source_when_loaded: true,
                             show_loader: true,
                         },
@@ -813,7 +838,7 @@ fn create_app(
                     );
                 }
                 Err(err) => {
-                    re_log::warn!("Failed to open URL {url:?}: {err}");
+                    re_log::warn!(?url, "Failed to open URL: {err}");
                 }
             }
         }

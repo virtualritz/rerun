@@ -2,6 +2,7 @@ use egui::emath::RectTransform;
 use egui::{Modifiers, NumExt as _};
 use glam::Vec3;
 use macaw::BoundingBox;
+use re_chunk_store::MissingChunkReporter;
 use re_log_types::Instance;
 use re_renderer::view_builder::{Projection, TargetConfiguration, ViewBuilder};
 use re_renderer::{LineDrawableBuilder, Size};
@@ -44,6 +45,7 @@ pub struct View3DState {
     eye_interact_fade_change_time: f64,
 
     pub show_smoothed_bbox: bool,
+    pub show_per_entity_bbox: bool,
 }
 
 impl Default for View3DState {
@@ -54,6 +56,7 @@ impl Default for View3DState {
             eye_interact_fade_in: false,
             eye_interact_fade_change_time: f64::NEG_INFINITY,
             show_smoothed_bbox: false,
+            show_per_entity_bbox: false,
         }
     }
 }
@@ -120,6 +123,7 @@ impl SpatialView3D {
     pub fn view_3d(
         &self,
         ctx: &ViewerContext<'_>,
+        missing_chunk_reporter: &MissingChunkReporter,
         ui: &mut egui::Ui,
         state: &mut SpatialViewState,
         query: &ViewQuery<'_>,
@@ -176,7 +180,7 @@ impl SpatialView3D {
 
         // Determine view port resolution and position.
         let resolution_in_pixel =
-            gpu_bridge::viewport_resolution_in_pixels(ui_rect, ui.ctx().pixels_per_point());
+            gpu_bridge::viewport_resolution_in_pixels(ui_rect, ui.pixels_per_point());
         if resolution_in_pixel[0] == 0 || resolution_in_pixel[1] == 0 {
             return Ok(());
         }
@@ -205,13 +209,16 @@ impl SpatialView3D {
                 Instance::ALL.get(),
             );
 
-            // If we are showing the axes for the space, then add the space origin to the bounding box.
-            state.bounding_boxes.current.extend(glam::Vec3::ZERO);
+            // If we are showing the axes for the space, then add the space origin to the region of interest, but not the scene bounding box.
+            state
+                .bounding_boxes
+                .region_of_interest_current
+                .extend(glam::Vec3::ZERO);
         }
 
         // Create labels now since their shapes participate are added to scene.ui for picking.
         let (label_shapes, ui_rects) = create_labels(
-            collect_ui_labels(&system_output.view_systems),
+            &collect_ui_labels(&system_output.view_systems),
             RectTransform::from_to(ui_rect, ui_rect),
             &eye,
             ui,
@@ -226,11 +233,12 @@ impl SpatialView3D {
             let picking_context = crate::picking::PickingContext::new(
                 pointer_pos_ui,
                 ui_pan_and_zoom_from_ui,
-                ui.ctx().pixels_per_point(),
+                ui.pixels_per_point(),
                 &eye,
             );
             crate::picking_ui::picking(
                 ctx,
+                missing_chunk_reporter,
                 &picking_context,
                 ui,
                 response,
@@ -259,7 +267,7 @@ impl SpatialView3D {
             },
             viewport_transformation: re_renderer::RectTransform::IDENTITY,
 
-            pixels_per_point: ui.ctx().pixels_per_point(),
+            pixels_per_point: ui.pixels_per_point(),
 
             outline_config: query
                 .highlights
@@ -278,7 +286,7 @@ impl SpatialView3D {
         );
 
         // Track focused entity if any.
-        if let Some(focused_item) = ctx.focused_item {
+        if let Some(focused_item) = ctx.focused_item() {
             let focused_entity = match focused_item {
                 Item::AppId(_)
                 | Item::DataSource(_)
@@ -299,9 +307,9 @@ impl SpatialView3D {
 
                 Item::InstancePath(instance_path) => Some(&instance_path.entity_path),
 
-                Item::DataResult(view_id, instance_path) => {
-                    if *view_id == query.view_id {
-                        Some(&instance_path.entity_path)
+                Item::DataResult(data_result) => {
+                    if data_result.view_id == query.view_id {
+                        Some(&data_result.instance_path.entity_path)
                     } else {
                         None
                     }
@@ -309,7 +317,7 @@ impl SpatialView3D {
             };
 
             if let Some(entity_path) = focused_entity {
-                if ui.ctx().input(|i| i.modifiers.alt)
+                if ui.input(|i| i.modifiers.alt)
                     || find_camera(space_cameras, entity_path).is_some()
                 {
                     if state.last_tracked_entity() != Some(entity_path) {
@@ -333,7 +341,7 @@ impl SpatialView3D {
             }
 
             // Make sure focus consequences happen in the next frames.
-            ui.ctx().request_repaint();
+            ui.request_repaint();
         }
 
         // Allow to restore the camera state with escape if a camera was tracked before.
@@ -348,7 +356,7 @@ impl SpatialView3D {
                 space_cameras,
                 state,
                 selected_context,
-                ui.ctx().selection_stroke().color,
+                ui.selection_stroke().color,
             );
         }
         if let Some(hovered_context) = ctx.selection_state().hovered_item_context() {
@@ -357,13 +365,15 @@ impl SpatialView3D {
                 space_cameras,
                 state,
                 hovered_context,
-                ui.ctx().hover_stroke().color,
+                ui.hover_stroke().color,
             );
         }
 
         // TODO(andreas): Make configurable. Could pick up default radius for this view?
         let box_line_radius = Size(*re_sdk_types::components::Radius::default().0);
 
+        // TODO(andreas): Make this an enum so the user can choose between showing
+        // the bounding box (all entities), the region of interest, or per-entity bounding boxes.
         if show_bounding_box {
             line_builder
                 .batch("scene_bbox_current")
@@ -376,13 +386,21 @@ impl SpatialView3D {
         }
         if state.state_3d.show_smoothed_bbox {
             line_builder
-                .batch("scene_bbox_smoothed")
-                .add_box_outline(&state.bounding_boxes.smoothed)
+                .batch("scene_region_of_interest_smoothed")
+                .add_box_outline(&state.bounding_boxes.region_of_interest_smoothed)
                 .map(|lines| {
                     lines
                         .radius(box_line_radius)
                         .color(ctx.tokens().frustum_color)
                 });
+        }
+        if state.state_3d.show_per_entity_bbox {
+            let mut batch = line_builder.batch("per_entity_regions_of_interest");
+            for region_of_interest in state.bounding_boxes.region_of_interest_per_entity.values() {
+                batch
+                    .add_box_outline(region_of_interest)
+                    .map(|lines| lines.radius(box_line_radius).color(egui::Color32::YELLOW));
+            }
         }
 
         show_orbit_eye_center(
@@ -428,8 +446,8 @@ impl SpatialView3D {
             clear_color,
         ));
 
-        // Add egui-rendered spinners/loaders on top of re_renderer content:
-        crate::ui::paint_loading_spinners(
+        // Add egui-rendered loading indicators on top of re_renderer content:
+        crate::ui::paint_loading_indicators(
             ui,
             RectTransform::from_to(ui_rect, ui_rect),
             &eye,
@@ -620,7 +638,7 @@ fn show_projections_from_2d_space(
                     add_picking_ray(
                         line_builder,
                         ray,
-                        &state.bounding_boxes.smoothed,
+                        &state.bounding_boxes.region_of_interest_smoothed,
                         thick_ray_length,
                         ray_color,
                     );
@@ -643,7 +661,7 @@ fn show_projections_from_2d_space(
                 add_picking_ray(
                     line_builder,
                     ray,
-                    &state.bounding_boxes.current,
+                    &state.bounding_boxes.region_of_interest_current,
                     distance,
                     ray_color,
                 );

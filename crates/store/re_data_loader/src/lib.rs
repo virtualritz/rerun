@@ -31,7 +31,7 @@ pub use self::loader_archetype::ArchetypeLoader;
 pub use self::loader_directory::DirectoryLoader;
 pub use self::loader_mcap::McapLoader;
 pub use self::loader_rrd::RrdLoader;
-pub use self::loader_urdf::{UrdfDataLoader, UrdfTree};
+pub use self::loader_urdf::{UrdfDataLoader, UrdfTree, joint_transform as urdf_joint_transform};
 #[cfg(not(target_arch = "wasm32"))]
 pub use self::{
     load_file::load_from_path,
@@ -88,18 +88,36 @@ pub struct DataLoaderSettings {
 
     /// At what time(s) should the data be logged to?
     pub timepoint: Option<TimePoint>,
+
+    /// If `true`, keep reading `.rrd` files past EOF, tailing new data as it arrives.
+    ///
+    /// Defaults to `false`.
+    pub follow: bool,
+
+    /// If set, an offset in nanoseconds to add to all `TimestampNs` time columns.
+    pub timestamp_offset_ns: Option<i64>,
+
+    /// The timeline type to use for timestamp timelines.
+    ///
+    /// Defaults to [`re_log_types::TimeType::TimestampNs`].
+    /// When set to [`re_log_types::TimeType::DurationNs`], all timestamp timelines
+    /// will be created as duration timelines instead.
+    pub timeline_type: re_log_types::TimeType,
 }
 
 impl DataLoaderSettings {
     #[inline]
     pub fn recommended(recording_id: impl Into<RecordingId>) -> Self {
         Self {
-            application_id: Default::default(),
             recording_id: recording_id.into(),
-            opened_store_id: Default::default(),
+            application_id: None,
+            opened_store_id: None,
             force_store_info: false,
-            entity_path_prefix: Default::default(),
-            timepoint: Default::default(),
+            entity_path_prefix: None,
+            timepoint: None,
+            follow: false,
+            timestamp_offset_ns: None,
+            timeline_type: re_log_types::TimeType::TimestampNs,
         }
     }
 
@@ -130,6 +148,9 @@ impl DataLoaderSettings {
             force_store_info: _,
             entity_path_prefix,
             timepoint,
+            follow: _,
+            timestamp_offset_ns: _,
+            timeline_type: _,
         } = self;
 
         let mut args = Vec::new();
@@ -236,7 +257,7 @@ pub type DataLoaderName = String;
 ///
 /// ## Registering custom loaders
 ///
-/// Checkout our [guide](https://www.rerun.io/docs/reference/data-loaders/overview).
+/// Checkout our [guide](https://www.rerun.io/docs/concepts/logging-and-ingestion/data-loaders/overview).
 ///
 /// ## Execution
 ///
@@ -294,7 +315,7 @@ pub trait DataLoader: Send + Sync {
         &self,
         settings: &DataLoaderSettings,
         path: std::path::PathBuf,
-        tx: std::sync::mpsc::Sender<LoadedData>,
+        tx: crossbeam::channel::Sender<LoadedData>,
     ) -> Result<(), DataLoaderError>;
 
     /// Loads data from in-memory file contents and sends it to `tx`.
@@ -327,7 +348,7 @@ pub trait DataLoader: Send + Sync {
         settings: &DataLoaderSettings,
         filepath: std::path::PathBuf,
         contents: std::borrow::Cow<'_, [u8]>,
-        tx: std::sync::mpsc::Sender<LoadedData>,
+        tx: crossbeam::channel::Sender<LoadedData>,
     ) -> Result<(), DataLoaderError>;
 }
 
@@ -378,6 +399,7 @@ impl DataLoaderError {
 /// This makes it trivial for [`DataLoader`]s to build the data in whatever form is
 /// most convenient for them, whether it is raw components, arrow chunks or even
 /// full-on [`LogMsg`]s.
+#[derive(Debug)]
 pub enum LoadedData {
     Chunk(DataLoaderName, re_log_types::StoreId, Chunk),
     ArrowMsg(DataLoaderName, re_log_types::StoreId, ArrowMsg),
@@ -404,6 +426,18 @@ impl LoadedData {
             Self::ArrowMsg(_name, store_id, msg) => Ok(LogMsg::ArrowMsg(store_id, msg)),
 
             Self::LogMsg(_name, msg) => Ok(msg),
+        }
+    }
+
+    /// Convert the data into a [`Chunk`], ignoring all non-chunk-related things.
+    pub fn into_chunk(self) -> Option<Chunk> {
+        match self {
+            Self::Chunk(_name, _store_id, chunk) => Some(chunk),
+            Self::ArrowMsg(_name, _store_id, arrow_msg) => Chunk::from_arrow_msg(&arrow_msg).ok(),
+            Self::LogMsg(_name, msg) => match msg {
+                LogMsg::ArrowMsg(_store_id, arrow_msg) => Chunk::from_arrow_msg(&arrow_msg).ok(),
+                LogMsg::SetStoreInfo { .. } | LogMsg::BlueprintActivationCommand { .. } => None,
+            },
         }
     }
 }
@@ -475,7 +509,7 @@ pub const SUPPORTED_DEPTH_IMAGE_EXTENSIONS: &[&str] = &["rvl", "png"];
 
 pub const SUPPORTED_VIDEO_EXTENSIONS: &[&str] = &["mp4"];
 
-pub const SUPPORTED_MESH_EXTENSIONS: &[&str] = &["glb", "gltf", "obj", "stl"];
+pub const SUPPORTED_MESH_EXTENSIONS: &[&str] = &["glb", "gltf", "obj", "stl", "dae"];
 
 // TODO(#4532): `.ply` data loader should support 2D point cloud & meshes
 pub const SUPPORTED_POINT_CLOUD_EXTENSIONS: &[&str] = &["ply"];
@@ -504,12 +538,42 @@ pub fn supported_extensions() -> impl Iterator<Item = &'static str> {
 
 /// Is this a supported file extension by any of our builtin [`DataLoader`]s?
 pub fn is_supported_file_extension(extension: &str) -> bool {
-    debug_assert!(
+    re_log::debug_assert!(
         !extension.starts_with('.'),
         "Expected extension without period, but got {extension:?}"
     );
     let extension = extension.to_lowercase();
     supported_extensions().any(|ext| ext == extension)
+}
+
+/// Detect the file format from the first bytes of a file (magic bytes).
+///
+/// Returns the file extension (e.g., `"rrd"`, `"mcap"`, `"png"`) if the format is recognized.
+///
+/// Delegates to [`re_sdk_types::components::MediaType::guess_from_data`] which handles
+/// Robotics-specific formats (RRD, MCAP, PLY) and standard formats (PNG, JPEG, GLB, MP4, etc.).
+pub fn detect_format_from_bytes(bytes: &[u8]) -> Option<String> {
+    let media_type = re_sdk_types::components::MediaType::guess_from_data(bytes)?;
+    media_type.file_extension().map(|e| e.to_owned())
+}
+
+/// Map a MIME content type to a file extension.
+///
+/// Returns `None` for types that are too generic to be useful (e.g. `application/octet-stream`)
+/// or for unrecognized types.
+///
+/// Delegates to [`re_sdk_types::components::MediaType::file_extension`].
+pub fn content_type_to_extension(content_type: &str) -> Option<String> {
+    // Take just the MIME type, ignoring parameters like charset
+    let mime = content_type.split(';').next()?.trim();
+
+    // Skip overly generic types
+    if mime == "application/octet-stream" {
+        return None;
+    }
+
+    let media_type = re_sdk_types::components::MediaType(mime.to_owned().into());
+    media_type.file_extension().map(|e| e.to_owned())
 }
 
 #[test]
@@ -518,4 +582,70 @@ fn test_supported_extensions() {
     assert!(is_supported_file_extension("mcap"));
     assert!(is_supported_file_extension("png"));
     assert!(is_supported_file_extension("urdf"));
+}
+
+#[test]
+fn test_detect_format_from_bytes() {
+    assert_eq!(
+        detect_format_from_bytes(b"RRF2xxxxx").as_deref(),
+        Some("rrd")
+    );
+    assert_eq!(
+        detect_format_from_bytes(b"RRF0xxxxx").as_deref(),
+        Some("rrd")
+    );
+    assert_eq!(
+        detect_format_from_bytes(&[0x89, 0x4D, 0x43, 0x41, 0x50, 0x30, 0x0D, 0x0A]).as_deref(),
+        Some("mcap")
+    );
+    assert_eq!(
+        detect_format_from_bytes(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).as_deref(),
+        Some("png")
+    );
+    assert_eq!(
+        detect_format_from_bytes(&[0xFF, 0xD8, 0xFF, 0xE0]).as_deref(),
+        Some("jpg")
+    );
+    assert_eq!(
+        detect_format_from_bytes(b"glTFxxxx").as_deref(),
+        Some("glb")
+    );
+    assert_eq!(
+        detect_format_from_bytes(b"ply\nxxx").as_deref(),
+        Some("ply")
+    );
+    assert_eq!(detect_format_from_bytes(b"unknown").as_deref(), None);
+    assert_eq!(detect_format_from_bytes(b"").as_deref(), None);
+}
+
+#[test]
+fn test_content_type_to_extension() {
+    assert_eq!(
+        content_type_to_extension("image/png").as_deref(),
+        Some("png")
+    );
+    assert_eq!(
+        content_type_to_extension("image/png; charset=utf-8").as_deref(),
+        Some("png")
+    );
+    assert_eq!(
+        content_type_to_extension("image/jpeg").as_deref(),
+        Some("jpg")
+    );
+    assert_eq!(
+        content_type_to_extension("video/mp4").as_deref(),
+        Some("mp4")
+    );
+    assert_eq!(
+        content_type_to_extension("model/gltf-binary").as_deref(),
+        Some("glb")
+    );
+    assert_eq!(
+        content_type_to_extension("application/x-rerun").as_deref(),
+        Some("rrd")
+    );
+    assert_eq!(
+        content_type_to_extension("application/octet-stream").as_deref(),
+        None
+    );
 }

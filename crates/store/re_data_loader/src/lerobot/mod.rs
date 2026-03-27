@@ -296,6 +296,11 @@ pub struct EpisodeIndex(pub usize);
 #[serde(transparent)]
 pub struct TaskIndex(pub usize);
 
+/// Newtype wrapper for subtask indices.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(transparent)]
+pub struct SubtaskIndex(pub usize);
+
 /// A task in a `LeRobot` dataset.
 ///
 /// Each task consists of its index and a task description.
@@ -306,11 +311,26 @@ pub struct LeRobotDatasetTask {
     pub task: String,
 }
 
+/// A subtask in a `LeRobot` dataset.
+///
+/// Subtasks break down complex tasks into finer-grained, interpretable steps.
+/// Each subtask consists of its index and a subtask description.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LeRobotDatasetSubtask {
+    #[serde(rename = "subtask_index")]
+    pub index: SubtaskIndex,
+    pub subtask: String,
+}
+
 /// Errors that might happen when loading data through a [`crate::loader_lerobot::LeRobotDatasetLoader`].
 #[derive(thiserror::Error, Debug)]
 pub enum LeRobotError {
-    #[error("IO error occurred on path: {1}")]
-    IO(#[source] std::io::Error, std::path::PathBuf),
+    #[error("IO error occurred on path: {path}")]
+    IO {
+        #[source]
+        source: std::io::Error,
+        path: std::path::PathBuf,
+    },
 
     #[error(transparent)]
     Json(#[from] serde_json::Error),
@@ -342,6 +362,16 @@ pub enum LeRobotError {
 
     #[error("Episode {0:?} data file does not contain any records")]
     EmptyEpisode(EpisodeIndex),
+}
+
+impl LeRobotError {
+    /// Create an IO error with the given source and path.
+    pub fn io(source: std::io::Error, path: impl Into<std::path::PathBuf>) -> Self {
+        Self::IO {
+            source,
+            path: path.into(),
+        }
+    }
 }
 
 #[cfg(test)]

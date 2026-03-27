@@ -4,20 +4,21 @@ use arrow::datatypes::Field;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
 use egui::containers::menu::MenuConfig;
-use egui::{Frame, Id, Margin, OpenUrl, RichText, TopBottomPanel, Ui, Widget as _};
+use egui::{Frame, Id, Margin, OpenUrl, Panel, RichText, Ui, Widget as _};
 use egui_table::{CellInfo, HeaderCellInfo};
 use itertools::Itertools as _;
 use re_format::{format_plural_s, format_uint};
 use re_log::error;
-use re_log_types::{EntryId, TimelineName, Timestamp};
+use re_log_types::{EntryId, Timestamp};
 use re_sorbet::{ColumnDescriptorRef, SorbetSchema};
 use re_ui::egui_ext::response_ext::ResponseExt as _;
 use re_ui::menu::menu_style;
 use re_ui::{UiExt as _, icons};
 use re_viewer_context::{
-    AsyncRuntimeHandle, SystemCommand, SystemCommandSender as _, ViewerContext,
+    AsyncRuntimeHandle, StoreViewContext, SystemCommand, SystemCommandSender as _,
 };
 
+use crate::StreamingCacheTableProvider;
 use crate::datafusion_adapter::{DataFusionAdapter, DataFusionQueryResult};
 use crate::display_record_batch::DisplayColumn;
 use crate::filters::{ColumnFilter, FilterState};
@@ -88,14 +89,14 @@ impl Columns<'_> {
 /// This is primarily useful for testing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TableStatus {
-    /// The table is loading its content for the first time and has no cached content. A spinner
-    /// is displayed.
+    /// The table is loading its content for the first time and has no cached content.
+    /// A loading indicator is displayed.
     InitialLoading,
 
     /// The table is fully loaded and no update is in progress.
     Loaded,
 
-    /// The table is currently updating its content and a spinner is displayed. The previously loaded
+    /// The table is currently updating its content and a loading indicator is displayed. The previously loaded
     /// content is displayed in the meantime.
     Updating,
 
@@ -127,13 +128,28 @@ pub struct DataFusionTableWidget<'a> {
 impl<'a> DataFusionTableWidget<'a> {
     /// Clears all caches related to this session context and table reference.
     pub fn refresh(
-        egui_ctx: &egui::Context,
-        session_ctx: &SessionContext,
+        runtime: &AsyncRuntimeHandle,
+        egui_ctx: egui::Context,
+        session_ctx: Arc<SessionContext>,
         table_ref: impl Into<TableReference>,
     ) {
-        let id = id_from_session_context_and_table(session_ctx, &table_ref.into());
+        let table_ref = table_ref.into();
 
-        DataFusionAdapter::clear_state(egui_ctx, id);
+        // Unfortunately, getting a TableProvider is async, so we need to spawn here:
+        runtime.spawn_future(async move {
+            if let Ok(provider) = session_ctx.table_provider(table_ref.clone()).await {
+                // If this is a StreamingCacheTableProvider, purge its cache
+                if let Some(cache_provider) = provider
+                    .as_any()
+                    .downcast_ref::<StreamingCacheTableProvider>()
+                {
+                    cache_provider.refresh();
+                }
+            }
+
+            let id = id_from_session_context_and_table(&session_ctx, &table_ref);
+            DataFusionAdapter::clear_state(&egui_ctx, id);
+        });
     }
 
     pub fn new(session_ctx: Arc<SessionContext>, table_ref: impl Into<TableReference>) -> Self {
@@ -214,7 +230,7 @@ impl<'a> DataFusionTableWidget<'a> {
     /// Display the table.
     pub fn show(
         self,
-        viewer_ctx: &ViewerContext<'_>,
+        viewer_ctx: &StoreViewContext<'_>,
         runtime: &AsyncRuntimeHandle,
         ui: &mut egui::Ui,
     ) -> TableStatus {
@@ -276,7 +292,12 @@ impl<'a> DataFusionTableWidget<'a> {
                         .clicked()
                     {
                         // This will trigger a fresh query on the next frame.
-                        Self::refresh(ui.ctx(), &session_ctx, table_ref);
+                        Self::refresh(
+                            runtime,
+                            ui.ctx().clone(),
+                            Arc::clone(&session_ctx),
+                            table_ref,
+                        );
                     }
                 });
                 return TableStatus::Error(error);
@@ -302,8 +323,9 @@ impl<'a> DataFusionTableWidget<'a> {
 
         let new_blueprint = Self::table_ui(
             viewer_ctx,
+            runtime,
             ui,
-            session_ctx.as_ref(),
+            Arc::clone(&session_ctx),
             table_ref,
             table_state.blueprint(),
             session_id,
@@ -330,16 +352,17 @@ impl<'a> DataFusionTableWidget<'a> {
     //TODO(ab): make the argument list less crazy
     #[expect(clippy::too_many_arguments)]
     fn table_ui(
-        viewer_ctx: &ViewerContext<'_>,
+        viewer_ctx: &StoreViewContext<'_>,
+        runtime: &AsyncRuntimeHandle,
         ui: &mut egui::Ui,
-        session_ctx: &SessionContext,
+        session_ctx: Arc<SessionContext>,
         table_ref: TableReference,
         table_blueprint: &TableBlueprint,
         session_id: egui::Id,
         title: Option<&str>,
         url: Option<&str>,
         queried_at: Timestamp,
-        should_show_spinner: bool,
+        should_show_loading_indicator: bool,
         query_result: &DataFusionQueryResult,
         column_blueprint_fn: &ColumnBlueprintFn<'_>,
     ) -> TableBlueprint {
@@ -399,7 +422,7 @@ impl<'a> DataFusionTableWidget<'a> {
                 Some(&mut table_config),
                 title,
                 url,
-                should_show_spinner,
+                should_show_loading_indicator,
             );
         }
 
@@ -459,7 +482,7 @@ impl<'a> DataFusionTableWidget<'a> {
 
         match action {
             Some(BottomBarAction::Refresh) => {
-                Self::refresh(ui.ctx(), session_ctx, table_ref);
+                Self::refresh(runtime, ui.ctx().clone(), session_ctx, table_ref);
             }
             None => {}
         }
@@ -480,7 +503,7 @@ impl<'a> DataFusionTableWidget<'a> {
 
     fn bottom_bar_ui(
         ui: &mut Ui,
-        ctx: &ViewerContext<'_>,
+        ctx: &StoreViewContext<'_>,
         session_id: Id,
         total_rows: u64,
         visible_columns: usize,
@@ -492,7 +515,7 @@ impl<'a> DataFusionTableWidget<'a> {
         let frame = Frame::new()
             .fill(ui.tokens().table_header_bg_fill)
             .inner_margin(Margin::symmetric(12, 0));
-        TopBottomPanel::bottom(session_id.with("bottom_bar"))
+        Panel::bottom(session_id.with("bottom_bar"))
             .frame(frame)
             .show_separator_line(false)
             .show_inside(ui, |ui| {
@@ -551,11 +574,11 @@ fn id_from_session_context_and_table(
 
 fn title_ui(
     ui: &mut egui::Ui,
-    ctx: &ViewerContext<'_>,
+    ctx: &StoreViewContext<'_>,
     table_config: Option<&mut TableConfig>,
     title: &str,
     url: Option<&str>,
-    should_show_spinner: bool,
+    should_show_loading_indicator: bool,
 ) {
     Frame::new()
         .inner_margin(Margin {
@@ -579,8 +602,8 @@ fn title_ui(
                             .send_system(SystemCommand::CopyViewerUrl(url.to_owned()));
                     }
 
-                    if should_show_spinner {
-                        ui.spinner();
+                    if should_show_loading_indicator {
+                        ui.loading_indicator("Fetching table data");
                     }
                 },
                 |ui| {
@@ -598,7 +621,7 @@ enum BottomBarAction {
 
 struct DataFusionTableDelegate<'a> {
     session_id: Id,
-    ctx: &'a ViewerContext<'a>,
+    ctx: &'a StoreViewContext<'a>,
     table_style: re_ui::TableStyle,
     query_result: &'a DataFusionQueryResult,
     migrated_fields: &'a Vec<Field>,
@@ -655,11 +678,7 @@ impl DataFusionTableDelegate<'_> {
             let selected_rows = selection.selected_rows;
 
             if let Some(segment_links_spec) = &self.blueprint.segment_links {
-                let label = format!(
-                    "Open {} segment{}",
-                    selected_rows.len(),
-                    format_plural_s(selected_rows.len())
-                );
+                let label = format!("Open {}", format_plural_s(selected_rows.len(), "segment"));
                 let response =
                     ui.add(icons::OPEN_RECORDING.as_button_with_label(ui.tokens(), label));
 
@@ -669,7 +688,7 @@ impl DataFusionTableDelegate<'_> {
                         if let Some(segment_link) =
                             self.segment_link_for_row(row, segment_links_spec)
                         {
-                            ui.ctx().open_url(OpenUrl {
+                            ui.open_url(OpenUrl {
                                 url: segment_link,
                                 new_tab,
                             });
@@ -791,17 +810,7 @@ impl egui_table::TableDelegate for DataFusionTableDelegate<'_> {
         {
             let column = &display_record_batch.columns()[col_index];
 
-            // TODO(#9029): it is _very_ unfortunate that we must provide a fake timeline, but
-            // avoiding doing so needs significant refactoring work.
-            column.data_ui(
-                self.ctx,
-                ui,
-                &re_viewer_context::external::re_chunk_store::LatestAtQuery::latest(
-                    TimelineName::new("unknown"),
-                ),
-                batch_index,
-                None,
-            );
+            column.data_ui(self.ctx, ui, batch_index, None);
         }
     }
 

@@ -3,12 +3,14 @@
 //! TODO(emilk): move some of this numeric formatting into `emath` so we can use it in `egui_plot`.
 
 mod duration;
+mod plural;
 pub mod time;
 
 use std::cmp::PartialOrd;
 use std::fmt::Display;
 
 pub use self::duration::DurationFormatOptions;
+pub use self::plural::{format_plural_s, format_plural_signed_s};
 
 // --- Numbers ---
 
@@ -617,6 +619,10 @@ fn test_format_bytes() {
 pub fn parse_bytes_base10(bytes: &str) -> Option<i64> {
     let bytes = strip_whitespace_and_normalize(bytes);
 
+    if bytes == "0" {
+        return Some(0);
+    }
+
     // Note: intentionally case sensitive so that we don't parse `Mb` (Megabit) as `MB` (Megabyte).
     if let Some(rest) = bytes.strip_prefix(MINUS) {
         Some(-parse_bytes_base10(rest)?)
@@ -638,6 +644,8 @@ pub fn parse_bytes_base10(bytes: &str) -> Option<i64> {
 #[test]
 fn test_parse_bytes_base10() {
     let test_cases = [
+        ("0", 0), // Zero requires no unit
+        ("-1B", -1),
         ("999B", 999),
         ("1000B", 1_000),
         ("1kB", 1_000),
@@ -662,6 +670,10 @@ fn test_parse_bytes_base10() {
 pub fn parse_bytes_base2(bytes: &str) -> Option<i64> {
     let bytes = strip_whitespace_and_normalize(bytes);
 
+    if bytes == "0" {
+        return Some(0);
+    }
+
     // Note: intentionally case sensitive so that we don't parse `Mib` (Mebibit) as `MiB` (Mebibyte).
     if let Some(rest) = bytes.strip_prefix(MINUS) {
         Some(-parse_bytes_base2(rest)?)
@@ -683,6 +695,8 @@ pub fn parse_bytes_base2(bytes: &str) -> Option<i64> {
 #[test]
 fn test_parse_bytes_base2() {
     let test_cases = [
+        ("0", 0), // Zero requires no unit
+        ("-1B", -1),
         ("999B", 999),
         ("1023B", 1_023),
         ("1024B", 1_024),
@@ -713,6 +727,8 @@ pub fn parse_bytes(bytes: &str) -> Option<i64> {
 fn test_parse_bytes() {
     let test_cases = [
         // base10
+        ("0", 0), // Zero requires no unit
+        ("-1B", -1),
         ("999B", 999),
         ("1000B", 1_000),
         ("1kB", 1_000),
@@ -812,10 +828,4 @@ fn test_remove_number_formatting() {
         remove_number_formatting(&format_uint(123_456_789_u32)),
         "123456789"
     );
-}
-
-/// Returns "s" if `count` is not one, otherwise returns an empty string.
-#[expect(clippy::needless_pass_by_value)]
-pub fn format_plural_s(count: impl num_traits::Num) -> &'static str {
-    if count.is_one() { "" } else { "s" }
 }

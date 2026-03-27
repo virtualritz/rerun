@@ -1,5 +1,6 @@
 use re_chunk::EntityPath;
 use re_log_types::example_components::MyPoint;
+use re_sdk_types::Archetype as _;
 use re_ui::Help;
 use re_viewer_context::external::re_chunk_store::external::re_chunk;
 use re_viewer_context::{
@@ -26,8 +27,14 @@ impl ViewState for TestViewState {
 pub struct TestSystem;
 
 impl VisualizerSystem for TestSystem {
-    fn visualizer_query_info(&self) -> re_viewer_context::VisualizerQueryInfo {
-        VisualizerQueryInfo::from_archetype::<re_log_types::example_components::MyPoints>()
+    fn visualizer_query_info(
+        &self,
+        _app_options: &re_viewer_context::AppOptions,
+    ) -> re_viewer_context::VisualizerQueryInfo {
+        VisualizerQueryInfo::single_required_component::<MyPoint>(
+            &re_log_types::example_components::MyPoints::descriptor_points(),
+            &re_log_types::example_components::MyPoints::all_components(),
+        )
     }
 
     fn execute(
@@ -37,10 +44,6 @@ impl VisualizerSystem for TestSystem {
         _context_systems: &re_viewer_context::ViewContextCollection,
     ) -> Result<VisualizerExecutionOutput, re_viewer_context::ViewSystemExecutionError> {
         Ok(VisualizerExecutionOutput::default())
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 
@@ -99,6 +102,7 @@ impl ViewClass for TestView {
     fn ui(
         &self,
         _ctx: &ViewerContext<'_>,
+        _missing_chunk_reporter: &re_viewer_context::MissingChunkReporter,
         ui: &mut egui::Ui,
         _state: &mut dyn re_viewer_context::ViewState,
         _query: &re_viewer_context::ViewQuery<'_>,

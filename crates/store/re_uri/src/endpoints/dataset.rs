@@ -9,7 +9,7 @@ use crate::{Error, Fragment, Origin, RedapUri};
 ///
 /// `segment_id` is currently mandatory, and `time_range` is optional.
 /// In the future we will add richer queries.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DatasetSegmentUri {
     pub origin: Origin,
     pub dataset_id: re_tuid::Tuid,
@@ -81,10 +81,11 @@ impl DatasetSegmentUri {
             }
         };
 
-        let mut fragment = Fragment::default();
-        if let Some(string) = url.fragment() {
-            fragment = Fragment::parse_forgiving(string);
-        }
+        let fragment = if let Some(string) = url.fragment() {
+            Fragment::parse_forgiving(string)
+        } else {
+            Fragment::default()
+        };
 
         Ok(Self {
             origin,

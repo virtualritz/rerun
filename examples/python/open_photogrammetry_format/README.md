@@ -4,6 +4,7 @@ tags = ["2D", "3D", "Camera", "Photogrammetry"]
 thumbnail = "https://static.rerun.io/open-photogrammetry-format/c9bec43a3a3abd725a55ee8eb527a4c0cb01979b/480w.png"
 thumbnail_dimensions = [480, 480]
 channel = "release"
+include_in_manifest = true
 build_args = ["--jpeg-quality=50"]
 -->
 
@@ -32,7 +33,7 @@ The visualizations in this example were created with the following Rerun code:
 
 ### Timelines
 
- For each processed frame, all data sent to Rerun is associated with specific time using [`timelines`](https://www.rerun.io/docs/concepts/timelines).
+ For each processed frame, all data sent to Rerun is associated with specific time using [`timelines`](https://www.rerun.io/docs/concepts/logging-and-ingestion/timelines).
 
 ```python
 rr.set_time("image", sequence=i)
@@ -43,10 +44,7 @@ rr.set_time("image", sequence=i)
 Pinhole camera is utilized for achieving a 3D view and camera perspective through the use of the [`Pinhole`](https://www.rerun.io/docs/reference/types/archetypes/pinhole) and [`Transform3D`](https://www.rerun.io/docs/reference/types/archetypes/transform3d) archetypes.
 
 ```python
-rr.log(
-    "world/cameras",
-    rr.Transform3D(translation=calib_camera.position, mat3x3=rot)
-)
+rr.log("world/cameras", rr.Transform3D(translation=calib_camera.position, mat3x3=rot))
 ```
 
 ```python

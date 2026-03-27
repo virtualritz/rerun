@@ -26,7 +26,7 @@ impl DataLoader for ArchetypeLoader {
         &self,
         settings: &crate::DataLoaderSettings,
         filepath: std::path::PathBuf,
-        tx: std::sync::mpsc::Sender<LoadedData>,
+        tx: crossbeam::channel::Sender<LoadedData>,
     ) -> Result<(), crate::DataLoaderError> {
         use anyhow::Context as _;
 
@@ -61,7 +61,7 @@ impl DataLoader for ArchetypeLoader {
         settings: &crate::DataLoaderSettings,
         filepath: std::path::PathBuf,
         contents: std::borrow::Cow<'_, [u8]>,
-        tx: std::sync::mpsc::Sender<LoadedData>,
+        tx: crossbeam::channel::Sender<LoadedData>,
     ) -> Result<(), crate::DataLoaderError> {
         let extension = crate::extension(&filepath);
         if !crate::is_supported_file_extension(&extension) {
@@ -76,9 +76,12 @@ impl DataLoader for ArchetypeLoader {
             .map(|prefix| prefix / EntityPath::from_file_path(&filepath))
             .unwrap_or_else(|| EntityPath::from_file_path(&filepath));
 
+        #[cfg_attr(target_arch = "wasm32", expect(unused_mut))]
         let mut timepoint = TimePoint::default();
-        // TODO(cmc): log these once heuristics (I think?) are fixed
+
+        #[cfg(not(target_arch = "wasm32"))]
         if false && let Ok(metadata) = filepath.metadata() {
+            // TODO(cmc): log these once heuristics (I think?) are fixed
             use re_log_types::TimeCell;
 
             if let Some(created) = metadata
@@ -133,7 +136,7 @@ impl DataLoader for ArchetypeLoader {
         } else if crate::SUPPORTED_MESH_EXTENSIONS.contains(&extension.as_str()) {
             re_log::debug!(?filepath, loader = self.name(), "Loading 3D model…",);
             rows.extend(load_mesh(
-                filepath,
+                filepath.clone(),
                 timepoint,
                 entity_path,
                 contents.into_owned(),
@@ -144,11 +147,17 @@ impl DataLoader for ArchetypeLoader {
         } else if crate::SUPPORTED_TEXT_EXTENSIONS.contains(&extension.as_str()) {
             re_log::debug!(?filepath, loader = self.name(), "Loading text document…",);
             rows.extend(load_text_document(
-                filepath,
+                filepath.clone(),
                 timepoint,
                 entity_path,
                 contents.into_owned(),
             )?);
+        } else {
+            return Err(crate::DataLoaderError::Incompatible(filepath.clone()));
+        }
+
+        if rows.is_empty() {
+            re_log::warn!("{} is empty", filepath.display());
         }
 
         let store_id = settings.opened_store_id.clone().unwrap_or_else(|| {
@@ -162,7 +171,7 @@ impl DataLoader for ArchetypeLoader {
         });
         for row in rows {
             let data = LoadedData::Chunk(Self::name(&Self), store_id.clone(), row);
-            if tx.send(data).is_err() {
+            if re_quota_channel::send_crossbeam(&tx, data).is_err() {
                 break; // The other end has decided to hang up, not our problem.
             }
         }
@@ -339,7 +348,8 @@ fn load_point_cloud(
     let rows = [
         {
             // TODO(#4532): `.ply` data loader should support 2D point cloud & meshes
-            let points3d = re_sdk_types::archetypes::Points3D::from_file_contents(contents)?;
+            let points3d = re_sdk_types::archetypes::Points3D::from_file_contents(contents)
+                .map_err(anyhow::Error::from)?;
             Chunk::builder(entity_path)
                 .with_archetype(RowId::new(), timepoint, &points3d)
                 .build()?
@@ -363,7 +373,8 @@ fn load_text_document(
             let arch = re_sdk_types::archetypes::TextDocument::from_file_contents(
                 contents,
                 re_sdk_types::components::MediaType::guess_from_path(filepath),
-            )?;
+            )
+            .map_err(anyhow::Error::from)?;
             Chunk::builder(entity_path)
                 .with_archetype(RowId::new(), timepoint, &arch)
                 .build()?

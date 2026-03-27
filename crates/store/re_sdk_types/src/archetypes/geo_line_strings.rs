@@ -212,6 +212,13 @@ impl ::re_types_core::AsComponents for GeoLineStrings {
 
 impl ::re_types_core::ArchetypeReflectionMarker for GeoLineStrings {}
 
+impl crate::VisualizableArchetype for GeoLineStrings {
+    #[inline]
+    fn visualizer(&self) -> crate::Visualizer {
+        crate::Visualizer::new("GeoLineStrings").with_overrides(self)
+    }
+}
+
 impl GeoLineStrings {
     /// Create a new `GeoLineStrings`.
     #[inline]

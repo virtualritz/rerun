@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use re_log_types::EntityPath;
 use re_types_core::ChunkId;
@@ -26,9 +28,6 @@ pub struct SorbetSchema {
     /// The segment id that this chunk belongs to.
     pub segment_id: Option<String>,
 
-    /// The heap size of this batch in bytes, if known.
-    pub heap_size_bytes: Option<u64>,
-
     /// Timing statistics.
     pub timestamps: TimestampMetadata,
 }
@@ -43,16 +42,10 @@ impl SorbetSchema {
     /// This is bumped everytime we require a migration, but notable it is
     /// decoupled from the Rerun version to avoid confusion as there will not
     /// be a new Sorbet version for each Rerun version.
-    pub(crate) const METADATA_VERSION: semver::Version = semver::Version::new(0, 1, 2);
+    pub(crate) const METADATA_VERSION: semver::Version = semver::Version::new(0, 1, 3);
 }
 
 impl SorbetSchema {
-    #[inline]
-    pub fn with_heap_size_bytes(mut self, heap_size_bytes: u64) -> Self {
-        self.heap_size_bytes = Some(heap_size_bytes);
-        self
-    }
-
     pub fn chunk_id_metadata(chunk_id: &ChunkId) -> (String, String) {
         ("rerun:id".to_owned(), chunk_id.to_string())
     }
@@ -76,7 +69,6 @@ impl SorbetSchema {
             columns: _,
             chunk_id,
             entity_path,
-            heap_size_bytes,
             segment_id,
             timestamps,
         } = self;
@@ -89,17 +81,20 @@ impl SorbetSchema {
             chunk_id.as_ref().map(Self::chunk_id_metadata),
             entity_path.as_ref().map(Self::entity_path_metadata),
             segment_id.as_ref().map(Self::segment_id_metadata),
-            heap_size_bytes.as_ref().map(|heap_size_bytes| {
-                (
-                    "rerun:heap_size_bytes".to_owned(),
-                    heap_size_bytes.to_string(),
-                )
-            }),
         ]
         .into_iter()
         .flatten()
         .chain(timestamps.to_metadata())
         .collect()
+    }
+
+    /// All the entities referenced by any column.
+    pub fn all_entities(&self) -> BTreeSet<&EntityPath> {
+        self.columns
+            .iter()
+            .filter_map(|c| c.entity_path())
+            .chain(self.entity_path.iter())
+            .collect()
     }
 }
 
@@ -130,7 +125,7 @@ impl SorbetSchema {
     pub(crate) fn try_from_migrated_arrow_schema(
         arrow_schema: &ArrowSchema,
     ) -> Result<Self, SorbetError> {
-        debug_assert!(
+        re_log::debug_assert!(
             !arrow_schema.metadata.contains_key("rerun.id"),
             "The schema should not contain the legacy 'rerun.id' key, because it should have already been migrated to 'rerun:id'."
         );
@@ -149,19 +144,6 @@ impl SorbetSchema {
                     "Failed to deserialize chunk id {chunk_id_str:?}: {err}"
                 ))
             })?)
-        } else {
-            None
-        };
-
-        let heap_size_bytes = if let Some(heap_size_bytes) = metadata.get("rerun:heap_size_bytes") {
-            heap_size_bytes
-                .parse()
-                .map_err(|err| {
-                    re_log::warn_once!(
-                        "Failed to parse heap_size_bytes {heap_size_bytes:?} in chunk: {err}"
-                    );
-                })
-                .ok()
         } else {
             None
         };
@@ -187,7 +169,6 @@ impl SorbetSchema {
             chunk_id,
             entity_path,
             segment_id,
-            heap_size_bytes,
             timestamps: TimestampMetadata::parse_record_batch_metadata(metadata),
         })
     }

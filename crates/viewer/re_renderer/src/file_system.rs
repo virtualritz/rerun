@@ -2,11 +2,12 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use ahash::{HashMap, HashMapExt as _};
-#[cfg(load_shaders_from_disk)]
-use anyhow::Context as _;
 use anyhow::{anyhow, ensure};
 use clean_path::Clean as _;
 use parking_lot::RwLock;
+
+#[cfg(load_shaders_from_disk)]
+use anyhow::Context as _;
 
 // ---
 

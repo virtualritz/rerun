@@ -5,7 +5,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array};
 use arrow::datatypes::Field;
 use itertools::Itertools as _;
-use re_log_types::{TimePoint, TimeType, Timeline};
+use re_log_types::{EntityPath, TimePoint, TimeType, Timeline, build_index_value};
 use re_sdk::RecordingStreamBuilder;
 use re_tuid::Tuid;
 use re_types_core::AsComponents;
@@ -20,7 +20,7 @@ use crate::TempPath;
 /// ```
 pub type TuidPrefix = u64;
 
-fn next_chunk_id_generator(prefix: u64) -> impl FnMut() -> re_chunk::ChunkId {
+pub fn next_chunk_id_generator(prefix: u64) -> impl FnMut() -> re_chunk::ChunkId {
     let mut chunk_id = re_chunk::ChunkId::from_tuid(Tuid::from_nanos_and_inc(prefix, 0));
     move || {
         chunk_id = chunk_id.next();
@@ -28,7 +28,7 @@ fn next_chunk_id_generator(prefix: u64) -> impl FnMut() -> re_chunk::ChunkId {
     }
 }
 
-fn next_row_id_generator(prefix: u64) -> impl FnMut() -> re_chunk::RowId {
+pub fn next_row_id_generator(prefix: u64) -> impl FnMut() -> re_chunk::RowId {
     let mut row_id = re_chunk::RowId::from_tuid(Tuid::from_nanos_and_inc(prefix, 0));
     move || {
         row_id = row_id.next();
@@ -46,9 +46,18 @@ pub fn create_simple_recording(
     tuid_prefix: TuidPrefix,
     segment_id: &str,
     entity_paths: &[&str],
+    start_time: i64,
+    time_type: TimeType,
 ) -> anyhow::Result<TempPath> {
     let tmp_dir = tempfile::tempdir()?;
-    let path = create_simple_recording_in(tuid_prefix, segment_id, entity_paths, tmp_dir.path())?;
+    let path = create_simple_recording_in(
+        tuid_prefix,
+        segment_id,
+        entity_paths,
+        start_time,
+        time_type,
+        tmp_dir.path(),
+    )?;
     Ok(TempPath::new(tmp_dir, path))
 }
 
@@ -61,11 +70,13 @@ pub fn create_simple_recording_in(
     tuid_prefix: TuidPrefix,
     segment_id: &str,
     entity_paths: &[&str],
+    start_time: i64,
+    time_type: TimeType,
     in_dir: &std::path::Path,
 ) -> anyhow::Result<PathBuf> {
     use re_chunk::{Chunk, TimePoint};
     use re_log_types::example_components::{MyColor, MyLabel, MyPoint, MyPoints};
-    use re_log_types::{EntityPath, TimeInt, build_frame_nr};
+    use re_log_types::{EntityPath, TimeInt};
 
     if !std::fs::metadata(in_dir)?.is_dir() {
         return Err(anyhow::anyhow!("Expected `in_dir` to be a directory"));
@@ -85,10 +96,10 @@ pub fn create_simple_recording_in(
         let entity_path = EntityPath::from(*entity_path);
 
         // Sequential frames
-        let frame1 = TimeInt::new_temporal(10);
-        let frame2 = TimeInt::new_temporal(20);
-        let frame3 = TimeInt::new_temporal(30);
-        let frame4 = TimeInt::new_temporal(40);
+        let frame1 = TimeInt::new_temporal(start_time + 10);
+        let frame2 = TimeInt::new_temporal(start_time + 20);
+        let frame3 = TimeInt::new_temporal(start_time + 30);
+        let frame4 = TimeInt::new_temporal(start_time + 40);
 
         // Data for each frame
         let points1 = MyPoint::from_iter(0..1);
@@ -107,7 +118,7 @@ pub fn create_simple_recording_in(
         let chunk = Chunk::builder_with_id(next_chunk_id(), entity_path.clone())
             .with_sparse_component_batches(
                 next_row_id(),
-                [build_frame_nr(frame1)],
+                [build_index_value(frame1, time_type)],
                 [
                     (MyPoints::descriptor_points(), Some(&points1 as _)),
                     (MyPoints::descriptor_colors(), Some(&colors1 as _)),
@@ -115,7 +126,7 @@ pub fn create_simple_recording_in(
             )
             .with_sparse_component_batches(
                 next_row_id(),
-                [build_frame_nr(frame2)],
+                [build_index_value(frame2, time_type)],
                 [
                     (MyPoints::descriptor_points(), Some(&points2 as _)),
                     (MyPoints::descriptor_colors(), Some(&colors2 as _)),
@@ -123,7 +134,7 @@ pub fn create_simple_recording_in(
             )
             .with_sparse_component_batches(
                 next_row_id(),
-                [build_frame_nr(frame3)],
+                [build_index_value(frame3, time_type)],
                 [
                     (MyPoints::descriptor_points(), Some(&points3 as _)),
                     (MyPoints::descriptor_colors(), Some(&colors3 as _)),
@@ -131,7 +142,7 @@ pub fn create_simple_recording_in(
             )
             .with_sparse_component_batches(
                 next_row_id(),
-                [build_frame_nr(frame4)],
+                [build_index_value(frame4, time_type)],
                 [
                     (MyPoints::descriptor_points(), Some(&points4 as _)),
                     (MyPoints::descriptor_colors(), Some(&colors4 as _)),
@@ -749,6 +760,40 @@ pub fn create_recording_with_properties(
     Ok(tmp_path)
 }
 
+pub fn create_recording_with_static_components(
+    tuid_prefix: TuidPrefix,
+    segment_id: &str,
+    components: BTreeMap<EntityPath, Box<dyn AsComponents>>,
+) -> anyhow::Result<TempPath> {
+    use re_chunk::Chunk;
+
+    let tmp_path = {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(format!("{segment_id}.rrd"));
+        TempPath::new(dir, path)
+    };
+
+    let rec = re_sdk::RecordingStreamBuilder::new("rerun_example_properties")
+        .recording_id(segment_id)
+        .send_properties(false)
+        .save(tmp_path.clone())?;
+
+    let mut next_chunk_id = next_chunk_id_generator(tuid_prefix);
+    let mut next_row_id = next_row_id_generator(tuid_prefix);
+
+    for (entity_path, components) in components {
+        let mut chunk_builder = Chunk::builder_with_id(next_chunk_id(), entity_path);
+        chunk_builder =
+            chunk_builder.with_archetype(next_row_id(), TimePoint::default(), components.as_ref());
+        let chunk = chunk_builder.build()?;
+        rec.send_chunk(chunk);
+    }
+
+    rec.flush_blocking()?;
+
+    Ok(tmp_path)
+}
+
 /// Create a minimal rerun recording with one entity and one component.
 ///
 /// Depending on the `is_binary` argument, the component will have underlying
@@ -806,4 +851,95 @@ pub fn create_minimal_binary_recording_in(
     rec.flush_blocking()?;
 
     Ok(tmp_path)
+}
+
+/// Creates a recording that can be split into multiple chunks.
+///
+/// This function creates an intentionally unsorted RRD. Each entity will have 9
+/// rows of unsorted data. When combined with the environment variable
+/// `RERUN_CHUNK_MAX_ROWS_IF_UNSORTED=3` it will produce 3 chunks of 3 rows each.
+/// The middle chunk will have nulls in some of the data.
+pub fn multi_chunked_entities_recording(
+    tuid_prefix: TuidPrefix,
+    segment_id: &str,
+    entity_paths: &[&str],
+) -> anyhow::Result<TempPath> {
+    use re_chunk::{Chunk, TimePoint};
+    use re_log_types::example_components::{MyColor, MyLabel, MyPoint, MyPoints};
+    use re_log_types::{EntityPath, TimeInt, build_frame_nr};
+
+    let tmp_dir = tempfile::tempdir()?;
+    let in_dir = tmp_dir.path();
+
+    if !std::fs::metadata(in_dir)?.is_dir() {
+        return Err(anyhow::anyhow!("Expected `in_dir` to be a directory"));
+    }
+
+    let tmp_path = in_dir.join(format!("{segment_id}.rrd"));
+
+    let rec = RecordingStreamBuilder::new(format!("rerun_example_{segment_id}"))
+        .recording_id(segment_id)
+        .send_properties(false)
+        .save(tmp_path.clone())?;
+
+    let mut next_chunk_id = next_chunk_id_generator(tuid_prefix);
+    let mut next_row_id = next_row_id_generator(tuid_prefix);
+
+    for base_time in [0, 30, 60] {
+        for entity_path in entity_paths {
+            let entity_path = EntityPath::from(*entity_path);
+
+            // Sequential frames
+            let frame1 = TimeInt::new_temporal(10 + base_time);
+            let frame2 = TimeInt::new_temporal(20 + base_time);
+            let frame3 = TimeInt::new_temporal(30 + base_time);
+
+            // Data for each frame
+            let points1 = MyPoint::from_iter(0..1);
+            let points2 = MyPoint::from_iter(1..2);
+            let points3 = MyPoint::from_iter(2..3);
+
+            let colors1 = MyColor::from_iter(0..1);
+            let colors2 = MyColor::from_iter(1..2);
+            let colors3 = MyColor::from_iter(2..3);
+
+            let labels = vec![MyLabel("simple".to_owned())];
+
+            let mut component1 = vec![(MyPoints::descriptor_points(), Some(&points1 as _))];
+            let mut component2 = vec![(MyPoints::descriptor_points(), Some(&points2 as _))];
+            let mut component3 = vec![(MyPoints::descriptor_points(), Some(&points3 as _))];
+
+            // Send nulls for the middle batch for the color component
+            if base_time != 30 {
+                component1.push((MyPoints::descriptor_colors(), Some(&colors1 as _)));
+                component2.push((MyPoints::descriptor_colors(), Some(&colors2 as _)));
+                component3.push((MyPoints::descriptor_colors(), Some(&colors3 as _)));
+            }
+
+            let chunk = Chunk::builder_with_id(next_chunk_id(), entity_path.clone())
+                .with_sparse_component_batches(next_row_id(), [build_frame_nr(frame1)], component1)
+                .with_sparse_component_batches(next_row_id(), [build_frame_nr(frame3)], component2)
+                .with_sparse_component_batches(next_row_id(), [build_frame_nr(frame2)], component3)
+                .build()?;
+
+            rec.send_chunk(chunk);
+
+            // send static data only once
+            if base_time == 0 {
+                let static_chunk = Chunk::builder_with_id(next_chunk_id(), entity_path.clone())
+                    .with_sparse_component_batches(
+                        next_row_id(),
+                        TimePoint::default(),
+                        [(MyPoints::descriptor_labels(), Some(&labels as _))],
+                    )
+                    .build()?;
+
+                rec.send_chunk(static_chunk);
+            }
+        }
+    }
+
+    rec.flush_blocking()?;
+
+    Ok(TempPath::new(tmp_dir, tmp_path))
 }

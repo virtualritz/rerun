@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
-use crossbeam::channel::Select;
 use parking_lot::Mutex;
 
-use super::LogReceiver;
-use crate::{LogSource, RecvError, SmartMessage};
+use crate::{LogReceiver, LogSource, SmartMessage};
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::RecvError;
 
 /// A set of connected [`LogReceiver`]s.
 ///
@@ -61,11 +62,11 @@ impl LogReceiverSet {
             // retain only sources which:
             // - aren't network sources
             // - don't point at the given `needle`
-            LogSource::RrdHttpStream { url, .. } => url != needle,
+            LogSource::HttpStream { url, .. } => url != needle,
             LogSource::MessageProxy(url) => url.to_string() != needle,
             LogSource::RedapGrpcStream { uri, .. } => uri.to_string() != needle,
 
-            LogSource::File(_)
+            LogSource::File { .. }
             | LogSource::Stdin
             | LogSource::Sdk
             | LogSource::RrdWebEvent
@@ -109,6 +110,7 @@ impl LogReceiverSet {
 
     /// Blocks until a message is ready to be received,
     /// or we are empty.
+    #[cfg(not(target_arch = "wasm32"))] // Cannot block on web
     pub fn recv(&self) -> Result<SmartMessage, RecvError> {
         re_tracing::profile_function!();
 
@@ -120,7 +122,7 @@ impl LogReceiverSet {
             return Err(RecvError);
         }
 
-        let mut sel = Select::new();
+        let mut sel = re_quota_channel::Select::new();
         for r in rx.iter() {
             sel.recv(r.inner());
         }
@@ -141,7 +143,7 @@ impl LogReceiverSet {
             return None;
         }
 
-        let mut sel = Select::new();
+        let mut sel = re_quota_channel::Select::new();
         for r in rx.iter() {
             sel.recv(r.inner());
         }
@@ -163,6 +165,7 @@ impl LogReceiverSet {
         None
     }
 
+    #[cfg(not(target_arch = "wasm32"))] // Cannot block on web
     pub fn recv_timeout(
         &self,
         timeout: std::time::Duration,
@@ -176,7 +179,7 @@ impl LogReceiverSet {
             return None;
         }
 
-        let mut sel = Select::new();
+        let mut sel = re_quota_channel::Select::new();
         for r in rx.iter() {
             sel.recv(r.inner());
         }
@@ -199,6 +202,19 @@ impl LogReceiverSet {
     }
 }
 
+impl re_byte_size::MemUsageTreeCapture for LogReceiverSet {
+    fn capture_mem_usage_tree(&self) -> re_byte_size::MemUsageTree {
+        let mut tree = re_byte_size::MemUsageNode::default();
+        self.for_each(|receiver| {
+            tree.add(
+                receiver.source().to_string(),
+                receiver.inner().current_bytes(),
+            );
+        });
+        tree.into_tree()
+    }
+}
+
 #[test]
 fn test_receive_set() {
     use re_log_types::StoreId;
@@ -207,7 +223,10 @@ fn test_receive_set() {
 
     let timeout = std::time::Duration::from_millis(100);
 
-    let (tx_file, rx_file) = log_channel(LogSource::File("path".into()));
+    let (tx_file, rx_file) = log_channel(LogSource::File {
+        path: "path".into(),
+        follow: false,
+    });
     let (tx_sdk, rx_sdk) = log_channel(LogSource::Sdk);
 
     let set = LogReceiverSet::default();
@@ -222,7 +241,10 @@ fn test_receive_set() {
     assert!(set.recv_timeout(timeout).is_none());
     assert_eq!(
         set.sources(),
-        vec![Arc::new(LogSource::File("path".into()))]
+        vec![Arc::new(LogSource::File {
+            path: "path".into(),
+            follow: false
+        })]
     );
 
     set.add(rx_sdk);
@@ -232,7 +254,10 @@ fn test_receive_set() {
     assert_eq!(
         set.sources(),
         vec![
-            Arc::new(LogSource::File("path".into())),
+            Arc::new(LogSource::File {
+                path: "path".into(),
+                follow: false
+            }),
             Arc::new(LogSource::Sdk)
         ]
     );
@@ -257,7 +282,10 @@ fn test_receive_set() {
     assert!(set.recv_timeout(timeout).is_none());
     assert_eq!(
         set.sources(),
-        vec![Arc::new(LogSource::File("path".into()))]
+        vec![Arc::new(LogSource::File {
+            path: "path".into(),
+            follow: false
+        })]
     );
 
     drop(tx_file);

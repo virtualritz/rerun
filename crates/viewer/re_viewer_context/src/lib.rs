@@ -2,9 +2,19 @@
 //!
 //! This crate contains data structures that are shared with most modules of the viewer.
 
+// Increased recursion is needed for VideoAssetCache.
+// We could also add Send bounds like this to help limit recursion:
+// impl Cache for VideoAssetCache
+// where
+//     Video: Send + Sync,
+//     VideoLoadError: Send + Sync,
+// but that slows compilation down by a ton
+#![recursion_limit = "256"]
 #![warn(clippy::iter_over_hash_type)] //  TODO(#6198): enable everywhere
 
+mod active_store_context;
 mod annotations;
+mod app_context;
 mod app_options;
 mod async_runtime_handle;
 mod blueprint_helpers;
@@ -15,10 +25,8 @@ mod command_sender;
 mod component_fallbacks;
 mod component_ui_registry;
 mod contents;
-mod display_mode;
 mod drag_and_drop;
 mod file_dialog;
-mod global_context;
 mod heuristics;
 mod image_info;
 mod item;
@@ -28,10 +36,11 @@ pub mod open_url;
 mod query_context;
 mod query_range;
 mod recording_or_table;
+mod route;
 mod selection_state;
 mod storage_context;
-mod store_context;
 pub mod store_hub;
+mod store_view_context;
 mod tables;
 mod tensor;
 mod time_control;
@@ -47,22 +56,24 @@ mod visitor_flow_control;
 
 pub use re_ui::UiLayout;
 
+pub use self::active_store_context::ActiveStoreContext;
 pub use self::annotations::{
     AnnotationContextStoreSubscriber, AnnotationMap, Annotations, ResolvedAnnotationInfo,
     ResolvedAnnotationInfos,
 };
-pub use self::app_options::AppOptions;
+pub use self::app_context::{AppContext, AuthContext};
+pub use self::app_options::{AppOptions, ExperimentalAppOptions, VideoOptions};
 pub use self::async_runtime_handle::{AsyncRuntimeError, AsyncRuntimeHandle, WasmNotSend};
 pub use self::blueprint_helpers::{
-    BlueprintContext, blueprint_timeline, blueprint_timepoint_for_writes,
+    AppBlueprintCtx, BlueprintContext, blueprint_timeline, blueprint_timepoint_for_writes,
 };
 pub use self::blueprint_id::{
     BlueprintId, BlueprintIdRegistry, ContainerId, GLOBAL_VIEW_ID, ViewId,
 };
 pub use self::cache::{
-    Cache, CacheMemoryReport, CacheMemoryReportItem, Caches, ImageDecodeCache, ImageStatsCache,
-    SharablePlayableVideoStream, TensorStatsCache, TransformDatabaseStoreCache, VideoAssetCache,
-    VideoStreamCache, VideoStreamProcessingError,
+    Cache, ImageDecodeCache, ImageStatsCache, Memoizers, SharablePlayableVideoStream, StoreCache,
+    TensorStatsCache, TransformDatabaseStoreCache, VideoAssetCache, VideoStreamCache,
+    VideoStreamProcessingError,
 };
 pub use self::collapsed_id::{CollapseItem, CollapseScope, CollapsedId};
 pub use self::command_sender::{
@@ -73,18 +84,18 @@ pub use self::component_fallbacks::{
     ComponentFallbackError, FallbackProviderRegistry, typed_fallback_for,
 };
 pub use self::component_ui_registry::{
-    ComponentUiRegistry, ComponentUiTypes, EditTarget, VariantName,
+    ComponentUiRegistry, ComponentUiTypes, EditTarget, TryShowEditUiResult, VariantName,
 };
 pub use self::contents::{Contents, ContentsName, blueprint_id_to_tile_id};
-pub use self::display_mode::DisplayMode;
 pub use self::drag_and_drop::{DragAndDropFeedback, DragAndDropManager, DragAndDropPayload};
 pub use self::file_dialog::sanitize_file_name;
-pub use self::global_context::{AuthContext, GlobalContext};
 pub use self::heuristics::suggest_view_for_each_entity;
 pub use self::image_info::{
     ColormapWithRange, ImageInfo, StoredBlobCacheKey, resolution_of_image_at,
 };
-pub use self::item::{Item, resolve_mono_instance_path, resolve_mono_instance_path_item};
+pub use self::item::{
+    DataResultInteractionAddress, Item, resolve_mono_instance_path, resolve_mono_instance_path_item,
+};
 pub use self::item_collection::{ItemCollection, ItemContext};
 pub use self::maybe_mut_ref::MaybeMutRef;
 pub use self::query_context::{
@@ -92,22 +103,24 @@ pub use self::query_context::{
 };
 pub use self::query_range::QueryRange;
 pub use self::recording_or_table::RecordingOrTable;
+pub use self::route::Route;
 pub use self::selection_state::{
     ApplicationSelectionState, HoverHighlight, InteractionHighlight, SelectionChange,
     SelectionHighlight,
 };
 pub use self::storage_context::StorageContext;
-pub use self::store_context::StoreContext;
 pub use self::store_hub::StoreHub;
+pub use self::store_view_context::StoreViewContext;
 pub use self::tables::{TableStore, TableStores};
 pub use self::tensor::{ImageStats, TensorStats};
 pub use self::time_control::{
-    TIME_PANEL_PATH, TimeControl, TimeControlCommand, TimeControlResponse, TimeView,
-    time_panel_blueprint_entity_path,
+    MoveDirection, MoveSpeed, TIME_PANEL_PATH, TimeControl, TimeControlCommand,
+    TimeControlResponse, TimeControlUpdateParams, TimeView, time_panel_blueprint_entity_path,
 };
 pub use self::typed_entity_collections::{
-    IndicatedEntities, PerVisualizer, PerVisualizerInViewClass, VisualizableEntities,
-    VisualizableReason,
+    BufferAndFormatMatch, DatatypeMatch, IndicatedEntities, PerVisualizerInstruction,
+    PerVisualizerType, PerVisualizerTypeInViewClass, SingleRequiredComponentMatch,
+    VisualizableEntities, VisualizableReason,
 };
 pub use self::undo::BlueprintUndoState;
 pub use self::utils::{
@@ -115,15 +128,18 @@ pub use self::utils::{
     video_timestamp_component_to_video_time,
 };
 pub use self::view::{
-    DataResult, IdentifiedViewSystem, OptionalViewEntityHighlight, OverridePath,
-    PerSystemDataResults, PerSystemEntities, PropertyOverrides, RecommendedView,
-    RequiredComponents, SmallVisualizerSet, SystemExecutionOutput, ViewClass, ViewClassExt,
+    BufferAndFormatConstraint, DataResult, IdentifiedViewSystem, OptionalViewEntityHighlight,
+    PerSystemEntities, RecommendedMappings, RecommendedView, RecommendedVisualizers,
+    SingleRequiredComponentConstraint, SystemExecutionOutput, ViewClass, ViewClassExt,
     ViewClassLayoutPriority, ViewClassPlaceholder, ViewClassRegistry, ViewClassRegistryError,
     ViewContext, ViewContextCollection, ViewContextSystem, ViewContextSystemOncePerFrameResult,
     ViewEntityHighlight, ViewHighlights, ViewOutlineMasks, ViewQuery, ViewSpawnHeuristics,
     ViewState, ViewStateExt, ViewStates, ViewSystemExecutionError, ViewSystemIdentifier,
-    ViewSystemRegistrator, VisualizerCollection, VisualizerExecutionErrorState,
-    VisualizerExecutionOutput, VisualizerQueryInfo, VisualizerSystem,
+    ViewSystemRegistrator, ViewSystemState, VisualizabilityConstraints, VisualizerCollection,
+    VisualizerComponentMappings, VisualizerComponentSource, VisualizerExecutionOutput,
+    VisualizerInstruction, VisualizerInstructionReport, VisualizerInstructionsPerType,
+    VisualizerQueryInfo, VisualizerReportContext, VisualizerReportSeverity, VisualizerSystem,
+    VisualizerTypeReport, VisualizerViewReport, VisualizersSectionOutput, VisualizersSectionUi,
 };
 pub use self::viewer_context::ViewerContext;
 pub use self::visitor_flow_control::VisitorControlFlow; // Historical reasons
@@ -133,6 +149,9 @@ pub mod external {
     pub use tokio;
     pub use {nohash_hasher, re_chunk_store, re_entity_db, re_log_types, re_query, re_ui};
 }
+
+// Re-export
+pub use re_chunk_store::MissingChunkReporter;
 
 // ---------------------------------------------------------------------------
 
@@ -180,13 +199,16 @@ pub struct ScreenshotInfo {
 }
 
 /// Where to put the screenshot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScreenshotTarget {
     /// The screenshot will be copied to the clipboard.
     CopyToClipboard,
 
-    /// The screenshot will be saved to disk.
-    SaveToDisk,
+    /// The screenshot will be saved to disk (prompting the user for a location).
+    SaveToPathFromFileDialog,
+
+    /// The screenshot will be saved to the specified file path.
+    SaveToPath(camino::Utf8PathBuf),
 }
 
 // ----------------------------------------------------------------------------------------

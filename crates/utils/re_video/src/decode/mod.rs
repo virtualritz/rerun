@@ -36,7 +36,7 @@
 //! * `picture.primaries()`
 //!   * now we have RGB but we kinda have no idea what that means!
 //!   * the color primaries tell us which space we're in
-//!   * ...meaning that if the primaries are anything else we'd have to do some conversion BUT
+//!   * …meaning that if the primaries are anything else we'd have to do some conversion BUT
 //!     it also means that we have no chance of displaying the picture perfectly on a screen taking in sRGB (or any other not-matching color space)
 //!   * [Wikipedia says](https://en.wikipedia.org/wiki/Rec._709#Relationship_to_sRGB) sRGB uses the same primaries as BT.709
 //!       * but I also found other sources (e.g. [this forum post](https://forum.doom9.org/showthread.php?p=1640342#post1640342))
@@ -95,7 +95,7 @@ pub use ffmpeg_cli::{
 #[cfg(target_arch = "wasm32")]
 mod webcodecs;
 
-use crate::{SampleIndex, Time, VideoDataDescription};
+use crate::{SampleIndex, Time, VideoDataDescription, player::VideoPlaybackIssueSeverity};
 
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum DecodeError {
@@ -126,6 +126,12 @@ pub enum DecodeError {
     BadBitsPerComponent(usize),
 }
 
+impl re_byte_size::SizeBytes for DecodeError {
+    fn heap_size_bytes(&self) -> u64 {
+        0
+    }
+}
+
 impl DecodeError {
     pub fn should_request_more_frames(&self) -> bool {
         // Decoders often (not always!) recover from errors and will succeed eventually.
@@ -148,6 +154,25 @@ impl DecodeError {
 
             // Unsupported format.
             Self::BadBitsPerComponent(_) => false,
+        }
+    }
+
+    pub fn severity(&self) -> VideoPlaybackIssueSeverity {
+        match self {
+            #[cfg(with_dav1d)]
+            Self::Dav1d(err) => match err {
+                dav1d::Error::Again => VideoPlaybackIssueSeverity::Loading,
+                _ => VideoPlaybackIssueSeverity::Error,
+            },
+            #[cfg(target_arch = "wasm32")]
+            Self::WebDecoder(err) => err.severity(),
+            #[cfg(with_ffmpeg)]
+            Self::Ffmpeg(_) => VideoPlaybackIssueSeverity::Error,
+
+            Self::UnsupportedCodec(_)
+            | Self::Dav1dWithoutNasm
+            | Self::NoDav1dOnLinuxArm64
+            | Self::BadBitsPerComponent(_) => VideoPlaybackIssueSeverity::Error,
         }
     }
 }
@@ -206,7 +231,7 @@ pub fn new_decoder(
     debug_name: &str,
     video: &crate::VideoDataDescription,
     decode_settings: &DecodeSettings,
-    output_sender: crossbeam::channel::Sender<FrameResult>,
+    output_sender: crate::Sender<FrameResult>,
 ) -> Result<Box<dyn AsyncDecoder>> {
     #![allow(clippy::allow_attributes, unused_variables, clippy::needless_return)] // With some feature flags
 
@@ -265,7 +290,7 @@ pub fn new_decoder(
 ///
 /// In MP4, one sample is one frame.
 pub struct Chunk {
-    /// The start of a new [`crate::demux::GroupOfPictures`]?
+    /// The start of a new group of pictures?
     ///
     /// This probably means this is a _keyframe_, and that and entire frame
     /// can be decoded from only this one sample (though I'm not 100% sure).
@@ -309,6 +334,21 @@ pub struct Chunk {
     /// Typically the time difference in presentation timestamp to the next sample.
     /// May be unknown if this is the last sample in an ongoing video stream.
     pub duration: Option<Time>,
+}
+
+impl re_byte_size::SizeBytes for Chunk {
+    fn heap_size_bytes(&self) -> u64 {
+        let Self {
+            is_sync: _,
+            data,
+            sample_idx: _,
+            frame_nr: _,
+            decode_timestamp: _,
+            presentation_timestamp: _,
+            duration: _,
+        } = self;
+        data.heap_size_bytes()
+    }
 }
 
 /// Data for a decoded frame on native targets.
@@ -362,7 +402,7 @@ impl FrameContent {
 /// Meta information about a decoded video frame, as reported by the decoder.
 #[derive(Debug, Clone)]
 pub struct FrameInfo {
-    /// The start of a new [`crate::demux::GroupOfPictures`]?
+    /// The start of a new group of pictures?
     ///
     /// This probably means this is a _keyframe_, and that and entire frame
     /// can be decoded from only this one sample (though I'm not 100% sure).

@@ -178,6 +178,7 @@ pub const ATTR_ARROW_SPARSE_UNION: &str = "attr.arrow.sparse_union";
 pub const ATTR_RERUN_COMPONENT_OPTIONAL: &str = "attr.rerun.component_optional";
 pub const ATTR_RERUN_COMPONENT_RECOMMENDED: &str = "attr.rerun.component_recommended";
 pub const ATTR_RERUN_COMPONENT_REQUIRED: &str = "attr.rerun.component_required";
+pub const ATTR_RERUN_COMPONENT_NO_UI_EDIT: &str = "attr.rerun.component_no_ui_edit";
 pub const ATTR_RERUN_OVERRIDE_TYPE: &str = "attr.rerun.override_type";
 pub const ATTR_RERUN_SCOPE: &str = "attr.rerun.scope";
 pub const ATTR_RERUN_VIEW_IDENTIFIER: &str = "attr.rerun.view_identifier";
@@ -449,6 +450,10 @@ fn generate_code(
     // Remove orphaned files:
     for path in orphan_paths_opt_out {
         files.retain(|filepath, _| filepath.parent() != Some(path));
+        // If paths are specific files make sure we don't try to delete them
+        if path.is_file() {
+            files.insert(path.clone(), String::default());
+        }
     }
     crate::codegen::common::remove_orphaned_files(reporter, &files);
 }
@@ -570,6 +575,18 @@ pub fn generate_docs(
 
     let mut generator = DocsCodeGenerator::new(output_docs_dir.as_ref());
     let mut formatter = NoopCodeFormatter;
+    // We removed these components but left redirects to the replacements
+    let orphan_path_opt_out = BTreeSet::from([
+        output_docs_dir
+            .as_ref()
+            .join("components/pose_rotation_axis_angle.md"),
+        output_docs_dir
+            .as_ref()
+            .join("components/pose_rotation_quat.md"),
+        output_docs_dir
+            .as_ref()
+            .join("components/pose_translation3d.md"),
+    ]);
 
     generate_code(
         reporter,
@@ -577,7 +594,7 @@ pub fn generate_docs(
         type_registry,
         &mut generator,
         &mut formatter,
-        &Default::default(),
+        &orphan_path_opt_out,
         check,
     );
 }

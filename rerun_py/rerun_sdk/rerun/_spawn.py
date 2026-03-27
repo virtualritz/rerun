@@ -7,9 +7,11 @@ def _spawn_viewer(
     *,
     port: int = 9876,
     memory_limit: str = "75%",
-    server_memory_limit: str = "0B",
+    server_memory_limit: str = "1GiB",
     hide_welcome_screen: bool = False,
     detach_process: bool = True,
+    executable_name: str = "rerun",
+    executable_path: str | None = None,
 ) -> None:
     """
     Internal helper to spawn a Rerun Viewer, listening on the given port.
@@ -32,11 +34,21 @@ def _spawn_viewer(
         When this limit is reached, Rerun will drop the oldest data.
         Example: `16GB` or `50%` (of system total).
 
-        Defaults to `0B`.
+        Defaults to `1GiB`.
     hide_welcome_screen:
         Hide the normal Rerun welcome screen.
     detach_process:
         Detach Rerun Viewer process from the application process.
+    executable_name:
+        Specifies the name of the Rerun executable.
+        You can omit the `.exe` suffix on Windows.
+
+        Defaults to `rerun`.
+    executable_path:
+        Enforce a specific executable to use instead of searching
+        through PATH for `executable_name`.
+
+        Unspecified by default.
 
     """
 
@@ -56,4 +68,6 @@ def _spawn_viewer(
         server_memory_limit=server_memory_limit,
         hide_welcome_screen=hide_welcome_screen,
         detach_process=detach_process,
+        executable_name=executable_name,
+        executable_path=executable_path,
     )

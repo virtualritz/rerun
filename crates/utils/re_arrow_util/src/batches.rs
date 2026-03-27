@@ -1,11 +1,23 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, RecordBatch, RecordBatchOptions};
+use arrow::array::{ArrayRef, RecordBatch, RecordBatchOptions, UInt64Array};
 use arrow::datatypes::{Field, Schema, SchemaBuilder};
 use itertools::Itertools as _;
 
 use crate::MissingColumnError;
+
+/// Takes rows from a [`RecordBatch`] at the specified indices.
+///
+/// This is a convenience wrapper around [`arrow::compute::take_record_batch`]
+/// that accepts `usize` indices instead of requiring a specific Arrow array type.
+pub fn take_record_batch(
+    batch: &RecordBatch,
+    indices: &[usize],
+) -> Result<RecordBatch, arrow::error::ArrowError> {
+    let indices: UInt64Array = indices.iter().map(|&i| i as u64).collect();
+    arrow::compute::take_record_batch(batch, &indices)
+}
 
 // ---
 
@@ -486,7 +498,7 @@ mod tests {
         );
         batch_concat.schema_metadata_mut().clear();
 
-        insta::assert_debug_snapshot!(batch_concat, @r###"
+        insta::assert_debug_snapshot!(batch_concat, @r#"
         RecordBatch {
             schema: Schema {
                 fields: [
@@ -494,33 +506,21 @@ mod tests {
                         name: "col1",
                         data_type: Int32,
                         nullable: true,
-                        dict_id: 0,
-                        dict_is_ordered: false,
-                        metadata: {},
                     },
                     Field {
                         name: "col2",
                         data_type: Utf8,
                         nullable: true,
-                        dict_id: 0,
-                        dict_is_ordered: false,
-                        metadata: {},
                     },
                     Field {
                         name: "col3",
                         data_type: Boolean,
                         nullable: true,
-                        dict_id: 0,
-                        dict_is_ordered: false,
-                        metadata: {},
                     },
                     Field {
                         name: "col4",
                         data_type: UInt64,
                         nullable: true,
-                        dict_id: 0,
-                        dict_is_ordered: false,
-                        metadata: {},
                     },
                 ],
                 metadata: {},
@@ -553,7 +553,7 @@ mod tests {
             ],
             row_count: 3,
         }
-        "###);
+        "#);
     }
 
     #[test]

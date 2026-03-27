@@ -30,7 +30,8 @@ def test_df_filters(catalog_client: CatalogClient, readonly_test_dataset: Datase
     def find_time_boundaries(time_index: str, segment: pa.Scalar) -> list[pa.Scalar]:
         """Find four times: start, middle third, upper third, stop."""
         rbs = (
-            readonly_test_dataset.reader(index=time_index)
+            readonly_test_dataset
+            .reader(index=time_index)
             .filter(col("rerun_segment_id") == segment)
             .select(time_index)
             .sort(col(time_index))
@@ -96,8 +97,8 @@ def test_df_filters(catalog_client: CatalogClient, readonly_test_dataset: Datase
         # Collect all data without any filtering and store in memory
         # so that we can have guarantees that our push-down filters
         # do not impact the results.
-        full_data = readonly_test_dataset.reader(index=time_idx).collect()
-        catalog_client.ctx.register_record_batches(time_idx, [full_data])
+        full_data_batches = readonly_test_dataset.reader(index=time_idx).collect()
+        catalog_client.ctx.register_record_batches(time_idx, [full_data_batches])
         full_data = catalog_client.ctx.table(time_idx)
 
         for test_filter in all_tests:

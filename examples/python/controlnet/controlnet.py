@@ -15,14 +15,15 @@ import cv2
 import numpy as np
 import PIL.Image
 import requests
-import rerun as rr
-import rerun.blueprint as rrb
 import torch
 from diffusers import (
     AutoencoderKL,
     ControlNetModel,
     StableDiffusionXLControlNetPipeline,
 )
+
+import rerun as rr
+import rerun.blueprint as rrb
 
 RERUN_LOGO_URL = "https://storage.googleapis.com/rerun-example-datasets/controlnet/rerun-icon-1000.png"
 
@@ -37,8 +38,8 @@ def controlnet_callback(
     rr.set_time("timestep", duration=timestep)
     latents = callback_kwargs["latents"]
 
-    image = pipe.vae.decode(latents / pipe.vae.config.scaling_factor, return_dict=False)[0]
-    image = pipe.image_processor.postprocess(image, output_type="np").squeeze()
+    image = pipe.vae.decode(latents / pipe.vae.config.scaling_factor, return_dict=False)[0]  # type: ignore[attr-defined]
+    image = pipe.image_processor.postprocess(image, output_type="np").squeeze()  # type: ignore[attr-defined]
     rr.log("output", rr.Image(image))
     rr.log("latent", rr.Tensor(latents.squeeze(), dim_names=["channel", "height", "width"]))
 

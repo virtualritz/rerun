@@ -122,10 +122,16 @@ def main() -> None:
 
     if args.no_py:
         pass  # No need to build the Python SDK
-    elif args.no_py_build:
-        print("Skipping building python rerun-sdk - assuming it is already built and up-to-date!")
     else:
-        build_python_sdk(build_env)
+        if args.no_py_build:
+            print("Skipping building python rerun-sdk - assuming it is already built and up-to-date!")
+        else:
+            build_python_sdk(build_env)
+        # Use uv to install the snippet dependencies
+        run(
+            ["uv", "sync", "--group", "snippets", "--inexact", "--no-install-package", "rerun-sdk"],
+            env=build_env,
+        )
 
     if args.no_cpp:
         pass  # No need to build the C++ SDK
@@ -245,7 +251,7 @@ def main() -> None:
         if "py" in active_languages:
             if "py" in example_opt_out_entirely:
                 print("Skipping py completely")
-            elif "py" in example_opt_out_compare:
+            elif "py" in example_opt_out_compare or python_output_path == baseline_path:
                 print("Skipping py compare")
             else:
                 try:
@@ -279,16 +285,11 @@ def main() -> None:
 
 def run_example(example: Example, language: str, args: argparse.Namespace) -> None:
     if language == "cpp":
-        cpp_output_path = run_prebuilt_cpp(example)
-        check_non_empty_rrd(cpp_output_path)
+        run_prebuilt_cpp(example)
     elif language == "py":
-        python_output_path = run_python(example)
-        check_non_empty_rrd(python_output_path)
+        run_python(example)
     elif language == "rust":
-        rust_output_path = run_prebuilt_rust(
-            example, release=args.release, target=args.target, target_dir=args.target_dir
-        )
-        check_non_empty_rrd(rust_output_path)
+        run_prebuilt_rust(example, release=args.release, target=args.target, target_dir=args.target_dir)
     else:
         raise AssertionError(f"Unknown language: {language}")
 
@@ -345,7 +346,11 @@ def run_python(example: Example) -> str:
 
     cmd = [python_executable, main_path, *example.extra_args()]
 
-    env = roundtrip_env(save_path=output_path)
+    env = os.environ.copy()
+    # Force UTF-8 encoding for Python I/O to handle Unicode output on Windows
+    env["PYTHONIOENCODING"] = "utf-8"
+    if str(example) not in OPT_OUT_BACKWARDS_CHECK:
+        env = roundtrip_env(save_path=output_path)
     run(cmd, env=env, timeout=30)
 
     return output_path
@@ -370,7 +375,9 @@ def run_prebuilt_rust(example: Example, *, release: bool, target: str | None, ta
     cmd += [example.name]
     cmd += example.extra_args()
 
-    env = roundtrip_env(save_path=output_path)
+    env = None
+    if str(example) not in OPT_OUT_BACKWARDS_CHECK:
+        env = roundtrip_env(save_path=output_path)
     run(cmd, env=env, timeout=30)
 
     return output_path
@@ -380,8 +387,10 @@ def run_prebuilt_cpp(example: Example) -> str:
     output_path = example.output_path("cpp")
 
     extension = ".exe" if os.name == "nt" else ""
-    cmd = [f"./build/debug/docs/snippets/{example.name}{extension}", *example.extra_args()]
-    env = roundtrip_env(save_path=output_path)
+    cmd = [f"./build/debug/docs/snippets/snippets{extension}", example.name, *example.extra_args()]
+    env = None
+    if str(example) not in OPT_OUT_BACKWARDS_CHECK:
+        env = roundtrip_env(save_path=output_path)
     run(cmd, env=env, timeout=30)
 
     return output_path

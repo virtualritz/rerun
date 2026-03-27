@@ -45,6 +45,12 @@ from .image_buffer import ImageBuffer, ImageBufferBatch
 from .image_format import ImageFormat, ImageFormatBatch
 from .image_plane_distance import ImagePlaneDistance, ImagePlaneDistanceBatch
 from .interactive import Interactive, InteractiveBatch
+from .interpolation_mode import (
+    InterpolationMode,
+    InterpolationModeArrayLike,
+    InterpolationModeBatch,
+    InterpolationModeLike,
+)
 from .key_value_pairs import KeyValuePairs, KeyValuePairsArrayLike, KeyValuePairsBatch, KeyValuePairsLike
 from .keypoint_id import KeypointId, KeypointIdBatch
 from .lat_lon import LatLon, LatLonBatch
@@ -61,6 +67,12 @@ from .magnification_filter import (
 from .marker_shape import MarkerShape, MarkerShapeArrayLike, MarkerShapeBatch, MarkerShapeLike
 from .marker_size import MarkerSize, MarkerSizeBatch
 from .media_type import MediaType, MediaTypeBatch
+from .mesh_face_rendering import (
+    MeshFaceRendering,
+    MeshFaceRenderingArrayLike,
+    MeshFaceRenderingBatch,
+    MeshFaceRenderingLike,
+)
 from .name import Name, NameBatch
 from .opacity import Opacity, OpacityBatch
 from .pinhole_projection import PinholeProjection, PinholeProjectionBatch
@@ -75,7 +87,6 @@ from .rotation_quat import RotationQuat, RotationQuatBatch
 from .scalar import Scalar, ScalarBatch
 from .scale3d import Scale3D, Scale3DBatch
 from .schema_id import SchemaId, SchemaIdBatch
-from .series_visible import SeriesVisible, SeriesVisibleBatch
 from .show_labels import ShowLabels, ShowLabelsBatch
 from .stroke_width import StrokeWidth, StrokeWidthBatch
 from .tensor_data import TensorData, TensorDataBatch
@@ -176,6 +187,10 @@ __all__ = [
     "ImagePlaneDistanceBatch",
     "Interactive",
     "InteractiveBatch",
+    "InterpolationMode",
+    "InterpolationModeArrayLike",
+    "InterpolationModeBatch",
+    "InterpolationModeLike",
     "KeyValuePairs",
     "KeyValuePairsArrayLike",
     "KeyValuePairsBatch",
@@ -208,6 +223,10 @@ __all__ = [
     "MarkerSizeBatch",
     "MediaType",
     "MediaTypeBatch",
+    "MeshFaceRendering",
+    "MeshFaceRenderingArrayLike",
+    "MeshFaceRenderingBatch",
+    "MeshFaceRenderingLike",
     "Name",
     "NameBatch",
     "Opacity",
@@ -236,8 +255,6 @@ __all__ = [
     "Scale3DBatch",
     "SchemaId",
     "SchemaIdBatch",
-    "SeriesVisible",
-    "SeriesVisibleBatch",
     "ShowLabels",
     "ShowLabelsBatch",
     "StrokeWidth",

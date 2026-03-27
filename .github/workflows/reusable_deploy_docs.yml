@@ -44,17 +44,6 @@ env:
   RUSTFLAGS: --deny warnings
   RUSTDOCFLAGS: --deny warnings
 
-  # Disable the GHA backend (Github's 10GB storage) since we use our own GCS backend.
-  # See: https://github.com/marketplace/actions/sccache-action
-  SCCACHE_GHA_ENABLED: "false"
-
-  # Wrap every `rustc` invocation in `sccache`.
-  RUSTC_WRAPPER: "sccache"
-
-  # Not only `sccache` cannot cache incremental builds, it's counter-productive to generate all
-  # these incremental artifacts when running on CI.
-  CARGO_INCREMENTAL: "0"
-
 jobs:
   # ---------------------------------------------------------------------------
 
@@ -69,7 +58,6 @@ jobs:
       - uses: prefix-dev/setup-pixi@v0.9.1
         with:
           pixi-version: v0.55.0
-          environments: py-docs
 
       - id: "auth"
         uses: google-github-actions/auth@v2
@@ -83,39 +71,21 @@ jobs:
           version: ">= 363.0.0"
 
       - name: Build docs
-        run: pixi run -e py-docs mkdocs build -f rerun_py/mkdocs.yml -d site
+        run: pixi run uv run --group docs mkdocs build -f rerun_py/mkdocs.yml -d site
 
       - name: "Upload Python Docs (version)"
-        uses: google-github-actions/upload-cloud-storage@v2
+        uses: google-github-actions/upload-cloud-storage@v3
         with:
           path: "rerun_py/site"
           destination: "rerun-docs/docs/python/${{ inputs.PY_DOCS_VERSION_NAME }}"
           process_gcloudignore: false
           parent: false
+          resumable: false
 
-      - name: "Update latest index.html"
+      - name: "Update URL rewrite rules for stable"
         if: ${{ inputs.UPDATE_LATEST }}
         run: |
-          cat <<EOF > index.html
-          <!DOCTYPE html>
-          <html>
-          <head>
-            <meta charset="utf-8">
-            <title>Redirecting</title>
-            <noscript>
-              <meta http-equiv="refresh" content="1; url=../${{ inputs.PY_DOCS_VERSION_NAME }}/" />
-            </noscript>
-            <script>
-              window.location.replace("../${{ inputs.PY_DOCS_VERSION_NAME }}/" + window.location.hash);
-            </script>
-          </head>
-          <body>
-            Redirecting to <a href="../${{ inputs.PY_DOCS_VERSION_NAME }}/">../${{ inputs.PY_DOCS_VERSION_NAME }}/</a>
-          </body>
-          </html>
-          EOF
-
-          gsutil cp ./index.html gs://rerun-docs/docs/python/stable/
+          pixi run uv run --group dev scripts/update_docs_url_rewrite.py --version ${{ inputs.PY_DOCS_VERSION_NAME }} --language python
 
       - name: "Update versions.json"
         if: ${{ inputs.UPDATE_LATEST }}
@@ -173,21 +143,23 @@ jobs:
         run: pixi run -e cpp cpp-docs
 
       - name: "Upload C++ Docs (version)"
-        uses: google-github-actions/upload-cloud-storage@v2
+        uses: google-github-actions/upload-cloud-storage@v3
         with:
           path: "rerun_cpp/docs/html"
           destination: "rerun-docs/docs/cpp/${{ inputs.RELEASE_VERSION }}"
           process_gcloudignore: false
           parent: false
+          resumable: false
 
       - name: "Upload C++ Docs (named)"
         if: ${{ inputs.UPDATE_LATEST }}
-        uses: google-github-actions/upload-cloud-storage@v2
+        uses: google-github-actions/upload-cloud-storage@v3
         with:
           path: "rerun_cpp/docs/html"
           destination: "rerun-docs/docs/cpp/${{ inputs.CPP_DOCS_VERSION_NAME }}"
           process_gcloudignore: false
           parent: false
+          resumable: false
 
   js-deploy-docs:
     name: JS
@@ -200,7 +172,6 @@ jobs:
       - uses: prefix-dev/setup-pixi@v0.9.1
         with:
           pixi-version: v0.55.0
-          environments: py-docs
 
       - id: "auth"
         uses: google-github-actions/auth@v2
@@ -217,33 +188,15 @@ jobs:
         run: pixi run js-docs
 
       - name: "Upload (version)"
-        uses: google-github-actions/upload-cloud-storage@v2
+        uses: google-github-actions/upload-cloud-storage@v3
         with:
           path: "rerun_js/docs"
           destination: "rerun-docs/docs/js/${{ inputs.JS_DOCS_VERSION_NAME }}"
           process_gcloudignore: false
           parent: false
+          resumable: false
 
-      - name: "Update latest"
+      - name: "Update URL rewrite rules for stable"
         if: ${{ inputs.UPDATE_LATEST }}
         run: |
-          cat <<EOF > index.html
-          <!DOCTYPE html>
-          <html>
-          <head>
-            <meta charset="utf-8">
-            <title>Redirecting</title>
-            <noscript>
-              <meta http-equiv="refresh" content="1; url=../${{ inputs.JS_DOCS_VERSION_NAME }}/" />
-            </noscript>
-            <script>
-              window.location.replace("../${{ inputs.JS_DOCS_VERSION_NAME }}/" + window.location.hash);
-            </script>
-          </head>
-          <body>
-            Redirecting to <a href="../${{ inputs.JS_DOCS_VERSION_NAME }}/">../${{ inputs.JS_DOCS_VERSION_NAME }}/</a>
-          </body>
-          </html>
-          EOF
-
-          gsutil cp ./index.html gs://rerun-docs/docs/js/stable/
+          pixi run uv run --group dev scripts/update_docs_url_rewrite.py --version ${{ inputs.JS_DOCS_VERSION_NAME }} --language js

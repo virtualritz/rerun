@@ -20,6 +20,21 @@ use crate::{Chunk, RowId, TimeColumn};
 
 // ---
 
+fn error_on_downcast_failure(
+    component: ComponentIdentifier,
+    target: &str,
+    actual: &arrow::datatypes::DataType,
+) {
+    re_log::debug_panic!(
+        "downcast to {target} failed for {component}. Array data type was {actual:?}. Data discarded"
+    );
+    re_log::error_once!(
+        "downcast to {target} failed for {component}. Array data type was {actual:?}. Data discarded"
+    );
+}
+
+// ---
+
 // NOTE: Regarding the use of (recursive) `Either` in this file: it is _not_ arbitrary.
 //
 // They _should_ all follow this model:
@@ -278,25 +293,15 @@ impl Chunk {
             .enumerate()
             .find_map(|(i, field)| (field.name() == field_name).then_some(i))
         else {
-            if cfg!(debug_assertions) {
-                panic!(
-                    "[DEBUG ASSERT] field {field_name} not found for {component}, data discarded"
-                );
-            } else {
-                re_log::error_once!("field {field_name} not found for {component}, data discarded");
-            }
+            re_log::debug_panic!("field {field_name} not found for {component}, data discarded");
+            re_log::error_once!("field {field_name} not found for {component}, data discarded");
             return Either::Left(std::iter::empty());
         };
 
         if field_idx >= struct_array.num_columns() {
-            if cfg!(debug_assertions) {
-                panic!(
-                    "[DEBUG ASSERT] field {field_name} not found for {component}, data discarded"
-                );
-            } else {
-                re_log::error_once!("field {field_name} not found for {component}, data discarded");
-                return Either::Left(std::iter::empty());
-            }
+            re_log::debug_panic!("field {field_name} not found for {component}, data discarded");
+            re_log::error_once!("field {field_name} not found for {component}, data discarded");
+            return Either::Left(std::iter::empty());
         }
 
         let component_offset_values = self.iter_component_offsets(component);
@@ -907,19 +912,18 @@ impl Chunk {
         let values = match C::from_arrow(&values) {
             Ok(values) => values,
             Err(err) => {
-                if cfg!(debug_assertions) {
-                    panic!(
-                        "[DEBUG-ONLY] deserialization failed for {}, data discarded: {}",
-                        C::name(),
-                        re_error::format_ref(&err),
-                    );
-                } else {
-                    re_log::error_once!(
-                        "deserialization failed for {}, data discarded: {}",
-                        C::name(),
-                        re_error::format_ref(&err),
-                    );
-                }
+                re_log::debug_panic!(
+                    "deserialization failed for {}, data discarded: {}",
+                    C::name(),
+                    re_error::format_ref(&err),
+                );
+
+                re_log::error_once!(
+                    "deserialization failed for {}, data discarded: {}",
+                    C::name(),
+                    re_error::format_ref(&err),
+                );
+
                 return ChunkComponentIter {
                     values: Arc::new(vec![]),
                     offsets: Either::Left(std::iter::empty()),
@@ -932,22 +936,6 @@ impl Chunk {
             values: Arc::new(values),
             offsets: Either::Right(self.iter_component_offsets(component)),
         }
-    }
-}
-
-fn error_on_downcast_failure(
-    component: ComponentIdentifier,
-    target: &str,
-    actual: &arrow::datatypes::DataType,
-) {
-    if cfg!(debug_assertions) {
-        panic!(
-            "[DEBUG ASSERT] downcast failed to {target} failed for {component}. Array data type was {actual:?}. Data discarded"
-        );
-    } else {
-        re_log::error_once!(
-            "downcast failed to {target} for {component}. Array data type was {actual:?}. data discarded"
-        );
     }
 }
 

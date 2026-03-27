@@ -1,6 +1,7 @@
 use re_log_types::EntityPath;
 use re_sdk_types::ViewClassIdentifier;
-use re_viewer_context::{ViewClass as _, VisualizerExecutionOutput};
+use re_sdk_types::blueprint::components::VisualizerInstructionId;
+use re_viewer_context::{ViewClass as _, VisualizerExecutionOutput, VisualizerReportSeverity};
 
 use crate::contexts::{TransformInfo, TransformTreeContext};
 use crate::view_kind::SpatialViewKind;
@@ -12,7 +13,7 @@ pub fn spatial_view_kind_from_view_class(class: ViewClassIdentifier) -> SpatialV
     } else if class == crate::SpatialView2D::identifier() {
         SpatialViewKind::TwoD
     } else {
-        debug_assert!(false, "Not a spatial view class identifier {class:?}");
+        re_log::debug_panic!("Not a spatial view class identifier {class:?}");
         SpatialViewKind::TwoD
     }
 }
@@ -23,13 +24,28 @@ pub fn transform_info_for_archetype_or_report_error<'a>(
     transform_context: &'a TransformTreeContext,
     archetype_kind: Option<SpatialViewKind>,
     view_kind: SpatialViewKind,
-    output: &mut VisualizerExecutionOutput,
+    instruction_id: &VisualizerInstructionId,
+    output: &VisualizerExecutionOutput,
 ) -> Option<&'a TransformInfo> {
-    let transform_info =
-        transform_info_for_entity_or_report_error(transform_context, entity_path, output)?;
+    re_tracing::profile_function!();
+
+    let result = transform_context.target_from_entity_path(entity_path.hash());
+    let transform_info = match format_transform_info_result(entity_path, transform_context, result)
+    {
+        Ok(transform_info) => transform_info,
+        Err(err_msg) => {
+            output.report_unspecified_source(
+                *instruction_id,
+                VisualizerReportSeverity::Error,
+                err_msg,
+            );
+            return None;
+        }
+    };
 
     is_valid_space_for_content(
         entity_path,
+        instruction_id,
         transform_context,
         transform_info,
         archetype_kind,
@@ -39,64 +55,71 @@ pub fn transform_info_for_archetype_or_report_error<'a>(
     .then_some(transform_info)
 }
 
-/// Retrieves the transform info for the given entity.
-pub fn transform_info_for_entity_or_report_error<'a>(
-    transform_context: &'a TransformTreeContext,
+/// Formats the result of a transform retrieval into a user-friendly message.
+pub fn format_transform_info_result<'a>(
     entity_path: &EntityPath,
-    output: &mut VisualizerExecutionOutput,
-) -> Option<&'a TransformInfo> {
-    match transform_context.target_from_entity_path(entity_path.hash()) {
-        None => {
-            output.report_error_for(
-                entity_path.clone(),
-                "No transform relation known for this entity.",
-            );
-            None
-        }
+    transform_context: &TransformTreeContext,
+    result: Option<&'a Result<TransformInfo, re_tf::TransformFromToError>>,
+) -> Result<&'a TransformInfo, String> {
+    match result {
+        None => Err("No transform relation known for this entity.".to_owned()),
 
         Some(Err(re_tf::TransformFromToError::NoPathBetweenFrames { src, target, .. })) => {
-            let src = transform_context.format_frame(*src);
-            let target = transform_context.format_frame(*target);
-            output.report_error_for(
-                entity_path.clone(),
-                format!("No transform path from {src:?} to the view's origin frame ({target:?})."),
-            );
-            None
+            let src = if let Some(frame_id) =
+                transform_context.format_frame_or_debug_warn(*src, entity_path)
+            {
+                format!("{frame_id:?}")
+            } else {
+                format!("{entity_path}:?")
+            };
+            let target = if let Some(target) =
+                transform_context.format_frame_or_debug_warn(*target, entity_path)
+            {
+                format!(" ({target:?})")
+            } else {
+                String::new()
+            };
+
+            Err(format!(
+                "No transform path from {src} to the view's target frame{target}."
+            ))
         }
 
         Some(Err(re_tf::TransformFromToError::UnknownTargetFrame(target))) => {
-            // The target frame is the view's origin.
-            // This means this could be hit if the view's origin frame doesn't show up in any data.
-            let target = transform_context.format_frame(*target);
-            output.report_error_for(
-                entity_path.clone(),
-                format!("The view's origin frame {target:?} is unknown."),
-            );
-            None
+            let target = if let Some(target) =
+                transform_context.format_frame_or_debug_warn(*target, entity_path)
+            {
+                format!("target frame {target:?}")
+            } else {
+                "target frame".to_owned()
+            };
+
+            Err(format!("The view's {target} is unknown."))
         }
 
         Some(Err(re_tf::TransformFromToError::UnknownSourceFrame(src))) => {
-            // Unclear how we'd hit this. This means that when processing transforms we encountered a coordinate frame that the transform cache didn't know about.
-            // That would imply that the cache is lagging behind.
-            let src = transform_context.format_frame(*src);
-            output.report_error_for(
-                entity_path.clone(),
-                format!("The entity's coordinate frame {src:?} is unknown."),
-            );
-            None
+            let src = if let Some(frame_id) =
+                transform_context.format_frame_or_debug_warn(*src, entity_path)
+            {
+                format!("{frame_id:?}")
+            } else {
+                format!("{entity_path:?}")
+            };
+            Err(format!("The entity's coordinate frame {src} is unknown."))
         }
 
-        Some(Ok(transform_info)) => Some(transform_info),
+        Some(Ok(transform_info)) => Ok(transform_info),
     }
 }
 
-fn is_valid_space_for_content(
+pub fn is_valid_space_for_content(
     entity_path: &EntityPath,
+    instruction_id: &VisualizerInstructionId,
     transform_context: &TransformTreeContext,
     transform: &TransformInfo,
     content_kind: Option<SpatialViewKind>,
     view_kind: SpatialViewKind,
-    output: &mut VisualizerExecutionOutput,
+    output: &VisualizerExecutionOutput,
 ) -> bool {
     let Some(content_view_kind) = content_kind else {
         // This means the content doesn't have any particular view kind affinity, we expect it to be handled elsewhere if at all.
@@ -114,11 +137,16 @@ fn is_valid_space_for_content(
     if view_kind == SpatialViewKind::ThreeD
         && let Some(target_frame_pinhole_root) = target_frame_pinhole_root
     {
-        let origin = transform_context.format_frame(target_frame_pinhole_root);
-        output.report_error_for(
-            entity_path.clone(),
-            format!("The origin of the 3D view ({origin:?}) is under pinhole projection which is not supported by most 3D visualizations."),
-        );
+        let origin = if let Some(origin) =
+            transform_context.format_frame_or_debug_warn(target_frame_pinhole_root, entity_path)
+        {
+            format!("The origin of the 3D view ({origin:?})")
+        } else {
+            "The origin of the 3D view".to_owned()
+        };
+        output.report_unspecified_source(*instruction_id, VisualizerReportSeverity::Error, format!(
+                "{origin} is under pinhole projection which is not supported by most 3D visualizations."
+            ));
         return false;
     }
 
@@ -137,8 +165,9 @@ fn is_valid_space_for_content(
                             target_frame_pinhole_root != transform.tree_root()
                         })
                     {
-                        output.report_error_for(
-                            entity_path.clone(),
+                        output.report_unspecified_source(
+                            *instruction_id,
+                            VisualizerReportSeverity::Error,
                             "Can't visualize 2D content with a pinhole ancestor that's embedded within the 2D view. This applies a 3D → 2D projection to a space that's already regarded 2D.",
                         );
                         false
@@ -152,8 +181,9 @@ fn is_valid_space_for_content(
                     if transform_has_pinhole_ancestor {
                         true
                     } else {
-                        output.report_error_for(
-                            entity_path.clone(),
+                        output.report_unspecified_source(
+                            *instruction_id,
+                            VisualizerReportSeverity::Error,
                             "2D visualizers require a pinhole ancestor to be shown in a 3D view.",
                         );
                         false
@@ -165,8 +195,9 @@ fn is_valid_space_for_content(
         SpatialViewKind::ThreeD => {
             // View agnostic failure case for 3D content: if the 3D content is under a pinhole projection, we can't show it!
             if transform_has_pinhole_ancestor {
-                output.report_error_for(
-                    entity_path.clone(),
+                output.report_unspecified_source(
+                    *instruction_id,
+                    VisualizerReportSeverity::Error,
                     "Can't visualize 3D content that is under a pinhole projection.",
                 );
                 return false;
@@ -184,8 +215,9 @@ fn is_valid_space_for_content(
                     if target_frame_pinhole_root == Some(transform_context.target_frame()) {
                         true
                     } else {
-                        output.report_error_for(
-                            entity_path.clone(),
+                        output.report_unspecified_source(
+                            *instruction_id,
+                            VisualizerReportSeverity::Error,
                             "3D visualizers require a pinhole at the origin of the 2D view.",
                         );
                         false

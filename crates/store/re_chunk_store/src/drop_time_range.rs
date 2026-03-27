@@ -1,20 +1,54 @@
+use std::sync::Arc;
+
 use re_chunk::{ChunkId, TimelineName};
+use re_log::debug_assert;
 use re_log_types::AbsoluteTimeRange;
 
-use crate::{ChunkStore, ChunkStoreEvent};
+use crate::{ChunkStore, ChunkStoreDiff, ChunkStoreEvent};
 
 impl ChunkStore {
     /// Drop all events that are in the given range on the given timeline.
     ///
     /// Note that matching events will be dropped from all timelines they appear on.
     ///
+    /// Chunks are [*shallowly* removed]: they can be recovered if they were originally fetched
+    /// from a known RRD manifest.
     /// Static chunks are unaffected.
     ///
-    /// Used to implement undo (erase the last event from the blueprint db).
-    pub fn drop_time_range(
+    /// [*shallowly* removed]: [`Self::remove_chunks_shallow`]
+    pub fn drop_time_range_shallow(
         &mut self,
         timeline: &TimelineName,
         drop_range: AbsoluteTimeRange,
+    ) -> Vec<ChunkStoreEvent> {
+        let deep_removal = false;
+        self.drop_time_range(timeline, drop_range, deep_removal)
+    }
+
+    /// Drop all events that are in the given range on the given timeline.
+    ///
+    /// Note that matching events will be dropped from all timelines they appear on.
+    ///
+    /// Chunks are [*deeply* removed]: they won't be recoverable.
+    /// Static chunks are unaffected.
+    ///
+    /// Used to implement undo (erase the last event from the blueprint db).
+    ///
+    /// [*deeply* removed]: [`Self::remove_chunks_deep`]
+    pub fn drop_time_range_deep(
+        &mut self,
+        timeline: &TimelineName,
+        drop_range: AbsoluteTimeRange,
+    ) -> Vec<ChunkStoreEvent> {
+        let deep_removal = true;
+        self.drop_time_range(timeline, drop_range, deep_removal)
+    }
+
+    fn drop_time_range(
+        &mut self,
+        timeline: &TimelineName,
+        drop_range: AbsoluteTimeRange,
+        deep_removal: bool,
     ) -> Vec<ChunkStoreEvent> {
         re_tracing::profile_function!();
 
@@ -24,10 +58,10 @@ impl ChunkStore {
 
         // Prepare the changes:
 
-        let mut chunk_ids_to_drop = vec![];
+        let mut chunks_to_drop = vec![];
         let mut new_chunks = vec![];
 
-        for (chunk_id, chunk) in &self.chunks_per_chunk_id {
+        for chunk in self.physical_chunks_per_chunk_id.values() {
             let Some(time_column) = chunk.timelines().get(timeline) else {
                 // static chunk, or chunk that doesn't overlap this timeline
                 continue; // keep it
@@ -37,7 +71,7 @@ impl ChunkStore {
 
             if drop_range.contains_range(chunk_range) {
                 // The whole chunk should be dropped!
-                chunk_ids_to_drop.push(*chunk_id);
+                chunks_to_drop.push(chunk.clone());
             } else if drop_range.intersects(chunk_range) {
                 let chunk = chunk.sorted_by_timeline_if_unsorted(timeline);
 
@@ -70,14 +104,15 @@ impl ChunkStore {
                 }
 
                 if min_idx < max_idx {
-                    chunk_ids_to_drop.push(*chunk_id);
+                    chunks_to_drop.push(Arc::new(chunk.clone()));
                     if 0 < min_idx {
-                        new_chunks.push(chunk.row_sliced(0, min_idx).with_id(ChunkId::new()));
+                        new_chunks
+                            .push(chunk.row_sliced_shallow(0, min_idx).with_id(ChunkId::new()));
                     }
                     if max_idx < num_rows {
                         new_chunks.push(
                             chunk
-                                .row_sliced(max_idx, num_rows - max_idx)
+                                .row_sliced_shallow(max_idx, num_rows - max_idx)
                                 .with_id(ChunkId::new()),
                         );
                     }
@@ -88,21 +123,19 @@ impl ChunkStore {
         // ------------------
         // Apply the changes:
 
-        let generation = self.generation();
-        let mut events: Vec<ChunkStoreEvent> = vec![];
+        let mut deletion_diffs: Vec<ChunkStoreDiff> = vec![];
 
-        for chunk_id in chunk_ids_to_drop {
-            for diff in self.remove_chunk(chunk_id) {
-                events.push(ChunkStoreEvent {
-                    store_id: self.id.clone(),
-                    store_generation: generation.clone(),
-                    event_id: self
-                        .event_id
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                    diff,
-                });
-            }
+        for chunk in chunks_to_drop {
+            let dels = if deep_removal {
+                self.remove_chunks_deep(vec![chunk], None)
+            } else {
+                self.remove_chunks_shallow(vec![chunk], None)
+            };
+            deletion_diffs.extend(dels.into_iter().map(ChunkStoreDiff::from));
         }
+
+        let mut events = self.finalize_events(deletion_diffs);
+
         for mut chunk in new_chunks {
             chunk.sort_if_unsorted();
             #[expect(clippy::unwrap_used)] // The chunk came from the store, so it should be fine

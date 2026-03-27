@@ -22,16 +22,8 @@ pub trait UiExt {
     fn ui(&self) -> &egui::Ui;
     fn ui_mut(&mut self) -> &mut egui::Ui;
 
-    fn theme(&self) -> egui::Theme {
-        if self.ui().visuals().dark_mode {
-            egui::Theme::Dark
-        } else {
-            egui::Theme::Light
-        }
-    }
-
     fn tokens(&self) -> &'static DesignTokens {
-        crate::design_tokens_of(self.theme())
+        crate::design_tokens_of(self.ui().theme())
     }
 
     /// Current time in seconds
@@ -53,9 +45,15 @@ pub trait UiExt {
         }
     }
 
-    #[inline]
-    fn is_tooltip(&self) -> bool {
-        self.ui().layer_id().order == egui::Order::Tooltip
+    /// Show an animated loading indicator.
+    ///
+    /// `reason` describes why we are loading. In debug builds, it is shown on hover.
+    ///
+    /// This will also cause the UI to re-render every frame,
+    /// so only use this when you actually have something loading and expect it to finish!
+    #[doc(alias = "spinner")]
+    fn loading_indicator(&mut self, reason: &str) -> egui::Response {
+        crate::loading_indicator::loading_indicator_ui(self.ui_mut(), reason)
     }
 
     /// Shows a success label with a large border.
@@ -122,14 +120,15 @@ pub trait UiExt {
 
     /// Adds a non-interactive, optionally tinted small icon.
     ///
-    /// Uses [`tokens.small_icon_size`]. Returns the rect where the icon was painted.
+    /// Uses [`DesignTokens::small_icon_size`]. Returns the rect where the icon was painted.
+    ///
+    /// If `tint` is `None`, the icon will be tinted with the current text color to ensure
+    /// it's visible in both light and dark themes.
     fn small_icon(&mut self, icon: &Icon, tint: Option<egui::Color32>) -> egui::Rect {
         let ui = self.ui_mut();
         let (_, rect) = ui.allocate_space(ui.tokens().small_icon_size);
-        let mut image = icon.as_image();
-        if let Some(tint) = tint {
-            image = image.tint(tint);
-        }
+        let tint = tint.unwrap_or_else(|| ui.visuals().text_color());
+        let image = icon.as_image().tint(tint);
         image.paint_at(ui, rect);
 
         rect
@@ -519,6 +518,7 @@ pub trait UiExt {
     /// Display content under a header that is conditionally collapsible. If `collapsing` is `true`,
     /// this is equivalent to [`Self::collapsing_header`]. If `collapsing` is `false`, the content
     /// is displayed under a static, non-collapsible header.
+    #[expect(clippy::fn_params_excessive_bools)] // TODO(emilk): remove bool parameters
     fn maybe_collapsing_header<R>(
         &mut self,
 
@@ -592,46 +592,10 @@ pub trait UiExt {
         egui::Grid::new(id).num_columns(2).spacing(spacing)
     }
 
-    /// Draws a shadow into the given rect with the shadow direction given from dark to light
+    /// Draws a shadow into the given rect with the shadow direction given from dark to light.
     fn draw_shadow_line(&self, rect: Rect, direction: egui::Direction) {
         let color_dark = self.tokens().shadow_gradient_dark_start;
-        let color_bright = Color32::TRANSPARENT;
-
-        let (left_top, right_top, left_bottom, right_bottom) = match direction {
-            egui::Direction::RightToLeft => (color_bright, color_dark, color_bright, color_dark),
-            egui::Direction::LeftToRight => (color_dark, color_bright, color_dark, color_bright),
-            egui::Direction::BottomUp => (color_bright, color_bright, color_dark, color_dark),
-            egui::Direction::TopDown => (color_dark, color_dark, color_bright, color_bright),
-        };
-
-        use egui::epaint::Vertex;
-        let shadow = egui::Mesh {
-            indices: vec![0, 1, 2, 2, 1, 3],
-            vertices: vec![
-                Vertex {
-                    pos: rect.left_top(),
-                    uv: egui::epaint::WHITE_UV,
-                    color: left_top,
-                },
-                Vertex {
-                    pos: rect.right_top(),
-                    uv: egui::epaint::WHITE_UV,
-                    color: right_top,
-                },
-                Vertex {
-                    pos: rect.left_bottom(),
-                    uv: egui::epaint::WHITE_UV,
-                    color: left_bottom,
-                },
-                Vertex {
-                    pos: rect.right_bottom(),
-                    uv: egui::epaint::WHITE_UV,
-                    color: right_bottom,
-                },
-            ],
-            texture_id: Default::default(),
-        };
-        self.ui().painter().add(shadow);
+        paint_gradient_rect(self.ui(), rect, direction, color_dark, Color32::TRANSPARENT);
     }
 
     fn draw_focus_outline(&self, rect: Rect) {
@@ -776,7 +740,7 @@ pub trait UiExt {
             let long_enough_text = raw_text.chars().count() >= MIN_COPY_LEN;
 
             let id = ui.next_auto_id();
-            let contains_pointer = ui.ctx().read_response(id).is_some_and(|last_response| {
+            let contains_pointer = ui.read_response(id).is_some_and(|last_response| {
                 ui.rect_contains_pointer(
                     last_response
                         .interact_rect
@@ -892,7 +856,7 @@ pub trait UiExt {
 
                 if copy_response.clicked() {
                     re_log::info!("Copied {raw_text:?}");
-                    ui.ctx().copy_text(raw_text);
+                    ui.copy_text(raw_text);
                 }
             }
         }
@@ -900,12 +864,17 @@ pub trait UiExt {
         response
     }
 
-    fn loading_screen_ui<R>(&mut self, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    fn loading_screen_ui<R>(
+        &mut self,
+        reason: &str,
+        add_contents: impl FnOnce(&mut egui::Ui) -> R,
+    ) -> R {
         let ui = self.ui_mut();
         ui.set_min_height(ui.available_height());
-        ui.center("loading spinner", |ui| {
+        let reason = reason.to_owned();
+        ui.center("loading indicator", |ui| {
             ui.vertical_centered(|ui| {
-                ui.spinner();
+                ui.loading_indicator(&reason);
                 add_contents(ui)
             })
             .inner
@@ -917,13 +886,11 @@ pub trait UiExt {
         header: impl Into<egui::RichText>,
         source: impl Into<egui::RichText>,
     ) {
-        self.loading_screen_ui(|ui| {
-            ui.label(
-                header
-                    .into()
-                    .heading()
-                    .color(ui.style().visuals.weak_text_color()),
-            );
+        let header = header.into();
+        // Reuse the header text as the loading reason shown on hover in debug builds.
+        let reason = header.text().to_owned();
+        self.loading_screen_ui(&reason, |ui| {
+            ui.label(header.heading().color(ui.style().visuals.weak_text_color()));
             ui.strong(source);
         });
     }
@@ -936,21 +903,30 @@ pub trait UiExt {
         x: f32,
         y: Rangef,
     ) {
-        let ui = self.ui();
-        let stroke = if let Some(response) = response {
-            ui.visuals().widgets.style(response).fg_stroke
+        let style = if let Some(response) = response {
+            self.ui().visuals().widgets.style(response)
         } else {
-            ui.visuals().widgets.inactive.fg_stroke
+            &self.ui().visuals().widgets.inactive
         };
+        self.paint_time_cursor_with_style(painter, style, x, y);
+    }
 
+    /// Like [`Self::paint_time_cursor`], but with an explicit widget style.
+    fn paint_time_cursor_with_style(
+        &self,
+        painter: &egui::Painter,
+        style: &egui::style::WidgetVisuals,
+        x: f32,
+        y: Rangef,
+    ) {
         let Rangef {
             min: y_min,
             max: y_max,
         } = y;
 
         let stroke = egui::Stroke {
-            width: 1.5 * stroke.width,
-            color: stroke.color,
+            width: 1.5 * style.fg_stroke.width,
+            color: style.fg_stroke.color,
         };
 
         let w = 10.0;
@@ -1053,7 +1029,7 @@ pub trait UiExt {
         });
 
         if ui.is_rect_visible(visual_rect) {
-            let how_on = ui.ctx().animate_bool(response.id, *on);
+            let how_on = ui.animate_bool(response.id, *on);
             let visuals = ui.style().interact(&response);
             let expanded_rect = visual_rect.expand(visuals.expansion);
             let fg_fill_off = visuals.bg_fill;
@@ -1109,9 +1085,9 @@ pub trait UiExt {
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
 
             if response.clicked_with_open_in_background() {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(url.into()));
+                ui.open_url(egui::OpenUrl::new_tab(url.into()));
             } else if response.clicked() {
-                ui.ctx().open_url(egui::OpenUrl {
+                ui.open_url(egui::OpenUrl {
                     url: url.into(),
                     new_tab: always_new_tab || ui.input(|i| i.modifiers.any()),
                 });
@@ -1119,7 +1095,7 @@ pub trait UiExt {
 
             response
         })
-        .response
+        .inner
     }
 
     /// Show some close/maximize/minimize buttons for the native window.
@@ -1139,7 +1115,7 @@ pub trait UiExt {
             .add(Button::new(RichText::new("❌").size(button_height)))
             .on_hover_text("Close the window");
         if close_response.clicked() {
-            ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+            ui.send_viewport_cmd(ViewportCommand::Close);
         }
 
         let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
@@ -1148,15 +1124,14 @@ pub trait UiExt {
                 .add(Button::new(RichText::new("🗗").size(button_height)))
                 .on_hover_text("Restore window");
             if maximized_response.clicked() {
-                ui.ctx()
-                    .send_viewport_cmd(ViewportCommand::Maximized(false));
+                ui.send_viewport_cmd(ViewportCommand::Maximized(false));
             }
         } else {
             let maximized_response = ui
                 .add(Button::new(RichText::new("🗗").size(button_height)))
                 .on_hover_text("Maximize window");
             if maximized_response.clicked() {
-                ui.ctx().send_viewport_cmd(ViewportCommand::Maximized(true));
+                ui.send_viewport_cmd(ViewportCommand::Maximized(true));
             }
         }
 
@@ -1164,7 +1139,7 @@ pub trait UiExt {
             .add(Button::new(RichText::new("🗕").size(button_height)))
             .on_hover_text("Minimize the window");
         if minimized_response.clicked() {
-            ui.ctx().send_viewport_cmd(ViewportCommand::Minimized(true));
+            ui.send_viewport_cmd(ViewportCommand::Minimized(true));
         }
     }
 
@@ -1247,7 +1222,7 @@ pub trait UiExt {
     fn markdown_ui(&mut self, markdown: &str) {
         use std::sync::Arc;
 
-        use parking_lot::Mutex;
+        use re_mutex::Mutex;
 
         let ui = self.ui_mut();
         let commonmark_cache = ui.data_mut(|data| {
@@ -1394,7 +1369,7 @@ pub trait UiExt {
     fn with_optional_extras<R>(&mut self, content: impl FnOnce(&mut egui::Ui, bool) -> R) -> R {
         let ui = self.ui_mut();
 
-        let show_extras = ui.ctx().show_extras();
+        let show_extras = ui.show_extras();
 
         let content_changed = ui.data_mut(|data| {
             let stored_show_extras = data
@@ -1410,7 +1385,7 @@ pub trait UiExt {
         let mut builder = egui::UiBuilder::new();
         if content_changed {
             builder = builder.sizing_pass();
-            ui.ctx().request_repaint();
+            ui.request_repaint();
         }
 
         ui.scope_builder(builder, |ui| content(ui, show_extras))
@@ -1444,6 +1419,56 @@ pub trait UiExt {
         ui.visuals_mut().widgets.inactive.bg_stroke =
             egui::Stroke::new(1.0, ui.visuals().error_fg_color);
     }
+}
+
+/// Paints a gradient rectangle that transitions from `color_from` to `color_to`
+/// along the given `direction`.
+///
+/// For example, `Direction::TopDown` paints `color_from` at the top edge fading
+/// to `color_to` at the bottom edge.
+fn paint_gradient_rect(
+    ui: &egui::Ui,
+    rect: Rect,
+    direction: egui::Direction,
+    color_from: Color32,
+    color_to: Color32,
+) {
+    use egui::epaint::Vertex;
+
+    let (left_top, right_top, left_bottom, right_bottom) = match direction {
+        egui::Direction::TopDown => (color_from, color_from, color_to, color_to),
+        egui::Direction::BottomUp => (color_to, color_to, color_from, color_from),
+        egui::Direction::LeftToRight => (color_from, color_to, color_from, color_to),
+        egui::Direction::RightToLeft => (color_to, color_from, color_to, color_from),
+    };
+
+    let mesh = egui::Mesh {
+        indices: vec![0, 1, 2, 2, 1, 3],
+        vertices: vec![
+            Vertex {
+                pos: rect.left_top(),
+                uv: egui::epaint::WHITE_UV,
+                color: left_top,
+            },
+            Vertex {
+                pos: rect.right_top(),
+                uv: egui::epaint::WHITE_UV,
+                color: right_top,
+            },
+            Vertex {
+                pos: rect.left_bottom(),
+                uv: egui::epaint::WHITE_UV,
+                color: left_bottom,
+            },
+            Vertex {
+                pos: rect.right_bottom(),
+                uv: egui::epaint::WHITE_UV,
+                color: right_bottom,
+            },
+        ],
+        texture_id: Default::default(),
+    };
+    ui.painter().add(mesh);
 }
 
 impl UiExt for egui::Ui {

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pyarrow as pa
 import pytest
 from rerun.server import Server
 
@@ -16,8 +17,8 @@ def test_server_starts_and_stops() -> None:
     server = Server()
     assert server.is_running()
 
-    address = server.address()
-    assert address.startswith("rerun+http://")
+    url = server.url()
+    assert url.startswith("rerun+http://")
 
     server.shutdown()
     assert not server.is_running()
@@ -27,8 +28,8 @@ def test_server_context_manager() -> None:
     """Test that the server works as a context manager."""
     with Server() as server:
         assert server.is_running()
-        address = server.address()
-        assert address.startswith("rerun+http://")
+        url = server.url()
+        assert url.startswith("rerun+http://")
 
     assert not server.is_running()
 
@@ -37,7 +38,7 @@ def test_server_custom_port() -> None:
     """Test that the server can be started on a custom port."""
     with Server(port=19876) as server:
         assert server.is_running()
-        assert "19876" in server.address()
+        assert "19876" in server.url()
 
 
 def test_server_random_port() -> None:
@@ -46,7 +47,7 @@ def test_server_random_port() -> None:
         # Both servers should be running on different ports
         assert server1.is_running()
         assert server2.is_running()
-        assert server1.address() != server2.address()
+        assert server1.url() != server2.url()
 
 
 def test_server_shutdown_twice_raises() -> None:
@@ -129,3 +130,33 @@ def test_server_dataset_files_must_be_files() -> None:
     """Test that dataset file paths must be files, not directories."""
     with pytest.raises(ValueError, match="must be a RRD file"):
         Server(datasets={"bad_dataset": [DATASET_DIR]})
+
+
+def test_server_version_info() -> None:
+    """Test that version_info() returns valid info for a local OSS server."""
+    with Server() as server:
+        client = server.client()
+        info = client.version_info()
+        assert isinstance(info.version, str)
+        assert info.cloud_provider is None
+        assert info.cloud_region is None
+
+
+def test_server_failed_table_creation_does_not_leak_entry(tmp_path: Path) -> None:
+    """Regression test for https://linear.app/rerun/issue/RR-3644/create-table-failure-leads-to-unlisted-existing-table."""
+
+    with Server() as server:
+        client = server.client()
+
+        schema = pa.schema([])
+
+        try:
+            # This must fail because the URI is unsupported
+            t = client.create_table("test", schema, url="surprise://bucket/does/not/exist")
+        except Exception:
+            pass
+
+        assert "t" not in locals()
+
+        # We should be free to
+        t = client.create_table("test", schema, url=tmp_path.as_uri())

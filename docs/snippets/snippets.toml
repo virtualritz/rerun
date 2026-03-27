@@ -1,4 +1,17 @@
-# This file is read in `compare_snippet_output.py` and the `snippets` command in `re_dev_tools`/`build_examples`.
+# This file controls snippet testing and documentation indexing.
+# It is read in `compare_snippet_output.py` and the `snippets` command in `re_dev_tools`/`build_examples`.
+#
+# Sections:
+#   [snippets_ref.snippets.opt_out]  — snippets excluded from the documentation index
+#   [snippets_ref.archetypes.opt_out] — archetypes that ignore associated snippets in the index
+#   [snippets_ref.components.opt_out] — components that ignore associated snippets in the index
+#   [snippets_ref.features]          — groups snippets by feature for documentation
+#   [opt_out.run]                    — snippets that won't be executed for certain SDKs
+#   [opt_out.compare]                — snippets that run but whose output isn't compared across
+#                                      languages (e.g. different RNG implementations)
+#   [extra_args]                     — extra arguments passed to snippets when running them
+#
+# Items within each section are in alphabetical order.
 
 # These snippets will be excluded from the snippet index, unconditionally.
 [snippets_ref.snippets.opt_out]
@@ -8,7 +21,7 @@
 
 # These archetypes will ignore the associated snippets in the snippet index.
 [snippets_ref.archetypes.opt_out]
-"DataframeQuery" = ["reference/dataframe_save_blueprint"]
+"DataframeQuery" = ["howto/visualization/save_blueprint"]
 
 # These components will ignore the associated snippets in the snippet index.
 [snippets_ref.components.opt_out]
@@ -21,9 +34,26 @@
 [snippets_ref]
 features = [
   [
+    "Query Data Platform",
+    [
+      "howto/dataframe_operations",
+      "howto/dataframe_performance",
+      "howto/dataset_resampling",
+      "howto/lerobot_export",
+      "howto/query_images",
+      "howto/query_videos",
+      "howto/query_video_keyframes",
+      "howto/sub_dataset",
+      "howto/time_alignment",
+      "howto/view_operations",
+    ],
+  ],
+  [
     "Setting recording properties",
     [
       "concepts/recording_properties",
+      "concepts/query-and-transform/segment_properties",
+      "howto/layers",
     ],
   ],
   [
@@ -78,7 +108,7 @@ features = [
   [
     "Query dataframes",
     [
-      "reference/dataframe_query",
+      "concepts/query-and-transform/dataframe_query_example",
       "reference/dataframe_view_query",
     ],
   ],
@@ -86,6 +116,19 @@ features = [
     "Host web viewer and connect it to a gRPC server",
     [
       "howto/serve_web_viewer",
+    ],
+  ],
+  [
+    "Experimental Viewer client",
+    [
+      "howto/screenshot",
+      "howto/send_table",
+    ],
+  ],
+  [
+    "Convert custom MCAP Protobuf",
+    [
+      "howto/convert_mcap_protobuf",
     ],
   ],
 ]
@@ -96,6 +139,23 @@ features = [
 backwards_check = [
   "archetypes/video_stream_synthetic", # Video encodes differently on CI :(
   "concepts/explicit_recording", # The file path differs locally and on CI
+  "howto/convert_mcap_protobuf", # Processes video from MCAP, non-deterministic encoding
+  "howto/convert_mcap_protobuf_send_column",
+  # Dataplatform examples don't generate rrds
+  "concepts/query-and-transform/dataframe_query_example",
+  "concepts/query-and-transform/segment_properties",
+  "howto/dataframe_operations",
+  "howto/dataframe_performance",
+  "howto/dataset_resampling",
+  "howto/layers",
+  "howto/lerobot_export",
+  "howto/query_images",
+  "howto/query_videos",
+  "howto/query_video_keyframes",
+  "howto/sub_dataset",
+  "howto/time_alignment",
+  "howto/query-and-transform/segment_url",
+  "howto/view_operations",
 ]
 
 
@@ -160,7 +220,7 @@ backwards_check = [
   "cpp", # Blueprint API doesn't exist for C++/Rust
   "rust", # Blueprint API doesn't exist for C++/Rust
 ]
-"concepts/app-model" = [ # Uses a non-standard logging workflow
+"concepts/how-does-rerun-work" = [ # Uses a non-standard logging workflow
   "py",
   "cpp",
   "rust",
@@ -175,10 +235,54 @@ backwards_check = [
   "cpp",
   "rust",
 ]
+"concepts/query-and-transform/dataframe_query_example" = [ # Skips backwards compatibility check, to opt out of _RERUN_TEST_FORCE_SAVE
+  "cpp",
+  "rust",
+]
+"concepts/query-and-transform/segment_properties" = [ # Skips backwards compatibility check, to opt out of _RERUN_TEST_FORCE_SAVE
+  "cpp",
+  "rust",
+]
 "howto/check_connection_status" = [
   "py", # TODO(#2353): Doesn't exist
   "cpp", # TODO(#2353): Doesn't exist
   "rust", # Runs indefinitely.
+]
+"howto/convert_mcap_protobuf" = [
+  "cpp", # Not implemented
+  "rust", # Not implemented
+]
+"howto/convert_mcap_protobuf_send_column" = [
+  "cpp", # Not implemented
+  "rust", # Not implemented
+]
+"howto/component_mapping" = [
+  "cpp", # Not implemented
+]
+"howto/dataframe_operations" = [
+  "cpp", # Not implemented
+  "rust", # Not implemented
+]
+"howto/dataframe_performance" = [
+  "cpp", # Not implemented
+  "rust", # Not implemented
+]
+"howto/dataset_resampling" = [
+  "cpp", # Not implemented
+  "rust", # Not implemented
+]
+"howto/layers" = [
+  "cpp", # Not implemented
+  "rust", # Not implemented
+]
+"howto/sub_dataset" = [
+  "cpp", # Not implemented
+  "rust", # Not implemented
+]
+"howto/lerobot_export" = [
+  "py", # lerobot is not part of our environment as it causes dependency issues
+  "cpp", # Not implemented
+  "rust", # Not implemented
 ]
 "howto/load_urdf" = [
   "cpp", # Not implemented
@@ -186,6 +290,23 @@ backwards_check = [
 ]
 "howto/micro_batching" = [
   "cpp", # TODO(#10661): Doesn't exist
+]
+"howto/query_images" = [
+  "cpp", # Not implemented
+  "rust", # Not implemented
+]
+"howto/query_videos" = [
+  "cpp", # Not implemented
+  "rust", # Not implemented
+]
+"howto/query_video_keyframes" = [
+  "cpp", # Not implemented
+  "rust", # Not implemented
+]
+"howto/screenshot" = [
+  "py", # Requires a server to connect to
+  "cpp", # Doesn't exist
+  "rust", # Doesn't exist
 ]
 "howto/send_table" = [
   "py", # Requires a server to connect to
@@ -201,6 +322,14 @@ backwards_check = [
   "py", # Requires a server to connect to
   "cpp", # Doesn't exist
   "rust", # Doesn't exist
+]
+"howto/query-and-transform/segment_url" = [
+  "cpp", # Not implemented
+  "rust", # Not implemented
+]
+"howto/time_alignment" = [
+  "cpp", # Not implemented
+  "rust", # Not implemented
 ]
 "views" = [
   "cpp", # TODO(#5520): C++ views are not yet implemented
@@ -237,12 +366,7 @@ backwards_check = [
   "rust",
   "py",
 ]
-"reference/dataframe_query" = [ # No output
-  "cpp",
-  "rust",
-  "py",
-]
-"reference/dataframe_save_blueprint" = [ # No output
+"howto/visualization/save_blueprint" = [ # No output
   "cpp",
   "rust",
   "py",
@@ -252,7 +376,7 @@ backwards_check = [
   "rust",
   "py",
 ]
-"reference/dataframe_view_query_external" = [ # No output
+"howto/visualization/load_blueprint" = [ # No output
   "cpp",
   "rust",
   "py",
@@ -292,12 +416,16 @@ backwards_check = [
   "rust", # Not implemented
 ]
 "tutorials/data_out" = [
-  "py", # Requires context (an RRD file to be exported by the user)
   "cpp", # Not implemented
   "rust", # Not implemented
 ]
+"howto/dual_color_point_cloud" = ["cpp"] # Not implemented
 "tutorials/visualization" = [
   "py", # Requires passing RRD as argument
+  "cpp", # Not implemented
+  "rust", # Not implemented
+]
+"howto/view_operations" = [
   "cpp", # Not implemented
   "rust", # Not implemented
 ]
@@ -381,17 +509,107 @@ quick_start = [ # These examples don't have exactly the same implementation.
   "py",
   "rust",
 ]
+"archetypes/video_stream_synthetic" = [ # No comparison because video is different on CI
+  "cpp",
+  "py",
+  "rust",
+]
+"concepts/query-and-transform/dataframe_query_example" = [ # Cloud examples don't generate rrds
+  "cpp",
+  "py",
+  "rust",
+]
+"concepts/query-and-transform/segment_properties" = [ # Cloud examples don't generate rrds
+  "cpp",
+  "py",
+  "rust",
+]
+"howto/dataframe_operations" = [ # Cloud examples don't generate rrds
+  "cpp",
+  "py",
+  "rust",
+]
+"howto/convert_mcap_protobuf" = [ # Uses external MCAP file, depends on mcap_protobuf package
+  "cpp",
+  "py",
+  "rust",
+]
+"howto/convert_mcap_protobuf_send_column" = [ # Uses external MCAP file, depends on mcap_protobuf package
+  "cpp",
+  "py",
+  "rust",
+]
+"howto/dataframe_performance" = [ # Cloud examples don't generate rrds
+  "cpp",
+  "py",
+  "rust",
+]
+"howto/dataset_resampling" = [ # Cloud examples don't generate rrds
+  "cpp",
+  "py",
+  "rust",
+]
+"howto/dual_color_point_cloud" = ["py", "rust"] # Uses random point generation
+"howto/layers" = [ # Cloud examples don't generate rrds
+  "cpp",
+  "py",
+  "rust",
+]
+"howto/sub_dataset" = [ # Cloud examples don't generate rrds
+  "cpp",
+  "py",
+  "rust",
+]
+"howto/lerobot_export" = [ # Cloud examples don't generate rrds
+  "cpp",
+  "py",
+  "rust",
+]
+"howto/query_images" = [ # Cloud examples don't generate rrds
+  "cpp",
+  "py",
+  "rust",
+]
+"howto/query_videos" = [ # Cloud examples don't generate rrds
+  "cpp",
+  "py",
+  "rust",
+]
+"howto/query_video_keyframes" = [ # Cloud examples don't generate rrds
+  "cpp",
+  "py",
+  "rust",
+]
+"howto/query-and-transform/segment_url" = [ # Cloud examples don't generate rrds
+  "cpp",
+  "py",
+  "rust",
+]
+"howto/time_alignment" = [ # Cloud examples don't generate rrds
+  "cpp",
+  "py",
+  "rust",
+]
+"howto/view_operations" = [ # Cloud examples don't generate rrds
+  "cpp",
+  "py",
+  "rust",
+]
 
 # -----------------------------------------------------------------------------
 
 # `$config_dir` will be replaced with the absolute path of `docs/snippets`.
 [extra_args]
 "concepts/send_recording" = ["$config_dir/../../tests/assets/rrd/dna.rrd"]
-"archetypes/asset3d_simple" = ["$config_dir/../../tests/assets/cube.glb"]
-"archetypes/asset3d_out_of_tree" = ["$config_dir/../../tests/assets/cube.glb"]
+"archetypes/asset3d_simple" = ["$config_dir/../../tests/assets/mesh/cube.glb"]
+"archetypes/asset3d_out_of_tree" = ["$config_dir/../../tests/assets/mesh/cube.glb"]
 "archetypes/encoded_depth_image" = ["$config_dir/../../tests/assets/encoded_depth_image.rvl"]
 "archetypes/video_auto_frames" = [
   "$config_dir/../../tests/assets/video/Big_Buck_Bunny_1080_10s_av1.mp4",
 ]
 "archetypes/video_manual_frames" = ["$config_dir/../../tests/assets/video/Sintel_1080_10s_av1.mp4"]
 "howto/load_mcap" = ["$config_dir/../../tests/assets/mcap/r2b_galileo.mcap"]
+"howto/convert_mcap_protobuf" = ["$config_dir/../../tests/assets/mcap/trossen_transfer_cube.mcap"]
+"howto/convert_mcap_protobuf_send_column" = [
+  "$config_dir/../../tests/assets/mcap/trossen_transfer_cube.mcap",
+]

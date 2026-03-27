@@ -84,6 +84,11 @@ impl AbsoluteTimeRange {
     }
 
     #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.max < self.min
+    }
+
+    #[inline]
     pub fn center(&self) -> TimeInt {
         self.min.midpoint(self.max)
     }
@@ -141,6 +146,11 @@ impl re_byte_size::SizeBytes for AbsoluteTimeRange {
     #[inline]
     fn heap_size_bytes(&self) -> u64 {
         0
+    }
+
+    #[inline]
+    fn is_pod() -> bool {
+        true
     }
 }
 

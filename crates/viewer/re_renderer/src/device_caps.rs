@@ -132,22 +132,6 @@ impl DeviceCapabilityTier {
     }
 }
 
-/// Type of Wgpu backend.
-///
-/// Used in the rare cases where it's necessary to be aware of the api differences between
-/// wgpu-core and webgpu.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WgpuBackendType {
-    /// Backend implemented via wgpu-core.
-    ///
-    /// This includes all native backends and WebGL.
-    WgpuCore,
-
-    /// Backend implemented by the browser's WebGPU javascript api.
-    #[cfg(web)]
-    WebGpu,
-}
-
 #[derive(thiserror::Error, Debug)]
 pub enum InsufficientDeviceCapabilities {
     #[error(
@@ -189,12 +173,6 @@ pub struct DeviceCaps {
     ///
     /// Since this has a direct effect on how much data a user can wrangle on the gpu, we always pick the highest possible.
     pub max_buffer_size: u64,
-
-    /// Wgpu backend type.
-    ///
-    /// Prefer using `tier` and other properties of this struct for distinguishing between abilities.
-    /// This is useful for making wgpu-core/webgpu api path decisions.
-    pub backend_type: WgpuBackendType,
 }
 
 impl DeviceCaps {
@@ -218,30 +196,12 @@ impl DeviceCaps {
             DeviceCapabilityTier::Limited
         };
 
-        let backend_type = match adapter.get_info().backend {
-            wgpu::Backend::Noop
-            | wgpu::Backend::Vulkan
-            | wgpu::Backend::Metal
-            | wgpu::Backend::Dx12
-            | wgpu::Backend::Gl => WgpuBackendType::WgpuCore,
-            wgpu::Backend::BrowserWebGpu => {
-                #[cfg(web)]
-                {
-                    WgpuBackendType::WebGpu
-                }
-                #[cfg(not(web))]
-                {
-                    unreachable!("WebGPU backend is not supported on native platforms.")
-                }
-            }
-        };
         let limits = adapter.limits();
 
         Self {
             tier,
             max_texture_dimension2d: limits.max_texture_dimension_2d,
             max_buffer_size: limits.max_buffer_size,
-            backend_type,
         }
     }
 
@@ -387,6 +347,7 @@ pub fn instance_descriptor(force_backend: Option<&str>) -> wgpu::InstanceDescrip
             .union(wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER),
         memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
         backend_options: wgpu::BackendOptions::default(),
+        display: None, // Needs to be filled out later.
     }
     // Allow manipulation of all options via environment variables.
     .with_env()
@@ -424,13 +385,13 @@ pub fn testing_instance_descriptor() -> wgpu::InstanceDescriptor {
 ///
 /// Panics if no adapter was found.
 #[cfg(native)]
-pub fn select_testing_adapter(instance: &wgpu::Instance) -> wgpu::Adapter {
-    let mut adapters = instance.enumerate_adapters(wgpu::Backends::all());
+pub async fn select_testing_adapter(instance: &wgpu::Instance) -> wgpu::Adapter {
+    let mut adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
     assert!(!adapters.is_empty(), "No graphics adapter found!");
 
-    re_log::debug!("Found the following adapters:");
+    re_log::info!("Found the following graphics adapters:");
     for adapter in &adapters {
-        re_log::debug!("* {}", crate::adapter_info_summary(&adapter.get_info()));
+        re_log::info!("* {}", crate::adapter_info_summary(&adapter.get_info()));
     }
 
     // Adapters are already sorted by preferred backend by wgpu, but let's be explicit.
@@ -458,6 +419,72 @@ pub fn select_testing_adapter(instance: &wgpu::Instance) -> wgpu::Adapter {
     adapter
 }
 
+/// Tries to select an adapter.
+///
+/// This is very similar to wgpu-core's implementation of `DynInstance::enumerate_adapters`.
+pub fn select_adapter(
+    adapters: &[wgpu::Adapter],
+    enabled_backends: wgpu::Backends,
+    surface: Option<&wgpu::Surface<'_>>,
+) -> Result<wgpu::Adapter, String> {
+    if adapters.is_empty() {
+        return Err(format!(
+            "No graphics adapter was found for the enabled graphics backends ({enabled_backends:?})"
+        ));
+    }
+
+    let mut adapters = adapters.to_vec();
+
+    // Filter out adapters that can't present to the given surface.
+    if let Some(surface) = &surface {
+        adapters.retain(|adapter| {
+            let capabilities = surface.get_capabilities(adapter);
+            if capabilities.formats.is_empty() {
+                re_log::debug!(
+                    "Adapter {:?} not compatible with the window's render surface.",
+                    adapter.get_info()
+                );
+                false
+            } else {
+                true
+            }
+        });
+        if adapters.is_empty() {
+            return Err(
+                "No graphics adapter was found that is compatible with the surface.".to_owned(),
+            );
+        }
+    }
+
+    re_log::debug!("Found the following viable graphics adapters:");
+    for adapter in &adapters {
+        re_log::debug!("* {}", crate::adapter_info_summary(&adapter.get_info()));
+    }
+
+    // Adapters are already sorted by preferred backend by wgpu, but let's be explicit.
+    adapters.sort_by_key(|a| match a.get_info().backend {
+        wgpu::Backend::Metal => 0,
+        wgpu::Backend::Vulkan => 1,
+        wgpu::Backend::Dx12 => 2,
+        wgpu::Backend::Gl => 4,
+        wgpu::Backend::BrowserWebGpu => 6,
+        wgpu::Backend::Noop => 7,
+    });
+
+    // Prefer hardware adapters.
+    adapters.sort_by_key(|a| match a.get_info().device_type {
+        wgpu::DeviceType::DiscreteGpu => 0,
+        wgpu::DeviceType::IntegratedGpu => 1,
+        wgpu::DeviceType::Other | wgpu::DeviceType::VirtualGpu => 2,
+        wgpu::DeviceType::Cpu => 3,
+    });
+
+    let adapter = adapters.remove(0);
+    re_log::debug!("Picked adapter: {:?}", adapter.get_info());
+
+    Ok(adapter)
+}
+
 /// Backends that are officially supported by `re_renderer`.
 ///
 /// Other backend might work as well, but lack of support isn't regarded as a bug.
@@ -475,8 +502,7 @@ pub fn default_backends() -> wgpu::Backends {
         // For changing the backend we use standard wgpu env var, i.e. WGPU_BACKEND.
         wgpu::Backends::from_env()
             .unwrap_or(wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::GL)
-    } else if is_safari_browser() || is_firefox_browser() {
-        // TODO(#10609): Fix WebGPU on Safari
+    } else if is_firefox_browser() {
         // TODO(#11009): Fix videos on WebGPU firefox
         wgpu::Backends::GL
     } else {
@@ -551,23 +577,6 @@ pub fn validate_graphics_backend_applicability(backend: wgpu::Backend) -> Result
         }
     }
     Ok(())
-}
-
-/// Are we running inside the Safari browser?
-pub fn is_safari_browser() -> bool {
-    #[cfg(target_arch = "wasm32")]
-    fn is_safari_browser_inner() -> Option<bool> {
-        use web_sys::wasm_bindgen::JsValue;
-        let window = web_sys::window()?;
-        Some(window.has_own_property(&JsValue::from("safari")))
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn is_safari_browser_inner() -> Option<bool> {
-        None
-    }
-
-    is_safari_browser_inner().unwrap_or(false)
 }
 
 /// Are we running inside the Firefox browser?

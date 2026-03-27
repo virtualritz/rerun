@@ -4,9 +4,10 @@ use std::sync::Arc;
 use arrow::datatypes::Schema;
 use arrow::pyarrow::PyArrowType;
 use pyo3::exceptions::{PyLookupError, PyRuntimeError, PyValueError};
-use pyo3::types::PyAnyMethods as _;
+use pyo3::types::{PyAnyMethods as _, PyDict};
 use pyo3::{Py, PyAny, PyErr, PyResult, Python, pyclass, pymethods};
 use re_datafusion::{DEFAULT_CATALOG_NAME, get_all_catalog_names};
+use re_log_types::EntryName;
 use re_protos::cloud::v1alpha1::{EntryFilter, EntryKind};
 
 use crate::catalog::datafusion_catalog::PyDataFusionCatalogProvider;
@@ -17,7 +18,7 @@ use crate::catalog::{
 use crate::utils::{get_tokio_runtime, wait_for_future};
 
 /// Client for a remote Rerun catalog server.
-#[pyclass(  // NOLINT: ignore[py-cls-eq] non-trivial implementation
+#[pyclass(
     name = "CatalogClientInternal",
     module = "rerun_bindings.rerun_bindings"
 )]
@@ -37,6 +38,27 @@ impl PyCatalogClientInternal {
     }
 }
 
+fn setup_datafusion_context(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    let df_module = py.import("datafusion")?;
+
+    let config_options = PyDict::new(py);
+    config_options.set_item("datafusion.execution.coalesce_batches", "false")?;
+
+    let session_config = df_module.call_method1("SessionConfig", (config_options,))?;
+    let datafusion_ctx = df_module.call_method1("SessionContext", (session_config,))?;
+
+    let html_renderer = PyRerunHtmlTable::new(None, None);
+    let format_fn = df_module
+        .getattr("dataframe_formatter")
+        .and_then(|df_formatter| df_formatter.getattr("set_formatter"));
+
+    if let Ok(format_fn) = format_fn {
+        let _ = format_fn.call1((html_renderer,))?;
+    }
+
+    Ok(datafusion_ctx.unbind())
+}
+
 #[pymethods]
 impl PyCatalogClientInternal {
     #[staticmethod]
@@ -46,8 +68,8 @@ impl PyCatalogClientInternal {
 
     /// Create a new catalog client object.
     #[new]
-    #[pyo3(text_signature = "(self, addr, token=None)")]
-    fn new(py: Python<'_>, addr: String, token: Option<String>) -> PyResult<Self> {
+    #[pyo3(text_signature = "(self, url, token=None)")]
+    fn new(py: Python<'_>, url: String, token: Option<String>) -> PyResult<Self> {
         // NOTE: The entire TLS stack expects this global variable to be set. It doesn't matter
         // what we set it to. But we have to set it, or we will crash at runtime, as soon as
         // anything tries to do anything TLS-related.
@@ -55,7 +77,7 @@ impl PyCatalogClientInternal {
         // but we removed that unused dependency, so now we must do it ourselves.
         _ = rustls::crypto::ring::default_provider().install_default();
 
-        let origin = addr.as_str().parse::<re_uri::Origin>().map_err(to_py_err)?;
+        let origin = url.as_str().parse::<re_uri::Origin>().map_err(to_py_err)?;
 
         let connection_registry =
             re_redap_client::ConnectionRegistry::new_with_stored_credentials();
@@ -72,23 +94,7 @@ impl PyCatalogClientInternal {
 
         let connection = ConnectionHandle::new(connection_registry, origin.clone());
 
-        let datafusion_ctx = py
-            .import("datafusion")
-            .and_then(|datafusion| Ok(datafusion.getattr("SessionContext")?.call0()?.unbind()))
-            .ok();
-
-        // Set up our renderer by default since we've already established datafusion
-        // is installed.
-        let html_renderer = PyRerunHtmlTable::new(None, None);
-
-        let format_fn = py
-            .import("datafusion")
-            .and_then(|datafusion| datafusion.getattr("dataframe_formatter"))
-            .and_then(|df_formatter| df_formatter.getattr("set_formatter"));
-
-        if let Ok(format_fn) = format_fn {
-            let _ = format_fn.call1((html_renderer,))?;
-        }
+        let datafusion_ctx = setup_datafusion_context(py).ok();
 
         let ret = Self {
             origin,
@@ -105,6 +111,16 @@ impl PyCatalogClientInternal {
     #[getter]
     pub fn url(&self) -> String {
         self.origin.to_string()
+    }
+
+    /// Returns version and deployment information as (version, cloud_provider, cloud_region).
+    fn version_info(
+        self_: Py<Self>,
+        py: Python<'_>,
+    ) -> PyResult<(String, Option<String>, Option<String>)> {
+        let connection = self_.borrow(py).connection.clone();
+        let info = connection.version_info(py)?;
+        Ok((info.version, info.cloud_provider, info.cloud_region))
     }
 
     /// Get a list of all dataset entries in the catalog.
@@ -150,7 +166,7 @@ impl PyCatalogClientInternal {
 
         entry_details
             .into_iter()
-            .filter(|details| !details.name.starts_with("__") || include_hidden)
+            .filter(|details| include_hidden || !details.name.is_hidden())
             .map(|details| {
                 let table_entry = connection.read_table(py, details.id)?;
                 let table = PyTableEntryInternal::new(self_.clone_ref(py), table_entry);
@@ -223,6 +239,7 @@ impl PyCatalogClientInternal {
             .parse::<url::Url>()
             .map_err(|err| PyValueError::new_err(format!("Invalid URL: {err}")))?;
 
+        let name = EntryName::new(name).map_err(|err| PyValueError::new_err(err.to_string()))?;
         let table_entry = connection.register_table(py, name, url)?;
 
         self_.borrow(py).update_catalog_providers(py, false)?;
@@ -233,6 +250,12 @@ impl PyCatalogClientInternal {
         )
     }
 
+    /// Create a table entry.
+    ///
+    /// NOTE: when provided, `url` is a _prefix_ for the table location, and we must ensure that
+    /// the actual url is unique by inserting a UUID in the path. This is different from the
+    /// semantics of the layers below ([`re_redap_client::ConnectionClient::create_table_entry`] and
+    /// redap), which expect a full url that we must guarantee is free to use.
     fn create_table(
         self_: Py<Self>,
         py: Python<'_>,
@@ -251,13 +274,25 @@ impl PyCatalogClientInternal {
 
         let url = url
             .map(|url| {
-                url.parse::<url::Url>()
-                    .map_err(|err| PyValueError::new_err(format!("Invalid URL: {err}")))
+                let mut url = url
+                    .parse::<url::Url>()
+                    .map_err(|err| PyValueError::new_err(format!("Invalid URL: {err}")))?;
+
+                if url.cannot_be_a_base() {
+                    return Err(PyValueError::new_err(format!(
+                        "URL cannot be a base: {url}"
+                    )));
+                }
+                url.path_segments_mut()
+                    .expect("just checked with cannot_be_a_base()")
+                    .push(&re_tuid::Tuid::new().to_string());
+                Ok::<_, PyErr>(url)
             })
             .transpose()?;
 
         let schema = Arc::new(schema.0);
-        let table_entry = connection.create_table_entry(py, name, schema, url)?;
+        let name = EntryName::new(name).map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let table_entry = connection.create_table_entry(py, &name, schema, url)?;
 
         self_.borrow(py).update_catalog_providers(py, false)?;
 

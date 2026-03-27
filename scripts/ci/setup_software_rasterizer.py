@@ -5,6 +5,13 @@ Borrows heavily from wgpu's CI setup.
 See https://github.com/gfx-rs/wgpu/blob/a8a91737b2d2f378976e292074c75817593a0224/.github/workflows/ci.yml#L10
 In fact we're the exact same Mesa builds that wgpu produces,
 see https://github.com/gfx-rs/ci-build
+
+Using a software rasterizer avoids GPU-related flakiness on CI runners which we hit quite often when
+running many tests in parallel - we got spurious timeouts and failure to find graphics devices,
+the cause of these issues is unknown. See https://github.com/rerun-io/rerun/issues/11359.
+
+All platforms use lavapipe (Mesa's software Vulkan implementation).
+For macOS, we use a custom static build from https://github.com/rerun-io/lavapipe-build.
 """
 
 from __future__ import annotations
@@ -14,6 +21,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from shutil import copytree
 
@@ -24,6 +32,12 @@ MESA_VERSION = "24.2.3"
 # Corresponds to https://github.com/gfx-rs/ci-build/releases
 CI_BINARY_BUILD = "build19"
 
+# Lavapipe build for macOS from https://github.com/rerun-io/lavapipe-build
+LAVAPIPE_MACOS_VERSION = "v0.4.0"
+LAVAPIPE_MACOS_URL = (
+    f"https://github.com/rerun-io/lavapipe-build/releases/download/{LAVAPIPE_MACOS_VERSION}/lavapipe-macos-arm64.tar.gz"
+)
+
 CARGO_TARGET_DIR = Path(os.environ.get("CARGO_TARGET_DIR", "target"))
 
 
@@ -33,8 +47,19 @@ def run(
     env: dict[str, str] | None = None,
     timeout: int | None = None,
     cwd: str | None = None,
+    retries: int = 0,
 ) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(args, env=env, cwd=cwd, timeout=timeout, check=False, capture_output=True, text=True)
+    for attempt in range(retries + 1):
+        result = subprocess.run(args, env=env, cwd=cwd, timeout=timeout, check=False, capture_output=True, text=True)
+        if result.returncode == 0:
+            return result
+
+        if attempt < retries:
+            print(
+                f"Command {args[0]} failed with exit-code {result.returncode}. Retrying in 5 seconds ({attempt + 1}/{retries})…"
+            )
+            time.sleep(5)
+
     assert result.returncode == 0, (
         f"{subprocess.list2cmdline(args)} failed with exit-code {result.returncode}. Output:\n{result.stdout}\n{result.stderr}"
     )
@@ -65,15 +90,18 @@ def set_environment_variables(variables: dict[str, str]) -> None:
 def setup_lavapipe_for_linux() -> dict[str, str]:
     """Sets up lavapipe mesa driver for Linux (x64)."""
     # Download mesa
-    run([
-        "curl",
-        "-L",
-        "--retry",
-        "5",
-        f"https://github.com/gfx-rs/ci-build/releases/download/{CI_BINARY_BUILD}/mesa-{MESA_VERSION}-linux-x86_64.tar.xz",
-        "-o",
-        "mesa.tar.xz",
-    ])
+    run(
+        [
+            "curl",
+            "-L",
+            "--retry",
+            "5",
+            f"https://github.com/gfx-rs/ci-build/releases/download/{CI_BINARY_BUILD}/mesa-{MESA_VERSION}-linux-x86_64.tar.xz",
+            "-o",
+            "mesa.tar.xz",
+        ],
+        retries=3,
+    )
 
     # Create mesa directory and extract
     os.makedirs("mesa", exist_ok=True)
@@ -115,15 +143,18 @@ def setup_lavapipe_for_windows() -> dict[str, str]:
     """Sets up lavapipe mesa driver for Windows (x64)."""
 
     # Download mesa
-    run([
-        "curl.exe",
-        "-L",
-        "--retry",
-        "5",
-        f"https://github.com/pal1000/mesa-dist-win/releases/download/{MESA_VERSION}/mesa3d-{MESA_VERSION}-release-msvc.7z",
-        "-o",
-        "mesa.7z",
-    ])
+    run(
+        [
+            "curl.exe",
+            "-L",
+            "--retry",
+            "5",
+            f"https://github.com/pal1000/mesa-dist-win/releases/download/{MESA_VERSION}/mesa3d-{MESA_VERSION}-release-msvc.7z",
+            "-o",
+            "mesa.7z",
+        ],
+        retries=3,
+    )
 
     # Extract needed files
     run([
@@ -137,8 +168,8 @@ def setup_lavapipe_for_windows() -> dict[str, str]:
     ])
 
     # Copy files to target directory.
-    copytree("mesa", CARGO_TARGET_DIR / "debug")
-    copytree("mesa", CARGO_TARGET_DIR / "debug" / "deps")
+    copytree("mesa", CARGO_TARGET_DIR / "debug", dirs_exist_ok=True)
+    copytree("mesa", CARGO_TARGET_DIR / "debug" / "deps", dirs_exist_ok=True)
 
     # Print icd file that should be used.
     icd_json_path = Path(os.path.join(os.getcwd(), "mesa", "lvp_icd.x86_64.json")).resolve()
@@ -185,8 +216,62 @@ def setup_lavapipe_for_windows() -> dict[str, str]:
     return env_vars
 
 
+def setup_lavapipe_for_macos() -> dict[str, str]:
+    """Sets up lavapipe mesa driver for macOS (arm64)."""
+    print("Setting up lavapipe for macOS…")
+
+    # Download lavapipe build (self-contained with bundled dependencies)
+    run([
+        "curl",
+        "-L",
+        "--retry",
+        "5",
+        LAVAPIPE_MACOS_URL,
+        "-o",
+        "lavapipe-macos-arm64.tar.gz",
+    ])
+
+    # Extract
+    run(["tar", "xzf", "lavapipe-macos-arm64.tar.gz"])
+
+    lavapipe_dir = Path(os.getcwd()) / "lavapipe-macos-arm64"
+    icd_json_path = lavapipe_dir / "lvp_icd.aarch64.json"
+
+    # The Vulkan SDK's loader may be incompatible with lavapipe. Replace it with
+    # Homebrew's vulkan-loader which is built against the same Vulkan headers as Mesa.
+    print("Installing Homebrew vulkan-loader for compatibility with lavapipe…")
+    run(["/opt/homebrew/bin/brew", "install", "vulkan-loader"])
+
+    # Replace the Vulkan SDK's loader with the Homebrew one in all search paths.
+    # DYLD_LIBRARY_PATH alone is unreliable on macOS due to SIP stripping it.
+    run(["sudo", "mkdir", "-p", "/usr/local/lib"])
+    for lib_name in ["libvulkan.dylib", "libvulkan.1.dylib"]:
+        homebrew_path = f"/opt/homebrew/lib/{lib_name}"
+        if Path(homebrew_path).exists():
+            run(["sudo", "ln", "-sf", homebrew_path, f"/usr/local/lib/{lib_name}"])
+            # Also overwrite in the Vulkan SDK lib directory
+            vulkan_sdk_path = os.environ.get("VULKAN_SDK")
+            if vulkan_sdk_path:
+                sdk_lib = f"{vulkan_sdk_path}/lib/{lib_name}"
+                if Path(sdk_lib).exists() or Path(f"{vulkan_sdk_path}/lib").is_dir():
+                    print(f"Replacing {sdk_lib} with symlink to {homebrew_path}")
+                    run(["sudo", "ln", "-sf", homebrew_path, sdk_lib])
+
+    # Set environment variables
+    env_vars = {
+        "VK_DRIVER_FILES": str(icd_json_path.resolve()),
+        # Clear VK_LAYER_PATH to prevent validation layer crashes with lavapipe.
+        "VK_LAYER_PATH": "",
+    }
+    set_environment_variables(env_vars)
+
+    return env_vars
+
+
 def vulkan_info(extra_env_vars: dict[str, str]) -> None:
+    """Run vulkaninfo to verify the Vulkan setup."""
     vulkan_sdk_path = os.environ["VULKAN_SDK"]
+
     env = os.environ.copy()
     env["VK_LOADER_DEBUG"] = "all"  # Enable verbose logging of vulkan loader for debugging.
     for key, value in extra_env_vars.items():
@@ -196,7 +281,14 @@ def vulkan_info(extra_env_vars: dict[str, str]) -> None:
         vulkaninfo_path = f"{vulkan_sdk_path}/bin/vulkaninfoSDK.exe"
     else:
         vulkaninfo_path = f"{vulkan_sdk_path}/bin/vulkaninfo"
-    print(run([vulkaninfo_path], env=env).stdout)
+
+    if not Path(vulkaninfo_path).exists():
+        print(f"ERROR: vulkaninfo not found at {vulkaninfo_path}")
+        print("The Vulkan SDK should be installed with vulkaninfo utility.")
+        sys.exit(1)
+
+    print(f"\nRunning vulkaninfo to verify setup (from {vulkaninfo_path})…\n")
+    print(run([vulkaninfo_path, "--summary"], env=env).stdout)
 
 
 def check_for_vulkan_sdk() -> None:
@@ -209,20 +301,22 @@ def check_for_vulkan_sdk() -> None:
 
 
 def main() -> None:
+    # We only use Vulkan software rasterizers right now.
+    check_for_vulkan_sdk()
+
     if os.name == "nt" and platform.machine() == "AMD64":
         # Note that we could also use WARP, the DX12 software rasterizer.
         # (wgpu tests with both llvmpip and WARP)
         # But practically speaking we prefer Vulkan anyways on Windows today and as such this is
         # both less variation and closer to what Rerun uses when running on a "real" machine.
-        check_for_vulkan_sdk()
         env_vars = setup_lavapipe_for_windows()
         vulkan_info(env_vars)
     elif os.name == "posix" and sys.platform != "darwin" and platform.machine() == "x86_64":
-        check_for_vulkan_sdk()
         env_vars = setup_lavapipe_for_linux()
         vulkan_info(env_vars)
     elif os.name == "posix" and sys.platform == "darwin":
-        print("Skipping software rasterizer setup for macOS - we have to rely on a real GPU here.")
+        env_vars = setup_lavapipe_for_macos()
+        vulkan_info(env_vars)
     else:
         raise ValueError(f"Unsupported OS / architecture: {os.name} / {platform.machine()}")
 

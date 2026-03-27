@@ -72,7 +72,7 @@ impl ExampleDragAndDrop {
             let source_item_position_index = egui::DragAndDrop::payload(ui.ctx()).map(|i| *i);
 
             if let Some(source_item_position_index) = source_item_position_index {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                ui.set_cursor_icon(egui::CursorIcon::Grabbing);
 
                 let (top, bottom) = response.rect.split_top_bottom_at_fraction(0.5);
 
@@ -106,15 +106,15 @@ impl ExampleDragAndDrop {
         // Handle the swap command (if any)
         //
 
-        if let Some((source, target)) = swap {
-            if source != target {
-                let item = self.items.remove(source);
+        if let Some((source, target)) = swap
+            && source != target
+        {
+            let item = self.items.remove(source);
 
-                if source < target {
-                    self.items.insert(target - 1, item);
-                } else {
-                    self.items.insert(target, item);
-                }
+            if source < target {
+                self.items.insert(target - 1, item);
+            } else {
+                self.items.insert(target, item);
             }
         }
     }

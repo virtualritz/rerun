@@ -1,9 +1,7 @@
 //! An in-memory channel of Rerun data messages
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 
-use arrow::array::RecordBatch;
 pub use crossbeam::channel::{RecvError, RecvTimeoutError, SendError, TryRecvError};
 use parking_lot::RwLock;
 use re_uri::RedapUri;
@@ -17,12 +15,6 @@ pub use self::data_source_message::{DataSourceMessage, DataSourceUiCommand};
 pub use self::receiver::LogReceiver;
 pub use self::receiver_set::LogReceiverSet;
 pub use self::sender::LogSender;
-
-/// An instruction sent from the viewer to the remote (gRPC only).
-pub enum LoadCommand {
-    /// Needs `chunk_key` column
-    LoadChunks(RecordBatch),
-}
 
 // --- Source ---
 
@@ -38,14 +30,22 @@ pub enum FlushError {
 
 /// Identifies in what context this smart channel was created,
 /// and what is holding the [`LogSender`].
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Deserialize, serde::Serialize,
+)]
 pub enum LogSource {
     /// The sender is a background thread reading data from a file on disk
     /// (could be `.rrd` files, or `.glb`, `.png`, …).
-    File(std::path::PathBuf),
+    File {
+        path: std::path::PathBuf,
+
+        /// If `true`, the viewer should start in `Following` mode.
+        follow: bool,
+    },
 
     /// The sender is a background thread fetching data from an HTTP file server.
-    RrdHttpStream {
+    #[serde(alias = "RrdHttpStream")]
+    HttpStream {
         /// Should include `http(s)://` prefix.
         url: String,
 
@@ -89,8 +89,8 @@ pub enum LogSource {
 impl std::fmt::Display for LogSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::File(path) => write!(f, "file://{}", path.to_string_lossy()),
-            Self::RrdHttpStream { url, follow: _ } => url.fmt(f),
+            Self::File { path, .. } => write!(f, "file://{}", path.to_string_lossy()),
+            Self::HttpStream { url, follow: _ } => url.fmt(f),
             Self::MessageProxy(uri) => uri.fmt(f),
             Self::RedapGrpcStream { uri, .. } => uri.fmt(f),
             Self::RrdWebEvent => "Web event listener".fmt(f),
@@ -102,10 +102,14 @@ impl std::fmt::Display for LogSource {
 }
 
 impl LogSource {
+    pub fn is_redap(&self) -> bool {
+        matches!(self, Self::RedapGrpcStream { .. })
+    }
+
     pub fn is_network(&self) -> bool {
         match self {
-            Self::File(_) | Self::Sdk | Self::RrdWebEvent | Self::Stdin => false,
-            Self::RrdHttpStream { .. }
+            Self::File { .. } | Self::Sdk | Self::RrdWebEvent | Self::Stdin => false,
+            Self::HttpStream { .. }
             | Self::JsChannel { .. }
             | Self::RedapGrpcStream { .. }
             | Self::MessageProxy { .. } => true,
@@ -114,11 +118,11 @@ impl LogSource {
 
     pub fn select_when_loaded(&self) -> bool {
         match self {
-            Self::File(_)
+            Self::File { .. }
             | Self::Sdk
             | Self::RrdWebEvent
             | Self::Stdin
-            | Self::RrdHttpStream { .. }
+            | Self::HttpStream { .. }
             | Self::JsChannel { .. }
             | Self::MessageProxy { .. } => true,
 
@@ -133,11 +137,11 @@ impl LogSource {
             Self::RedapGrpcStream { uri, .. } => Some(RedapUri::DatasetData(uri.clone())),
             Self::MessageProxy(uri) => Some(RedapUri::Proxy(uri.clone())),
 
-            Self::File(_)
+            Self::File { .. }
             | Self::Sdk
             | Self::RrdWebEvent
             | Self::Stdin
-            | Self::RrdHttpStream { .. }
+            | Self::HttpStream { .. }
             | Self::JsChannel { .. } => None,
         }
     }
@@ -157,8 +161,8 @@ impl LogSource {
     pub fn loading_name(&self) -> Option<String> {
         match self {
             // We only show things we know are very-soon-to-be recordings:
-            Self::File(path) => Some(path.to_string_lossy().into_owned()),
-            Self::RrdHttpStream { url, .. } => Some(url.clone()),
+            Self::File { path, .. } => Some(path.to_string_lossy().into_owned()),
+            Self::HttpStream { url, .. } => Some(url.clone()),
             Self::RedapGrpcStream { uri, .. } => Some(uri.segment_id.clone()),
 
             Self::RrdWebEvent
@@ -176,11 +180,11 @@ impl LogSource {
     /// Status string describing waiting or loading status for a source.
     pub fn status_string(&self) -> String {
         match self {
-            Self::File(path) => {
+            Self::File { path, .. } => {
                 format!("Loading {}…", path.display())
             }
             Self::Stdin => "Loading stdin…".to_owned(),
-            Self::RrdHttpStream { url, .. } => {
+            Self::HttpStream { url, .. } => {
                 format!("Waiting for data on {url}…")
             }
             Self::MessageProxy(uri) => {
@@ -204,7 +208,7 @@ impl LogSource {
             (Self::RedapGrpcStream { uri: uri1, .. }, Self::RedapGrpcStream { uri: uri2, .. }) => {
                 uri1.clone().without_fragment() == uri2.clone().without_fragment()
             }
-            (Self::RrdHttpStream { url: url1, .. }, Self::RrdHttpStream { url: url2, .. }) => {
+            (Self::HttpStream { url: url1, .. }, Self::HttpStream { url: url2, .. }) => {
                 url1 == url2
             }
             _ => self == other,
@@ -221,24 +225,17 @@ pub(crate) struct Channel {
     ///
     /// This can be used to wake up the receiver thread.
     waker: RwLock<Option<Box<dyn Fn() + Send + Sync + 'static>>>,
-
-    /// Counts how many [`LogSender`]s are currently waiting on
-    /// new [`LoadCommand`]s from the viewer to the gRPC client.
-    ///
-    /// Used for debouncing load requests.
-    pub num_waiting_receivers: AtomicUsize,
 }
 
 /// Create a new communication channel for [`DataSourceMessage`].
 pub fn log_channel(source: LogSource) -> (LogSender, LogReceiver) {
-    // TODO(emilk): add a back-channel to be used for controlling what data we load.
+    let max_bytes_on_wire = 128 * 1024 * 1024; // TODO(emilk): make configurable
 
     let source = Arc::new(source);
     let channel = Arc::new(Channel::default());
-    let (tx, rx) = crossbeam::channel::unbounded();
-    let (cmd_tx, cmd_rx) = async_channel::unbounded();
-    let sender = LogSender::new(tx, cmd_rx, source.clone(), channel.clone());
-    let receiver = LogReceiver::new(rx, cmd_tx, channel, source);
+    let (tx, rx) = re_quota_channel::channel(format!("log_channel({source})"), max_bytes_on_wire);
+    let sender = LogSender::new(tx, source.clone(), channel.clone());
+    let receiver = LogReceiver::new(rx, channel, source);
     (sender, receiver)
 }
 
@@ -290,6 +287,16 @@ impl SmartMessage {
         match self.payload {
             SmartMessagePayload::Msg(msg) => Some(msg),
             SmartMessagePayload::Flush { .. } | SmartMessagePayload::Quit(_) => None,
+        }
+    }
+}
+
+impl re_byte_size::SizeBytes for SmartMessage {
+    fn heap_size_bytes(&self) -> u64 {
+        let Self { source: _, payload } = self;
+        match payload {
+            SmartMessagePayload::Msg(msg) => msg.heap_size_bytes(),
+            SmartMessagePayload::Flush { .. } | SmartMessagePayload::Quit(..) => 0,
         }
     }
 }

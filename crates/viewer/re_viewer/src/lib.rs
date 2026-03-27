@@ -2,12 +2,33 @@
 //!
 //! This crate contains all the GUI code for the Rerun Viewer,
 //! including all 2D and 3D visualization code.
+//!
+//! # Failure handling overview
+//!
+//! ## High-level
+//!
+//! Errors that affect the Viewer broadly, either user error or general issues,
+//! are reported via [`re_log`] (i.e. [`re_log::error!`] / [`re_log::warn!`]).
+//! These are not scoped to a specific view or entity and are often intermittent.
+//! They are shown in the notification panel.
+//!
+//! ## Per-visualizer-type in a view ([`re_viewer_context::VisualizerTypeReport::OverallError`])
+//!
+//! A specific visualizer type fails entirely for a view.
+//! Rare and almost always a Viewer bug.
+//!
+//! ## Per-instruction (per entity × visualizer × view) ([`re_viewer_context::VisualizerInstructionReport`])
+//!
+//! The most common failure mode: something goes wrong for a specific entity being
+//! processed by a specific visualizer in a specific view.
+//! Collected in [`re_viewer_context::VisualizerTypeReport::PerInstructionReport`].
+//!
+//! See [`re_viewer_context::VisualizerInstructionReport`] for how these break down further.
 
 #![warn(clippy::iter_over_hash_type)] //  TODO(#6198): enable everywhere
 
 mod app;
 mod app_blueprint;
-mod app_blueprint_ctx;
 mod app_state;
 mod background_tasks;
 mod default_views;
@@ -15,11 +36,14 @@ mod docker_detection;
 pub mod env_vars;
 pub mod event;
 mod history;
+mod latency_tracker;
 mod navigation;
 mod open_url_description;
+mod prefetch_chunks;
 mod saving;
 mod screenshotter;
 mod startup_options;
+mod texture_readback;
 mod ui;
 
 #[cfg(feature = "analytics")]
@@ -57,8 +81,8 @@ pub mod external {
     pub use re_viewport::external::*;
     pub use {
         eframe, egui, parking_lot, re_chunk, re_chunk_store, re_data_ui, re_entity_db, re_log,
-        re_log_channel, re_log_types, re_memory, re_renderer, re_sdk_types, re_ui, re_view_spatial,
-        re_viewer_context, re_viewport,
+        re_log_channel, re_log_types, re_memory, re_renderer, re_sdk_types, re_ui, re_view,
+        re_view_spatial, re_viewer_context, re_viewport,
     };
 }
 
@@ -185,40 +209,28 @@ impl AppEnvironment {
 pub(crate) fn wgpu_options(force_wgpu_backend: Option<&str>) -> egui_wgpu::WgpuConfiguration {
     re_tracing::profile_function!();
 
+    let instance_descriptor = re_renderer::device_caps::instance_descriptor(force_wgpu_backend);
+    let backends = instance_descriptor.backends;
+
     egui_wgpu::WgpuConfiguration {
-            // When running wgpu on native debug builds, we want some extra control over how
-            // and when a poisoned surface gets recreated.
-            #[cfg(all(not(target_arch = "wasm32"), debug_assertions))] // native debug build
-            on_surface_error: std::sync::Arc::new(|err| {
-                // On windows, this error also occurs when the app is minimized.
-                // Silently return here to prevent spamming the console with:
-                // "The underlying surface has changed, and therefore the swap chain
-                //  must be updated"
-                if err == wgpu::SurfaceError::Outdated && !cfg!(target_os = "windows"){
-                    // We haven't been able to present anything to the swapchain for
-                    // a while, because the pipeline is poisoned.
-                    // Recreate a sane surface to restart the cycle and see if the
-                    // user has fixed the issue.
-                    egui_wgpu::SurfaceErrorAction::RecreateSurface
-                } else {
-                    egui_wgpu::SurfaceErrorAction::SkipFrame
-                }
+        wgpu_setup: egui_wgpu::WgpuSetup::CreateNew(egui_wgpu::WgpuSetupCreateNew {
+            instance_descriptor,
+
+            // TODO(#8475): Add the ability to pick adapter by name.
+            // (user may e.g. request "nvidia" or "intel" and it should just work!)
+            // Should ideally produce structured reasoning of why which one was picked in the process.
+            native_adapter_selector: Some(std::sync::Arc::new(move |adapters, surface| {
+                re_renderer::device_caps::select_adapter(adapters, backends, surface)
+            })),
+            device_descriptor: std::sync::Arc::new(|adapter| {
+                re_renderer::device_caps::DeviceCaps::from_adapter_without_validation(adapter)
+                    .device_descriptor()
             }),
 
-            wgpu_setup: egui_wgpu::WgpuSetup::CreateNew(egui_wgpu::WgpuSetupCreateNew {
-                instance_descriptor: re_renderer::device_caps::instance_descriptor(force_wgpu_backend),
-
-                // TODO(#8475): Install custom native adapter selector with more extensive logging and the ability to pick adapter by name
-                // (user may e.g. request "nvidia" or "intel" and it should just work!)
-                // ideally producing structured reasoning of why which one was picked in the process.
-                // This should live in re_renderer::config so that we can reuse it in tests & re_renderer examples.
-                native_adapter_selector: None,
-                device_descriptor: std::sync::Arc::new(|adapter| re_renderer::device_caps::DeviceCaps::from_adapter_without_validation(adapter).device_descriptor()),
-
-                ..Default::default()
-             }),
-            ..Default::default()
-        }
+            ..egui_wgpu::WgpuSetupCreateNew::without_display_handle()
+        }),
+        ..Default::default()
+    }
 }
 
 /// Customize eframe and egui to suit the rerun viewer.
@@ -311,7 +323,7 @@ pub fn reset_viewer_persistence() -> anyhow::Result<()> {
 
 /// Hook into [`re_log`] to receive copies of text log messages on a channel,
 /// which we will then show in the notification panel.
-pub fn register_text_log_receiver() -> std::sync::mpsc::Receiver<re_log::LogMsg> {
+pub fn register_text_log_receiver() -> crossbeam::channel::Receiver<re_log::LogMsg> {
     let (logger, text_log_rx) = re_log::ChannelLogger::new(re_log::LevelFilter::Info);
     if re_log::add_boxed_logger(Box::new(logger)).is_err() {
         // This can happen when users wrap re_viewer in their own eframe app.

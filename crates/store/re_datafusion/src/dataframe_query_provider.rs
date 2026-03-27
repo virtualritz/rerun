@@ -5,6 +5,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use crate::dataframe_query_common::{
+    DataframeClientAPI, IndexValuesMap, group_chunk_infos_by_segment_id,
+    prepend_string_column_schema,
+};
 use arrow::array::{Array, RecordBatch, RecordBatchOptions, StringArray, UInt64Array};
 use arrow::compute::SortOptions;
 use arrow::datatypes::{Schema, SchemaRef};
@@ -19,25 +23,23 @@ use datafusion::physical_expr::{
 };
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
-use futures_util::Stream;
+use futures_util::{FutureExt as _, Stream};
 use re_dataframe::external::re_chunk::Chunk;
 use re_dataframe::external::re_chunk_store::ChunkStore;
+use re_dataframe::utils::align_record_batch_to_schema;
 use re_dataframe::{
     ChunkStoreHandle, Index, QueryCache, QueryEngine, QueryExpression, QueryHandle, StorageEngine,
 };
 use re_log_types::{ApplicationId, StoreId, StoreKind};
 use re_protos::cloud::v1alpha1::{FetchChunksRequest, ScanSegmentTableResponse};
-use re_redap_client::{ApiResult, ConnectionClient};
+use re_redap_client::ApiResult;
 use re_sorbet::{ColumnDescriptor, ColumnSelector};
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
+use tonic::IntoRequest as _;
 use tracing::Instrument as _;
-
-use crate::dataframe_query_common::{
-    align_record_batch_to_schema, group_chunk_infos_by_segment_id, prepend_string_column_schema,
-};
 
 /// This parameter sets the back pressure that either the streaming provider
 /// can place on the CPU worker thread or the CPU worker thread can place on
@@ -74,9 +76,10 @@ fn attach_trace_context(
 }
 
 #[derive(Debug)]
-pub(crate) struct SegmentStreamExec {
+pub(crate) struct SegmentStreamExec<T: DataframeClientAPI> {
     props: PlanProperties,
     chunk_info_batches: Arc<Vec<RecordBatch>>,
+    index_values: IndexValuesMap,
 
     /// Describes the chunks per partition, derived from `chunk_info_batches`.
     /// We keep both around so that we only have to process once, but we may
@@ -88,7 +91,7 @@ pub(crate) struct SegmentStreamExec {
     projected_schema: Arc<Schema>,
     target_partitions: usize,
     worker_runtime: Arc<CpuRuntime>,
-    client: ConnectionClient,
+    client: T,
 
     /// passing trace headers between phases of execution pipeline helps keep
     /// the entire operation under a single trace.
@@ -97,9 +100,9 @@ pub(crate) struct SegmentStreamExec {
 
 type ChunksWithSegment = Vec<(Chunk, Option<String>)>;
 
-pub struct DataframeSegmentStreamInner {
+pub struct DataframeSegmentStreamInner<T: DataframeClientAPI> {
     projected_schema: SchemaRef,
-    client: ConnectionClient,
+    client: T,
     chunk_infos: Vec<RecordBatch>,
 
     chunk_tx: Option<Sender<ApiResult<ChunksWithSegment>>>,
@@ -109,6 +112,7 @@ pub struct DataframeSegmentStreamInner {
     /// We must keep a handle on the cpu runtime because the execution plan
     /// is dropped during streaming. We need this handle to continue to exist
     /// so that our worker does not shut down unexpectedly.
+    #[expect(dead_code)]
     cpu_runtime: Arc<CpuRuntime>,
     cpu_join_handle: Option<JoinHandle<Result<(), DataFusionError>>>,
 
@@ -125,11 +129,11 @@ pub struct DataframeSegmentStreamInner {
 /// FFI interface. When the upstream issue resolves, change
 /// `DataframeSegmentStreamInner` back into `DataframeSegmentStream`
 /// and delete this wrapper struct.
-pub struct DataframeSegmentStream {
-    inner: Option<DataframeSegmentStreamInner>,
+pub struct DataframeSegmentStream<T: DataframeClientAPI> {
+    inner: Option<DataframeSegmentStreamInner<T>>,
 }
 
-impl Stream for DataframeSegmentStream {
+impl<T: DataframeClientAPI> Stream for DataframeSegmentStream<T> {
     type Item = Result<RecordBatch, DataFusionError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -153,7 +157,9 @@ impl Stream for DataframeSegmentStream {
             let Some(join_handle) = this.cpu_join_handle.take() else {
                 return Poll::Ready(Some(exec_err!("CPU join handle is None")));
             };
-            let cpu_join_result = this.cpu_runtime.handle().block_on(join_handle);
+
+            // Below is safe because we have already checked is_finished
+            let cpu_join_result = join_handle.now_or_never().expect("is_finished is true");
 
             match cpu_join_result {
                 Err(err) => return Poll::Ready(Some(exec_err!("{err}"))),
@@ -196,7 +202,7 @@ impl Stream for DataframeSegmentStream {
     }
 }
 
-impl RecordBatchStream for DataframeSegmentStream {
+impl<T: DataframeClientAPI> RecordBatchStream for DataframeSegmentStream<T> {
     fn schema(&self) -> SchemaRef {
         self.inner
             .as_ref()
@@ -205,7 +211,7 @@ impl RecordBatchStream for DataframeSegmentStream {
     }
 }
 
-impl SegmentStreamExec {
+impl<T: DataframeClientAPI> SegmentStreamExec<T> {
     #[tracing::instrument(level = "info", skip_all)]
     #[expect(clippy::too_many_arguments)]
     pub fn try_new(
@@ -215,7 +221,8 @@ impl SegmentStreamExec {
         num_partitions: usize,
         chunk_info_batches: Arc<Vec<RecordBatch>>,
         mut query_expression: QueryExpression,
-        client: ConnectionClient,
+        index_values: IndexValuesMap,
+        client: T,
         trace_headers: Option<crate::TraceHeaders>,
     ) -> datafusion::common::Result<Self> {
         let projected_schema = match projection {
@@ -312,6 +319,7 @@ impl SegmentStreamExec {
             chunk_info_batches,
             chunk_info,
             query_expression,
+            index_values,
             projected_schema,
             target_partitions: num_partitions,
             worker_runtime,
@@ -377,6 +385,7 @@ async fn chunk_store_cpu_worker_thread(
     output_channel: Sender<RecordBatch>,
     query_expression: QueryExpression,
     projected_schema: Arc<Schema>,
+    index_values: IndexValuesMap,
 ) -> Result<(), DataFusionError> {
     let mut current_stores: Option<(String, ChunkStoreHandle, QueryHandle<StorageEngine>)> = None;
     while let Some(chunks_and_segment_ids) = input_channel.recv().await {
@@ -386,6 +395,11 @@ async fn chunk_store_cpu_worker_thread(
         for (chunk, segment_id) in chunks_and_segment_ids {
             let segment_id = segment_id
                 .ok_or_else(|| exec_datafusion_err!("Received chunk without a segment id"))?;
+            if let Some(idx_values) = &index_values
+                && !idx_values.contains_key(&segment_id)
+            {
+                continue;
+            }
 
             if let Some((current_segment, _, query_handle)) = &current_stores {
                 // When we change segments, flush the outputs
@@ -404,7 +418,7 @@ async fn chunk_store_cpu_worker_thread(
                 }
             }
 
-            let current_stores = current_stores.get_or_insert({
+            let current_stores = current_stores.get_or_insert_with(|| {
                 let store_id = StoreId::random(
                     StoreKind::Recording,
                     ApplicationId::from(segment_id.as_str()),
@@ -413,7 +427,13 @@ async fn chunk_store_cpu_worker_thread(
 
                 let query_engine =
                     QueryEngine::new(store.clone(), QueryCache::new_handle(store.clone()));
-                let query_handle = query_engine.query(query_expression.clone());
+                let mut individual_query = query_expression.clone();
+                if let Some(values_map) = &index_values
+                    && let Some(values) = values_map.get(&segment_id)
+                {
+                    individual_query.using_index_values = Some(values.clone());
+                }
+                let query_handle = query_engine.query(individual_query);
 
                 (segment_id.clone(), store, query_handle)
             });
@@ -570,13 +590,7 @@ fn split_large_segments(
             current_size += chunk_size;
         } else {
             // Create batch from current indices
-            let indices_array = arrow::array::UInt32Array::from(
-                current_indices
-                    .iter()
-                    .map(|&i| i as u32)
-                    .collect::<Vec<_>>(),
-            );
-            let batch = arrow::compute::take_record_batch(chunk_info, &indices_array)?;
+            let batch = re_arrow_util::take_record_batch(chunk_info, &current_indices)?;
             result_batches.push(batch);
 
             // Start new batch with current chunk
@@ -587,13 +601,7 @@ fn split_large_segments(
 
     // Don't forget the last batch
     if !current_indices.is_empty() {
-        let indices_array = arrow::array::UInt32Array::from(
-            current_indices
-                .iter()
-                .map(|&i| i as u32)
-                .collect::<Vec<_>>(),
-        );
-        let batch = arrow::compute::take_record_batch(chunk_info, &indices_array)?;
+        let batch = re_arrow_util::take_record_batch(chunk_info, &current_indices)?;
         result_batches.push(batch);
     }
 
@@ -644,7 +652,7 @@ fn sort_chunks_by_segment_order(
 }
 
 /// This is the function that will run on the IO (main) tokio runtime that will listen
-/// to the gRPC channel for chunks coming in from the data platform. This loop is started
+/// to the gRPC channel for chunks coming in from the Data Platform. This loop is started
 /// up by the execute fn of the physical plan, so we will start one per output DataFusion partition,
 /// which is different from the Rerun `segment_id`. The sorting by time index will happen within
 /// the cpu worker thread.
@@ -658,11 +666,13 @@ fn sort_chunks_by_segment_order(
 /// and process them concurrently in groups. After data for each group is collected, it is sorted
 /// by the input segment order before being sent to the CPU worker thread.
 #[tracing::instrument(level = "trace", skip_all)]
-async fn chunk_stream_io_loop(
-    client: ConnectionClient,
+async fn chunk_stream_io_loop<T: DataframeClientAPI>(
+    client: T,
     chunk_infos: Vec<RecordBatch>,
     output_channel: Sender<ApiResult<ChunksWithSegment>>,
 ) -> Result<(), DataFusionError> {
+    #![expect(clippy::redundant_iter_cloned)] // False positive? Or requires smarter async code.
+
     // TODO(zehiko) make these configurable
     let target_size_bytes = TARGET_BATCH_SIZE_BYTES as u64;
     let target_concurrency = TARGET_CONCURRENCY;
@@ -687,8 +697,7 @@ async fn chunk_stream_io_loop(
                     };
 
                     let fetch_chunks_response_stream = client
-                        .inner()
-                        .fetch_chunks(fetch_chunks_request)
+                        .fetch_chunks(fetch_chunks_request.into_request())
                         .instrument(tracing::trace_span!("batched_fetch_chunks"))
                         .await
                         .map_err(|err| exec_datafusion_err!("{err}"))?
@@ -730,7 +739,7 @@ async fn chunk_stream_io_loop(
     Ok(())
 }
 
-impl ExecutionPlan for SegmentStreamExec {
+impl<T: DataframeClientAPI> ExecutionPlan for SegmentStreamExec<T> {
     fn name(&self) -> &'static str {
         "SegmentStreamExec"
     }
@@ -789,7 +798,7 @@ impl ExecutionPlan for SegmentStreamExec {
 
         // if no chunks match this datafusion partition, return an empty stream
         if chunk_infos.is_empty() {
-            let stream = DataframeSegmentStream { inner: None };
+            let stream: DataframeSegmentStream<T> = DataframeSegmentStream { inner: None };
             return Ok(Box::pin(stream));
         }
 
@@ -799,7 +808,13 @@ impl ExecutionPlan for SegmentStreamExec {
         let query_expression = self.query_expression.clone();
         let projected_schema = self.projected_schema.clone();
         let cpu_join_handle = Some(self.worker_runtime.handle().spawn(
-            chunk_store_cpu_worker_thread(chunk_rx, batches_tx, query_expression, projected_schema),
+            chunk_store_cpu_worker_thread(
+                chunk_rx,
+                batches_tx,
+                query_expression,
+                projected_schema,
+                self.index_values.clone(),
+            ),
         ));
 
         let stream = DataframeSegmentStreamInner {
@@ -834,6 +849,7 @@ impl ExecutionPlan for SegmentStreamExec {
             chunk_info_batches: self.chunk_info_batches.clone(),
             chunk_info: self.chunk_info.clone(),
             query_expression: self.query_expression.clone(),
+            index_values: self.index_values.clone(),
             projected_schema: self.projected_schema.clone(),
             target_partitions,
             worker_runtime: Arc::new(CpuRuntime::try_new(target_partitions)?),
@@ -853,7 +869,7 @@ impl ExecutionPlan for SegmentStreamExec {
     }
 }
 
-impl DisplayAs for SegmentStreamExec {
+impl<T: DataframeClientAPI> DisplayAs for SegmentStreamExec<T> {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,

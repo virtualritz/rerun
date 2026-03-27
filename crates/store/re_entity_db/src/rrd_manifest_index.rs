@@ -1,75 +1,97 @@
-use std::collections::BTreeMap;
-use std::ops::RangeInclusive;
+use std::{collections::BTreeMap, sync::Arc};
 
-use ahash::{HashMap, HashSet};
-use arrow::array::{Int32Array, RecordBatch};
-use arrow::compute::take_record_batch;
-use itertools::Itertools as _;
-use nohash_hasher::{IntMap, IntSet};
-use re_chunk::{ChunkId, TimeInt, Timeline, TimelineName};
-use re_chunk_store::ChunkStoreEvent;
-use re_log_encoding::{CodecResult, RrdManifest, RrdManifestTemporalMapEntry};
-use re_log_types::{AbsoluteTimeRange, StoreKind};
+use ahash::HashMap;
+use arrow::array::RecordBatch;
+use itertools::izip;
+use nohash_hasher::IntSet;
+use re_byte_size::{MemUsageTree, MemUsageTreeCapture};
+use re_chunk::{ChunkId, EntityPath, Timeline, TimelineName};
+use re_chunk_store::{ChunkStore, ChunkStoreDiff, ChunkStoreEvent};
+use re_log::debug_assert;
+use re_log_encoding::{CodecResult, RrdManifest};
+use re_log_types::{AbsoluteTimeRange, StoreKind, TimelinePoint};
+use re_mutex::Mutex;
 
-use crate::sorted_range_map::SortedRangeMap;
+use crate::chunk_requests::ChunkBatchRequest;
+pub use crate::chunk_requests::{ChunkPromise, ChunkRequests, RequestInfo};
 
-/// Errors that can occur during prefetching.
-#[derive(thiserror::Error, Debug)]
-pub enum PrefetchError {
-    #[error("No manifest available")]
-    NoManifest,
+mod chunk_prioritizer;
+mod collapsed_time_ranges;
+mod sorted_temporal_chunks;
+mod time_range_merger;
 
-    #[error("Unknown timeline: {0:?}")]
-    UnknownTimeline(Timeline),
+pub use chunk_prioritizer::{ChunkPrefetchOptions, ChunkPrioritizer, PrefetchError};
+pub use sorted_temporal_chunks::ChunkCountInfo;
 
-    #[error("Codec: {0}")]
-    Codec(#[from] re_log_encoding::CodecError),
-
-    #[error("Arrow: {0}")]
-    Arrow(#[from] arrow::error::ArrowError),
-
-    #[error("Row index too large: {0}")]
-    BadIndex(usize),
-}
+use sorted_temporal_chunks::SortedTemporalChunks;
 
 /// Is the following chunk loaded?
 ///
 /// The order here is used for priority to show the state in the ui (lower is more prioritized)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum LoadState {
-    /// The chunk is not loaded, nor being loaded.
+enum LoadState {
+    /// The chunk is not fully loaded, nor being loaded.
+    ///
+    /// It may be that we've previously loaded this chunk,
+    /// split it on ingestion, removed part of it.
+    /// In that case, we consider the chunk [`Self::Unloaded`].
     #[default]
     Unloaded,
 
     /// We have requested it.
+    ///
+    /// TODO(emilk): move this state to [`ChunkRequests`]
     InTransit,
 
-    /// We have the chole chunk in memory.
-    Loaded,
+    /// We have the whole chunk in memory.
+    FullyLoaded,
 }
 
-/// How to calculate which chunks to prefetch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChunkPrefetchOptions {
-    pub timeline: Timeline,
-
-    /// Only consider chunks overlapping this range on [`Self::timeline`].
-    pub desired_range: AbsoluteTimeRange,
-
-    /// Total budget for all loaded chunks.
-    pub total_byte_budget: u64,
-
-    /// Budget for this specific prefetch request.
-    pub delta_byte_budget: u64,
+impl LoadState {
+    pub fn is_fully_loaded(self) -> bool {
+        self == Self::FullyLoaded
+    }
 }
 
 /// Info about a single chunk that we know ahead of loading it.
-#[derive(Clone, Debug, Default)]
-pub struct ChunkInfo {
-    pub state: LoadState,
+#[derive(Clone, Debug)]
+pub struct RootChunkInfo {
+    pub entity_path: EntityPath,
 
-    /// None for static chunks
-    pub temporal: Option<TemporalChunkInfo>,
+    /// What row in the source RRD manifest is this chunk in?
+    pub row_id: usize,
+
+    state: LoadState,
+
+    /// Empty for static chunks
+    pub temporals: HashMap<TimelineName, TemporalChunkInfo>,
+}
+
+impl RootChunkInfo {
+    fn new(entity_path: EntityPath, row_idx: usize) -> Self {
+        Self {
+            entity_path,
+            state: LoadState::Unloaded,
+            row_id: row_idx,
+            temporals: Default::default(),
+        }
+    }
+
+    pub fn is_fully_loaded(&self) -> bool {
+        self.state.is_fully_loaded()
+    }
+}
+
+impl re_byte_size::SizeBytes for RootChunkInfo {
+    fn heap_size_bytes(&self) -> u64 {
+        let Self {
+            entity_path,
+            state: _,
+            row_id: _,
+            temporals,
+        } = self;
+        entity_path.heap_size_bytes() + temporals.heap_size_bytes()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -79,110 +101,172 @@ pub struct TemporalChunkInfo {
     /// The time range covered by this entry.
     pub time_range: AbsoluteTimeRange,
 
-    /// The number of rows in the original chunk which are associated with this entry.
+    /// The total number of events in the original chunk for this time range.
     ///
-    /// At most, this is the same as the number of rows in the chunk as a whole. For a specific
-    /// entry it might be less, since chunks allow sparse components.
-    pub num_rows: u64,
+    /// This accumulates for all entities and all components, but still accounts for sparness.
+    pub num_rows_for_all_entities_all_components: u64,
+}
+
+impl re_byte_size::SizeBytes for TemporalChunkInfo {
+    fn heap_size_bytes(&self) -> u64 {
+        0
+    }
+
+    #[inline]
+    fn is_pod() -> bool {
+        true
+    }
+}
+
+/// A cache used to calculate which ranges are loaded from a latest at perspective.
+#[derive(Clone)]
+struct LoadedRanges {
+    ranges: time_range_merger::MergedRanges,
+
+    /// The timeline this is cached for.
+    timeline: TimelineName,
+}
+
+impl re_byte_size::SizeBytes for LoadedRanges {
+    fn heap_size_bytes(&self) -> u64 {
+        let Self { ranges, timeline } = self;
+
+        ranges.heap_size_bytes() + timeline.heap_size_bytes()
+    }
 }
 
 /// A secondary index that keeps track of which chunks have been loaded into memory.
 ///
-/// This is constructed from an [`RrdManifest`], which is what
-/// the server sends to the client/viewer.
-#[derive(Default, Debug, Clone)]
+/// This is constructed from an [`RrdManifest`], which is what the server sends to the client/viewer.
+/// The manifest may be received in parts and concatenated together.
+#[derive(Default)]
+#[cfg_attr(feature = "testing", derive(Clone))]
 pub struct RrdManifestIndex {
-    /// The raw manifest.
+    /// The raw manifest (accumulated from possibly multiple parts).
     ///
     /// This is known ahead-of-time for _some_ data sources.
-    manifest: Option<RrdManifest>,
+    manifest: Option<Arc<RrdManifest>>,
+
+    /// True once all parts of the manifest have been received.
+    manifest_complete: bool,
 
     /// These are the chunks known to exist in the data source (e.g. remote server).
     ///
-    /// The chunk store may split large chunks and merge (compact) small ones,
-    /// so what's in the chunk store can differ significantally.
-    remote_chunks: HashMap<ChunkId, ChunkInfo>,
+    /// The chunk store may split and/or merge root chunks, producing _derived_ chunks.
+    root_chunks: HashMap<ChunkId, RootChunkInfo>,
 
-    /// The chunk store may split large chunks and merge (compact) small ones.
-    /// When we later drop a chunk, we need to know which other chunks to invalidate.
-    parents: HashMap<ChunkId, HashSet<ChunkId>>,
+    chunk_prioritizer: ChunkPrioritizer,
 
-    /// Have we ever deleted a chunk?
+    /// Keeps track of temporal chunks that are related to a specific entity.
     ///
-    /// If so, we have run some GC and should not show progress bar.
-    has_deleted: bool,
+    /// Used for displaying chunks as unloaded in the density graph in the time panel.
+    sorted_chunks: SortedTemporalChunks,
+
+    /// Keeps track of what chunks need to be loaded for a time range to be displayed
+    /// as loaded.
+    ///
+    /// Used for displaying the top loaded indicator in the time panel.
+    loaded_ranges: Option<LoadedRanges>,
 
     /// Full time range per timeline
     timelines: BTreeMap<TimelineName, AbsoluteTimeRange>,
 
-    pub entity_tree: crate::EntityTree,
-    entity_has_temporal_data_on_timeline: IntMap<re_chunk::EntityPath, IntSet<TimelineName>>,
+    /// Cached data time ranges per timeline, used for gap collapsing in the time panel.
+    /// Computed from chunk time ranges when the manifest is complete.
+    data_time_ranges: BTreeMap<TimelineName, Vec<AbsoluteTimeRange>>,
+
     entity_has_static_data: IntSet<re_chunk::EntityPath>,
 
-    native_static_map: re_log_encoding::RrdManifestStaticMap,
-    native_temporal_map: re_log_encoding::RrdManifestTemporalMap,
+    full_uncompressed_size: u64,
+}
 
-    chunk_intervals: BTreeMap<Timeline, SortedRangeMap<TimeInt, ChunkId>>,
-
-    manifest_row_from_chunk_id: BTreeMap<ChunkId, usize>,
+impl std::fmt::Debug for RrdManifestIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RrdManifestIndex").finish_non_exhaustive()
+    }
 }
 
 impl RrdManifestIndex {
-    pub fn append(&mut self, manifest: RrdManifest) -> CodecResult<()> {
+    pub fn append(
+        &mut self,
+        delta: Arc<RrdManifest>,
+        entity_tree: &re_chunk_store::EntityTree,
+    ) -> CodecResult<()> {
         re_tracing::profile_function!();
 
-        self.native_static_map = manifest.get_static_data_as_a_map()?;
-        self.native_temporal_map = manifest.get_temporal_data_as_a_map()?;
+        self.update_timeline_stats(&delta);
+        self.update_entity_static_data(&delta);
+        self.chunk_prioritizer.on_rrd_manifest(&delta);
 
-        self.update_timeline_stats();
-        self.update_entity_tree();
-        self.update_entity_temporal_data();
-        self.update_entity_static_data();
-        self.update_chunk_intervals();
+        self.full_uncompressed_size += delta.col_chunk_byte_size_uncompressed().iter().sum::<u64>();
 
-        for chunk_id in manifest.col_chunk_id()? {
-            self.remote_chunks.entry(chunk_id).or_default();
+        self.loaded_ranges = None; // invalidate and recompute
+
+        let row_offset = self
+            .manifest
+            .as_ref()
+            .map_or(0, |manifest| manifest.data().num_rows());
+
+        for (delta_row_idx, (&root_chunk_id, entity_path)) in
+            izip!(delta.col_chunk_ids(), delta.col_chunk_entity_path()).enumerate()
+        {
+            self.root_chunks.insert(
+                root_chunk_id,
+                RootChunkInfo::new(entity_path, row_offset + delta_row_idx),
+            );
         }
 
-        for timelines in self.native_temporal_map.values() {
+        for timelines in delta.temporal_map().values() {
             for (&timeline, comps) in timelines {
                 for chunks in comps.values() {
                     for (&chunk_id, entry) in chunks {
-                        let chunk_info = self.remote_chunks.entry(chunk_id).or_default();
-                        chunk_info.temporal = Some(TemporalChunkInfo {
-                            timeline,
-                            time_range: entry.time_range,
-                            num_rows: entry.num_rows,
-                        });
+                        let chunk_info = self
+                            .root_chunks
+                            .get_mut(&chunk_id)
+                            .expect("Bug in RRD manifest");
+                        chunk_info
+                            .temporals
+                            .entry(*timeline.name())
+                            .and_modify(|info| {
+                                info.time_range = entry.time_range.union(info.time_range);
+                                info.num_rows_for_all_entities_all_components += entry.num_rows;
+                            })
+                            .or_insert(TemporalChunkInfo {
+                                timeline,
+                                time_range: entry.time_range,
+                                num_rows_for_all_entities_all_components: entry.num_rows,
+                            });
                     }
                 }
             }
         }
 
-        if self.manifest.is_some() {
-            re_log::warn!(
-                "Received a second RRD manifest schema for the same recording. This is not yet supported."
-            );
-        }
+        let new_full_manifest = if let Some(existing) = self.manifest.take() {
+            Arc::new(RrdManifest::concat(&[&existing, &delta])?)
+        } else {
+            delta
+        };
 
-        self.manifest_row_from_chunk_id.clear();
-        let chunk_id = manifest.col_chunk_id()?;
-        for (row_idx, chunk_id) in chunk_id.enumerate() {
-            self.manifest_row_from_chunk_id.insert(chunk_id, row_idx);
-        }
+        self.sorted_chunks =
+            SortedTemporalChunks::new(entity_tree, new_full_manifest.temporal_map());
 
-        self.manifest = Some(manifest);
+        self.manifest = Some(new_full_manifest);
 
         Ok(())
     }
 
-    /// Info about a chunk that is in the manifest
-    pub fn remote_chunk_info(&self, chunk_id: &ChunkId) -> Option<&ChunkInfo> {
-        self.remote_chunks.get(chunk_id)
+    /// Iterate over all chunks in the manifest.
+    pub fn root_chunks(&self) -> impl Iterator<Item = &RootChunkInfo> {
+        self.root_chunks.values()
     }
 
-    fn update_timeline_stats(&mut self) {
-        for timelines in self.native_temporal_map.values() {
+    /// Info about a chunk that is in the manifest
+    pub fn root_chunk_info(&self, chunk_id: &ChunkId) -> Option<&RootChunkInfo> {
+        self.root_chunks.get(chunk_id)
+    }
+
+    fn update_timeline_stats(&mut self, manifest: &RrdManifest) {
+        for timelines in manifest.temporal_map().values() {
             for (timeline, comps) in timelines {
                 let mut timeline_range = self
                     .timelines
@@ -203,61 +287,97 @@ impl RrdManifestIndex {
         }
     }
 
-    fn update_entity_tree(&mut self) {
-        for entity in self
-            .native_static_map
-            .keys()
-            .chain(self.native_temporal_map.keys())
-        {
-            self.entity_tree.on_new_entity(entity);
-        }
-    }
-
-    fn update_entity_temporal_data(&mut self) {
-        for (entity, timelines) in &self.native_temporal_map {
-            self.entity_has_temporal_data_on_timeline
-                .entry(entity.clone())
-                .or_default()
-                .extend(timelines.keys().map(|t| *t.name()));
-        }
-    }
-
-    fn update_entity_static_data(&mut self) {
-        for entity in self.native_static_map.keys() {
+    fn update_entity_static_data(&mut self, manifest: &RrdManifest) {
+        for entity in manifest.static_map().keys() {
             self.entity_has_static_data.insert(entity.clone());
         }
     }
 
-    fn update_chunk_intervals(&mut self) {
-        let mut per_timeline_chunks: BTreeMap<Timeline, Vec<(RangeInclusive<TimeInt>, ChunkId)>> =
-            BTreeMap::default();
+    fn update_loaded_ranges(&mut self, current_timeline: TimelineName) {
+        re_tracing::profile_function!();
 
-        for timelines in self.native_temporal_map.values() {
-            for (timeline, components) in timelines {
-                let timeline_chunks = per_timeline_chunks.entry(*timeline).or_default();
-                for chunks in components.values() {
-                    for (chunk_id, entry) in chunks {
-                        timeline_chunks.push((entry.time_range.into(), *chunk_id));
-                    }
-                }
+        let is_unloaded = |id| {
+            self.root_chunks
+                .get(&id)
+                .is_none_or(|c| !c.state.is_fully_loaded())
+        };
+
+        // Skip fully updating if timeline didn't change.
+        if let Some(loaded_ranges) = &mut self.loaded_ranges
+            && loaded_ranges.timeline == current_timeline
+        {
+            loaded_ranges.ranges.update_components_of_interest(
+                &self.chunk_prioritizer.components_of_interest,
+                &self.chunk_prioritizer.component_paths_from_root_id,
+                is_unloaded,
+            );
+            return;
+        }
+
+        let Some(timeline_range) = self.timeline_range(&current_timeline) else {
+            return;
+        };
+
+        let mut ranges = Vec::new();
+
+        // First we merge ranges for individual components, since chunks' time ranges
+        // often have gaps which we don't want to display other components' chunks
+        // loaded state in.
+        for chunks in self
+            .sorted_chunks
+            .iter_all_component_chunks_on_timeline(current_timeline)
+        {
+            let mut new_ranges = time_range_merger::merge_ranges(
+                chunks
+                    .iter()
+                    .map(|info| time_range_merger::TimeRange::new(info.id, info.time_range)),
+            );
+
+            // Make sure the last range covers to the end of the timeline.
+            if let Some(range) = new_ranges.last_mut() {
+                range.max = timeline_range.max;
             }
+
+            ranges.extend(new_ranges);
         }
 
-        self.chunk_intervals.clear();
-        for (timeline, chunks) in per_timeline_chunks {
-            self.chunk_intervals
-                .insert(timeline, SortedRangeMap::new(chunks));
-        }
+        self.loaded_ranges = Some(LoadedRanges {
+            ranges: time_range_merger::MergedRanges::new(
+                time_range_merger::merge_ranges(ranges.drain(..)),
+                &self.chunk_prioritizer.components_of_interest,
+                &self.chunk_prioritizer.component_paths_from_root_id,
+                is_unloaded,
+            ),
+            timeline: current_timeline,
+        });
     }
 
+    /// Returns true if an entity has any temporal data on the given timeline.
+    ///
+    /// This ignores static data.
     pub fn entity_has_temporal_data_on_timeline(
         &self,
         entity: &re_chunk::EntityPath,
         timeline: &TimelineName,
     ) -> bool {
-        self.entity_has_temporal_data_on_timeline
-            .get(entity)
-            .is_some_and(|timelines| timelines.contains(timeline))
+        self.sorted_chunks
+            .get(timeline, &entity.hash())
+            .is_some_and(|e| e.has_data())
+    }
+
+    /// Returns true if an entity has data for the given component on the given timeline at any point in time.
+    ///
+    /// This ignores static data.
+    /// This is a more fine grained version of [`Self::entity_has_temporal_data_on_timeline`].
+    pub fn entity_has_temporal_data_on_timeline_for_component(
+        &self,
+        entity: &re_chunk::EntityPath,
+        timeline: &TimelineName,
+        component: re_chunk::ComponentIdentifier,
+    ) -> bool {
+        self.sorted_chunks
+            .get(timeline, &entity.hash())
+            .is_some_and(|e| !e.component_chunks(&component).is_empty())
     }
 
     pub fn entity_has_static_data(&self, entity: &re_chunk::EntityPath) -> bool {
@@ -274,25 +394,40 @@ impl RrdManifestIndex {
     }
 
     /// False for recordings streamed from SDK via proxy
+    ///
+    /// This is true as soon as the first piece of the manifest is available.
     pub fn has_manifest(&self) -> bool {
         self.manifest.is_some()
     }
 
-    /// The full manifest, if known.
+    /// Have all parts of the manifest been received?
+    pub fn is_manifest_complete(&self) -> bool {
+        self.manifest_complete
+    }
+
+    /// Mark the manifest as complete (all parts have been received).
+    pub fn set_manifest_complete(&mut self) {
+        self.manifest_complete = true;
+
+        let num_root_chunks = self.root_chunks.len();
+        if 10_000 < num_root_chunks {
+            re_log::warn!(
+                "There are {} root chunks in this recording. Consider running `rerun rrd compact` on the original.",
+                re_format::format_uint(num_root_chunks)
+            );
+        }
+
+        self.data_time_ranges = collapsed_time_ranges::compute_data_time_ranges(&self.root_chunks);
+    }
+
+    /// The manifest as it currently stands.
+    ///
+    /// More pieces of it may still arrive unless [`Self::is_manifest_complete`] is true.
     pub fn manifest(&self) -> Option<&RrdManifest> {
-        self.manifest.as_ref()
+        self.manifest.as_deref()
     }
 
-    pub fn native_temporal_map(&self) -> &re_log_encoding::RrdManifestTemporalMap {
-        &self.native_temporal_map
-    }
-
-    pub fn mark_as_loaded(&mut self, chunk_id: ChunkId) {
-        let chunk_info = self.remote_chunks.entry(chunk_id).or_default();
-        chunk_info.state = LoadState::Loaded;
-    }
-
-    pub fn on_events(&mut self, store_events: &[ChunkStoreEvent]) {
+    pub fn on_events(&mut self, store: &ChunkStore, store_events: &[ChunkStoreEvent]) {
         re_tracing::profile_function!();
 
         if self.manifest.is_none() {
@@ -300,53 +435,110 @@ impl RrdManifestIndex {
         }
 
         for event in store_events {
-            let store_kind = event.store_id.kind();
-            let chunk_id = event.chunk.id();
-            match event.kind {
-                re_chunk_store::ChunkStoreDiffKind::Addition => {
-                    if let Some(chunk_info) = self.remote_chunks.get_mut(&chunk_id) {
-                        chunk_info.state = LoadState::Loaded;
-                    } else if let Some(source) = event.split_source {
-                        // The added chunk was the result of splitting another chunk:
-                        self.parents.entry(chunk_id).or_default().insert(source);
-                    } else {
-                        warn_when_editing_recording(
-                            store_kind,
-                            "Added chunk that was not part of the chunk index",
+            match &event.diff {
+                ChunkStoreDiff::Addition(add) => {
+                    // This is about marking root-level persistent chunks as either loaded or unloaded.
+                    //
+                    // It doesn't really matter which chunk we pick because `mark_as` will take care of
+                    // walking upwards through the lineage tree until one can be found in any case.
+                    //
+                    // Picking the unprocessed chunk gives us a better chance of not even needing to walk
+                    // back the tree at all.
+                    self.mark_roots_as(
+                        store,
+                        &add.chunk_before_processing.id(),
+                        LoadState::FullyLoaded,
+                    );
+                }
+
+                ChunkStoreDiff::Deletion(del) => {
+                    // If we deleted part of a root, we mark the whole root as unloaded.
+                    self.mark_roots_as(store, &del.chunk.id(), LoadState::Unloaded);
+                }
+
+                ChunkStoreDiff::VirtualAddition(_) | ChunkStoreDiff::SchemaAddition(_) => {}
+            }
+        }
+    }
+
+    fn mark_roots_as(&mut self, store: &ChunkStore, chunk_id: &ChunkId, new_state: LoadState) {
+        re_tracing::profile_function!();
+
+        let store_kind = store.id().kind();
+
+        let root_chunk_ids = store.find_root_chunks(chunk_id);
+
+        if root_chunk_ids.is_empty() {
+            warn_when_editing_recording(
+                store_kind,
+                "Added chunk that was not part of the chunk index",
+            );
+        } else {
+            // Track which timelines had a large chunk transition to loaded
+            let mut timelines_to_recalculate: Vec<TimelineName> = Vec::new();
+
+            for chunk_id in root_chunk_ids {
+                if let Some(chunk_info) = self.root_chunks.get_mut(&chunk_id) {
+                    let old_state = chunk_info.state;
+                    chunk_info.state = new_state;
+
+                    // Only update loaded ranges on actual state transitions to avoid
+                    // mismatched increments/decrements.
+                    if let Some(loaded_ranges) = &mut self.loaded_ranges
+                        && old_state != new_state
+                    {
+                        match new_state {
+                            LoadState::Unloaded => {
+                                loaded_ranges.ranges.on_chunk_unloaded(
+                                    &chunk_id,
+                                    &self.chunk_prioritizer.component_paths_from_root_id,
+                                );
+                            }
+                            LoadState::InTransit => {}
+                            LoadState::FullyLoaded => {
+                                loaded_ranges.ranges.on_chunk_loaded(
+                                    &chunk_id,
+                                    &self.chunk_prioritizer.component_paths_from_root_id,
+                                );
+                            }
+                        }
+                    }
+
+                    // When a large chunk gets loaded, recalculate data ranges for its timelines
+                    if new_state == LoadState::FullyLoaded && old_state != LoadState::FullyLoaded {
+                        timelines_to_recalculate.extend(
+                            collapsed_time_ranges::should_recalculate_for_chunk(
+                                chunk_info,
+                                &self.timelines,
+                            ),
                         );
                     }
+                } else {
+                    warn_when_editing_recording(
+                        store_kind,
+                        "Added chunk that was not part of the chunk index",
+                    );
                 }
-                re_chunk_store::ChunkStoreDiffKind::Deletion => {
-                    self.mark_deleted(store_kind, &chunk_id);
+            }
+
+            for timeline_name in timelines_to_recalculate {
+                if let Some(ranges) = collapsed_time_ranges::calculate_data_ranges_for_timeline(
+                    &self.root_chunks,
+                    &self.timelines,
+                    store,
+                    &timeline_name,
+                ) {
+                    self.data_time_ranges.insert(timeline_name, ranges);
                 }
             }
         }
     }
 
-    fn mark_deleted(&mut self, store_kind: StoreKind, chunk_id: &ChunkId) {
-        self.has_deleted = true;
-
-        if let Some(chunk_info) = self.remote_chunks.get_mut(chunk_id) {
-            chunk_info.state = LoadState::Unloaded;
-        } else if let Some(parents) = self.parents.remove(chunk_id) {
-            // Mark all ancestors as not being fully loaded:
-
-            let mut ancestors = parents.into_iter().collect_vec();
-            while let Some(chunk_id) = ancestors.pop() {
-                if let Some(chunk_info) = self.remote_chunks.get_mut(&chunk_id) {
-                    chunk_info.state = LoadState::Unloaded;
-                } else if let Some(grandparents) = self.parents.get(&chunk_id) {
-                    ancestors.extend(grandparents);
-                } else {
-                    warn_when_editing_recording(
-                        store_kind,
-                        "Removed ancestor chunk that was not part of the index",
-                    );
-                }
-            }
-        } else {
-            warn_when_editing_recording(store_kind, "Removed chunk that was not part of the index");
-        }
+    /// Data time ranges for the given timeline, used for gap collapsing in the time panel.
+    ///
+    /// Returns `None` if the manifest is not yet complete or if there are no ranges.
+    pub fn data_time_ranges_for(&self, timeline: &TimelineName) -> Option<&[AbsoluteTimeRange]> {
+        self.data_time_ranges.get(timeline).map(|v| v.as_slice())
     }
 
     /// When do we have data on this timeline?
@@ -354,112 +546,178 @@ impl RrdManifestIndex {
         self.timelines.get(timeline).copied()
     }
 
+    pub fn chunk_prioritizer(&self) -> &ChunkPrioritizer {
+        &self.chunk_prioritizer
+    }
+
+    pub fn chunk_requests(&self) -> &ChunkRequests {
+        self.chunk_prioritizer.chunk_requests()
+    }
+
+    pub fn chunk_requests_mut(&mut self) -> &mut ChunkRequests {
+        self.chunk_prioritizer.chunk_requests_mut()
+    }
+
+    /// Cancel all fetches of things that are not currently needed.
+    pub fn cancel_outdated_requests(&mut self, egui_now_time: f64) {
+        if self.has_manifest() {
+            let cancelred_chunks = self
+                .chunk_prioritizer
+                .cancel_outdated_requests(egui_now_time);
+            for chunk_id in cancelred_chunks {
+                if let Some(chunk_info) = self.root_chunks.get_mut(&chunk_id) {
+                    chunk_info.state = LoadState::Unloaded;
+                } else {
+                    re_log::warn!(
+                        "Canceled chunk fetch that was not part of the chunk index. This is unexpected and may indicate a bug in the RRD manifest or chunk store."
+                    );
+                }
+            }
+        }
+    }
+
     /// Find the next candidates for prefetching.
+    ///
+    /// This will also clear the tracked missing/used chunks ids in the store.
     pub fn prefetch_chunks(
         &mut self,
+        store: &ChunkStore,
         options: &ChunkPrefetchOptions,
-    ) -> Result<RecordBatch, PrefetchError> {
+        time_cursor: Option<TimelinePoint>,
+        load_chunks: &dyn Fn(RecordBatch) -> ChunkPromise,
+    ) -> Result<(), PrefetchError> {
         re_tracing::profile_function!();
 
-        let ChunkPrefetchOptions {
-            timeline,
-            desired_range,
-            mut total_byte_budget,
-            mut delta_byte_budget,
-        } = *options;
+        let used_and_missing = store.take_tracked_chunk_ids(); // Note: this mutates the store (kind of).
 
-        let Some(manifest) = self.manifest.as_ref() else {
-            return Err(PrefetchError::NoManifest);
-        };
+        if let Some(manifest) = &self.manifest {
+            let to_load = self.chunk_prioritizer.prioritize_and_prefetch(
+                store,
+                &used_and_missing,
+                options,
+                time_cursor,
+                manifest,
+                &self.root_chunks,
+            )?;
 
-        let Some(chunks) = self.chunk_intervals.get(&timeline) else {
-            return Err(PrefetchError::UnknownTimeline(timeline));
-        };
-
-        let chunk_byte_size_uncompressed_raw: &[u64] =
-            manifest.col_chunk_byte_size_uncompressed_raw()?.values();
-        let mut indices: Vec<i32> = vec![];
-
-        for (_, chunk_id) in chunks.query(desired_range.into()) {
-            let Some(remote_chunk) = self.remote_chunks.get_mut(chunk_id) else {
-                re_log::warn_once!("Chunk {chunk_id:?} not found in RRD manifest index");
-                continue;
-            };
-
-            let row_idx = self.manifest_row_from_chunk_id[chunk_id];
-
-            let chunk_size = chunk_byte_size_uncompressed_raw[row_idx];
-            total_byte_budget = total_byte_budget.saturating_sub(chunk_size);
-            if total_byte_budget == 0 {
-                break; // We've already loaded too much.
-            }
-
-            if remote_chunk.state == LoadState::Unloaded {
-                remote_chunk.state = LoadState::InTransit;
-
-                if let Ok(row_idx) = i32::try_from(row_idx) {
-                    indices.push(row_idx);
-                } else {
-                    // Improbable
-                    return Err(PrefetchError::BadIndex(row_idx));
+            // Start loading all batches we prepared:
+            for (rb, batch_info) in to_load {
+                for root_chunk_id in &batch_info.root_chunk_ids {
+                    if let Some(root_chunk) = self.root_chunks.get_mut(root_chunk_id) {
+                        root_chunk.state = LoadState::InTransit;
+                    }
                 }
 
-                delta_byte_budget = delta_byte_budget.saturating_sub(chunk_size);
-                if delta_byte_budget == 0 {
-                    break; // We aren't allowed to prefetch more than this in one go.
-                }
+                let promise = load_chunks(rb);
+                let batch = ChunkBatchRequest {
+                    promise: Mutex::new(Some(promise)),
+                    info: batch_info.into(),
+                };
+                self.chunk_prioritizer.chunk_requests_mut().add(batch);
             }
-        }
 
-        Ok(take_record_batch(
-            &manifest.data,
-            &Int32Array::from(indices),
-        )?)
-    }
+            if let Some(time_cursor) = time_cursor {
+                self.update_loaded_ranges(time_cursor.name);
+            }
 
-    #[must_use]
-    pub fn time_ranges_all_chunks(
-        &self,
-        timeline: &Timeline,
-    ) -> Vec<(LoadState, AbsoluteTimeRange)> {
-        re_tracing::profile_function!();
-
-        let mut time_ranges_all_chunks = Vec::new();
-
-        for timelines in self.native_temporal_map.values() {
-            let Some(entity_component_chunks) = timelines.get(timeline) else {
-                continue;
-            };
-
-            for chunks in entity_component_chunks.values() {
-                for (chunk_id, entry) in chunks {
-                    let RrdManifestTemporalMapEntry { time_range, .. } = entry;
-
-                    let Some(info) = self.remote_chunks.get(chunk_id) else {
-                        continue;
-                    };
+            // Sanity checking:
+            if let Some(state) = self.chunk_prioritizer.latest_result()
+                && state.all_chunks_loaded_or_in_transit()
+            {
+                for (root_chunk_id, chunk_info) in &self.root_chunks {
                     debug_assert!(
-                        time_range.min <= time_range.max,
-                        "Unexpected negative time range in RRD manifest"
+                        chunk_info.state != LoadState::Unloaded,
+                        "All root chunks should be either loading or already loaded"
                     );
-                    time_ranges_all_chunks.push((info.state, *time_range));
+                    debug_assert!(
+                        self.chunk_prioritizer
+                            .protected_chunks()
+                            .roots
+                            .contains(root_chunk_id)
+                    );
                 }
             }
-        }
 
-        time_ranges_all_chunks
+            Ok(())
+        } else {
+            Err(PrefetchError::NoManifest)
+        }
     }
 
-    pub fn full_uncompressed_size(&self) -> Option<u64> {
+    /// Creates an iterator of time ranges which are loaded on a specific timeline.
+    ///
+    /// The ranges are guaranteed to be ordered and non-overlapping.
+    pub fn loaded_ranges_on_timeline(&self, timeline: &TimelineName) -> Vec<AbsoluteTimeRange> {
         re_tracing::profile_function!();
-        Some(
-            self.manifest()?
-                .col_chunk_byte_size_uncompressed_raw()
-                .ok()?
-                .values()
-                .iter()
-                .sum(),
-        )
+
+        let Some(loaded_ranges) = self
+            .loaded_ranges
+            .as_ref()
+            .filter(|l| l.timeline == *timeline)
+        else {
+            return Vec::new();
+        };
+
+        loaded_ranges.ranges.loaded_ranges()
+    }
+
+    /// If `component` is some, this returns all unloaded temporal entries for that specific
+    /// component on the given timeline.
+    ///
+    /// If not, this returns all unloaded temporal entries for `entity`'s components and its
+    /// descendants' unloaded temporal entries.
+    pub fn unloaded_temporal_entries_for(
+        &self,
+        timeline: &re_chunk::TimelineName,
+        entity: &re_chunk::EntityPath,
+        component: Option<re_chunk::ComponentIdentifier>,
+    ) -> impl Iterator<Item = &ChunkCountInfo> {
+        re_tracing::profile_function!();
+
+        self.temporal_entries_for(timeline, entity, component)
+            .iter()
+            .filter(|info| self.is_chunk_unloaded(&info.id))
+    }
+
+    /// If `component` is some, this returns all temporal entries for that specific
+    /// component on the given timeline.
+    ///
+    /// If not, this returns all temporal entries for `entity`'s components and its
+    /// descendants' unloaded temporal entries.
+    pub fn temporal_entries_for(
+        &self,
+        timeline: &re_chunk::TimelineName,
+        entity: &re_chunk::EntityPath,
+        component: Option<re_chunk::ComponentIdentifier>,
+    ) -> &[ChunkCountInfo] {
+        re_tracing::profile_function!();
+
+        let Some(entry) = self.sorted_chunks.get(timeline, &entity.hash()) else {
+            return &[];
+        };
+
+        if let Some(component) = component {
+            entry.component_chunks(&component)
+        } else {
+            entry.per_entity()
+        }
+    }
+
+    fn is_chunk_unloaded(&self, chunk_id: &ChunkId) -> bool {
+        self.root_chunks
+            .get(chunk_id)
+            .is_none_or(|c| !c.state.is_fully_loaded())
+    }
+
+    /// Expected RAM use of all _chunks_.
+    pub fn full_uncompressed_size(&self) -> u64 {
+        self.full_uncompressed_size
+    }
+
+    /// Have we downloaded the entire recording?
+    pub fn is_fully_loaded(&self) -> bool {
+        self.root_chunks()
+            .all(|chunk| chunk.state == LoadState::FullyLoaded)
     }
 }
 
@@ -467,14 +725,73 @@ impl RrdManifestIndex {
 fn warn_when_editing_recording(store_kind: StoreKind, warning: &str) {
     match store_kind {
         StoreKind::Recording => {
-            if cfg!(debug_assertions) {
-                re_log::warn_once!("[DEBUG] {warning}");
-            } else {
-                re_log::debug_once!("{warning}");
-            }
+            re_log::debug_warn_once!("{warning}");
         }
         StoreKind::Blueprint => {
             // We edit blueprint by generating new chunks in the viewer.
         }
+    }
+}
+
+impl re_byte_size::SizeBytes for RrdManifestIndex {
+    fn heap_size_bytes(&self) -> u64 {
+        re_tracing::profile_function!();
+
+        let Self {
+            entity_has_static_data,
+            manifest,
+            sorted_chunks,
+            loaded_ranges,
+            root_chunks: virtual_chunks,
+            chunk_prioritizer,
+            timelines,
+            data_time_ranges,
+            full_uncompressed_size: _,
+            manifest_complete: _,
+        } = self;
+
+        entity_has_static_data.heap_size_bytes()
+            + manifest.heap_size_bytes()
+            + sorted_chunks.heap_size_bytes()
+            + loaded_ranges.heap_size_bytes()
+            + virtual_chunks.heap_size_bytes()
+            + chunk_prioritizer.heap_size_bytes()
+            + timelines.heap_size_bytes()
+            + data_time_ranges.heap_size_bytes()
+    }
+}
+
+impl MemUsageTreeCapture for RrdManifestIndex {
+    fn capture_mem_usage_tree(&self) -> MemUsageTree {
+        re_tracing::profile_function!();
+
+        use re_byte_size::SizeBytes as _;
+
+        let Self {
+            entity_has_static_data,
+            sorted_chunks,
+            loaded_ranges,
+            manifest,
+            root_chunks: virtual_chunks,
+            chunk_prioritizer,
+            timelines,
+            data_time_ranges: _,
+            full_uncompressed_size: _,
+            manifest_complete: _,
+        } = self;
+
+        let mut node = re_byte_size::MemUsageNode::new();
+        node.add("chunk_prioritizer", chunk_prioritizer.total_size_bytes());
+        node.add(
+            "entity_has_static_data",
+            entity_has_static_data.total_size_bytes(),
+        );
+        node.add("sorted_chunks", sorted_chunks.total_size_bytes());
+        node.add("loaded_ranges", loaded_ranges.total_size_bytes());
+        node.add("manifest", manifest.total_size_bytes());
+        node.add("virtual_chunks", virtual_chunks.total_size_bytes());
+        node.add("timelines", timelines.total_size_bytes());
+
+        node.into_tree()
     }
 }

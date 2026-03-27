@@ -420,6 +420,13 @@ impl ::re_types_core::AsComponents for Ellipsoids3D {
 
 impl ::re_types_core::ArchetypeReflectionMarker for Ellipsoids3D {}
 
+impl crate::VisualizableArchetype for Ellipsoids3D {
+    #[inline]
+    fn visualizer(&self) -> crate::Visualizer {
+        crate::Visualizer::new("Ellipsoids3D").with_overrides(self)
+    }
+}
+
 impl Ellipsoids3D {
     /// Create a new `Ellipsoids3D`.
     #[inline]

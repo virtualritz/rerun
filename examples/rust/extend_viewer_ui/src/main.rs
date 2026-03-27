@@ -76,16 +76,16 @@ impl eframe::App for MyApp {
     }
 
     /// Called whenever we need repainting, which could be 60 Hz.
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         // First add our panel(s):
-        egui::SidePanel::right("my_side_panel")
-            .default_width(200.0)
-            .show(ctx, |ui| {
+        egui::Panel::right("my_side_panel")
+            .default_size(200.0)
+            .show_inside(ui, |ui| {
                 self.ui(ui);
             });
 
         // Now show the Rerun Viewer in the remaining space:
-        self.rerun_app.update(ctx, frame);
+        self.rerun_app.ui(ui, frame);
     }
 }
 
@@ -121,7 +121,7 @@ fn entity_db_ui(ui: &mut egui::Ui, entity_db: &re_entity_db::EntityDb) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, true])
         .show(ui, |ui| {
-            for entity_path in entity_db.entity_paths() {
+            for entity_path in entity_db.sorted_entity_paths() {
                 ui.collapsing(entity_path.to_string(), |ui| {
                     entity_ui(ui, entity_db, timeline, entity_path);
                 });

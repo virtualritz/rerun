@@ -24,19 +24,18 @@ fn test_all_component_fallbacks() {
             let ctx = QueryContext {
                 view_ctx: &view_context,
                 target_entity_path: &"/stockholm/södermalm/slussen".into(),
+                instruction_id: None,
                 archetype_name: Some(*arch_name),
-                query: &test_context.blueprint_query,
+                query: test_context.blueprint_query.clone(),
             };
             let mut arch_display = String::new();
 
             for field in &arch.fields {
                 let descr = field.component_descriptor(*arch_name);
 
-                let res = test_context.component_fallback_registry.fallback_for(
-                    descr.component,
-                    descr.component_type,
-                    &ctx,
-                );
+                let res = test_context
+                    .component_fallback_registry
+                    .fallback_for(&descr, &ctx);
 
                 let formatter =
                     ArrayFormatter::try_new(&res, &FormatOptions::default().with_null("null"))

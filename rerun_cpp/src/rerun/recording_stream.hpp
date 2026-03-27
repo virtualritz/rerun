@@ -176,19 +176,15 @@ namespace rerun {
         /// Swaps the underlying sink for a gRPC server sink pre-configured to listen on `rerun+http://{bind_ip}:{port}/proxy`.
         ///
         /// The gRPC server will buffer all log data in memory so that late connecting viewers will get all the data.
-        /// You can limit the amount of data buffered by the gRPC server with the `server_memory_limit` argument.
+        /// You can control the amount of data buffered by the gRPC server with the `server_memory_limit` argument.
         /// Once reached, the earliest logged data will be dropped. Static data is never dropped.
-        ///
-        /// If server & client are running on the same machine and all clients are expected to connect before
-        /// any data is sent, it is highly recommended that you set the memory limit to `0B`,
-        /// otherwise you're potentially doubling your memory usage!
         ///
         /// Returns the URI of the gRPC server so you can connect to it from a viewer.
         ///
         /// This function returns immediately.
         Result<std::string> serve_grpc(
             std::string_view bind_ip = "0.0.0.0", uint16_t port = 9876,
-            std::string_view server_memory_limit = "25%",
+            std::string_view server_memory_limit = "1GiB",
             PlaybackBehavior playback_behavior = PlaybackBehavior::OldestFirst
         ) const;
 
@@ -445,7 +441,7 @@ namespace rerun {
         /// This is the main entry point for logging data to rerun. It can be used to log anything
         /// that implements the `AsComponents<T>` trait.
         ///
-        /// When logging data, you must always provide an [entity_path](https://www.rerun.io/docs/concepts/entity-path)
+        /// When logging data, you must always provide an [entity_path](https://www.rerun.io/docs/concepts/logging-and-ingestion/entity-path)
         /// for identifying the data. Note that paths prefixed with "__" are considered reserved for use by the Rerun SDK
         /// itself and should not be used for logging user data. This is where Rerun will log additional information
         /// such as properties and warnings.
@@ -667,7 +663,7 @@ namespace rerun {
         /// This method blocks until either at least one `DataLoader` starts streaming data in
         /// or all of them fail.
         ///
-        /// See <https://www.rerun.io/docs/reference/data-loaders/overview> for more information.
+        /// See <https://www.rerun.io/docs/concepts/logging-and-ingestion/data-loaders/overview> for more information.
         ///
         /// \param filepath Path to the file to be logged.
         /// \param entity_path_prefix What should the logged entity paths be prefixed with?
@@ -692,7 +688,7 @@ namespace rerun {
         /// This method blocks until either at least one `DataLoader` starts streaming data in
         /// or all of them fail.
         ///
-        /// See <https://www.rerun.io/docs/reference/data-loaders/overview> for more information.
+        /// See <https://www.rerun.io/docs/concepts/logging-and-ingestion/data-loaders/overview> for more information.
         ///
         /// \param filepath Path to the file to be logged.
         /// \param entity_path_prefix What should the logged entity paths be prefixed with?
@@ -715,7 +711,7 @@ namespace rerun {
         /// This method blocks until either at least one `DataLoader` starts streaming data in
         /// or all of them fail.
         ///
-        /// See <https://www.rerun.io/docs/reference/data-loaders/overview> for more information.
+        /// See <https://www.rerun.io/docs/concepts/logging-and-ingestion/data-loaders/overview> for more information.
         ///
         /// \param filepath Path to the file that the `contents` belong to.
         /// \param contents Contents to be logged.
@@ -749,7 +745,7 @@ namespace rerun {
         /// This method blocks until either at least one `DataLoader` starts streaming data in
         /// or all of them fail.
         ///
-        /// See <https://www.rerun.io/docs/reference/data-loaders/overview> for more information.
+        /// See <https://www.rerun.io/docs/concepts/logging-and-ingestion/data-loaders/overview> for more information.
         ///
         /// \param filepath Path to the file that the `contents` belong to.
         /// \param contents Contents to be logged.

@@ -47,6 +47,11 @@ impl MediaType {
     /// <https://www.iana.org/assignments/media-types/model/stl>
     pub const STL: &'static str = "model/stl";
 
+    /// [COLLADA `.dae`](https://en.wikipedia.org/wiki/COLLADA): `model/collada+xml`.
+    ///
+    /// <https://www.iana.org/assignments/media-types/model/vnd.collada+xml>
+    pub const DAE: &'static str = "model/vnd.collada+xml";
+
     // -------------------------------------------------------
     // Compressed Depth Data:
 
@@ -63,6 +68,30 @@ impl MediaType {
     ///
     /// <https://www.iana.org/assignments/media-types/video/mp4>
     pub const MP4: &'static str = "video/mp4";
+
+    // -------------------------------------------------------
+    // Robotics formats:
+
+    /// Rerun recording data: `application/x-rerun`.
+    ///
+    /// This is not a standardized format and mostly exists here to accommodate file type detection
+    /// in the data loader.
+    pub const RRD: &'static str = "application/x-rerun";
+
+    /// [MCAP](https://mcap.dev/) recording: `application/x-mcap`.
+    ///
+    /// This is not a standardized format and mostly exists here to accommodate file type detection
+    /// in the data loader.
+    pub const MCAP: &'static str = "application/x-mcap";
+
+    // -------------------------------------------------------
+    // Point clouds:
+
+    /// [PLY (Polygon File Format)](https://en.wikipedia.org/wiki/PLY_(file_format)): `application/x-ply`.
+    ///
+    /// This is not a standardized format and mostly exists here to accommodate file type detection
+    /// in the data loader.
+    pub const PLY: &'static str = "application/x-ply";
 }
 
 impl MediaType {
@@ -120,6 +149,12 @@ impl MediaType {
         Self(Self::STL.into())
     }
 
+    /// `model/vnd.collada+xml`
+    #[inline]
+    pub fn dae() -> Self {
+        Self(Self::DAE.into())
+    }
+
     // -------------------------------------------------------
     // Compressed Depth Data:
 
@@ -136,6 +171,39 @@ impl MediaType {
     #[inline]
     pub fn mp4() -> Self {
         Self(Self::MP4.into())
+    }
+
+    // -------------------------------------------------------
+    // Robotics formats:
+
+    /// `application/x-rerun`
+    ///
+    /// This is not a standardized format and mostly exists here to accommodate file type detection
+    /// in the data loader.
+    #[inline]
+    pub fn rrd() -> Self {
+        Self(Self::RRD.into())
+    }
+
+    /// `application/x-mcap`
+    ///
+    /// This is not a standardized format and mostly exists here to accommodate file type detection
+    /// in the data loader.
+    #[inline]
+    pub fn mcap() -> Self {
+        Self(Self::MCAP.into())
+    }
+
+    // -------------------------------------------------------
+    // Point clouds:
+
+    /// `application/x-ply`
+    ///
+    /// This is not a standardized format and mostly exists here to accommodate file type detection
+    /// in the data loader.
+    #[inline]
+    pub fn ply() -> Self {
+        Self(Self::PLY.into())
     }
 }
 
@@ -193,6 +261,11 @@ impl MediaType {
             // https://en.wikipedia.org/wiki/STL_(file_format)#Binary
         }
 
+        fn dae_matcher(buf: &[u8]) -> bool {
+            // COLLADA .dae files are XML, so we can look for the <COLLADA> tag.
+            buf.starts_with(b"<COLLADA>")
+        }
+
         fn rvl_matcher(buf: &[u8]) -> bool {
             const MAX_REASONABLE_DIMENSION: u32 = 65_536;
 
@@ -216,6 +289,20 @@ impl MediaType {
                 && metadata.height <= MAX_REASONABLE_DIMENSION
         }
 
+        fn rrd_matcher(buf: &[u8]) -> bool {
+            // "RRF2" (current) or "RRF1"/"RRF0" (legacy)
+            buf.starts_with(b"RRF2") || buf.starts_with(b"RRF1") || buf.starts_with(b"RRF0")
+        }
+
+        fn mcap_matcher(buf: &[u8]) -> bool {
+            // MCAP magic
+            buf.starts_with(b"\x89MCAP0\r\n")
+        }
+
+        fn ply_matcher(buf: &[u8]) -> bool {
+            buf.starts_with(b"ply\n") || buf.starts_with(b"ply\r\n")
+        }
+
         // NOTE:
         // - gltf is simply json, so no magic byte
         //   (also most gltf files contain file:// links, so not much point in sending that to
@@ -223,8 +310,12 @@ impl MediaType {
         // - obj is simply text, so no magic byte
 
         let mut inferer = infer::Infer::new();
+        inferer.add(Self::RRD, "rrd", rrd_matcher);
+        inferer.add(Self::MCAP, "mcap", mcap_matcher);
+        inferer.add(Self::PLY, "ply", ply_matcher);
         inferer.add(Self::GLB, "glb", glb_matcher);
         inferer.add(Self::STL, "stl", stl_matcher);
+        inferer.add(Self::DAE, "dae", dae_matcher);
         inferer.add(Self::RVL, "rvl", rvl_matcher);
 
         inferer
@@ -257,7 +348,13 @@ impl MediaType {
             Self::MARKDOWN => Some("md"),
             Self::RVL => Some("rvl"),
             Self::STL => Some("stl"),
+            Self::DAE => Some("dae"),
             Self::TEXT => Some("txt"),
+
+            // Custom MIME types not known to mime_guess2:
+            Self::RRD => Some("rrd"),
+            Self::MCAP => Some("mcap"),
+            Self::PLY => Some("ply"),
 
             _ => {
                 let alternatives = mime_guess2::get_mime_extensions_str(&self.0)?;

@@ -5,7 +5,7 @@ Usage:
   pixi run py-build
   pixi run -e py python tests/python/table_zoo/table_zoo.py [--host HOST] [--port PORT] [--register-to-server]
 
-By default, behaves as before: sends the table to the Rerun Viewer via ViewerClient at rerun+http://0.0.0.0:9876/proxy.
+By default, behaves as before: sends the table to the Rerun Viewer via ViewerClient at rerun+http://127.0.0.1:9876/proxy.
 """
 
 from __future__ import annotations
@@ -18,8 +18,9 @@ from pathlib import Path
 
 import lancedb
 import pyarrow as pa
-import rerun as rr
 from platformdirs import user_cache_dir
+
+import rerun as rr
 from rerun.catalog import CatalogClient
 
 
@@ -323,7 +324,7 @@ def _run_register_mode(host: str, port: int, cache_dir: Path) -> None:
     c = CatalogClient(f"rerun+http://{host}:{port}")
 
     try:
-        entry = c.get_table_entry(name=name)
+        entry = c.get_table(name)
         entry.delete()
     except Exception:
         pass

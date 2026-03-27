@@ -29,6 +29,8 @@
 use clap::Parser as _;
 
 use crate::image::ImageCommand;
+use crate::scalars::ScalarsCommand;
+use crate::transform3d::Transform3DCommand;
 
 mod boxes3d_batch;
 mod image;
@@ -36,6 +38,7 @@ mod points3d_large_batch;
 mod points3d_many_individual;
 mod points3d_shared;
 mod scalars;
+mod transform3d;
 mod very_large_chunk;
 
 // ---
@@ -53,7 +56,7 @@ pub fn lcg(lcg_state: &mut i64) -> i64 {
 #[derive(Debug, Clone, clap::Subcommand)]
 enum Benchmark {
     #[command(name = "scalars")]
-    Scalars,
+    Scalars(ScalarsCommand),
 
     #[command(name = "points3d_large_batch")]
     Points3DLargeBatch,
@@ -66,6 +69,9 @@ enum Benchmark {
 
     #[command(name = "image")]
     Image(ImageCommand),
+
+    #[command(name = "transform3d")]
+    Transform3D(Transform3DCommand),
 
     #[command(name = "very_large_chunk")]
     VeryLargeChunk,
@@ -122,11 +128,12 @@ fn main() -> anyhow::Result<()> {
     println!("Running benchmark: {benchmark:?}");
 
     match benchmark {
-        Benchmark::Scalars => scalars::run(&rec)?,
+        Benchmark::Scalars(cmd) => cmd.run(&rec)?,
         Benchmark::Points3DLargeBatch => points3d_large_batch::run(&rec)?,
         Benchmark::Points3DManyIndividual => points3d_many_individual::run(&rec)?,
         Benchmark::Boxes3D => boxes3d_batch::run(&rec)?,
         Benchmark::Image(cmd) => cmd.run(&rec)?,
+        Benchmark::Transform3D(cmd) => cmd.run(&rec)?,
         Benchmark::VeryLargeChunk => very_large_chunk::run(&rec)?,
     }
 

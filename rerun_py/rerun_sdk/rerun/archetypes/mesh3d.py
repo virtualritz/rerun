@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, ClassVar
+
 import numpy as np
 import pyarrow as pa
 from attrs import define, field
@@ -13,15 +15,20 @@ from .. import components, datatypes
 from .._baseclasses import (
     Archetype,
     ComponentColumnList,
+    ComponentDescriptor,
 )
+from ..blueprint import VisualizableArchetype, Visualizer
 from ..error_utils import catch_and_log_exceptions
 from .mesh3d_ext import Mesh3DExt
+
+if TYPE_CHECKING:
+    from ..blueprint.datatypes import VisualizerComponentMappingLike
 
 __all__ = ["Mesh3D"]
 
 
 @define(str=False, repr=False, init=False)
-class Mesh3D(Mesh3DExt, Archetype):
+class Mesh3D(Mesh3DExt, Archetype, VisualizableArchetype):
     """
     **Archetype**: A 3D triangle mesh as specified by its per-mesh and per-vertex properties.
 
@@ -30,8 +37,9 @@ class Mesh3D(Mesh3DExt, Archetype):
     If there are multiple [`archetypes.InstancePoses3D`][rerun.archetypes.InstancePoses3D] instances logged to the same entity as a mesh,
     an instance of the mesh will be drawn for each transform.
 
-    The viewer draws meshes always two-sided. However, for transparency ordering
-    front faces are assumed to those with counter clockwise triangle winding order (this is the same as in the GLTF specification).
+    For transparency ordering, as well as back face culling (disabled by default),
+    front faces are assumed to be those with counter clockwise triangle winding order
+    (this is the same as in the GLTF specification).
 
     Examples
     --------
@@ -104,6 +112,8 @@ class Mesh3D(Mesh3DExt, Archetype):
 
     """
 
+    NAME: ClassVar[str] = "rerun.archetypes.Mesh3D"
+
     # __init__ can be found in mesh3d_ext.py
 
     def __attrs_clear__(self) -> None:
@@ -115,6 +125,7 @@ class Mesh3D(Mesh3DExt, Archetype):
             vertex_colors=None,
             vertex_texcoords=None,
             albedo_factor=None,
+            face_rendering=None,
             albedo_texture_buffer=None,
             albedo_texture_format=None,
             class_ids=None,
@@ -138,6 +149,7 @@ class Mesh3D(Mesh3DExt, Archetype):
         vertex_colors: datatypes.Rgba32ArrayLike | None = None,
         vertex_texcoords: datatypes.Vec2DArrayLike | None = None,
         albedo_factor: datatypes.Rgba32Like | None = None,
+        face_rendering: components.MeshFaceRenderingLike | None = None,
         albedo_texture_buffer: datatypes.BlobLike | None = None,
         albedo_texture_format: datatypes.ImageFormatLike | None = None,
         class_ids: datatypes.ClassIdArrayLike | None = None,
@@ -167,6 +179,10 @@ class Mesh3D(Mesh3DExt, Archetype):
             A color multiplier applied to the whole mesh.
 
             Alpha channel governs the overall mesh transparency.
+        face_rendering:
+            Determines which faces of the mesh are rendered.
+
+            The default is [`components.MeshFaceRendering.DoubleSided`][rerun.components.MeshFaceRendering.DoubleSided], meaning both front and back faces are shown.
         albedo_texture_buffer:
             Optional albedo texture.
 
@@ -194,6 +210,7 @@ class Mesh3D(Mesh3DExt, Archetype):
                 "vertex_colors": vertex_colors,
                 "vertex_texcoords": vertex_texcoords,
                 "albedo_factor": albedo_factor,
+                "face_rendering": face_rendering,
                 "albedo_texture_buffer": albedo_texture_buffer,
                 "albedo_texture_format": albedo_texture_format,
                 "class_ids": class_ids,
@@ -213,6 +230,86 @@ class Mesh3D(Mesh3DExt, Archetype):
         """Clear all the fields of a `Mesh3D`."""
         return cls.from_fields(clear_unset=True)
 
+    @staticmethod
+    def descriptor_vertex_positions() -> ComponentDescriptor:
+        return ComponentDescriptor(
+            "Mesh3D:vertex_positions",
+            archetype=Mesh3D.NAME,
+            component_type=components.Position3DBatch._COMPONENT_TYPE,
+        )
+
+    @staticmethod
+    def descriptor_triangle_indices() -> ComponentDescriptor:
+        return ComponentDescriptor(
+            "Mesh3D:triangle_indices",
+            archetype=Mesh3D.NAME,
+            component_type=components.TriangleIndicesBatch._COMPONENT_TYPE,
+        )
+
+    @staticmethod
+    def descriptor_vertex_normals() -> ComponentDescriptor:
+        return ComponentDescriptor(
+            "Mesh3D:vertex_normals",
+            archetype=Mesh3D.NAME,
+            component_type=components.Vector3DBatch._COMPONENT_TYPE,
+        )
+
+    @staticmethod
+    def descriptor_vertex_colors() -> ComponentDescriptor:
+        return ComponentDescriptor(
+            "Mesh3D:vertex_colors",
+            archetype=Mesh3D.NAME,
+            component_type=components.ColorBatch._COMPONENT_TYPE,
+        )
+
+    @staticmethod
+    def descriptor_vertex_texcoords() -> ComponentDescriptor:
+        return ComponentDescriptor(
+            "Mesh3D:vertex_texcoords",
+            archetype=Mesh3D.NAME,
+            component_type=components.Texcoord2DBatch._COMPONENT_TYPE,
+        )
+
+    @staticmethod
+    def descriptor_albedo_factor() -> ComponentDescriptor:
+        return ComponentDescriptor(
+            "Mesh3D:albedo_factor",
+            archetype=Mesh3D.NAME,
+            component_type=components.AlbedoFactorBatch._COMPONENT_TYPE,
+        )
+
+    @staticmethod
+    def descriptor_face_rendering() -> ComponentDescriptor:
+        return ComponentDescriptor(
+            "Mesh3D:face_rendering",
+            archetype=Mesh3D.NAME,
+            component_type=components.MeshFaceRenderingBatch._COMPONENT_TYPE,
+        )
+
+    @staticmethod
+    def descriptor_albedo_texture_buffer() -> ComponentDescriptor:
+        return ComponentDescriptor(
+            "Mesh3D:albedo_texture_buffer",
+            archetype=Mesh3D.NAME,
+            component_type=components.ImageBufferBatch._COMPONENT_TYPE,
+        )
+
+    @staticmethod
+    def descriptor_albedo_texture_format() -> ComponentDescriptor:
+        return ComponentDescriptor(
+            "Mesh3D:albedo_texture_format",
+            archetype=Mesh3D.NAME,
+            component_type=components.ImageFormatBatch._COMPONENT_TYPE,
+        )
+
+    @staticmethod
+    def descriptor_class_ids() -> ComponentDescriptor:
+        return ComponentDescriptor(
+            "Mesh3D:class_ids",
+            archetype=Mesh3D.NAME,
+            component_type=components.ClassIdBatch._COMPONENT_TYPE,
+        )
+
     @classmethod
     def columns(
         cls,
@@ -223,6 +320,7 @@ class Mesh3D(Mesh3DExt, Archetype):
         vertex_colors: datatypes.Rgba32ArrayLike | None = None,
         vertex_texcoords: datatypes.Vec2DArrayLike | None = None,
         albedo_factor: datatypes.Rgba32ArrayLike | None = None,
+        face_rendering: components.MeshFaceRenderingArrayLike | None = None,
         albedo_texture_buffer: datatypes.BlobArrayLike | None = None,
         albedo_texture_format: datatypes.ImageFormatArrayLike | None = None,
         class_ids: datatypes.ClassIdArrayLike | None = None,
@@ -255,6 +353,10 @@ class Mesh3D(Mesh3DExt, Archetype):
             A color multiplier applied to the whole mesh.
 
             Alpha channel governs the overall mesh transparency.
+        face_rendering:
+            Determines which faces of the mesh are rendered.
+
+            The default is [`components.MeshFaceRendering.DoubleSided`][rerun.components.MeshFaceRendering.DoubleSided], meaning both front and back faces are shown.
         albedo_texture_buffer:
             Optional albedo texture.
 
@@ -282,6 +384,7 @@ class Mesh3D(Mesh3DExt, Archetype):
                 vertex_colors=vertex_colors,
                 vertex_texcoords=vertex_texcoords,
                 albedo_factor=albedo_factor,
+                face_rendering=face_rendering,
                 albedo_texture_buffer=albedo_texture_buffer,
                 albedo_texture_format=albedo_texture_format,
                 class_ids=class_ids,
@@ -298,6 +401,7 @@ class Mesh3D(Mesh3DExt, Archetype):
             "Mesh3D:vertex_colors": vertex_colors,
             "Mesh3D:vertex_texcoords": vertex_texcoords,
             "Mesh3D:albedo_factor": albedo_factor,
+            "Mesh3D:face_rendering": face_rendering,
             "Mesh3D:albedo_texture_buffer": albedo_texture_buffer,
             "Mesh3D:albedo_texture_format": albedo_texture_format,
             "Mesh3D:class_ids": class_ids,
@@ -311,17 +415,21 @@ class Mesh3D(Mesh3DExt, Archetype):
             if pa.types.is_primitive(arrow_array.type) or pa.types.is_fixed_size_list(arrow_array.type):
                 param = kwargs[batch.component_descriptor().component]  # type: ignore[index]
                 shape = np.shape(param)  # type: ignore[arg-type]
-                elem_flat_len = int(np.prod(shape[1:])) if len(shape) > 1 else 1  # type: ignore[redundant-expr,misc]
-
-                if pa.types.is_fixed_size_list(arrow_array.type) and arrow_array.type.list_size == elem_flat_len:
-                    # If the product of the last dimensions of the shape are equal to the size of the fixed size list array,
-                    # we have `num_rows` single element batches (each element is a fixed sized list).
-                    # (This should have been already validated by conversion to the arrow_array)
-                    batch_length = 1
-                else:
-                    batch_length = shape[1] if len(shape) > 1 else 1  # type: ignore[redundant-expr,misc]
-
                 num_rows = shape[0] if len(shape) >= 1 else 1  # type: ignore[redundant-expr,misc]
+
+                if pa.types.is_fixed_size_list(arrow_array.type):
+                    elem_flat_len = int(np.prod(shape[1:])) if len(shape) > 1 else 1  # type: ignore[redundant-expr,misc]
+                    if arrow_array.type.list_size == elem_flat_len:
+                        # The product of the last dimensions of the shape are equal to the size of the fixed size list array,
+                        # so we have `num_rows` single element batches (each element is a fixed sized list).
+                        batch_length = 1
+                    else:
+                        batch_length = shape[1] if len(shape) > 1 else 1  # type: ignore[redundant-expr,misc]
+                else:
+                    # For primitive types, derive batch_length from the actual arrow array length
+                    # since the input shape can be misleading (e.g. colors [R,G,B] -> single uint32).
+                    batch_length = len(arrow_array) // num_rows if num_rows > 0 else 1
+
                 sizes = batch_length * np.ones(num_rows)
             else:
                 # For non-primitive types, default to partitioning each element separately.
@@ -391,6 +499,17 @@ class Mesh3D(Mesh3DExt, Archetype):
     #
     # (Docstring intentionally commented out to hide this field from the docs)
 
+    face_rendering: components.MeshFaceRenderingBatch | None = field(
+        metadata={"component": True},
+        default=None,
+        converter=components.MeshFaceRenderingBatch._converter,  # type: ignore[misc]
+    )
+    # Determines which faces of the mesh are rendered.
+    #
+    # The default is [`components.MeshFaceRendering.DoubleSided`][rerun.components.MeshFaceRendering.DoubleSided], meaning both front and back faces are shown.
+    #
+    # (Docstring intentionally commented out to hide this field from the docs)
+
     albedo_texture_buffer: components.ImageBufferBatch | None = field(
         metadata={"component": True},
         default=None,
@@ -429,3 +548,18 @@ class Mesh3D(Mesh3DExt, Archetype):
 
     __str__ = Archetype.__str__
     __repr__ = Archetype.__repr__  # type: ignore[assignment]
+
+    def visualizer(self, *, mappings: list[VisualizerComponentMappingLike] | None = None) -> Visualizer:
+        """
+        Creates a visualizer for this archetype, using all currently set values as overrides.
+
+        Parameters
+        ----------
+        mappings:
+            Optional component mappings to control how the visualizer sources its data.
+
+            ⚠️ **Experimental**: Component mappings are an experimental feature and may change.
+            See https://github.com/rerun-io/rerun/issues/10631 for more information.
+
+        """
+        return Visualizer("Mesh3D", overrides=self.as_component_batches(), mappings=mappings)

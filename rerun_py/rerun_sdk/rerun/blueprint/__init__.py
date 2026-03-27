@@ -12,7 +12,6 @@ from ..datatypes import (  # Re-export time range types for better discoverabili
 from . import (
     archetypes as archetypes,
     components as components,
-    visualizers as visualizers,
 )
 from .api import (
     Blueprint as Blueprint,
@@ -29,6 +28,7 @@ from .api import (
     View as View,
 )
 from .archetypes import (
+    ActiveVisualizers as ActiveVisualizers,
     Background as Background,
     EntityBehavior as EntityBehavior,
     EyeControls3D as EyeControls3D,
@@ -41,9 +41,9 @@ from .archetypes import (
     TextLogColumns as TextLogColumns,
     TextLogFormat as TextLogFormat,
     TextLogRows as TextLogRows,
+    TimeAxis as TimeAxis,
     VisibleTimeRanges as VisibleTimeRanges,
     VisualBounds2D as VisualBounds2D,
-    VisualizerOverrides as VisualizerOverrides,
 )
 from .components import (
     BackgroundKind as BackgroundKind,
@@ -70,3 +70,4 @@ from .views import (
     TextLogView as TextLogView,
     TimeSeriesView as TimeSeriesView,
 )
+from .visualizers import VisualizableArchetype as VisualizableArchetype, Visualizer as Visualizer

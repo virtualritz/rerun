@@ -11,6 +11,7 @@ use itertools::{Either, Itertools as _, izip};
 use nohash_hasher::IntMap;
 use re_arrow_util::{ArrowArrayDowncastRef as _, widen_binary_arrays};
 use re_byte_size::SizeBytes as _;
+use re_log::debug_assert;
 use re_log_types::{
     AbsoluteTimeRange, EntityPath, NonMinI64, TimeInt, TimeType, Timeline, TimelineName,
 };
@@ -214,7 +215,6 @@ impl FromIterator<SerializedComponentColumn> for ChunkComponents {
 ///
 /// This is the in-memory representation of a chunk, optimized for efficient manipulation of the
 /// data within. For transport, see [`re_sorbet::ChunkBatch`] instead.
-#[derive(Debug)]
 pub struct Chunk {
     pub(crate) id: ChunkId,
 
@@ -245,6 +245,37 @@ pub struct Chunk {
     ///
     /// Sparse so that we can e.g. log a `Position` at one timestamp but not a `Color`.
     pub(crate) components: ChunkComponents,
+}
+
+impl std::fmt::Debug for Chunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            id,
+            entity_path,
+            heap_size_bytes,
+            is_sorted,
+            row_ids: _, // printed nicely formatted
+            timelines,
+            components,
+        } = self;
+
+        if f.alternate() {
+            f.debug_struct("Chunk")
+                .field("id", id)
+                .field("entity_path", entity_path)
+                .field("heap_size_bytes", &heap_size_bytes.load(Ordering::Relaxed))
+                .field("is_sorted", is_sorted)
+                .field("row_ids", &self.row_ids_slice())
+                .field("timelines", timelines)
+                .field("components", components)
+                .finish()
+        } else {
+            f.debug_struct("Chunk")
+                .field("id", id)
+                .field("entity_path", entity_path)
+                .finish_non_exhaustive()
+        }
+    }
 }
 
 impl PartialEq for Chunk {
@@ -374,6 +405,30 @@ impl Chunk {
             && *timelines == other.timelines
             && components.0 == other.components.0
     }
+
+    /// Clones the chunk and renames a component.
+    ///
+    /// Note: archetype information and component type information is lost.
+    pub fn with_mapped_component<E>(
+        &self,
+        source: ComponentIdentifier,
+        target: ComponentIdentifier,
+        f: impl FnOnce(ArrowListArray) -> Result<ArrowListArray, E>,
+    ) -> Result<Self, E> {
+        let mut new_chunk = self.clone();
+        if let Some(old_entry) = new_chunk.components.remove(&source) {
+            new_chunk.components.insert(SerializedComponentColumn {
+                descriptor: ComponentDescriptor {
+                    component: target,
+                    archetype: None,
+                    component_type: None,
+                },
+                list_array: f(old_entry.list_array)?,
+            });
+        }
+
+        Ok(new_chunk)
+    }
 }
 
 impl Clone for Chunk {
@@ -392,6 +447,10 @@ impl Clone for Chunk {
 }
 
 impl Chunk {
+    fn reset_cached_heap_size_bytes(&self) {
+        self.heap_size_bytes.store(0, Ordering::Relaxed);
+    }
+
     /// Clones the chunk and assign new IDs to the resulting chunk and its rows.
     ///
     /// `first_row_id` will become the [`RowId`] of the first row in the duplicated chunk.
@@ -409,17 +468,24 @@ impl Chunk {
         .take(self.row_ids.len())
         .collect_vec();
 
-        Self {
+        let new_chunk = Self {
             id,
             row_ids: RowId::arrow_from_slice(&row_ids),
             ..self.clone()
-        }
+        };
+
+        // Need to reset the cache size here as `row_ids`'s capacity could have
+        // changed here.
+        new_chunk.reset_cached_heap_size_bytes();
+
+        new_chunk
     }
 
     /// Clones the chunk into a new chunk without any time data.
     #[inline]
     pub fn into_static(mut self) -> Self {
         self.timelines.clear();
+        self.reset_cached_heap_size_bytes();
         self
     }
 
@@ -429,7 +495,13 @@ impl Chunk {
 
         let row_ids = RowId::arrow_from_slice(&row_ids);
 
-        Self { row_ids, ..self }
+        let new_chunk = Self { row_ids, ..self };
+
+        // Need to reset the cache size here as `row_ids`'s capacity could have
+        // changed here.
+        new_chunk.reset_cached_heap_size_bytes();
+
+        new_chunk
     }
 
     /// Computes the time range covered by each individual component column on each timeline.
@@ -492,8 +564,6 @@ impl Chunk {
         &self,
         timeline: &TimelineName,
     ) -> Vec<(TimeInt, u64)> {
-        re_tracing::profile_function!();
-
         if self.is_static() {
             return vec![(TimeInt::STATIC, self.num_events_cumulative())];
         }
@@ -527,8 +597,6 @@ impl Chunk {
         &self,
         time_column: &TimeColumn,
     ) -> Vec<(TimeInt, u64)> {
-        re_tracing::profile_function!();
-
         debug_assert!(time_column.is_sorted());
 
         // NOTE: This is used on some very hot paths (time panel rendering).
@@ -578,8 +646,6 @@ impl Chunk {
         &self,
         time_column: &TimeColumn,
     ) -> Vec<(TimeInt, u64)> {
-        re_tracing::profile_function!();
-
         debug_assert!(!time_column.is_sorted());
 
         // NOTE: This is used on some very hot paths (time panel rendering).
@@ -859,6 +925,7 @@ impl Chunk {
         component_column: SerializedComponentColumn,
     ) -> ChunkResult<()> {
         self.components.insert(component_column);
+        self.reset_cached_heap_size_bytes();
         self.sanity_check()
     }
 
@@ -871,6 +938,8 @@ impl Chunk {
     pub fn add_timeline(&mut self, chunk_timeline: TimeColumn) -> ChunkResult<()> {
         self.timelines
             .insert(*chunk_timeline.timeline.name(), chunk_timeline);
+        self.reset_cached_heap_size_bytes();
+
         self.sanity_check()
     }
 }
@@ -1382,31 +1451,86 @@ impl TimeColumn {
             })
             .collect()
     }
+
+    /// Find the earliest time strictly after `after` in this time column.
+    pub fn find_next_time(&self, after: TimeInt) -> Option<TimeInt> {
+        if self.is_sorted() {
+            let times = self.times_raw();
+            let idx = times.partition_point(|&t| t <= after.as_i64());
+            (idx < times.len()).then(|| TimeInt::new_temporal(times[idx]))
+        } else {
+            self.times_raw()
+                .iter()
+                .filter(|&&t| t > after.as_i64())
+                .min()
+                .map(|&t| TimeInt::new_temporal(t))
+        }
+    }
+
+    /// Find the latest time strictly before `before` in this time column.
+    pub fn find_prev_time(&self, before: TimeInt) -> Option<TimeInt> {
+        if self.is_sorted() {
+            let times = self.times_raw();
+            let idx = times.partition_point(|&t| t < before.as_i64());
+            (idx > 0).then(|| TimeInt::new_temporal(times[idx - 1]))
+        } else {
+            self.times_raw()
+                .iter()
+                .filter(|&&t| t < before.as_i64())
+                .max()
+                .map(|&t| TimeInt::new_temporal(t))
+        }
+    }
+
+    /// Returns a new [`TimeColumn`] with all time values offset by `offset_ns` nanoseconds.
+    ///
+    /// Uses saturating arithmetic.
+    pub fn offset_by_nanos(&self, offset_ns: i64) -> Self {
+        let new_times: Vec<i64> = self
+            .times
+            .iter()
+            .map(|&t| NonMinI64::saturating_from_i64(t.saturating_add(offset_ns)).get())
+            .collect();
+
+        Self::new(
+            Some(self.is_sorted),
+            self.timeline,
+            ArrowScalarBuffer::from(new_times),
+        )
+    }
 }
 
-impl re_byte_size::SizeBytes for Chunk {
-    #[inline]
-    fn heap_size_bytes(&self) -> u64 {
+impl Chunk {
+    fn heap_size_bytes_inner(&self) -> u64 {
+        re_tracing::profile_function!();
+
         let Self {
             id,
             entity_path,
-            heap_size_bytes,
+            heap_size_bytes: _,
             is_sorted,
             row_ids,
             timelines,
             components,
         } = self;
 
-        let mut size_bytes = heap_size_bytes.load(Ordering::Relaxed);
+        id.heap_size_bytes()
+            + entity_path.heap_size_bytes()
+            + is_sorted.heap_size_bytes()
+            + row_ids.heap_size_bytes()
+            + timelines.heap_size_bytes()
+            + components.heap_size_bytes()
+    }
+}
+
+impl re_byte_size::SizeBytes for Chunk {
+    #[inline]
+    fn heap_size_bytes(&self) -> u64 {
+        let mut size_bytes = self.heap_size_bytes.load(Ordering::Relaxed);
 
         if size_bytes == 0 {
-            size_bytes = id.heap_size_bytes()
-                + entity_path.heap_size_bytes()
-                + is_sorted.heap_size_bytes()
-                + row_ids.heap_size_bytes()
-                + timelines.heap_size_bytes()
-                + components.heap_size_bytes();
-            heap_size_bytes.store(size_bytes, Ordering::Relaxed);
+            size_bytes = self.heap_size_bytes_inner();
+            self.heap_size_bytes.store(size_bytes, Ordering::Relaxed);
         }
 
         size_bytes
@@ -1451,9 +1575,10 @@ impl Chunk {
         } = self;
 
         if cfg!(debug_assertions) {
-            let measured = self.heap_size_bytes();
+            let measured = self.heap_size_bytes_inner();
             let advertised = heap_size_bytes.load(Ordering::Relaxed);
-            if advertised != measured {
+            // We use 0 as not set yet.
+            if advertised != 0 && advertised != measured {
                 return Err(ChunkError::Malformed {
                     reason: format!(
                         "Chunk advertises a heap size of {} but we measure {} instead",
@@ -1469,9 +1594,9 @@ impl Chunk {
             if *row_ids.data_type() != RowId::arrow_datatype() {
                 return Err(ChunkError::Malformed {
                     reason: format!(
-                        "RowId data has the wrong datatype: expected {:?} but got {:?} instead",
+                        "RowId data has the wrong datatype: expected {} but got {} instead",
                         RowId::arrow_datatype(),
-                        *row_ids.data_type(),
+                        row_ids.data_type(),
                     ),
                 });
             }

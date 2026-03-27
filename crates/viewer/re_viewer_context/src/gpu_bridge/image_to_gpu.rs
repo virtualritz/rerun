@@ -9,7 +9,8 @@ use half::f16;
 use re_renderer::device_caps::DeviceCaps;
 use re_renderer::renderer::{ColorMapper, ColormappedTexture, ShaderDecoding, TextureAlpha};
 use re_renderer::resource_managers::{
-    ImageDataDesc, SourceImageDataFormat, YuvMatrixCoefficients, YuvPixelLayout, YuvRange,
+    AlphaChannelUsage, ImageDataDesc, SourceImageDataFormat, YuvMatrixCoefficients, YuvPixelLayout,
+    YuvRange,
 };
 use re_renderer::{RenderContext, pad_rgb_to_rgba};
 use re_sdk_types::components::ClassId;
@@ -46,7 +47,7 @@ pub fn image_to_gpu(
     debug_name: &str,
     image: &ImageInfo,
     image_stats: &ImageStats,
-    annotations: &Annotations,
+    annotations: Option<&Annotations>,
     colormap: Option<&ColormapWithRange>,
 ) -> anyhow::Result<ColormappedTexture> {
     re_tracing::profile_function!();
@@ -65,14 +66,20 @@ pub fn image_to_gpu(
             image_stats,
             colormap,
         ),
-        ImageKind::Segmentation => segmentation_image_to_gpu(
-            render_ctx,
-            debug_name,
-            texture_key,
-            image,
-            image_stats,
-            annotations,
-        ),
+        ImageKind::Segmentation => {
+            if let Some(annotations) = annotations {
+                segmentation_image_to_gpu(
+                    render_ctx,
+                    debug_name,
+                    texture_key,
+                    image,
+                    image_stats,
+                    annotations,
+                )
+            } else {
+                anyhow::bail!("Missing annotations for segmentation image")
+            }
+        }
     }
 }
 
@@ -372,6 +379,7 @@ pub fn texture_creation_desc_from_color_image<'a>(
         data,
         format,
         width_height: image.width_height(),
+        alpha_channel_usage: AlphaChannelUsage::DontKnow,
     }
 }
 
@@ -461,6 +469,7 @@ fn segmentation_image_to_gpu(
     let colormap_height = num_colors.div_ceil(colormap_width);
 
     let colormap_texture_handle = get_or_create_texture(render_ctx, colormap_key, || {
+        let mut has_alpha = false;
         let data: Vec<u8> = (0..(colormap_width * colormap_height))
             .flat_map(|id| {
                 let color = annotations
@@ -468,6 +477,9 @@ fn segmentation_image_to_gpu(
                     .annotation_info()
                     .color()
                     .unwrap_or(re_renderer::Color32::TRANSPARENT);
+                if !color.is_opaque() {
+                    has_alpha = true;
+                }
                 color.to_array() // premultiplied!
             })
             .collect();
@@ -477,6 +489,11 @@ fn segmentation_image_to_gpu(
             data: data.into(),
             format: SourceImageDataFormat::WgpuCompatible(TextureFormat::Rgba8UnormSrgb),
             width_height: [colormap_width as u32, colormap_height as u32],
+            alpha_channel_usage: if has_alpha {
+                re_renderer::AlphaChannelUsage::AlphaChannelInUse
+            } else {
+                re_renderer::AlphaChannelUsage::Opaque
+            },
         }
     })
     .context("Failed to create class_id_colormap.")?;
@@ -611,6 +628,7 @@ fn general_texture_creation_desc_from_image<'a>(
         data,
         format: SourceImageDataFormat::WgpuCompatible(format),
         width_height: image.width_height(),
+        alpha_channel_usage: AlphaChannelUsage::DontKnow,
     }
 }
 

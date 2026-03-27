@@ -4,11 +4,14 @@ mod app_testing_ext;
 pub use app_testing_ext::AppTestingExt;
 use egui_kittest::Harness;
 use re_build_info::build_info;
+use re_viewer_context::AppOptions;
 
 use crate::{
     App, AppEnvironment, AsyncRuntimeHandle, MainThreadToken, StartupOptions,
     customize_eframe_and_setup_renderer,
 };
+
+pub type AppOptionsEditor = Box<dyn Fn(&mut AppOptions)>;
 
 #[derive(Default)]
 pub struct HarnessOptions {
@@ -16,6 +19,7 @@ pub struct HarnessOptions {
     pub max_steps: Option<u64>,
     pub step_dt: Option<f32>,
     pub startup_url: Option<String>,
+    pub enable_component_mapping: bool,
 }
 
 /// Convenience function for creating a kittest harness of the viewer App.
@@ -52,8 +56,8 @@ pub fn viewer_harness(options: &HarnessOptions) -> Harness<'static, App> {
                 .expect("Failed to create AsyncRuntimeHandle"),
         );
         // Force the FFmpeg path to be wrong so we have a reproducible behavior.
-        app.app_options_mut().video_decoder_ffmpeg_path = "/fake/ffmpeg/path".to_owned();
-        app.app_options_mut().video_decoder_override_ffmpeg_path = true;
+        app.app_options_mut().video.ffmpeg_path = "/fake/ffmpeg/path".to_owned();
+        app.app_options_mut().video.override_ffmpeg_path = true;
 
         // This is slightly different than calling this after we created the harness since
         // the harness will do some stepping upon creation.

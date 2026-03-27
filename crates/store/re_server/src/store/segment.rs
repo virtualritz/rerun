@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use itertools::Itertools as _;
-use re_chunk_store::ChunkStoreHandle;
 use re_protos::common::v1alpha1::ext::IfDuplicateBehavior;
 
 use crate::store::{Error, Layer, Tracked};
@@ -29,16 +28,6 @@ impl Default for Segment {
 }
 
 impl Segment {
-    pub fn from_layer_data(layer_name: &str, chunk_store_handle: ChunkStoreHandle) -> Self {
-        Self {
-            inner: Tracked::new(SegmentInner {
-                layers: vec![(layer_name.to_owned(), Layer::new(chunk_store_handle))]
-                    .into_iter()
-                    .collect(),
-            }),
-        }
-    }
-
     pub fn layer_count(&self) -> usize {
         self.inner.layers.len()
     }
@@ -96,6 +85,22 @@ impl Segment {
             self.inner.modify().layers.insert(layer_name, layer);
             Ok(false)
         }
+    }
+
+    /// Returns the removed [`Layer`], if any.
+    pub fn remove_layer(&mut self, layer_name: &str) -> Option<Layer> {
+        self.inner.modify().layers.remove(layer_name)
+    }
+
+    /// Retains only the layers specified by the predicate.
+    ///
+    /// In other words, remove all pairs `(name, layer)` for which `f(&name, &mut layer)` returns `false`.
+    /// The layers are visited in unsorted (and unspecified) order.
+    pub fn retain_layers<F>(&mut self, f: F)
+    where
+        F: FnMut(&String, &mut Layer) -> bool,
+    {
+        self.inner.modify().layers.retain(f);
     }
 
     pub fn num_chunks(&self) -> u64 {

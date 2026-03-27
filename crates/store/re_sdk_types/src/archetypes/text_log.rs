@@ -200,6 +200,13 @@ impl ::re_types_core::AsComponents for TextLog {
 
 impl ::re_types_core::ArchetypeReflectionMarker for TextLog {}
 
+impl crate::VisualizableArchetype for TextLog {
+    #[inline]
+    fn visualizer(&self) -> crate::Visualizer {
+        crate::Visualizer::new("TextLog").with_overrides(self)
+    }
+}
+
 impl TextLog {
     /// Create a new `TextLog`.
     #[inline]

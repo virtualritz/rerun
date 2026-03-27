@@ -9,9 +9,9 @@ use re_sdk_types::blueprint::components::{self as blueprint_components, ViewOrig
 use re_sdk_types::components::{Name, Visible};
 use re_types_core::Archetype as _;
 use re_viewer_context::{
-    BlueprintContext as _, ContentsName, QueryRange, RecommendedView, StoreContext, SystemCommand,
-    SystemCommandSender as _, ViewClass, ViewClassRegistry, ViewContext, ViewId, ViewState,
-    ViewStates, ViewerContext,
+    ActiveStoreContext, BlueprintContext as _, ContentsName, QueryRange, RecommendedView,
+    SystemCommand, SystemCommandSender as _, ViewClass, ViewClassRegistry, ViewContext, ViewId,
+    ViewState, ViewStates, ViewerContext,
 };
 
 use crate::{ViewContents, ViewProperty};
@@ -237,7 +237,7 @@ impl ViewBlueprint {
     /// Creates a new [`ViewBlueprint`] with the same contents, but a different [`ViewId`]
     ///
     /// Also duplicates all the queries in the view.
-    pub fn duplicate(&self, store_context: &StoreContext<'_>, query: &LatestAtQuery) -> Self {
+    pub fn duplicate(&self, store_context: &ActiveStoreContext<'_>, query: &LatestAtQuery) -> Self {
         let mut pending_writes = Vec::new();
         let blueprint = store_context.blueprint;
         let blueprint_engine = blueprint.storage_engine();
@@ -248,7 +248,8 @@ impl ViewBlueprint {
 
         // Create pending write operations to duplicate the entire subtree
         // TODO(jleibs): This should be a helper somewhere.
-        if let Some(tree) = blueprint.tree().subtree(&current_path) {
+        let bp_engine = blueprint.storage_engine();
+        if let Some(tree) = bp_engine.store().entity_tree().subtree(&current_path) {
             tree.visit_children_recursively(|path| {
                 let sub_path: EntityPath = new_path
                     .iter()
@@ -277,7 +278,7 @@ impl ViewBlueprint {
                                     .cache()
                                     .latest_at(query, path, [component])
                                     .component_batch_raw(component)?;
-                                let descriptor = blueprint_engine.store().entity_component_descriptor(path, component)?;
+                                let descriptor = blueprint_engine.schema().entity_component_descriptor(path, component)?;
                                 Some((descriptor, array))
                             }),
                     )
@@ -388,6 +389,8 @@ impl ViewBlueprint {
         view_class_registry: &ViewClassRegistry,
         view_state: &dyn ViewState,
     ) -> QueryRange {
+        re_tracing::profile_function!();
+
         // Visual time range works with regular overrides for the most part but it's a bit special:
         // * we need it for all entities unconditionally
         // * default does not vary per visualizer
@@ -408,7 +411,7 @@ impl ViewBlueprint {
                 .ok()??
                 .iter()
                 .find(|range| range.timeline.as_str() == active_timeline.name().as_str())
-                .map(|range| range.range.clone())
+                .map(|range| range.range)
         });
 
         time_range.map_or_else(
@@ -416,7 +419,7 @@ impl ViewBlueprint {
                 let view_class = view_class_registry.get_class_or_log_error(self.class_identifier);
                 view_class.default_query_range(view_state)
             },
-            |time_range| QueryRange::TimeRange(time_range.clone()),
+            QueryRange::TimeRange,
         )
     }
 
@@ -428,7 +431,7 @@ impl ViewBlueprint {
         let class = ctx
             .view_class_registry()
             .get_class_or_log_error(self.class_identifier());
-        let view_state = view_states.get_mut_or_create(self.id, class);
+        let view_state = view_states.get_mut_or_create(ctx.store_id(), self.id, class);
         self.bundle_context_with_state(ctx, view_state)
     }
 
@@ -450,27 +453,24 @@ impl ViewBlueprint {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     use ahash::HashSet;
-    use re_chunk::{ComponentIdentifier, RowId};
+    use re_chunk::RowId;
+    use re_log_types::TimePoint;
     use re_log_types::example_components::{MyLabel, MyPoint, MyPoints};
-    use re_log_types::{StoreKind, TimePoint};
     use re_sdk_types::blueprint::archetypes::EntityBehavior;
     use re_test_context::TestContext;
     use re_viewer_context::{
-        IndicatedEntities, OverridePath, PerVisualizer, PerVisualizerInViewClass,
-        ViewClassPlaceholder, VisualizableEntities, VisualizableReason,
+        PerVisualizerType, ViewClassPlaceholder, VisualizableEntities, VisualizableReason,
     };
 
     use super::*;
-    use crate::view_contents::DataQueryPropertyResolver;
 
     #[test]
-    fn test_component_overrides() {
+    fn test_visible_interactive_overrides() {
         let mut test_ctx = TestContext::new();
-        let mut visualizable_entities = PerVisualizer::<VisualizableEntities>::default();
+        let mut visualizable_entities = PerVisualizerType::<VisualizableEntities>::default();
 
         // Set up a store DB with some entities.
         {
@@ -506,22 +506,12 @@ mod tests {
                 });
         }
 
-        let visualizable_entities = PerVisualizerInViewClass::<VisualizableEntities> {
-            view_class_identifier: ViewClassPlaceholder::identifier(),
-            per_visualizer: visualizable_entities.0.clone(),
-        };
-
         // Basic blueprint - a single view that queries everything.
         test_ctx.register_view_class::<ViewClassPlaceholder>();
         let view = ViewBlueprint::new_with_root_wildcard(ViewClassPlaceholder::identifier());
-        let override_root = ViewContents::override_path_for_entity(view.id, &EntityPath::root());
-
-        // Things needed to resolve properties:
-        let indicated_entities_per_visualizer = PerVisualizer::<IndicatedEntities>::default(); // Don't care about indicated entities.
 
         struct Scenario {
-            blueprint_overrides: Vec<(EntityPath, Box<dyn re_types_core::AsComponents>)>,
-            expected_overrides: HashMap<EntityPath, HashSet<ComponentIdentifier>>,
+            base_overrides: Vec<(EntityPath, Box<dyn re_types_core::AsComponents>)>,
             expected_hidden: HashSet<EntityPath>,
             expected_non_interactive: HashSet<EntityPath>,
         }
@@ -529,36 +519,27 @@ mod tests {
         let scenarios: Vec<Scenario> = vec![
             // No overrides.
             Scenario {
-                blueprint_overrides: Vec::new(),
-                expected_overrides: HashMap::default(),
+                base_overrides: Vec::new(),
                 expected_hidden: HashSet::default(),
                 expected_non_interactive: HashSet::default(),
             },
             // Set a single individual.
             Scenario {
-                blueprint_overrides: vec![(
+                base_overrides: vec![(
                     "parent".into(),
                     Box::new(
                         MyPoints::default().with_labels([MyLabel("parent_individual".to_owned())]),
                     ),
                 )],
-                expected_overrides: HashMap::from([(
-                    "parent".into(),
-                    std::iter::once(MyPoints::descriptor_labels().component).collect(),
-                )]),
                 expected_hidden: HashSet::default(),
                 expected_non_interactive: HashSet::default(),
             },
             // Hide everything.
             Scenario {
-                blueprint_overrides: vec![(
+                base_overrides: vec![(
                     "parent".into(),
                     Box::new(EntityBehavior::new().with_visible(false)),
                 )],
-                expected_overrides: HashMap::from([(
-                    "parent".into(),
-                    std::iter::once(EntityBehavior::descriptor_visible().component).collect(),
-                )]),
                 expected_hidden: [
                     "parent/skipped/grandchild".into(),
                     "parent/skipped".into(),
@@ -571,7 +552,7 @@ mod tests {
             },
             // Hide part of the tree.
             Scenario {
-                blueprint_overrides: vec![
+                base_overrides: vec![
                     (
                         "parent".into(),
                         Box::new(EntityBehavior::new().with_visible(false)),
@@ -581,16 +562,6 @@ mod tests {
                         Box::new(EntityBehavior::new().with_visible(true)),
                     ),
                 ],
-                expected_overrides: HashMap::from([
-                    (
-                        "parent".into(),
-                        std::iter::once(EntityBehavior::descriptor_visible().component).collect(),
-                    ),
-                    (
-                        "parent/skipped".into(),
-                        std::iter::once(EntityBehavior::descriptor_visible().component).collect(),
-                    ),
-                ]),
                 expected_hidden: ["parent".into(), "parent/child".into()]
                     .into_iter()
                     .collect(),
@@ -598,14 +569,10 @@ mod tests {
             },
             // Make everything non-interactive.
             Scenario {
-                blueprint_overrides: vec![(
+                base_overrides: vec![(
                     "parent".into(),
                     Box::new(EntityBehavior::new().with_interactive(false)),
                 )],
-                expected_overrides: HashMap::from([(
-                    "parent".into(),
-                    HashSet::from_iter([EntityBehavior::descriptor_interactive().component]),
-                )]),
                 expected_hidden: HashSet::default(),
                 expected_non_interactive: [
                     "parent/skipped/grandchild".into(),
@@ -618,7 +585,7 @@ mod tests {
             },
             // Make part of the tree non-interactive.
             Scenario {
-                blueprint_overrides: vec![
+                base_overrides: vec![
                     (
                         "parent".into(),
                         Box::new(EntityBehavior::new().with_interactive(false)),
@@ -628,18 +595,6 @@ mod tests {
                         Box::new(EntityBehavior::new().with_interactive(true)),
                     ),
                 ],
-                expected_overrides: HashMap::from([
-                    (
-                        "parent".into(),
-                        std::iter::once(EntityBehavior::descriptor_interactive().component)
-                            .collect(),
-                    ),
-                    (
-                        "parent/skipped".into(),
-                        std::iter::once(EntityBehavior::descriptor_interactive().component)
-                            .collect(),
-                    ),
-                ]),
                 expected_hidden: HashSet::default(),
                 expected_non_interactive: ["parent".into(), "parent/child".into()]
                     .into_iter()
@@ -650,8 +605,7 @@ mod tests {
         for (
             i,
             Scenario {
-                blueprint_overrides,
-                expected_overrides,
+                base_overrides,
                 expected_hidden,
                 expected_non_interactive,
             },
@@ -662,8 +616,7 @@ mod tests {
             // Reset blueprint store for each scenario.
             {
                 let blueprint_entities = blueprint_store
-                    .entity_paths()
-                    .iter()
+                    .sorted_entity_paths()
                     .map(|path| (*path).clone())
                     .collect::<Vec<_>>();
                 for entity_path in blueprint_entities {
@@ -682,51 +635,16 @@ mod tests {
                 };
 
             // log override components as instructed.
-            for (entity_path, batch) in blueprint_overrides {
-                add_to_blueprint(&override_root.join(&entity_path), batch.as_ref());
+            for (entity_path, batch) in base_overrides {
+                let base_override_path =
+                    ViewContents::base_override_path_for_entity(view.id, &entity_path);
+                add_to_blueprint(&base_override_path, batch.as_ref());
             }
 
-            // Set up a store query and update the overrides.
-            let resolver = DataQueryPropertyResolver::new(
-                &view,
-                &test_ctx.view_class_registry,
-                &visualizable_entities,
-                &indicated_entities_per_visualizer,
-            );
-            let query_result =
-                update_overrides(&test_ctx, &view, &visualizable_entities, &resolver);
+            let query_result = update_overrides(&test_ctx, &view, &visualizable_entities.as_ref());
 
             query_result.tree.visit(&mut |node| {
                 let result = &node.data_result;
-
-                let component_overrides = &result.property_overrides.component_overrides;
-                let mut expected_overrides = expected_overrides
-                    .get(&result.entity_path)
-                    .cloned()
-                    .unwrap_or_default();
-
-                for (component, override_path) in component_overrides {
-                    assert_eq!(
-                        override_path.store_kind,
-                        StoreKind::Blueprint,
-                        "Scenario {i}"
-                    );
-
-                    assert!(
-                        expected_overrides.remove(component),
-                        "Scenario {i}: expected override for {component} at {override_path:?} but got none"
-                    );
-
-                    assert_eq!(
-                        override_path,
-                        &OverridePath {
-                            store_kind: StoreKind::Blueprint,
-                            path: override_root.join(&node.data_result.entity_path),
-                        },
-                        "Scenario {i}"
-                    );
-                }
-                assert!(expected_overrides.is_empty(), "Scenario {i}");
 
                 assert_eq!(
                     result.is_visible(),
@@ -749,36 +667,38 @@ mod tests {
     fn update_overrides(
         test_ctx: &TestContext,
         view: &ViewBlueprint,
-        visualizable_entities: &PerVisualizerInViewClass<VisualizableEntities>,
-        resolver: &DataQueryPropertyResolver<'_>,
+        visualizable_entities: &PerVisualizerType<&VisualizableEntities>,
     ) -> re_viewer_context::DataQueryResult {
         let mut result = None;
 
         test_ctx.run_in_egui_central_panel(|ctx, _ui| {
-            let mut query_result = view.contents.execute_query(
-                ctx.store_context,
-                &test_ctx.view_class_registry,
-                &test_ctx.blueprint_query,
-                visualizable_entities,
-            );
             let mut view_states = ViewStates::default();
             let view_state = view_states.get_mut_or_create(
+                ctx.store_id(),
                 view.id,
-                ctx.view_class_registry
+                ctx.view_class_registry()
                     .class(view.class_identifier())
                     .expect("view class should be registered"),
             );
 
-            resolver.update_overrides(
+            let query_range = view.query_range(
                 ctx.blueprint_db(),
-                ctx.blueprint_query,
+                ctx.blueprint_query(),
                 ctx.time_ctrl.timeline(),
                 ctx.view_class_registry(),
-                &mut query_result,
                 view_state,
             );
 
-            result = Some(query_result.clone());
+            result = Some(view.contents.build_data_result_tree(
+                ctx.store_context,
+                ctx.time_ctrl.timeline(),
+                &test_ctx.view_class_registry,
+                &test_ctx.blueprint_query,
+                &query_range,
+                visualizable_entities,
+                ctx.indicated_entities_per_visualizer,
+                ctx.app_options(),
+            ));
         });
 
         result.expect("result should be set with a processed query result")

@@ -144,7 +144,7 @@ impl Tuid {
 
             let new = Self::from_nanos_and_inc(monotonic_nanos_since_epoch(), latest.inc() + 1);
 
-            debug_assert!(
+            re_log::debug_assert!(
                 latest.nanos_since_epoch() <= new.nanos_since_epoch(),
                 "Time should be monotonically increasing"
             );
@@ -295,6 +295,11 @@ impl re_byte_size::SizeBytes for Tuid {
     #[inline]
     fn heap_size_bytes(&self) -> u64 {
         0
+    }
+
+    #[inline]
+    fn is_pod() -> bool {
+        true
     }
 }
 

@@ -432,6 +432,13 @@ impl ::re_types_core::AsComponents for Pinhole {
 
 impl ::re_types_core::ArchetypeReflectionMarker for Pinhole {}
 
+impl crate::VisualizableArchetype for Pinhole {
+    #[inline]
+    fn visualizer(&self) -> crate::Visualizer {
+        crate::Visualizer::new("Cameras").with_overrides(self)
+    }
+}
+
 impl Pinhole {
     /// Create a new `Pinhole`.
     #[inline]

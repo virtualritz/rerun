@@ -1,9 +1,10 @@
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SendError, Sender, SyncSender};
 
+use crossbeam::channel::{Receiver, RecvTimeoutError, SendError, Sender};
 use parking_lot::Mutex;
 use re_log_types::LogMsg;
+use re_quota_channel::send_crossbeam;
 
 /// An error that can occur when flushing.
 #[derive(Debug, thiserror::Error)]
@@ -27,8 +28,11 @@ impl FileFlushError {
 #[derive(thiserror::Error, Debug)]
 pub enum FileSinkError {
     /// Error creating the file.
-    #[error("Failed to create file {0}: {1}")]
-    CreateFile(PathBuf, std::io::Error),
+    #[error("Failed to create file: {source}, path: {path}")]
+    CreateFile {
+        source: std::io::Error,
+        path: PathBuf,
+    },
 
     /// Error spawning the file writer thread.
     #[error("Failed to spawn thread: {0}")]
@@ -39,16 +43,15 @@ pub enum FileSinkError {
     LogMsgEncode(#[from] crate::rrd::EncodeError),
 }
 
+#[derive(Debug)]
 enum Command {
     Send(LogMsg),
-    Flush {
-        on_done: SyncSender<Result<(), String>>,
-    },
+    Flush { on_done: Sender<Result<(), String>> },
 }
 
 impl Command {
     fn flush() -> (Self, Receiver<Result<(), String>>) {
-        let (tx, rx) = std::sync::mpsc::sync_channel(0); // oneshot
+        let (tx, rx) = crossbeam::channel::bounded(0); // oneshot
         (Self::Flush { on_done: tx }, rx)
     }
 }
@@ -67,7 +70,7 @@ pub struct FileSink {
 
 impl Drop for FileSink {
     fn drop(&mut self) {
-        self.tx.lock().send(None).ok();
+        send_crossbeam(&self.tx.lock(), None).ok();
         if let Some(join_handle) = self.join_handle.take() {
             join_handle.join().ok();
         }
@@ -80,7 +83,7 @@ impl FileSink {
         // We always compress on disk
         let encoding_options = crate::rrd::EncodingOptions::PROTOBUF_COMPRESSED;
 
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = crossbeam::channel::bounded(1024);
 
         let path = path.into();
 
@@ -90,8 +93,10 @@ impl FileSink {
         // have multiple file sinks for the same file live?
         // This likely caused an instability in the past, see https://github.com/rerun-io/rerun/issues/3306
 
-        let file = std::fs::File::create(&path)
-            .map_err(|err| FileSinkError::CreateFile(path.clone(), err))?;
+        let file = std::fs::File::create(&path).map_err(|err| FileSinkError::CreateFile {
+            path: path.clone(),
+            source: err,
+        })?;
         let encoder =
             crate::Encoder::new_eager(re_build_info::CrateVersion::LOCAL, encoding_options, file)?;
         let join_handle = spawn_and_stream(Some(&path), encoder, rx)?;
@@ -107,7 +112,7 @@ impl FileSink {
     pub fn stdout() -> Result<Self, FileSinkError> {
         let encoding_options = crate::rrd::EncodingOptions::PROTOBUF_COMPRESSED;
 
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = crossbeam::channel::bounded(1024);
 
         re_log::debug!("Writing to stdout…");
 
@@ -128,7 +133,7 @@ impl FileSink {
     #[inline]
     pub fn flush_blocking(&self, timeout: std::time::Duration) -> Result<(), FileFlushError> {
         let (cmd, oneshot) = Command::flush();
-        self.tx.lock().send(Some(cmd)).map_err(|_ignored| {
+        send_crossbeam(&self.tx.lock(), Some(cmd)).map_err(|_ignored| {
             FileFlushError::failed("File-writer thread shut down prematurely")
         })?;
 
@@ -145,7 +150,7 @@ impl FileSink {
 
     #[inline]
     pub fn send(&self, log_msg: LogMsg) {
-        self.tx.lock().send(Some(Command::Send(log_msg))).ok();
+        send_crossbeam(&self.tx.lock(), Some(Command::Send(log_msg))).ok();
     }
 }
 
@@ -180,7 +185,7 @@ fn spawn_and_stream<W: std::io::Write + Send + 'static>(
                             });
 
                             // Send back the result:
-                            if let Err(SendError(result)) = on_done.send(result)
+                            if let Err(SendError(result)) = send_crossbeam(&on_done, result)
                                 && let Err(err) = result
                             {
                                 // There was an error, and nobody received it:

@@ -22,11 +22,13 @@ all-features = true
 [dependencies]
 re_build_tools.workspace = true
 re_format.workspace = true
+re_quota_channel.workspace = true
 
 # External
 anyhow.workspace = true
 argh.workspace = true
 camino.workspace = true
+crossbeam.workspace = true
 cargo_metadata.workspace = true
 glob.workspace = true
 indicatif.workspace = true
@@ -37,7 +39,6 @@ rustdoc-json.workspace = true
 rustdoc-types.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-serde_yaml.workspace = true
 tempfile.workspace = true
 toml = { workspace = true, features = ["parse", "preserve_order", "serde"] }
 ureq = { workspace = true, features = ["json"] }

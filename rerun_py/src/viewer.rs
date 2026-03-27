@@ -11,32 +11,31 @@ use crate::utils::wait_for_future;
 
 /// Register the `rerun.catalog` module.
 pub(crate) fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<PyViewerClient>()?;
+    m.add_class::<PyViewerClientInternal>()?;
 
     Ok(())
 }
 
 /// A connection to an instance of a Rerun viewer.
-#[pyclass(name = "ViewerClient", module = "rerun_bindings.rerun_bindings")] // NOLINT: ignore[py-cls-eq] non-trivial implementation
-pub struct PyViewerClient {
+#[pyclass(
+    name = "ViewerClientInternal",
+    module = "rerun_bindings.rerun_bindings"
+)]
+pub struct PyViewerClientInternal {
     conn: ViewerConnectionHandle,
 }
-#[pymethods] // NOLINT: ignore[py-mthd-str]
-impl PyViewerClient {
-    /// Create a new viewer client object.
+#[pymethods]
+impl PyViewerClientInternal {
     #[new]
     #[pyo3(text_signature = "(self, addr)")]
-    fn new(py: Python<'_>, addr: String) -> PyResult<Self> {
-        let origin = addr.as_str().parse::<re_uri::Origin>().map_err(to_py_err)?;
+    fn new(py: Python<'_>, addr: &str) -> PyResult<Self> {
+        let origin = addr.parse::<re_uri::Origin>().map_err(to_py_err)?;
 
         let conn = ViewerConnectionHandle::new(py, origin.clone())?;
 
         Ok(Self { conn })
     }
 
-    /// Sends a table to the viewer.
-    ///
-    /// A table is represented as a dataframe defined by an Arrow record batch.
     fn send_table(
         self_: Py<Self>,
         id: String,
@@ -46,6 +45,24 @@ impl PyViewerClient {
         let mut conn = self_.borrow(py).conn.clone();
 
         conn.send_table(py, id, table)
+    }
+
+    fn save_screenshot(
+        self_: Py<Self>,
+        file_path: String,
+        view_id: Option<Bound<'_, pyo3::PyAny>>,
+        py: Python<'_>,
+    ) -> PyResult<()> {
+        let mut conn = self_.borrow(py).conn.clone();
+
+        let view_id_str = view_id
+            .map(|v| {
+                v.extract::<String>()
+                    .or_else(|_| v.str()?.extract::<String>())
+            })
+            .transpose()?;
+
+        conn.save_screenshot(py, file_path, view_id_str)
     }
 }
 
@@ -80,6 +97,25 @@ impl ViewerConnectionHandle {
                 .write_table(re_protos::sdk_comms::v1alpha1::WriteTableRequest {
                     id: Some(re_protos::common::v1alpha1::TableId { id }),
                     data: Some(table.0.into()),
+                }),
+        )
+        .map_err(to_py_err)?;
+
+        Ok(())
+    }
+
+    fn save_screenshot(
+        &mut self,
+        py: Python<'_>,
+        file_path: String,
+        view_id: Option<String>,
+    ) -> PyResult<()> {
+        wait_for_future(
+            py,
+            self.client
+                .save_screenshot(re_protos::sdk_comms::v1alpha1::SaveScreenshotRequest {
+                    view_id,
+                    file_path,
                 }),
         )
         .map_err(to_py_err)?;

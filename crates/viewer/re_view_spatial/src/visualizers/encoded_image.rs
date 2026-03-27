@@ -1,16 +1,16 @@
 use re_sdk_types::Archetype as _;
 use re_sdk_types::archetypes::EncodedImage;
-use re_sdk_types::components::{MediaType, Opacity};
-use re_view::HybridResults;
+use re_sdk_types::components::{Blob, MagnificationFilter, MediaType, Opacity};
+use re_view::VisualizerInstructionQueryResults;
 use re_viewer_context::{
     IdentifiedViewSystem, ImageDecodeCache, QueryContext, ViewContext, ViewContextCollection,
     ViewQuery, ViewSystemExecutionError, VisualizerExecutionOutput, VisualizerQueryInfo,
-    VisualizerSystem, typed_fallback_for,
+    VisualizerReportSeverity, VisualizerSystem, typed_fallback_for,
 };
 
 use super::SpatialViewVisualizerData;
 use super::entity_iterator::process_archetype;
-use crate::contexts::SpatialSceneEntityContext;
+use crate::contexts::SpatialSceneVisualizerInstructionContext;
 use crate::view_kind::SpatialViewKind;
 use crate::visualizers::textured_rect_from_image;
 use crate::{PickableRectSourceData, PickableTexturedRect};
@@ -34,8 +34,14 @@ impl IdentifiedViewSystem for EncodedImageVisualizer {
 }
 
 impl VisualizerSystem for EncodedImageVisualizer {
-    fn visualizer_query_info(&self) -> VisualizerQueryInfo {
-        VisualizerQueryInfo::from_archetype::<EncodedImage>()
+    fn visualizer_query_info(
+        &self,
+        _app_options: &re_viewer_context::AppOptions,
+    ) -> VisualizerQueryInfo {
+        VisualizerQueryInfo::single_required_component::<Blob>(
+            &EncodedImage::descriptor_blob(),
+            &EncodedImage::all_components(),
+        )
     }
 
     fn execute(
@@ -44,13 +50,15 @@ impl VisualizerSystem for EncodedImageVisualizer {
         view_query: &ViewQuery<'_>,
         context_systems: &ViewContextCollection,
     ) -> Result<VisualizerExecutionOutput, ViewSystemExecutionError> {
-        let mut output = VisualizerExecutionOutput::default();
+        re_tracing::profile_function!();
+
+        let output = VisualizerExecutionOutput::default();
 
         process_archetype::<Self, EncodedImage, _>(
             ctx,
             view_query,
             context_systems,
-            &mut output,
+            &output,
             self.data.preferred_view_kind,
             |ctx, spatial_ctx, results| {
                 self.process_encoded_image(ctx, results, spatial_ctx);
@@ -67,42 +75,37 @@ impl VisualizerSystem for EncodedImageVisualizer {
     fn data(&self) -> Option<&dyn std::any::Any> {
         Some(self.data.as_any())
     }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 }
 
 impl EncodedImageVisualizer {
     fn process_encoded_image(
         &mut self,
         ctx: &QueryContext<'_>,
-        results: &HybridResults<'_>,
-        spatial_ctx: &mut SpatialSceneEntityContext<'_>,
+        results: &VisualizerInstructionQueryResults<'_>,
+        spatial_ctx: &SpatialSceneVisualizerInstructionContext<'_>,
     ) {
-        use re_view::RangeResultsExt as _;
-
-        use super::entity_iterator::iter_slices;
+        re_tracing::profile_function!();
 
         let entity_path = ctx.target_entity_path;
 
-        let Some(all_blob_chunks) =
-            results.get_required_chunks(EncodedImage::descriptor_blob().component)
-        else {
+        let all_blobs = results.iter_required(EncodedImage::descriptor_blob().component);
+        if all_blobs.is_empty() {
             return;
-        };
-
-        let timeline = ctx.query.timeline();
-        let all_blobs_indexed = iter_slices::<&[u8]>(&all_blob_chunks, timeline);
+        }
         let all_media_types =
-            results.iter_as(timeline, EncodedImage::descriptor_media_type().component);
-        let all_opacities = results.iter_as(timeline, EncodedImage::descriptor_opacity().component);
+            results.iter_optional(EncodedImage::descriptor_media_type().component);
+        let all_opacities = results.iter_optional(EncodedImage::descriptor_opacity().component);
+        let all_magnification_filters =
+            results.iter_optional(EncodedImage::descriptor_magnification_filter().component);
 
-        for ((_time, tensor_data_row_id), blobs, media_types, opacities) in re_query::range_zip_1x2(
-            all_blobs_indexed,
-            all_media_types.slice::<String>(),
-            all_opacities.slice::<f32>(),
-        ) {
+        for ((_time, tensor_data_row_id), blobs, media_types, opacities, magnification_filters) in
+            re_query::range_zip_1x3(
+                all_blobs.slice::<&[u8]>(),
+                all_media_types.slice::<String>(),
+                all_opacities.slice::<f32>(),
+                all_magnification_filters.slice::<u8>(),
+            )
+        {
             let Some(blob) = blobs.first() else {
                 continue;
             };
@@ -110,7 +113,7 @@ impl EncodedImageVisualizer {
                 .and_then(|media_types| media_types.first().cloned())
                 .map(|media_type| MediaType(media_type.into()));
 
-            let image = ctx.store_ctx().caches.entry(|c: &mut ImageDecodeCache| {
+            let image = ctx.store_ctx().memoizer(|c: &mut ImageDecodeCache| {
                 c.entry_encoded_color(
                     tensor_data_row_id,
                     EncodedImage::descriptor_blob().component,
@@ -139,6 +142,11 @@ impl EncodedImageVisualizer {
                 re_renderer::Rgba::from_white_alpha(opacity.0.clamp(0.0, 1.0));
             let colormap = None;
 
+            let magnification_filter = magnification_filters
+                .and_then(|f| f.first().copied())
+                .and_then(MagnificationFilter::from_u8)
+                .unwrap_or_default();
+
             match textured_rect_from_image(
                 ctx.viewer_ctx(),
                 entity_path,
@@ -146,6 +154,7 @@ impl EncodedImageVisualizer {
                 &image,
                 colormap,
                 multiplicative_tint,
+                magnification_filter,
                 EncodedImage::name(),
             ) {
                 Ok(textured_rect) => {
@@ -161,9 +170,13 @@ impl EncodedImageVisualizer {
                         spatial_ctx.view_class_identifier,
                     );
                 }
-                Err(err) => spatial_ctx
-                    .output
-                    .report_error_for(entity_path.clone(), re_error::format(err)),
+                Err(err) => {
+                    results.report_for_component(
+                        EncodedImage::descriptor_blob().component,
+                        VisualizerReportSeverity::Error,
+                        re_error::format(err),
+                    );
+                }
             }
         }
     }

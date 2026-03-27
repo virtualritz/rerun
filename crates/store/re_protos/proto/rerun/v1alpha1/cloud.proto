@@ -23,6 +23,12 @@ import "rerun/v1alpha1/log_msg.proto";
 service RerunCloudService {
   rpc Version(VersionRequest) returns (VersionResponse) {}
 
+  // Returns information about the currently authenticated user.
+  //
+  // This is a lightweight endpoint that can be used to verify that authentication
+  // is successful and to retrieve the user's identity.
+  rpc WhoAmI(WhoAmIRequest) returns (WhoAmIResponse) {}
+
   // --- Catalog ---
 
   rpc FindEntries(FindEntriesRequest) returns (FindEntriesResponse) {}
@@ -52,6 +58,17 @@ service RerunCloudService {
   //
   // This endpoint requires the standard dataset headers.
   rpc RegisterWithDataset(RegisterWithDatasetRequest) returns (RegisterWithDatasetResponse) {}
+
+  // Unregisters segments and layers from the Dataset.
+  //
+  // Excluding IO errors, this will always succeed as long the target dataset exists.
+  // Corollary: unregistering data that doesn't exist is a no-op.
+  //
+  // This always returns a subset of the data from `ScanDatasetManifest`, and therefore the data will
+  // also follow the schema returned by `GetDatasetManifestSchema`.
+  //
+  // This endpoint requires the standard dataset headers.
+  rpc UnregisterFromDataset(UnregisterFromDatasetRequest) returns (stream UnregisterFromDatasetResponse) {}
 
   // Write chunks to one or more segments.
   //
@@ -105,7 +122,12 @@ service RerunCloudService {
   // Get the RRD Footer manifest.
   //
   // This includes details about what chunks there are, and what kind of data they contain.
-  rpc GetRrdManifest(GetRrdManifestRequest) returns (GetRrdManifestResponse) {}
+  //
+  // The manifest might be returned in multiple parts, at the discretion of the server.
+  // When that happens, it is guaranteed that all parts have the same exact Sorbet schemas (and therefore
+  // identical Sorbet schema hashes too).
+  // That means it is always semantically valid to concatenate the data from these RRD manifests.
+  rpc GetRrdManifest(GetRrdManifestRequest) returns (stream GetRrdManifestResponse) {}
 
   /* Indexing */
 
@@ -200,6 +222,28 @@ message VersionRequest {}
 
 message VersionResponse {
   rerun.common.v1alpha1.BuildInfo build_info = 1;
+
+  // A single version string representing the version of the whole stack.
+  string version = 2;
+
+  // Cloud provider hosting this instance (e.g. "aws", "azure"). Null if not deployed on cloud.
+  optional string cloud_provider = 3;
+
+  // Cloud region where this instance is deployed (e.g. "us-west-2", "eastus"). Null if not deployed on cloud.
+  optional string cloud_region = 4;
+}
+
+message WhoAmIRequest {}
+
+message WhoAmIResponse {
+  // The user ID of the authenticated user, if any.
+  optional string user_id = 1;
+
+  // Whether the user has read access.
+  bool can_read = 2;
+
+  // Whether the user has write access.
+  bool can_write = 3;
 }
 
 // Application level error - used as `details` in the `google.rpc.Status` message
@@ -263,6 +307,39 @@ message RegisterWithDatasetRequest {
 }
 
 message RegisterWithDatasetResponse {
+  rerun.common.v1alpha1.DataframePart data = 1;
+}
+
+// This request acts as a *product* filter:
+// * empty `segments_to_drop` + empty `layers_to_drop`: invalid argument error
+// * empty `segments_to_drop` + non-empty `layers_to_drop`: remove specified layers for *all* segments
+// * non-empty `segments_to_drop` + empty `layers_to_drop`: remove *all* layers for specified segments
+// * non-empty `segments_to_drop` + non-empty `layers_to_drop`: delete *all* specified layers for *all* specified segments
+message UnregisterFromDatasetRequest {
+  // The segment IDs to drop. All of them if empty.
+  //
+  // The final filter will be the *outer product* of this and `layers_to_drop`.
+  repeated rerun.common.v1alpha1.SegmentId segments_to_drop = 1;
+
+  // The layer names to drop. All of them if empty.
+  //
+  // The final filter will be the *outer product* of this and `segments_to_drop`.
+  repeated string layers_to_drop = 2;
+
+  // If true, deletion will go through regardless of the segments/layers' current statuses.
+  //
+  // This is only useful in the very specific, catatrophic scenario where the contents of the
+  // task queue were lost and some tasks are now stuck in `status=pending` forever.
+  //
+  // Do not use this unless you know exactly what you're doing.
+  bool force = 3;
+}
+
+message UnregisterFromDatasetResponse {
+  // This contains all the information about the segments and layers that were actually removed.
+  //
+  // This dataframe is always guaranteed to be a subset of the one found in `ScanDatasetManifestResponse`.
+  // They share the same semantics, schemas, etc.
   rerun.common.v1alpha1.DataframePart data = 1;
 }
 
@@ -608,9 +685,6 @@ message Query {
   // If true, `columns` will contain the entire schema.
   bool columns_always_include_everything = 3;
 
-  // If true, `columns` always includes `chunk_id`,
-  bool columns_always_include_chunk_ids = 4;
-
   // If true, `columns` always includes `byte_offset` and `byte_size`.
   bool columns_always_include_byte_offsets = 5;
 
@@ -625,6 +699,9 @@ message Query {
 
   // If true, `columns` always includes all component-level indexes.
   bool columns_always_include_component_indexes = 9;
+
+  reserved 4;
+  reserved "columns_always_include_chunk_ids";
 }
 
 // A chunk-level latest-at query, aka `LatestAtRelevantChunks`.
@@ -862,8 +939,11 @@ message CreateTableEntryRequest {
 
   // Information about the table to register.
   //
-  // This must be encoded message of one of the following supported types:
-  // - LanceTable
+  // If not provided, a Lance-backed table will be created using at an auto-generated URL based on the server's
+  // configuration.
+  //
+  // If provided, it must be an encoded message of the `LanceTable` type, which contains the intended storage URL. The
+  // caller is responsible for ensuring that the storage is writable and free to use.
   optional google.protobuf.Any provider_details = 2;
 
   // Schema of the table to create

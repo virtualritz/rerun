@@ -228,6 +228,13 @@ impl ::re_types_core::AsComponents for GeoPoints {
 
 impl ::re_types_core::ArchetypeReflectionMarker for GeoPoints {}
 
+impl crate::VisualizableArchetype for GeoPoints {
+    #[inline]
+    fn visualizer(&self) -> crate::Visualizer {
+        crate::Visualizer::new("GeoPoints").with_overrides(self)
+    }
+}
+
 impl GeoPoints {
     /// Create a new `GeoPoints`.
     #[inline]

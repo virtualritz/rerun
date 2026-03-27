@@ -13,6 +13,20 @@ if TYPE_CHECKING:
     from .conftest import PrefilledCatalog
 
 
+def test_version_info(catalog_client: CatalogClient) -> None:
+    """Tests that version_info() returns valid info from any server."""
+
+    info = catalog_client.version_info()
+    assert isinstance(info.version, str)
+    assert info.version  # version should never be empty
+
+    # If a provider is set, region should also be set (and vice versa)
+    if info.cloud_provider:
+        assert info.cloud_region, "cloud_provider is set but cloud_region is empty"
+    if info.cloud_region:
+        assert info.cloud_provider, "cloud_region is set but cloud_provider is empty"
+
+
 def test_urls(prefilled_catalog: PrefilledCatalog) -> None:
     """Tests the url property on the catalog and dataset."""
 
@@ -42,6 +56,6 @@ def test_network_unreachable() -> None:
         with pytest.raises(ConnectionError, match=r"failed to connect to server"):  # Adjust exception type as needed
             # This works because 192.0.2.0 is a reserved address block for documentation and examples.
             # ISPs should not route traffic to this block and just drop SYN packets.
-            CatalogClient(address="rerun+http://192.0.2.1")
+            CatalogClient(url="rerun+http://192.0.2.1")
     finally:
         signal.alarm(0)  # Cancel the alarm

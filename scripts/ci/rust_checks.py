@@ -84,10 +84,15 @@ def run_cargo(
             f"{os.getcwd()}/{clippy_conf}"
         )
 
+    capture = output_checks is not None
+
     env = os.environ.copy()
     env.update(additional_env_vars)
 
-    result = subprocess.run(args, env=env, check=False, capture_output=True, text=True)
+    # Use encoding='utf-8' with errors='replace' to handle binary data in cargo/linker output on Windows
+    result = subprocess.run(
+        args, env=env, check=False, capture_output=capture, text=True, encoding="utf-8", errors="replace"
+    )
     success = result.returncode == 0
 
     if success:
@@ -128,6 +133,8 @@ def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
 
+    # On CI, we split these checks into groups to reduce the time it takes to run all of this.
+    # Make sure the `reusable_checks_rust` workflow stays up-to-date with this list.
     checks = [
         ("base_checks", base_checks),
         ("sdk_variations", sdk_variations),
@@ -238,7 +245,7 @@ def cargo_deny(results: list[Result]) -> None:
     # Note: running just `cargo deny check` without a `--target` can result in
     # false positives due to https://github.com/EmbarkStudios/cargo-deny/issues/324
     # Installing is quite quick if it's already installed.
-    results.append(run_cargo("install", "--locked cargo-deny@^0.18"))
+    results.append(run_cargo("install", "--locked cargo-deny@^0.19"))
 
     for target in deny_targets:
         results.append(
@@ -306,7 +313,11 @@ def wasm(results: list[Result]) -> None:
     )
     # Check re_renderer examples for wasm32.
     results.append(
-        run_cargo("check", "--target wasm32-unknown-unknown --target-dir target_wasm -p re_renderer --examples"),
+        run_cargo(
+            "clippy",
+            "--target wasm32-unknown-unknown --target-dir target_wasm -p re_renderer_examples",
+            clippy_conf="scripts/clippy_wasm",  # Use ./scripts/clippy_wasm/clippy.toml
+        ),
     )
 
 
@@ -349,7 +360,7 @@ test_failure_message = 'See the "Upload test results" step for a link to the sna
 def tests(results: list[Result]) -> None:
     # We first use `--no-run` to measure the time of compiling vs actually running
     results.append(run_cargo("nextest", "run --all-targets --all-features --no-run", deny_warnings=False))
-    results.append(run_cargo("nextest", "run --all-targets --all-features", deny_warnings=False))
+    results.append(run_cargo("nextest", "run --all-targets --all-features --no-fail-fast", deny_warnings=False))
 
     if not results[-1].success:
         print(test_failure_message)
@@ -361,7 +372,7 @@ def tests(results: list[Result]) -> None:
 def tests_without_all_features(results: list[Result]) -> None:
     # We first use `--no-run` to measure the time of compiling vs actually running
     results.append(run_cargo("test", "--all-targets --no-run", deny_warnings=False))
-    results.append(run_cargo("nextest", "run --all-targets", deny_warnings=False))
+    results.append(run_cargo("nextest", "run --all-targets --no-fail-fast", deny_warnings=False))
 
     if not results[-1].success:
         print(test_failure_message)

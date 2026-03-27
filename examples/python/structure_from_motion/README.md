@@ -4,6 +4,7 @@ tags = ["2D", "3D", "COLMAP", "Pinhole camera", "Time series"]
 thumbnail = "https://static.rerun.io/structure-from-motion/af24e5e8961f46a9c10399dbc31b6611eea563b4/480w.png"
 thumbnail_dimensions = [480, 480]
 channel = "main"
+include_in_manifest = true
 build_args = ["--dataset=colmap_fiat", "--resize=800x600"]
 -->
 
@@ -35,7 +36,7 @@ The visualizations in this example were created with the following Rerun code:
 ### Timelines
 
 All data logged using Rerun in the following sections is connected to a specific frame.
-Rerun assigns a frame id to each piece of logged data, and these frame ids are associated with a [`timeline`](https://www.rerun.io/docs/concepts/timelines).
+Rerun assigns a frame id to each piece of logged data, and these frame ids are associated with a [`timeline`](https://www.rerun.io/docs/concepts/logging-and-ingestion/timelines).
 
  ```python
 rr.set_time("frame", sequence=frame_idx)
@@ -58,7 +59,12 @@ This defines how to go from the 3D camera frame to the 2D image plane. The extri
 [`Transform3D`](https://www.rerun.io/docs/reference/types/archetypes/transform3d) to the `camera` entity.
 
 ```python
-rr.log("camera", rr.Transform3D(translation=image.tvec, rotation=rr.Quaternion(xyzw=quat_xyzw), relation=rr.TransformRelation.ChildFromParent))
+rr.log(
+    "camera",
+    rr.Transform3D(
+        translation=image.tvec, rotation=rr.Quaternion(xyzw=quat_xyzw), relation=rr.TransformRelation.ChildFromParent
+    ),
+)
 ```
 
 ```python

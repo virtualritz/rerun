@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use indicatif::ProgressBar;
-use parking_lot::Mutex;
+use re_mutex::Mutex;
 
 fn main() {
     re_log::setup_logging();
@@ -25,12 +25,13 @@ fn main() {
     println!("Decoding {video_path}");
 
     let video_blob = std::fs::read(video_path).expect("failed to read video");
-    let video = re_video::VideoDataDescription::load_mp4(&video_blob, video_path)
+    let source_id = re_tuid::Tuid::new();
+    let video = re_video::VideoDataDescription::load_mp4(&video_blob, video_path, source_id)
         .expect("failed to load video");
 
     println!(
         "{} {}x{}",
-        video.gops.num_elements(),
+        video.keyframe_indices.len(),
         video
             .encoding_details
             .as_ref()
@@ -47,7 +48,7 @@ fn main() {
     progress.enable_steady_tick(Duration::from_millis(100));
 
     let frames = Arc::new(Mutex::new(Vec::new()));
-    let (output_sender, output_receiver) = crossbeam::channel::unbounded();
+    let (output_sender, output_receiver) = re_video::channel("video_output");
 
     let output_thread = std::thread::Builder::new()
         .name("output".to_owned())
@@ -78,9 +79,12 @@ fn main() {
     .expect("Failed to create decoder");
 
     let start = Instant::now();
-    let video_buffers = std::iter::once(video_blob.as_ref()).collect();
     for (sample_idx, sample) in video.samples.iter_indexed() {
-        let chunk = sample.get(&video_buffers, sample_idx).unwrap();
+        let Some(sample) = sample.sample() else {
+            continue;
+        };
+
+        let chunk = sample.get(&|_| &video_blob, sample_idx).unwrap();
         decoder.submit_chunk(chunk).expect("Failed to submit chunk");
     }
     decoder.end_of_video().expect("Failed to end of video");

@@ -21,7 +21,7 @@ impl crate::DataLoader for RrdLoader {
         &self,
         settings: &crate::DataLoaderSettings,
         filepath: std::path::PathBuf,
-        tx: std::sync::mpsc::Sender<crate::LoadedData>,
+        tx: crossbeam::channel::Sender<crate::LoadedData>,
     ) -> Result<(), crate::DataLoaderError> {
         use anyhow::Context as _;
 
@@ -84,14 +84,38 @@ impl crate::DataLoader for RrdLoader {
                     .with_context(|| format!("Failed to spawn IO thread for {filepath:?}"))?;
             }
 
-            "rrd" => {
-                // For .rrd files we retry reading despite reaching EOF to support live (writer) streaming.
-                // Decoder will give up when it sees end of file marker (i.e. end-of-stream message header)
+            "rrd" if settings.follow => {
+                // In follow/tail mode we retry reading despite reaching EOF to support live streaming.
+                // Decoder will give up when it sees end-of-stream marker.
                 let retryable_reader = RetryableFileReader::new(&filepath).with_context(|| {
                     format!("failed to create retryable file reader for {filepath:?}")
                 })?;
                 let wait_for_eos = true;
                 let messages = Decoder::decode_eager_with_opts(retryable_reader, wait_for_eos)?;
+
+                // NOTE: This is IO bound, it must run on a dedicated thread, not the shared rayon thread pool.
+                std::thread::Builder::new()
+                    .name(format!("decode_and_stream({filepath:?})"))
+                    .spawn({
+                        let filepath = filepath.clone();
+                        move || {
+                            decode_and_stream(
+                                &filepath, &tx, messages,
+                                // Never use import semantics for .rrd files
+                                None, None,
+                            );
+                        }
+                    })
+                    .with_context(|| format!("Failed to spawn IO thread for {filepath:?}"))?;
+            }
+
+            "rrd" => {
+                // Non-follow mode: read the file once and stop at EOF.
+                let file = std::fs::File::open(&filepath)
+                    .with_context(|| format!("Failed to open file {filepath:?}"))?;
+                let file = std::io::BufReader::new(file);
+
+                let messages = Decoder::decode_eager(file)?;
 
                 // NOTE: This is IO bound, it must run on a dedicated thread, not the shared rayon thread pool.
                 std::thread::Builder::new()
@@ -119,7 +143,7 @@ impl crate::DataLoader for RrdLoader {
         settings: &crate::DataLoaderSettings,
         filepath: std::path::PathBuf,
         contents: std::borrow::Cow<'_, [u8]>,
-        tx: std::sync::mpsc::Sender<crate::LoadedData>,
+        tx: crossbeam::channel::Sender<crate::LoadedData>,
     ) -> Result<(), crate::DataLoaderError> {
         re_tracing::profile_function!(filepath.display().to_string());
 
@@ -168,7 +192,7 @@ impl crate::DataLoader for RrdLoader {
 
 fn decode_and_stream(
     filepath: &std::path::Path,
-    tx: &std::sync::mpsc::Sender<crate::LoadedData>,
+    tx: &crossbeam::channel::Sender<crate::LoadedData>,
     msgs: impl Iterator<Item = Result<re_log_types::LogMsg, re_log_encoding::DecodeError>>,
     forced_application_id: Option<&ApplicationId>,
     forced_recording_id: Option<&String>,
@@ -179,7 +203,7 @@ fn decode_and_stream(
         let msg = match msg {
             Ok(msg) => msg,
             Err(err) => {
-                re_log::warn_once!("Failed to decode message in {filepath:?}: {err}");
+                re_log::warn!(?filepath, "Failed to decode message: {err}");
                 continue;
             }
         };
@@ -234,7 +258,7 @@ fn decode_and_stream(
         };
 
         let data = LoadedData::LogMsg(RrdLoader::name(&RrdLoader), msg);
-        if tx.send(data).is_err() {
+        if re_quota_channel::send_crossbeam(tx, data).is_err() {
             break; // The other end has decided to hang up, not our problem.
         }
     }
@@ -269,7 +293,7 @@ impl RetryableFileReader {
         // while not needlessly hammering the CPU.
         let rx_ticker = crossbeam::channel::tick(std::time::Duration::from_millis(50));
 
-        let (tx_file_notifs, rx_file_notifs) = crossbeam::channel::unbounded();
+        let (tx_file_notifs, rx_file_notifs) = crossbeam::channel::bounded(32 * 1024);
         let mut watcher = notify::recommended_watcher(tx_file_notifs)
             .with_context(|| format!("failed to create file watcher for {filepath:?}"))?;
 

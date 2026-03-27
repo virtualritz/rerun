@@ -3,7 +3,6 @@ use egui::{Id, Key, KeyboardShortcut, Modifiers};
 use smallvec::{SmallVec, smallvec};
 
 use crate::context_ext::ContextExt as _;
-use crate::egui_ext::context_ext::ContextExt as _;
 
 /// Interface for sending [`UICommand`] messages.
 pub trait UICommandSender {
@@ -209,7 +208,7 @@ impl UICommand {
 
             Self::ResetViewer => (
                 "Reset Viewer",
-                "Reset the Viewer to how it looked the first time you ran it, forgetting all stored blueprints and UI state",
+                "Reset the Viewer to how it looked the first time you ran it, forgetting UI state and all stored blueprints, except the ones loaded from *.rbl resources",
             ),
 
             Self::ClearActiveBlueprint => (
@@ -375,7 +374,7 @@ impl UICommand {
             ),
 
             Self::AddRedapServer => (
-                "Add Redap server…",
+                "Connect to a server…",
                 "Connect to a Redap server (experimental)",
             ),
         }
@@ -493,7 +492,7 @@ impl UICommand {
             #[cfg(not(target_arch = "wasm32"))]
             Self::ZoomReset => smallvec![egui::gui_zoom::kb_shortcuts::ZOOM_RESET],
 
-            Self::ToggleCommandPalette => smallvec![cmd(Key::P)],
+            Self::ToggleCommandPalette => smallvec![cmd(Key::P), cmd(Key::K)],
 
             Self::PlaybackTogglePlayPause => smallvec![key(Key::Space)],
             Self::PlaybackFollow => smallvec![alt(Key::ArrowRight)],
@@ -661,9 +660,24 @@ impl UICommand {
 
     #[must_use = "Returns the Command that was triggered by some keyboard shortcut"]
     pub fn listen_for_kb_shortcut(egui_ctx: &egui::Context) -> Option<Self> {
+        fn conflicts_with_text_editing(kb_shortcut: &KeyboardShortcut) -> bool {
+            // TODO(emilk): move this into egui
+            kb_shortcut.modifiers.is_none()
+                || matches!(
+                    kb_shortcut.logical_key,
+                    Key::Space
+                        | Key::ArrowLeft
+                        | Key::ArrowRight
+                        | Key::ArrowUp
+                        | Key::ArrowDown
+                        | Key::Home
+                        | Key::End
+                )
+        }
+
         use strum::IntoEnumIterator as _;
 
-        let anything_has_focus = egui_ctx.memory(|mem| mem.focused().is_some());
+        let text_edit_has_focus = egui_ctx.text_edit_focused();
 
         let mut commands: Vec<(KeyboardShortcut, Self)> = Self::iter()
             .flat_map(|cmd| {
@@ -688,16 +702,8 @@ impl UICommand {
 
         let command = egui_ctx.input_mut(|input| {
             for (kb_shortcut, command) in commands {
-                if anything_has_focus {
-                    // If a text edit has focus, is should usually get exclusive access to that input.
-                    // For instance: use alt-arrows to move the cursor a whole word (at least on mac).
-                    // The exception are shortcuts with ctrl/cmd in them:
-                    let is_command = kb_shortcut.modifiers.command
-                        || kb_shortcut.modifiers.mac_cmd
-                        || kb_shortcut.modifiers.ctrl;
-                    if !is_command {
-                        continue; // ignore
-                    }
+                if text_edit_has_focus && conflicts_with_text_editing(&kb_shortcut) {
+                    continue; // Make sure we can move text cursor with alt-arrow keys, etc
                 }
 
                 if input.consume_shortcut(&kb_shortcut) {
@@ -762,7 +768,7 @@ impl UICommand {
 
     /// Show name of command and how to activate it
     pub fn tooltip_ui(self, ui: &mut egui::Ui) {
-        let os = ui.ctx().os();
+        let os = ui.os();
 
         let (label, details) = self.text_and_tooltip();
 

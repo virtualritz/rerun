@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use re_chunk::{EntityPath, TimelineName};
-use re_entity_db::{TimeHistogram, TimeHistogramPerTimeline};
+use re_entity_db::EntityDb;
 use re_log_types::{
     AbsoluteTimeRange, AbsoluteTimeRangeF, Duration, TimeCell, TimeInt, TimeReal, TimeType,
     Timeline,
@@ -208,6 +208,20 @@ impl From<AbsoluteTimeRange> for TimeView {
     }
 }
 
+/// Direction for time movement commands.
+#[derive(Debug, Clone, Copy)]
+pub enum MoveDirection {
+    Back,
+    Forward,
+}
+
+/// Speed for time movement commands.
+#[derive(Debug, Clone, Copy)]
+pub enum MoveSpeed {
+    Normal,
+    Fast,
+}
+
 /// A command used to mutate `TimeControl`.
 ///
 /// Can be sent using [`crate::SystemCommand::TimeControlCommands`].
@@ -227,7 +241,10 @@ pub enum TimeControlCommand {
     TogglePlayPause,
     StepTimeBack,
     StepTimeForward,
-    MoveBySeconds(f64),
+    Move {
+        direction: MoveDirection,
+        speed: MoveSpeed,
+    },
     MoveBeginning,
     MoveEnd,
 
@@ -303,15 +320,33 @@ impl TimeState {
     }
 }
 
+/// Which timeline is currently active in the time panel.
+///
+/// The active timeline can be in one of three states:
+/// - Automatically chosen based on heuristics (e.g. the timeline with most data),
+/// - Explicitly selected by the user,
+/// - Or "pending": requested by name (via blueprint or user action) but not yet
+///   present in the entity database. A pending timeline is promoted to `UserEdited`
+///   once data containing that timeline arrives (see [`TimeControl::select_valid_timeline`]).
 // TODO(andreas): This should be a blueprint property and follow the usual rules of how we determine fallbacks.
 #[derive(serde::Deserialize, serde::Serialize, Clone, PartialEq, Debug)]
 enum ActiveTimeline {
+    /// Automatically selected based on heuristics. Re-evaluated every frame.
     Auto(Timeline),
+
+    /// Explicitly selected by the user or resolved from blueprint.
     UserEdited(Timeline),
+
+    /// A timeline was requested by name but hasn't been seen in the data yet.
+    ///
+    /// This happens when the blueprint or a [`TimeControlCommand::SetActiveTimeline`] references
+    /// a timeline that doesn't exist in the current [`EntityDb`]. We store only the name
+    /// and wait for matching data to arrive, at which point this becomes `UserEdited`.
     Pending(TimelineName),
 }
 
 impl ActiveTimeline {
+    /// The name of the active timeline, regardless of its state.
     pub fn name(&self) -> &TimelineName {
         match self {
             Self::Auto(timeline) | Self::UserEdited(timeline) => timeline.name(),
@@ -319,6 +354,10 @@ impl ActiveTimeline {
         }
     }
 
+    /// The full [`Timeline`], if available.
+    ///
+    /// Returns `None` for [`Self::Pending`] since the timeline hasn't been
+    /// resolved against the entity database yet.
     pub fn timeline(&self) -> Option<&Timeline> {
         match self {
             Self::Auto(timeline) | Self::UserEdited(timeline) => Some(timeline),
@@ -345,8 +384,15 @@ pub struct TimeControl {
     playing: bool,
 
     /// If true, we are in "follow" mode (see [`PlayState::Following`]).
-    /// Ignored when [`Self.playing`] is `false`.
+    /// Ignored when [`Self::playing`] is `false`.
     following: bool,
+
+    /// If `true`, and we're [`Self::playing`], then we only advance
+    /// the time cursor once we have all the data needed loaded locally.
+    ///
+    /// This is a larger-than-ram feature: only once we have loaded
+    /// the necessary data from redap do we start playback.
+    wait_for_data: bool,
 
     speed: f32,
 
@@ -361,15 +407,35 @@ pub struct TimeControl {
 impl Default for TimeControl {
     fn default() -> Self {
         Self {
-            timeline: ActiveTimeline::Auto(default_timeline([])),
+            timeline: ActiveTimeline::Auto(default_timeline([], |_| 0)),
             states: Default::default(),
             playing: true,
             following: true,
+            wait_for_data: true,
             speed: 1.0,
             loop_mode: LoopMode::Off,
             highlighted_range: None,
         }
     }
+}
+
+/// Parameters for [`TimeControl::update`].
+pub struct TimeControlUpdateParams {
+    /// The time step in seconds.
+    pub stable_dt: f32,
+
+    /// Is more data expected to arrive (e.g. still connected to a data source)?
+    ///
+    /// Set to true e.g. when viewing live data,
+    /// or we're still downloading a recording.
+    pub more_data_is_streaming_in: bool,
+
+    /// True if we're waiting for chunks to be downloaded,
+    /// and they are expected to come (eventually).
+    pub is_buffering: bool,
+
+    /// Should we diff state changes to trigger callbacks?
+    pub should_diff_state: bool,
 }
 
 #[must_use]
@@ -418,12 +484,11 @@ impl TimeControl {
 
     /// Read from the time panel blueprint and update the state from that.
     ///
-    /// If `timeline_histograms` is some this will also make sure we are on
-    /// a valid timeline.
+    /// If `entity_db` is some this will also make sure we are on a valid timeline.
     pub fn update_from_blueprint(
         &mut self,
         blueprint_ctx: &impl BlueprintContext,
-        timeline_histograms: Option<&TimeHistogramPerTimeline>,
+        entity_db: Option<&EntityDb>,
     ) {
         if let Some(timeline) = blueprint_ctx.timeline() {
             if matches!(self.timeline, ActiveTimeline::Auto(_))
@@ -437,27 +502,14 @@ impl TimeControl {
 
         let old_timeline = *self.timeline_name();
         // Make sure we are on a valid timeline.
-        if let Some(timeline_histograms) = timeline_histograms {
-            self.select_valid_timeline(timeline_histograms);
-        }
-        // If we are on a new timeline insert that new state at the start. Or end if we're following.
-        else if let Some(timeline_histograms) = timeline_histograms
-            && let Some(full_range) = self.full_range(timeline_histograms)
-        {
-            self.states.insert(
-                *self.timeline_name(),
-                TimeState::new(if self.following {
-                    full_range.max
-                } else {
-                    full_range.min
-                }),
-            );
+        if let Some(entity_db) = entity_db {
+            self.select_valid_timeline(entity_db);
         }
 
         if let Some(new_play_state) = blueprint_ctx.play_state()
             && new_play_state != self.play_state()
         {
-            self.set_play_state(timeline_histograms, new_play_state, Some(blueprint_ctx));
+            self.set_play_state(entity_db, new_play_state, Some(blueprint_ctx));
         }
 
         if let Some(new_loop_mode) = blueprint_ctx.loop_mode() {
@@ -465,11 +517,7 @@ impl TimeControl {
 
             if self.loop_mode != LoopMode::Off {
                 if self.play_state() == PlayState::Following {
-                    self.set_play_state(
-                        timeline_histograms,
-                        PlayState::Playing,
-                        Some(blueprint_ctx),
-                    );
+                    self.set_play_state(entity_db, PlayState::Playing, Some(blueprint_ctx));
                 }
 
                 // It makes no sense with looping and follow.
@@ -514,11 +562,17 @@ impl TimeControl {
 
     /// Sets the current time.
     ///
-    /// If `blueprint_ctx` is some, this will also update the time stored in
-    /// the blueprint if `time_int` has changed.
-    fn update_time(&mut self, time: TimeReal) {
+    /// This will NOT update the blueprint!
+    pub fn set_time_ad_hoc(&mut self, time: TimeReal) {
+        self.set_time_cursor_ad_hoc(*self.timeline_name(), time);
+    }
+
+    /// Sets the current time.
+    ///
+    /// This will NOT update the blueprint!
+    pub fn set_time_cursor_ad_hoc(&mut self, timeline: TimelineName, time: TimeReal) {
         self.states
-            .entry(*self.timeline_name())
+            .entry(timeline)
             .or_insert_with(|| TimeState::new(time))
             .time = time;
     }
@@ -527,12 +581,17 @@ impl TimeControl {
     /// we've reached the end.
     pub fn update(
         &mut self,
-        timeline_histograms: &TimeHistogramPerTimeline,
-        stable_dt: f32,
-        more_data_is_coming: bool,
-        should_diff_state: bool,
+        entity_db: &EntityDb,
+        params: &TimeControlUpdateParams,
         blueprint_ctx: Option<&impl BlueprintContext>,
     ) -> TimeControlResponse {
+        let TimeControlUpdateParams {
+            stable_dt,
+            more_data_is_streaming_in,
+            is_buffering,
+            should_diff_state,
+        } = *params;
+
         let (old_playing, old_timeline, old_state) = (
             self.playing,
             self.timeline().copied(),
@@ -540,12 +599,12 @@ impl TimeControl {
         );
 
         if let Some(blueprint_ctx) = blueprint_ctx {
-            self.update_from_blueprint(blueprint_ctx, Some(timeline_histograms));
+            self.update_from_blueprint(blueprint_ctx, Some(entity_db));
         } else {
-            self.select_valid_timeline(timeline_histograms);
+            self.select_valid_timeline(entity_db);
         }
 
-        let Some(full_range) = self.full_range(timeline_histograms) else {
+        let Some(full_range) = entity_db.time_range_for(self.timeline_name()) else {
             return TimeControlResponse::no_repaint(); // we have no data on this timeline yet, so bail
         };
 
@@ -564,67 +623,68 @@ impl TimeControl {
                 });
 
                 state.last_paused_time = Some(state.time);
+                self.wait_for_data = true; // in case we hit play again!
                 NeedsRepaint::No
             }
-            PlayState::Playing => {
-                let dt = stable_dt.min(0.1) * self.speed;
 
+            PlayState::Playing => {
                 let state = self
                     .states
                     .entry(*self.timeline_name())
                     .or_insert_with(|| TimeState::new(full_range.min()));
 
-                if self.loop_mode == LoopMode::Off && full_range.max() <= state.time {
-                    // We've reached the end of the data
-                    self.update_time(full_range.max().into());
+                if self.wait_for_data && is_buffering {
+                    // Do not move time cursor until we are done buffering
+                    NeedsRepaint::No
+                } else {
+                    self.wait_for_data = false; // Don't auto-pause once we are actually playing
 
-                    if more_data_is_coming {
-                        // then let's wait for it without pausing!
-                        return self.apply_state_diff_if_needed(
-                            TimeControlResponse::no_repaint(), // ui will wake up when more data arrives
-                            should_diff_state,
-                            timeline_histograms,
-                            old_timeline,
-                            old_playing,
-                            old_state,
-                        );
+                    let dt = stable_dt.min(0.1) * self.speed;
+
+                    if self.loop_mode == LoopMode::Off && full_range.max() <= state.time {
+                        // We've reached the end of the data
+                        self.set_time_ad_hoc(full_range.max().into());
+
+                        if more_data_is_streaming_in {
+                            // then let's wait for it without pausing!
+                        } else {
+                            self.pause(blueprint_ctx);
+                        }
+                        NeedsRepaint::No
                     } else {
-                        self.pause(blueprint_ctx);
-                        return TimeControlResponse::no_repaint();
+                        let mut new_time = state.time;
+
+                        let loop_range = match self.loop_mode {
+                            LoopMode::Off => None,
+                            LoopMode::Selection => state.time_selection,
+                            LoopMode::All => Some(full_range.into()),
+                        };
+
+                        match self.timeline.timeline().map(|t| t.typ()) {
+                            Some(TimeType::Sequence) => {
+                                new_time += TimeReal::from(state.fps * dt);
+                            }
+                            Some(TimeType::DurationNs | TimeType::TimestampNs) => {
+                                new_time += TimeReal::from(Duration::from_secs(dt));
+                            }
+                            None => {}
+                        }
+
+                        if let Some(loop_range) = loop_range
+                            && loop_range.max < new_time
+                        {
+                            new_time = loop_range.min; // loop!
+                        }
+
+                        self.set_time_ad_hoc(new_time);
+
+                        NeedsRepaint::Yes
                     }
                 }
-
-                let mut new_time = state.time;
-
-                let loop_range = match self.loop_mode {
-                    LoopMode::Off => None,
-                    LoopMode::Selection => state.time_selection,
-                    LoopMode::All => Some(full_range.into()),
-                };
-
-                match self.timeline.timeline().map(|t| t.typ()) {
-                    Some(TimeType::Sequence) => {
-                        new_time += TimeReal::from(state.fps * dt);
-                    }
-                    Some(TimeType::DurationNs | TimeType::TimestampNs) => {
-                        new_time += TimeReal::from(Duration::from_secs(dt));
-                    }
-                    None => {}
-                }
-
-                if let Some(loop_range) = loop_range
-                    && loop_range.max < new_time
-                {
-                    new_time = loop_range.min; // loop!
-                }
-
-                self.update_time(new_time);
-
-                NeedsRepaint::Yes
             }
             PlayState::Following => {
                 // Set the time to the max:
-                self.update_time(full_range.max().into());
+                self.set_time_ad_hoc(full_range.max().into());
 
                 NeedsRepaint::No // no need for request_repaint - we already repaint when new data arrives
             }
@@ -633,7 +693,7 @@ impl TimeControl {
         self.apply_state_diff_if_needed(
             TimeControlResponse::new(needs_repaint),
             should_diff_state,
-            timeline_histograms,
+            entity_db,
             old_timeline,
             old_playing,
             old_state,
@@ -641,22 +701,19 @@ impl TimeControl {
     }
 
     /// Apply state diff to response if needed.
+    #[expect(clippy::fn_params_excessive_bools)] // TODO(emilk): remove bool parameters
     fn apply_state_diff_if_needed(
         &mut self,
         response: TimeControlResponse,
         should_diff_state: bool,
-        timeline_histograms: &TimeHistogramPerTimeline,
+        entity_db: &EntityDb,
         old_timeline: Option<Timeline>,
         old_playing: bool,
         old_state: Option<TimeState>,
     ) -> TimeControlResponse {
         let mut response = response;
 
-        if should_diff_state
-            && timeline_histograms
-                .get(self.timeline_name())
-                .is_some_and(|stats| !stats.is_empty())
-        {
+        if should_diff_state && entity_db.time_range_for(self.timeline_name()).is_some() {
             self.diff_with(&mut response, old_timeline, old_playing, old_state);
         }
 
@@ -714,7 +771,7 @@ impl TimeControl {
     pub fn handle_time_commands(
         &mut self,
         blueprint_ctx: Option<&impl BlueprintContext>,
-        timeline_histograms: &TimeHistogramPerTimeline,
+        entity_db: &EntityDb,
         commands: &[TimeControlCommand],
     ) -> TimeControlResponse {
         let mut response = TimeControlResponse {
@@ -731,8 +788,7 @@ impl TimeControl {
         );
 
         for command in commands {
-            let needs_repaint =
-                self.handle_time_command(blueprint_ctx, timeline_histograms, command);
+            let needs_repaint = self.handle_time_command(blueprint_ctx, entity_db, command);
 
             if needs_repaint == NeedsRepaint::Yes {
                 response.needs_repaint = NeedsRepaint::Yes;
@@ -753,7 +809,7 @@ impl TimeControl {
     fn handle_time_command(
         &mut self,
         blueprint_ctx: Option<&impl BlueprintContext>,
-        timeline_histograms: &TimeHistogramPerTimeline,
+        entity_db: &EntityDb,
         command: &TimeControlCommand,
     ) -> NeedsRepaint {
         match command {
@@ -781,11 +837,11 @@ impl TimeControl {
                 if let Some(timeline) = self
                     .timeline()
                     .copied()
-                    .or_else(|| timeline_histograms.timelines().next())
+                    .or_else(|| entity_db.timelines().into_values().next())
                 {
                     self.timeline = ActiveTimeline::Auto(timeline);
                 }
-                self.select_valid_timeline(timeline_histograms);
+                self.select_valid_timeline(entity_db);
 
                 NeedsRepaint::Yes
             }
@@ -794,8 +850,8 @@ impl TimeControl {
                     blueprint_ctx.set_timeline(*timeline_name);
                 }
 
-                if let Some(stats) = timeline_histograms.get(timeline_name) {
-                    self.timeline = ActiveTimeline::UserEdited(stats.timeline());
+                if let Some(timeline) = entity_db.timelines().get(timeline_name) {
+                    self.timeline = ActiveTimeline::UserEdited(*timeline);
                 } else {
                     self.timeline = ActiveTimeline::Pending(*timeline_name);
                 }
@@ -808,7 +864,7 @@ impl TimeControl {
                             None => blueprint_ctx.clear_time_selection(),
                         }
                     }
-                } else if let Some(full_range) = self.full_range(timeline_histograms) {
+                } else if let Some(full_range) = entity_db.time_range_for(timeline_name) {
                     self.states
                         .insert(*timeline_name, TimeState::new(full_range.min));
                 }
@@ -823,11 +879,7 @@ impl TimeControl {
                     self.loop_mode = *loop_mode;
                     if self.loop_mode != LoopMode::Off {
                         if self.play_state() == PlayState::Following {
-                            self.set_play_state(
-                                Some(timeline_histograms),
-                                PlayState::Playing,
-                                blueprint_ctx,
-                            );
+                            self.set_play_state(Some(entity_db), PlayState::Playing, blueprint_ctx);
                         }
 
                         // It makes no sense with looping and follow.
@@ -841,7 +893,7 @@ impl TimeControl {
             }
             TimeControlCommand::SetPlayState(play_state) => {
                 if self.play_state() != *play_state {
-                    self.set_play_state(Some(timeline_histograms), *play_state, blueprint_ctx);
+                    self.set_play_state(Some(entity_db), *play_state, blueprint_ctx);
 
                     if self.following {
                         if let Some(blueprint_ctx) = blueprint_ctx {
@@ -865,27 +917,26 @@ impl TimeControl {
             }
 
             TimeControlCommand::TogglePlayPause => {
-                self.toggle_play_pause(timeline_histograms, blueprint_ctx);
+                self.toggle_play_pause(entity_db, blueprint_ctx);
 
                 NeedsRepaint::Yes
             }
             TimeControlCommand::StepTimeBack => {
-                self.step_time_back(timeline_histograms, blueprint_ctx);
+                self.step_time_back(entity_db, blueprint_ctx);
 
                 NeedsRepaint::Yes
             }
             TimeControlCommand::StepTimeForward => {
-                self.step_time_fwd(timeline_histograms, blueprint_ctx);
+                self.step_time_fwd(entity_db, blueprint_ctx);
 
                 NeedsRepaint::Yes
             }
-            TimeControlCommand::MoveBySeconds(seconds) => {
-                self.move_by_seconds(timeline_histograms, *seconds);
-
+            TimeControlCommand::Move { direction, speed } => {
+                self.move_time(entity_db, blueprint_ctx, *direction, *speed);
                 NeedsRepaint::Yes
             }
             TimeControlCommand::MoveBeginning => {
-                if let Some(full_range) = self.full_range(timeline_histograms) {
+                if let Some(full_range) = entity_db.time_range_for(self.timeline_name()) {
                     self.states
                         .entry(*self.timeline_name())
                         .or_insert_with(|| TimeState::new(full_range.min))
@@ -897,7 +948,7 @@ impl TimeControl {
                 }
             }
             TimeControlCommand::MoveEnd => {
-                if let Some(full_range) = self.full_range(timeline_histograms) {
+                if let Some(full_range) = entity_db.time_range_for(self.timeline_name()) {
                     self.states
                         .entry(*self.timeline_name())
                         .or_insert_with(|| TimeState::new(full_range.max))
@@ -908,7 +959,7 @@ impl TimeControl {
                 }
             }
             TimeControlCommand::Restart => {
-                if let Some(full_range) = self.full_range(timeline_histograms) {
+                if let Some(full_range) = entity_db.time_range_for(self.timeline_name()) {
                     self.following = false;
 
                     if let Some(state) = self.states.get_mut(self.timeline.name()) {
@@ -949,13 +1000,20 @@ impl TimeControl {
                 }
             }
             TimeControlCommand::SetTimeSelection(time_range) => {
-                if let Some(state) = self.states.get_mut(self.timeline.name()) {
-                    if let Some(blueprint_ctx) = blueprint_ctx {
-                        blueprint_ctx.set_time_selection(*time_range);
-                    }
+                if let Some(blueprint_ctx) = blueprint_ctx {
+                    blueprint_ctx.set_time_selection(*time_range);
+                }
 
-                    state.time_selection = Some((*time_range).into());
+                let state = self
+                    .states
+                    .entry(*self.timeline_name())
+                    .or_insert_with(|| TimeState::new(time_range.min));
 
+                let repaint = state.time_selection.map(|r| r.to_int()) != Some(*time_range);
+
+                state.time_selection = Some((*time_range).into());
+
+                if repaint {
                     NeedsRepaint::Yes
                 } else {
                     NeedsRepaint::No
@@ -983,10 +1041,21 @@ impl TimeControl {
             TimeControlCommand::SetTime(time) => {
                 let time_int = time.floor();
                 let repaint = self.time_int() != Some(time_int);
-                self.states
+                let state = self
+                    .states
                     .entry(*self.timeline_name())
-                    .or_insert_with(|| TimeState::new(*time))
-                    .time = *time;
+                    .or_insert_with(|| TimeState::new(*time));
+                state.time = *time;
+
+                // If we were following, pause so we stay at the scrubbed time
+                // instead of advancing. This also persists to the blueprint so
+                // `update_from_blueprint` doesn't re-enable following on the next frame.
+                if self.play_state() == PlayState::Following {
+                    self.pause(blueprint_ctx);
+                }
+
+                self.following = false;
+                self.wait_for_data = true;
 
                 if repaint {
                     NeedsRepaint::Yes
@@ -1021,7 +1090,7 @@ impl TimeControl {
     /// blueprint.
     pub fn set_play_state(
         &mut self,
-        timeline_histograms: Option<&TimeHistogramPerTimeline>,
+        entity_db: Option<&EntityDb>,
         play_state: PlayState,
         blueprint_ctx: Option<&impl BlueprintContext>,
     ) {
@@ -1038,20 +1107,19 @@ impl TimeControl {
             PlayState::Playing => {
                 self.playing = true;
                 self.following = false;
+                self.wait_for_data = true;
 
                 // Start from beginning if we are at the end:
-                if let Some(timeline_histograms) = timeline_histograms
-                    && let Some(histogram) = timeline_histograms.get(self.timeline_name())
+                if let Some(entity_db) = entity_db
+                    && let Some(range) = entity_db.time_range_for(self.timeline_name())
                 {
                     if let Some(state) = self.states.get_mut(self.timeline.name()) {
-                        if histogram.max() <= state.time {
-                            let new_time = histogram.min();
-                            state.time = new_time.into();
+                        if range.max <= state.time {
+                            state.time = range.min.into();
                         }
                     } else {
-                        let new_time = histogram.min();
                         self.states
-                            .insert(*self.timeline_name(), TimeState::new(new_time));
+                            .insert(*self.timeline_name(), TimeState::new(range.min));
                     }
                 }
             }
@@ -1059,15 +1127,14 @@ impl TimeControl {
                 self.playing = true;
                 self.following = true;
 
-                if let Some(timeline_histograms) = timeline_histograms
-                    && let Some(histogram) = timeline_histograms.get(self.timeline_name())
+                if let Some(entity_db) = entity_db
+                    && let Some(range) = entity_db.time_range_for(self.timeline_name())
                 {
                     // Set the time to the max:
-                    let new_time = histogram.max();
                     self.states
                         .entry(*self.timeline_name())
-                        .or_insert_with(|| TimeState::new(new_time))
-                        .time = new_time.into();
+                        .or_insert_with(|| TimeState::new(range.max))
+                        .time = range.max.into();
                 }
             }
         }
@@ -1075,20 +1142,40 @@ impl TimeControl {
 
     fn step_time_back(
         &mut self,
-        timeline_histograms: &TimeHistogramPerTimeline,
+        entity_db: &EntityDb,
         blueprint_ctx: Option<&impl BlueprintContext>,
     ) {
-        let Some(histogram) = timeline_histograms.get(self.timeline.name()) else {
-            return;
-        };
-
+        re_tracing::profile_function!();
         self.pause(blueprint_ctx);
 
         if let Some(time) = self.time() {
+            let timeline = self.timeline_name();
+            let prev = entity_db.prev_time_on_timeline(timeline, time.ceil());
+
             let new_time = if let Some(loop_range) = self.active_loop_selection() {
-                histogram.step_back_time_looped(time, &loop_range)
+                if let Some(prev) = prev
+                    && TimeReal::from(prev) >= loop_range.min
+                {
+                    prev.into()
+                } else {
+                    // Wrap to end of loop
+                    if let Some(prev_from_end) =
+                        entity_db.prev_time_on_timeline(timeline, loop_range.max.ceil())
+                    {
+                        prev_from_end.into()
+                    } else {
+                        loop_range.max
+                    }
+                }
+            } else if let Some(prev) = prev {
+                prev.into()
             } else {
-                histogram.step_back_time(time).into()
+                // Wrap to the end
+                if let Some(range) = entity_db.time_range_for(timeline) {
+                    range.max.into()
+                } else {
+                    return;
+                }
             };
 
             if let Some(state) = self.states.get_mut(self.timeline.name()) {
@@ -1099,20 +1186,40 @@ impl TimeControl {
 
     fn step_time_fwd(
         &mut self,
-        timeline_histograms: &TimeHistogramPerTimeline,
+        entity_db: &EntityDb,
         blueprint_ctx: Option<&impl BlueprintContext>,
     ) {
-        let Some(stats) = timeline_histograms.get(self.timeline_name()) else {
-            return;
-        };
-
+        re_tracing::profile_function!();
         self.pause(blueprint_ctx);
 
         if let Some(time) = self.time() {
+            let timeline = self.timeline_name();
+            let next = entity_db.next_time_on_timeline(timeline, time.floor());
+
             let new_time = if let Some(loop_range) = self.active_loop_selection() {
-                stats.step_fwd_time_looped(time, &loop_range)
+                if let Some(next) = next
+                    && TimeReal::from(next) <= loop_range.max
+                {
+                    next.into()
+                } else {
+                    // Wrap to start of loop
+                    if let Some(next_from_start) =
+                        entity_db.next_time_on_timeline(timeline, loop_range.min.floor())
+                    {
+                        next_from_start.into()
+                    } else {
+                        loop_range.min
+                    }
+                }
+            } else if let Some(next) = next {
+                next.into()
             } else {
-                stats.step_fwd_time(time).into()
+                // Wrap to the start
+                if let Some(range) = entity_db.time_range_for(timeline) {
+                    range.min.into()
+                } else {
+                    return;
+                }
             };
 
             if let Some(state) = self.states.get_mut(self.timeline.name()) {
@@ -1121,19 +1228,52 @@ impl TimeControl {
         }
     }
 
-    fn move_by_seconds(&mut self, timeline_histograms: &TimeHistogramPerTimeline, seconds: f64) {
-        if let Some(time) = self.time() {
-            let mut new_time = match self.time_type() {
-                Some(TimeType::Sequence) => time + TimeReal::from(seconds as i64),
-                Some(TimeType::DurationNs | TimeType::TimestampNs) => {
-                    time + TimeReal::from_secs(seconds)
+    fn move_time(
+        &mut self,
+        entity_db: &EntityDb,
+        blueprint_ctx: Option<&impl BlueprintContext>,
+        direction: MoveDirection,
+        speed: MoveSpeed,
+    ) {
+        match self.time_type() {
+            Some(TimeType::Sequence) => {
+                let steps = match speed {
+                    MoveSpeed::Normal => 1,
+                    MoveSpeed::Fast => 10,
+                };
+                for _ in 0..steps {
+                    match direction {
+                        MoveDirection::Back => {
+                            self.step_time_back(entity_db, blueprint_ctx);
+                        }
+                        MoveDirection::Forward => {
+                            self.step_time_fwd(entity_db, blueprint_ctx);
+                        }
+                    }
                 }
-                None => return,
-            };
+            }
+            Some(TimeType::DurationNs | TimeType::TimestampNs) => {
+                let seconds = match (direction, speed) {
+                    (MoveDirection::Back, MoveSpeed::Normal) => -0.1,
+                    (MoveDirection::Forward, MoveSpeed::Normal) => 0.1,
+                    (MoveDirection::Back, MoveSpeed::Fast) => -1.0,
+                    (MoveDirection::Forward, MoveSpeed::Fast) => 1.0,
+                };
+                self.move_by_seconds_temporal(entity_db, seconds);
+            }
+            None => {}
+        }
+    }
 
-            let range = self
-                .time_selection()
-                .or_else(|| self.full_range(timeline_histograms).map(|r| r.into()));
+    fn move_by_seconds_temporal(&mut self, entity_db: &EntityDb, seconds: f64) {
+        if let Some(time) = self.time() {
+            let mut new_time = time + TimeReal::from_secs(seconds);
+
+            let range = self.time_selection().or_else(|| {
+                entity_db
+                    .time_range_for(self.timeline_name())
+                    .map(|r| r.into())
+            });
             if let Some(range) = range {
                 if time == range.min && new_time < range.min {
                     // jump right to the end
@@ -1168,7 +1308,7 @@ impl TimeControl {
 
     fn toggle_play_pause(
         &mut self,
-        timeline_histograms: &TimeHistogramPerTimeline,
+        entity_db: &EntityDb,
         blueprint_ctx: Option<&impl BlueprintContext>,
     ) {
         if self.playing {
@@ -1197,25 +1337,20 @@ impl TimeControl {
             // the beginning in play mode.
 
             // Start from beginning if we are at the end:
-            if let Some(stats) = timeline_histograms.get(self.timeline_name())
+            if let Some(range) = entity_db.time_range_for(self.timeline_name())
                 && let Some(state) = self.states.get_mut(self.timeline.name())
-                && stats.max() <= state.time
+                && range.max <= state.time
             {
-                let new_time = stats.min();
-                state.time = new_time.into();
+                state.time = range.min.into();
                 self.playing = true;
                 self.following = false;
                 return;
             }
 
             if self.following {
-                self.set_play_state(
-                    Some(timeline_histograms),
-                    PlayState::Following,
-                    blueprint_ctx,
-                );
+                self.set_play_state(Some(entity_db), PlayState::Following, blueprint_ctx);
             } else {
-                self.set_play_state(Some(timeline_histograms), PlayState::Playing, blueprint_ctx);
+                self.set_play_state(Some(entity_db), PlayState::Playing, blueprint_ctx);
             }
         }
     }
@@ -1231,34 +1366,19 @@ impl TimeControl {
     }
 
     /// Make sure the selected timeline is a valid one
-    fn select_valid_timeline(&mut self, timeline_histograms: &TimeHistogramPerTimeline) {
-        fn is_timeline_valid(
-            selected: &Timeline,
-            timeline_histograms: &TimeHistogramPerTimeline,
-        ) -> bool {
-            for timeline in timeline_histograms.timelines() {
-                if selected == &timeline {
-                    return true; // it's valid
-                }
-            }
-            false
-        }
+    fn select_valid_timeline(&mut self, entity_db: &EntityDb) {
+        let timelines = entity_db.timelines();
 
         let reset_timeline = match &self.timeline {
             // If the timeline is auto refresh it every frame.
             ActiveTimeline::Auto(_) => true,
             // If it's user edited, refresh it if it's invalid.
-            ActiveTimeline::UserEdited(timeline) => {
-                !is_timeline_valid(timeline, timeline_histograms)
-            }
+            ActiveTimeline::UserEdited(selected) => !timelines.contains_key(selected.name()),
             // If it's pending never automatically refresh it.
-            ActiveTimeline::Pending(timeline) => {
+            ActiveTimeline::Pending(timeline_name) => {
                 // If the pending timeline is valid, it shouldn't be pending anymore.
-                if let Some(timeline) = timeline_histograms
-                    .timelines()
-                    .find(|t| t.name() == timeline)
-                {
-                    self.timeline = ActiveTimeline::UserEdited(timeline);
+                if let Some(timeline) = timelines.get(timeline_name) {
+                    self.timeline = ActiveTimeline::UserEdited(*timeline);
                 }
 
                 false
@@ -1266,8 +1386,9 @@ impl TimeControl {
         };
 
         if reset_timeline || matches!(self.timeline, ActiveTimeline::Auto(_)) {
-            self.timeline =
-                ActiveTimeline::Auto(default_timeline(timeline_histograms.histograms()));
+            self.timeline = ActiveTimeline::Auto(default_timeline(timelines.values(), |t| {
+                entity_db.num_temporal_rows_on_timeline(t.name())
+            }));
         }
     }
 
@@ -1336,17 +1457,6 @@ impl TimeControl {
         }
     }
 
-    /// The full range of times for the current timeline, skipping times outside of the valid data ranges
-    /// at the start and end.
-    fn full_range(
-        &self,
-        timeline_histograms: &TimeHistogramPerTimeline,
-    ) -> Option<AbsoluteTimeRange> {
-        timeline_histograms
-            .get(self.timeline_name())
-            .map(|stats| stats.full_range())
-    }
-
     /// The selected slice of time that is called the "loop selection".
     ///
     /// This can still return `Some` even if looping is currently off.
@@ -1367,7 +1477,10 @@ impl TimeControl {
         }
     }
 
-    /// Is the active timeline pending?
+    /// Is the active timeline pending resolution?
+    ///
+    /// When `true`, the requested timeline name hasn't been found in the data yet,
+    /// so [`Self::timeline()`] returns `None` and time-dependent queries may not work.
     pub fn is_pending(&self) -> bool {
         matches!(self.timeline, ActiveTimeline::Pending(_))
     }
@@ -1384,11 +1497,13 @@ impl TimeControl {
     }
 }
 
-/// Pick the timeline that should be the default, by number of elements and prioritizing user-defined ones.
-fn default_timeline<'a>(timelines: impl IntoIterator<Item = &'a TimeHistogram>) -> Timeline {
+/// Pick the timeline that should be the default, by row count and prioritizing user-defined ones.
+fn default_timeline<'a>(
+    timelines: impl IntoIterator<Item = &'a Timeline>,
+    row_count: impl Fn(&Timeline) -> u64,
+) -> Timeline {
     re_tracing::profile_function!();
 
-    // Helper function that acts as a tie-breaker.
     fn timeline_priority(timeline: &Timeline) -> u8 {
         match timeline {
             t if *t == Timeline::log_tick() => 0, // lowest priority
@@ -1396,79 +1511,80 @@ fn default_timeline<'a>(timelines: impl IntoIterator<Item = &'a TimeHistogram>) 
             _ => 2,                               // user-defined, highest priority
         }
     }
-    let most_events = timelines.into_iter().max_by(|a, b| {
-        a.num_events()
-            .cmp(&b.num_events())
-            .then_with(|| timeline_priority(&a.timeline()).cmp(&timeline_priority(&b.timeline())))
-    });
 
-    if let Some(most_events) = most_events {
-        most_events.timeline()
-    } else {
-        Timeline::log_time()
-    }
+    timelines
+        .into_iter()
+        .max_by(|a, b| {
+            timeline_priority(a)
+                .cmp(&timeline_priority(b))
+                .then_with(|| row_count(a).cmp(&row_count(b)))
+        })
+        .copied()
+        .unwrap_or_else(Timeline::log_time)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn with_events(timeline: Timeline, num: u64) -> TimeHistogram {
-        let mut stats = TimeHistogram::new(timeline);
-        stats.insert(TimeInt::ZERO, num);
-        stats
-    }
-
     #[test]
     fn test_default_timeline() {
-        let log_time = with_events(Timeline::log_time(), 42);
-        let log_tick = with_events(Timeline::log_tick(), 42);
-        let custom_timeline0 = with_events(Timeline::new("my_timeline0", TimeType::DurationNs), 42);
-        let custom_timeline1 = with_events(Timeline::new("my_timeline1", TimeType::DurationNs), 43);
+        let log_time = Timeline::log_time();
+        let log_tick = Timeline::log_tick();
+        let custom_timeline0 = Timeline::new("my_timeline0", TimeType::DurationNs);
+        let custom_timeline1 = Timeline::new("my_timeline1", TimeType::DurationNs);
 
-        assert_eq!(default_timeline([]), log_time.timeline());
-        assert_eq!(default_timeline([&log_tick]), log_tick.timeline());
-        assert_eq!(default_timeline([&log_time]), log_time.timeline());
+        // With equal row counts, priority alone decides.
+        let equal = |_: &Timeline| 42_u64;
+
+        assert_eq!(default_timeline([], equal), log_time);
+        assert_eq!(default_timeline([&log_tick], equal), log_tick);
+        assert_eq!(default_timeline([&log_time], equal), log_time);
+        assert_eq!(default_timeline([&log_time, &log_tick], equal), log_time);
         assert_eq!(
-            default_timeline([&log_time, &log_tick]),
-            log_time.timeline()
+            default_timeline([&log_time, &log_tick, &custom_timeline0], equal),
+            custom_timeline0
         );
         assert_eq!(
-            default_timeline([&log_time, &log_tick, &custom_timeline0]),
-            custom_timeline0.timeline()
+            default_timeline([&custom_timeline0, &log_time, &log_tick], equal),
+            custom_timeline0
         );
         assert_eq!(
-            default_timeline([&custom_timeline0, &log_time, &log_tick]),
-            custom_timeline0.timeline()
+            default_timeline([&log_time, &custom_timeline0, &log_tick], equal),
+            custom_timeline0
         );
         assert_eq!(
-            default_timeline([&log_time, &custom_timeline0, &log_tick]),
-            custom_timeline0.timeline()
+            default_timeline([&custom_timeline0, &log_time], equal),
+            custom_timeline0
         );
         assert_eq!(
-            default_timeline([&custom_timeline0, &log_time]),
-            custom_timeline0.timeline()
+            default_timeline([&custom_timeline0, &log_tick], equal),
+            custom_timeline0
         );
         assert_eq!(
-            default_timeline([&custom_timeline0, &log_tick]),
-            custom_timeline0.timeline()
+            default_timeline([&log_time, &custom_timeline0], equal),
+            custom_timeline0
         );
         assert_eq!(
-            default_timeline([&log_time, &custom_timeline0]),
-            custom_timeline0.timeline()
+            default_timeline([&log_tick, &custom_timeline0], equal),
+            custom_timeline0
         );
         assert_eq!(
-            default_timeline([&log_tick, &custom_timeline0]),
-            custom_timeline0.timeline()
+            default_timeline([&custom_timeline0], equal),
+            custom_timeline0
         );
 
+        // Row count breaks ties between timelines with the same priority.
+        let more_rows_on_1 = |t: &Timeline| {
+            if *t == custom_timeline1 { 100 } else { 10 }
+        };
         assert_eq!(
-            default_timeline([&custom_timeline0, &custom_timeline1]),
-            custom_timeline1.timeline()
+            default_timeline([&custom_timeline0, &custom_timeline1], more_rows_on_1),
+            custom_timeline1
         );
         assert_eq!(
-            default_timeline([&custom_timeline0]),
-            custom_timeline0.timeline()
+            default_timeline([&custom_timeline1, &custom_timeline0], more_rows_on_1),
+            custom_timeline1
         );
     }
 }

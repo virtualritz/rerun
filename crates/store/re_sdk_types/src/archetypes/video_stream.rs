@@ -234,6 +234,13 @@ impl ::re_types_core::AsComponents for VideoStream {
 
 impl ::re_types_core::ArchetypeReflectionMarker for VideoStream {}
 
+impl crate::VisualizableArchetype for VideoStream {
+    #[inline]
+    fn visualizer(&self) -> crate::Visualizer {
+        crate::Visualizer::new("VideoStream").with_overrides(self)
+    }
+}
+
 impl VideoStream {
     /// Create a new `VideoStream`.
     #[inline]

@@ -1,5 +1,5 @@
 use egui::NumExt as _;
-use re_entity_db::TimeHistogramPerTimeline;
+use re_entity_db::EntityDb;
 use re_log_types::TimeType;
 use re_sdk_types::blueprint::components::{LoopMode, PlayState};
 use re_ui::{UICommand, UiExt as _, list_item};
@@ -13,7 +13,7 @@ impl TimeControlUi {
     pub fn timeline_selector_ui(
         &self,
         time_ctrl: &TimeControl,
-        timeline_histograms: &TimeHistogramPerTimeline,
+        entity_db: &EntityDb,
         ui: &mut egui::Ui,
         time_commands: &mut Vec<TimeControlCommand>,
     ) {
@@ -26,8 +26,15 @@ impl TimeControlUi {
             let response = egui::ComboBox::from_id_salt("timeline")
                 .selected_text(time_ctrl.timeline_name().as_str())
                 .show_ui(ui, |ui| {
-                    for histogram in timeline_histograms.histograms() {
-                        let timeline = &histogram.timeline();
+                    let timelines = entity_db.timelines();
+
+                    if timelines.is_empty() {
+                        ui.weak("The recording has no timelines");
+                        return;
+                    }
+
+                    for timeline in timelines.values() {
+                        let num_rows = entity_db.num_temporal_rows_on_timeline(timeline.name());
                         if ui
                             .selectable_label(
                                 timeline.name() == time_ctrl.timeline_name(),
@@ -35,8 +42,8 @@ impl TimeControlUi {
                                     timeline.name().as_str(),
                                     egui::Atom::grow(),
                                     egui::RichText::new(format!(
-                                        "{} events",
-                                        re_format::format_uint(histogram.num_events())
+                                        "{} rows",
+                                        re_format::format_uint(num_rows)
                                     ))
                                     .size(10.0)
                                     .color(ui.tokens().text_subdued),
@@ -69,7 +76,7 @@ You can also define your own timelines, e.g. for sensor time or camera frame num
 
                         ui.re_hyperlink(
                             "Full documentation",
-                            "https://rerun.io/docs/concepts/timelines",
+                            "https://rerun.io/docs/concepts/logging-and-ingestion/timelines",
                             // Always open in a new tab
                             true,
                         );
@@ -94,7 +101,7 @@ You can also define your own timelines, e.g. for sensor time or camera frame num
                     if ui.button("Copy timeline name").clicked() {
                         let timeline = format!("{}", time_ctrl.timeline_name());
                         re_log::info!("Copied timeline: {}", timeline);
-                        ui.ctx().copy_text(timeline);
+                        ui.copy_text(timeline);
                     }
                 })
         });

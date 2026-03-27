@@ -22,7 +22,7 @@ impl ViewContextSystem for AnnotationSceneContext {
         // Alternatively, we could do this only for visible ones per View but this is actually a lot more expensive to do
         // given that there's typically just one annotation map per recording anyways!
         let mut annotation_map = AnnotationMap::default();
-        annotation_map.load(ctx, &ctx.current_query());
+        annotation_map.load(ctx.recording(), &ctx.current_query());
 
         Box::new(Self(Arc::new(annotation_map)))
     }
@@ -30,6 +30,7 @@ impl ViewContextSystem for AnnotationSceneContext {
     fn execute(
         &mut self,
         _ctx: &re_viewer_context::ViewContext<'_>,
+        _missing_chunk_reporter: &re_viewer_context::MissingChunkReporter,
         _query: &re_viewer_context::ViewQuery<'_>,
         once_per_frame_result: &ViewContextSystemOncePerFrameResult,
     ) {
@@ -39,9 +40,5 @@ impl ViewContextSystem for AnnotationSceneContext {
             .expect("Unexpected static execution result type")
             .0
             .clone();
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }

@@ -77,17 +77,11 @@ Filter message types and toggle column visibility in a selection panel.",
         system_registry.register_array_fallback_provider(
             TextLogColumns::descriptor_timeline_columns().component,
             |ctx| {
-                ctx.viewer_ctx()
-                    .recording()
-                    .timelines()
-                    .keys()
-                    .map(|t| {
-                        TimelineColumn(bp_datatypes::TimelineColumn {
-                            visible: true.into(),
-                            timeline: t.as_str().into(),
-                        })
-                    })
-                    .collect::<Vec<_>>()
+                let active_timeline = ctx.viewer_ctx().time_ctrl.timeline_name();
+                vec![TimelineColumn(bp_datatypes::TimelineColumn {
+                    visible: true.into(),
+                    timeline: active_timeline.as_str().into(),
+                })]
             },
         );
 
@@ -183,9 +177,9 @@ Filter message types and toggle column visibility in a selection panel.",
     fn ui(
         &self,
         ctx: &ViewerContext<'_>,
+        _missing_chunk_reporter: &re_viewer_context::MissingChunkReporter,
         ui: &mut egui::Ui,
         state: &mut dyn ViewState,
-
         query: &ViewQuery<'_>,
         system_output: re_viewer_context::SystemExecutionOutput,
     ) -> Result<(), ViewSystemExecutionError> {
@@ -372,7 +366,7 @@ fn table_ui(
                 }
 
                 header.col(|ui| {
-                    timeline_button(ctx, ui, &TimelineName::new(&col.timeline));
+                    timeline_button(&ctx.app_ctx, ui, &TimelineName::new(&col.timeline));
                 });
             }
             for col in columns {
@@ -388,8 +382,6 @@ fn table_ui(
             tokens.setup_table_body(&mut body, table_style);
 
             body_clip_rect = Some(body.max_rect());
-
-            let query = ctx.current_query();
 
             let row_heights = entries
                 .iter()
@@ -415,7 +407,6 @@ fn table_ui(
                         if let Some(global_time) = global_time
                             && timeline == global_timeline
                         {
-                            #[expect(clippy::comparison_chain)]
                             if global_time < row_time {
                                 // We've past the global time - it is thus above this row.
                                 if current_time_y.is_none() {
@@ -439,9 +430,7 @@ fn table_ui(
                     row.col(|ui| match col.kind {
                         bp_datatypes::TextLogColumnKind::EntityPath => {
                             item_ui::entity_path_button(
-                                ctx,
-                                &query,
-                                ctx.recording(),
+                                &ctx.active_recording_store_view_context(),
                                 ui,
                                 None,
                                 &entry.entity_path,

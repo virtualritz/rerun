@@ -3,7 +3,9 @@
 use glam::DAffine3;
 use itertools::{Either, Itertools as _};
 use re_arrow_util::ArrowArrayDowncastRef as _;
-use re_chunk_store::{Chunk, LatestAtQuery, UnitChunkShared};
+use re_chunk_store::{
+    Chunk, ChunkTrackingMode, LatestAtQuery, MissingChunkReporter, UnitChunkShared,
+};
 use re_entity_db::EntityDb;
 use re_log_types::{EntityPath, TimeInt};
 use re_sdk_types::archetypes::{self, InstancePoses3D};
@@ -24,6 +26,11 @@ pub enum TransformError {
 
     #[error("missing transform on entity `{entity_path}`")]
     MissingTransform { entity_path: EntityPath },
+
+    #[error(
+        "Ignoring transform at root entity /. Transforms require either a parent entity that can be used as implicit frame, or the parent_frame field to be set."
+    )]
+    ImplicitRootParentFrame,
 }
 
 /// Returns true if any of the given components is non-null on the given row.
@@ -58,6 +65,7 @@ struct AtomicLatestAtFrameFilter {
 /// (Unlike transform components, we immediately read out clears and add those clear events to our event book-keeping)
 fn atomic_latest_at_query(
     entity_db: &EntityDb,
+    missing_chunk_reporter: &MissingChunkReporter,
     query: &LatestAtQuery,
     entity_path: &EntityPath,
     frame_filter: Option<AtomicLatestAtFrameFilter>,
@@ -65,9 +73,26 @@ fn atomic_latest_at_query(
 ) -> Option<UnitChunkShared> {
     let storage_engine = entity_db.storage_engine();
     let store = storage_engine.store();
-    let include_static = true;
-    let chunks =
-        store.latest_at_relevant_chunks_for_all_components(query, entity_path, include_static);
+    let chunks = atomic_component_set
+        .iter()
+        .flat_map(|comp| {
+            let re_chunk_store::QueryResults {
+                chunks,
+                missing_virtual,
+            } = store.latest_at_relevant_chunks(
+                ChunkTrackingMode::Report,
+                query,
+                entity_path,
+                *comp,
+            );
+            if !missing_virtual.is_empty() {
+                missing_chunk_reporter.report_missing_chunk();
+            }
+
+            chunks
+        })
+        // An optimization to avoid duplicates early.
+        .unique_by(|c| c.id());
 
     let entity_path_derived_frame_id = TransformFrameIdHash::from_entity_path(entity_path);
 
@@ -126,7 +151,7 @@ fn atomic_latest_at_query(
                 let Some(frame_id_row) =
                     frame_id_row_untyped.downcast_array_ref::<arrow::array::StringArray>()
                 else {
-                    re_log::error_once!("Expected at {condition_frame_id_component:?} @ {entity_path:?} to be a string array, but its type is instead {:?}", frame_id_row_untyped.data_type());
+                    re_log::error_once!("Expected at {condition_frame_id_component:?} @ {entity_path:?} to be a string array, but its type is instead {}", frame_id_row_untyped.data_type());
                     return false;
                 };
                 // Right now everything is singular on a single row, so check only the first element of this string array.
@@ -172,9 +197,8 @@ fn atomic_latest_at_query(
         };
 
         if let Some(row_index) = highest_row_index_with_expected_frame_id {
-            debug_assert!(!chunk.is_empty());
-            let new_unit_chunk = chunk.row_sliced(row_index, 1).into_unit()
-                .expect("Chunk was just sliced to single row, therefore it must be convertible to a unit chunk");
+            re_log::debug_assert!(!chunk.is_empty());
+            let new_unit_chunk = chunk.row_sliced_unit_shallow(row_index);
 
             if let Some(previous_chunk) = &unit_chunk
                 && previous_chunk.row_id() > new_unit_chunk.row_id()
@@ -182,7 +206,7 @@ fn atomic_latest_at_query(
                 // This should be rare: there's another chunk that also fits the exact same child id and the exact same time.
                 // Have to use row id as the tie breaker - if we failed that we're in here.
             } else {
-                unit_chunk = chunk.row_sliced(row_index, 1).into_unit();
+                unit_chunk = Some(chunk.row_sliced_unit_shallow(row_index));
             }
         }
     }
@@ -195,9 +219,10 @@ fn atomic_latest_at_query(
 /// If any of the components yields an invalid transform, returns `None`.
 // TODO(#3849): There's no way to discover invalid transforms right now (they can be intentional but often aren't).
 pub fn query_and_resolve_tree_transform_at_entity(
+    entity_db: &EntityDb,
+    missing_chunk_reporter: &MissingChunkReporter,
     entity_path: &EntityPath,
     child_frame_id: TransformFrameIdHash,
-    entity_db: &EntityDb,
     query: &LatestAtQuery,
 ) -> Result<ParentFromChildTransform, TransformError> {
     // Topology
@@ -237,6 +262,7 @@ pub fn query_and_resolve_tree_transform_at_entity(
     // * we already handled `Clear`/`ClearRecursive` upon pre-population of our cache entries (we know when a clear occurs on this entity!)
     let unit_chunk: Option<UnitChunkShared> = atomic_latest_at_query(
         entity_db,
+        missing_chunk_reporter,
         query,
         entity_path,
         Some(AtomicLatestAtFrameFilter {
@@ -253,8 +279,9 @@ pub fn query_and_resolve_tree_transform_at_entity(
 
     // TODO(andreas): silently ignores deserialization error right now.
 
-    let parent = get_parent_frame(&unit_chunk, entity_path, identifier_parent_frame);
+    let parent = get_parent_frame(&unit_chunk, entity_path, identifier_parent_frame)?;
 
+    #[expect(clippy::useless_let_if_seq)]
     let mut transform = DAffine3::IDENTITY;
 
     // The order of the components here is important.
@@ -341,8 +368,9 @@ pub fn query_and_resolve_tree_transform_at_entity(
 /// (this effectively ignores the instance for most visualizations!)
 // TODO(#3849): There's no way to discover invalid transforms right now (they can be intentional but often aren't).
 pub fn query_and_resolve_instance_poses_at_entity(
-    entity_path: &EntityPath,
     entity_db: &EntityDb,
+    missing_chunk_reporter: &MissingChunkReporter,
+    entity_path: &EntityPath,
     query: &LatestAtQuery,
 ) -> Vec<DAffine3> {
     let identifier_translations = InstancePoses3D::descriptor_translations().component;
@@ -372,6 +400,7 @@ pub fn query_and_resolve_instance_poses_at_entity(
     // * we already handled `Clear`/`ClearRecursive` upon pre-population of our cache entries (we know when a clear occurs on this entity!)
     let unit_chunk: Option<UnitChunkShared> = atomic_latest_at_query(
         entity_db,
+        missing_chunk_reporter,
         query,
         entity_path,
         None,
@@ -451,7 +480,9 @@ pub fn query_and_resolve_instance_poses_at_entity(
     (0..max_num_instances)
         .map(|_| {
             // We apply these in a specific order.
+            #[expect(clippy::useless_let_if_seq)]
             let mut transform = DAffine3::IDENTITY;
+
             if let Some(translation) = iter_translation.next() {
                 transform = convert::translation_3d_to_daffine3(translation);
             }
@@ -483,9 +514,10 @@ pub fn query_and_resolve_instance_poses_at_entity(
 }
 
 pub fn query_and_resolve_pinhole_projection_at_entity(
+    entity_db: &EntityDb,
+    missing_chunk_reporter: &MissingChunkReporter,
     entity_path: &EntityPath,
     child_frame_id: TransformFrameIdHash,
-    entity_db: &EntityDb,
     query: &LatestAtQuery,
 ) -> Result<ResolvedPinholeProjection, TransformError> {
     // Topology
@@ -506,6 +538,7 @@ pub fn query_and_resolve_pinhole_projection_at_entity(
 
     let unit_chunk = atomic_latest_at_query(
         entity_db,
+        missing_chunk_reporter,
         query,
         entity_path,
         Some(AtomicLatestAtFrameFilter {
@@ -533,7 +566,7 @@ pub fn query_and_resolve_pinhole_projection_at_entity(
         .component_mono::<components::Resolution>(identifier_resolution)
         .and_then(|v| v.ok());
 
-    let parent = get_parent_frame(&unit_chunk, entity_path, identifier_parent_frame);
+    let parent = get_parent_frame(&unit_chunk, entity_path, identifier_parent_frame)?;
 
     Ok(ResolvedPinholeProjection {
         parent,
@@ -554,17 +587,18 @@ fn get_parent_frame(
     unit_chunk: &UnitChunkShared,
     entity_path: &EntityPath,
     identifier_parent_frame: ComponentIdentifier,
-) -> TransformFrameIdHash {
+) -> Result<TransformFrameIdHash, TransformError> {
     unit_chunk
         .component_mono::<components::TransformFrameId>(identifier_parent_frame)
         .and_then(|v| v.ok())
         .map_or_else(
             || {
-                TransformFrameIdHash::from_entity_path(
-                    &entity_path.parent().unwrap_or_else(EntityPath::root),
-                )
+                entity_path
+                    .parent()
+                    .ok_or(TransformError::ImplicitRootParentFrame)
+                    .map(|parent| TransformFrameIdHash::from_entity_path(&parent))
             },
-            |frame_id| TransformFrameIdHash::new(&frame_id),
+            |frame_id| Ok(TransformFrameIdHash::new(&frame_id)),
         )
 }
 
@@ -631,6 +665,29 @@ mod tests {
 
     use super::*;
 
+    fn atomic_latest_at_query_test(
+        entity_db: &EntityDb,
+        query: &LatestAtQuery,
+        entity_path: &EntityPath,
+        frame_filter: Option<AtomicLatestAtFrameFilter>,
+        atomic_component_set: &[ComponentIdentifier],
+    ) -> Option<UnitChunkShared> {
+        let missing_chunk_reporter = MissingChunkReporter::default();
+        let result = atomic_latest_at_query(
+            entity_db,
+            &missing_chunk_reporter,
+            query,
+            entity_path,
+            frame_filter,
+            atomic_component_set,
+        );
+        assert!(
+            missing_chunk_reporter.is_empty(),
+            "Test expected no missing chunks, but some were missing. This likely means the test is not properly populating the store with all relevant chunks."
+        );
+        result
+    }
+
     fn timeline() -> Timeline {
         Timeline::new("test_timeline", re_log_types::TimeType::Sequence)
     }
@@ -692,7 +749,7 @@ mod tests {
         let requested_frame_id = TransformFrameIdHash::from_entity_path(&entity_path);
 
         let query_row_at_time = |t| {
-            atomic_latest_at_query(
+            atomic_latest_at_query_test(
                 &entity_db,
                 &LatestAtQuery::new(*timeline().name(), t),
                 &entity_path,
@@ -726,7 +783,7 @@ mod tests {
         for t in [0, 10, 15, 20, 25, 30, 35] {
             assert_eq!(
                 query_row_at_time(t),
-                atomic_latest_at_query(
+                atomic_latest_at_query_test(
                     &entity_db,
                     &LatestAtQuery::new(*timeline().name(), t),
                     &entity_path,
@@ -740,7 +797,7 @@ mod tests {
         // Any query with another frame should fail
         for t in [0, 15, 30, 40] {
             assert!(
-                atomic_latest_at_query(
+                atomic_latest_at_query_test(
                     &entity_db,
                     &LatestAtQuery::new(*timeline().name(), t),
                     &entity_path,
@@ -813,7 +870,7 @@ mod tests {
         let requested_frame_id = TransformFrameIdHash::from_entity_path(&entity_path);
 
         let query_row_at_time = |t| {
-            atomic_latest_at_query(
+            atomic_latest_at_query_test(
                 &entity_db,
                 &LatestAtQuery::new(*timeline().name(), t),
                 &entity_path,
@@ -832,7 +889,7 @@ mod tests {
 
         // Any query with another frame should fail
         assert!(
-            atomic_latest_at_query(
+            atomic_latest_at_query_test(
                 &entity_db,
                 &LatestAtQuery::new(*timeline().name(), 0),
                 &entity_path,
@@ -890,7 +947,7 @@ mod tests {
         entity_db.add_chunk(&Arc::new(chunk))?;
 
         let query_row = |t, label: &str| {
-            atomic_latest_at_query(
+            atomic_latest_at_query_test(
                 &entity_db,
                 &LatestAtQuery::new(*timeline().name(), t),
                 &entity_path,
@@ -904,7 +961,7 @@ mod tests {
         };
 
         let query_row_no_cond = |t| {
-            atomic_latest_at_query(
+            atomic_latest_at_query_test(
                 &entity_db,
                 &LatestAtQuery::new(*timeline().name(), t),
                 &entity_path,
@@ -1017,7 +1074,7 @@ mod tests {
         entity_db.add_chunk(&Arc::new(chunk))?;
 
         let query_row = |t, label: &str| {
-            atomic_latest_at_query(
+            atomic_latest_at_query_test(
                 &entity_db,
                 &LatestAtQuery::new(*timeline().name(), t),
                 &entity_path,
@@ -1073,7 +1130,7 @@ mod tests {
         entity_db.add_chunk(&Arc::new(chunk))?;
 
         let query_row = |t, label: &str| {
-            atomic_latest_at_query(
+            atomic_latest_at_query_test(
                 &entity_db,
                 &LatestAtQuery::new(*timeline().name(), t),
                 &entity_path,

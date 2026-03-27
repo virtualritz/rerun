@@ -203,6 +203,13 @@ impl ::re_types_core::AsComponents for TransformAxes3D {
 
 impl ::re_types_core::ArchetypeReflectionMarker for TransformAxes3D {}
 
+impl crate::VisualizableArchetype for TransformAxes3D {
+    #[inline]
+    fn visualizer(&self) -> crate::Visualizer {
+        crate::Visualizer::new("TransformAxes3D").with_overrides(self)
+    }
+}
+
 impl TransformAxes3D {
     /// Create a new `TransformAxes3D`.
     #[inline]

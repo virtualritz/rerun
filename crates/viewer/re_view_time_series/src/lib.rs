@@ -5,17 +5,29 @@
 #![warn(clippy::iter_over_hash_type)] //  TODO(#6198): enable everywhere
 
 mod aggregation;
+mod fallbacks;
 mod line_visualizer_system;
+mod naming;
 mod point_visualizer_system;
 mod series_query;
 mod util;
 mod view_class;
+mod visualizer_ui;
 
-use re_log_types::EntityPath;
-use re_sdk_types::components::{AggregationPolicy, MarkerShape};
+use re_sdk_types::{
+    blueprint::components::VisualizerInstructionId,
+    components::{AggregationPolicy, MarkerShape},
+};
 use re_viewer_context::external::re_entity_db::InstancePath;
-use re_viewport_blueprint::ViewPropertyQueryError;
 pub use view_class::TimeSeriesView;
+
+/// Maximum number of time series shown per entity when the scalar component
+/// has a non-identity mapping (e.g. sourced from a different component or using a selector).
+///
+/// This limit is NOT applied when the scalar component has an identity mapping,
+/// since in that case the user explicitly logged `Scalars` data and knows how many series to expect.
+pub(crate) const MAX_NUM_SERIES_FOR_REMAPPED_SCALARS: usize = 100;
+pub const MAX_NUM_NON_INDICATED_RECOMMENDED_VISUALIZERS_PER_ENTITY: usize = 4;
 
 /// Computes a deterministic, globally unique ID for the plot based on the ID of the view
 /// itself.
@@ -66,9 +78,18 @@ struct PlotPoint {
     attrs: PlotPointAttrs,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StepMode {
+    #[default]
+    After,
+    Before,
+    Mid,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlotSeriesKind {
     Continuous,
+    Stepped(StepMode),
     Scatter(ScatterAttrs),
     Clear,
 }
@@ -77,8 +98,8 @@ pub enum PlotSeriesKind {
 pub struct PlotSeries {
     pub instance_path: InstancePath,
 
-    /// Id used for this series in the egui plot view.
-    pub id: egui::Id,
+    /// Id of the visualizer instruction that is responsible for this series.
+    pub visualizer_instruction_id: VisualizerInstructionId,
 
     /// Whether the individual series is visible.
     ///
@@ -109,17 +130,12 @@ pub struct PlotSeries {
     pub aggregation_factor: f64,
 }
 
-/// Error that can occur when loading a single series.
-enum LoadSeriesError {
-    ViewPropertyQuery(ViewPropertyQueryError),
-    EntitySpecificVisualizerError {
-        entity_path: EntityPath,
-        error: String,
-    },
-}
-
-impl From<ViewPropertyQueryError> for LoadSeriesError {
-    fn from(err: ViewPropertyQueryError) -> Self {
-        Self::ViewPropertyQuery(err)
+impl PlotSeries {
+    /// Returns a unique id for a given plot series.
+    ///
+    /// NOTE: A single visualizer instruction can be responsible for multiple series,
+    /// so we use the instance path number as an additional differentiator.
+    pub fn id(&self) -> egui::Id {
+        egui::Id::new((&self.visualizer_instruction_id, self.instance_path.instance))
     }
 }

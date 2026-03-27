@@ -1,4 +1,5 @@
 use egui::NumExt as _;
+use re_chunk_store::MissingChunkReporter;
 use re_data_ui::{DataUi as _, item_ui};
 use re_log_types::Instance;
 use re_renderer::ViewPickingConfiguration;
@@ -6,8 +7,8 @@ use re_ui::UiExt as _;
 use re_ui::list_item::{PropertyContent, list_item_scope};
 use re_view::AnnotationSceneContext;
 use re_viewer_context::{
-    Item, ItemCollection, ItemContext, UiLayout, ViewQuery, ViewSystemExecutionError,
-    ViewerContext, VisualizerCollection,
+    DataResultInteractionAddress, Item, ItemCollection, ItemContext, UiLayout, ViewQuery,
+    ViewSystemExecutionError, ViewerContext, VisualizerCollection,
 };
 
 use crate::visualizers::DepthImageProcessResult;
@@ -26,6 +27,7 @@ use crate::{
 #[expect(clippy::too_many_arguments)]
 pub fn picking(
     ctx: &ViewerContext<'_>,
+    missing_chunk_reporter: &MissingChunkReporter,
     picking_context: &PickingContext,
     ui: &egui::Ui,
     mut response: egui::Response,
@@ -37,12 +39,12 @@ pub fn picking(
 ) -> Result<(egui::Response, Option<ViewPickingConfiguration>), ViewSystemExecutionError> {
     re_tracing::profile_function!();
 
-    if ui.ctx().dragged_id().is_some() {
+    if ui.dragged_id().is_some() {
         state.previous_picking_result = None;
         return Ok((response, None));
     }
 
-    let picking_rect_size = PickingContext::UI_INTERACTION_RADIUS * ui.ctx().pixels_per_point();
+    let picking_rect_size = PickingContext::UI_INTERACTION_RADIUS * ui.pixels_per_point();
     // Make the picking rect bigger than necessary so we can use it to counter-act delays.
     // (by the time the picking rectangle is read back, the cursor may have moved on).
     let picking_rect_size = (picking_rect_size * 2.0)
@@ -61,7 +63,7 @@ pub fn picking(
 
     let annotations = system_output
         .context_systems
-        .get::<AnnotationSceneContext>()?;
+        .get_and_report_missing::<AnnotationSceneContext>(missing_chunk_reporter)?;
 
     let picking_result = picking_context.pick(
         ctx.render_ctx(),
@@ -124,7 +126,7 @@ pub fn picking(
                     ui.set_max_width(320.0);
                     ui.vertical(|ui| {
                         textured_rect_hover_ui(
-                            ctx,
+                            &ctx.active_recording_store_view_context(),
                             ui,
                             &instance_path,
                             query,
@@ -142,19 +144,27 @@ pub fn picking(
                 list_item_scope(ui, "spatial_hover", |ui| {
                     hit_ui(ui, hit);
                     item_ui::instance_path_button(
-                        ctx,
-                        &query.latest_at_query(),
-                        ctx.recording(),
+                        &ctx.active_recording_store_view_context(),
                         ui,
                         Some(query.view_id),
                         &instance_path,
                     );
-                    instance_path.data_ui_recording(ctx, ui, UiLayout::Tooltip);
+                    instance_path.data_ui(
+                        &ctx.active_recording_store_view_context(),
+                        ui,
+                        UiLayout::Tooltip,
+                    );
                 });
             })
         };
 
-        let item = Item::DataResult(query.view_id, instance_path.clone());
+        // TODO(andreas): GPU picking doesn't tell us which visualizer produced the result.
+        // We need to add the ability to look up the visualizer id when using GPU-based picking.
+        let item = Item::DataResult(DataResultInteractionAddress {
+            view_id: query.view_id,
+            instance_path: instance_path.clone(),
+            visualizer: None,
+        });
 
         if hit.hit_type == PickingHitType::TexturedRect {
             hovered_image_items.push(item);

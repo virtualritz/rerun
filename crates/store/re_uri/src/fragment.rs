@@ -17,7 +17,7 @@ use crate::TimeSelection;
 /// #     assert!(test.parse::<Fragment>().unwrap() != Fragment::default());
 /// # }
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Fragment {
     pub selection: Option<DataPath>,
 
@@ -35,6 +35,7 @@ impl std::fmt::Display for Fragment {
             time_selection,
         } = self;
 
+        #[expect(clippy::useless_let_if_seq)]
         let mut did_write = false;
 
         if let Some(selection) = selection {
@@ -46,7 +47,8 @@ impl std::fmt::Display for Fragment {
             if did_write {
                 write!(f, "&")?;
             }
-            write!(f, "when={timeline}@{time_cell}")?;
+            write!(f, "when={timeline}@",)?;
+            time_cell.format_url(f)?;
             did_write = true;
         }
 
@@ -54,7 +56,8 @@ impl std::fmt::Display for Fragment {
             if did_write {
                 write!(f, "&")?;
             }
-            write!(f, "time_selection={time_selection}")?;
+            write!(f, "time_selection=",)?;
+            time_selection.format_url(f)?;
         }
 
         Ok(())

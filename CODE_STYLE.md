@@ -59,6 +59,7 @@ We log problems using our own `re_log` crate (which is currently a wrapper aroun
 * The code should only panic if there is a bug in the code.
 * Never ignore an error: either pass it on, or log it.
 * Handle each error exactly once. If you log it, don't pass it on. If you pass it on, don't log it.
+* Put any sensitive data (like URLs, file paths etc) LAST in the error message, so that users can send us the first half and omit the sensitive half.
 
 Strive to encode code invariants and contracts in the type system as much as possible. So if a vector cannot be empty, consider using [`vec1`](https://crates.io/crates/vec1). [Parse, don’t validate](https://lexi-lambda.github.io/blog/2019/11/05/parse-don-t-validate/).
 
@@ -110,6 +111,43 @@ This is the last-resort log level, and mostly for debugging libraries or the use
 The distinction between `DEBUG` and `TRACE` is the least clear. Here we use a rule of thumb: if it generates a lot of continuous logging (e.g. each frame), it should go to `TRACE`.
 
 
+### Warning reporter pattern
+For reporting warnings (or partial-failures) up the call-stack, we like the _reporter pattern_:
+
+```rs
+struct WarningReporter {
+    reports: Mutex<Vec<Warning>>,
+}
+
+pub fn thing_that_can_produce_warnings(reporter: &WarningReporter, other_paramets: …) -> Result<…> {}
+```
+
+The important parts of this pattern is:
+* Accumulate warnings and then continue
+* Interior mutability, so we can share the reporter with child threads
+* Structured warnings (more than just a String!)
+
+We use this for _partial failures_, when something went wrong but we don't want to abort, but instead continue with best-effort.
+
+We prefer this pattern complex return types (`(Vec<Warning>, Object)`), because the reporter pattern is often a lot less syntactically noisy in Rust.
+It is also easy to ignore part of a return-type, but it is harder to ignore an extra parameter. Thus we force ourselves to handle warnings.
+
+This allows code like this:
+
+```rs
+fn some_panel_ui(ctx: &ViewerContext, ui: &mut Ui) {
+    let reporter = WarningReporter::default();
+    let object = do_some_query(&reporter, …)?;
+    object.ui(ui);
+    if reporter.is_missing_chunks() {
+        ui.loading_indicator("Doing query");
+    }
+    if !reporter.warnings().is_empty() {
+        warnings_ui(reporter.warnings());
+    }
+}
+````
+
 ### Libraries
 We use [`thiserror`](https://crates.io/crates/thiserror) for errors in our libraries, and [`anyhow`](https://crates.io/crates/anyhow) for type-erased errors in applications.
 
@@ -134,6 +172,8 @@ We group and order imports (`use` statements) by `std`, other crates, and lastly
 
 We group our `use` statements by module, e.g. `crate_name::module::{a, b, c}`. This is a compromise, being rather terse while still avoiding excessive merge conflicts. See [the cargofmt docs](https://rust-lang.github.io/rustfmt/?version=v1.8.0&search=group#Module%5C%3A) for details.
 
+Use the destructor syntax (`let Self { a, b, c} = self;`) whenever you're accessing most of (or all) of the fields of a struct.
+
 ### `TODO`:s
 When you must remember to do something before merging a PR, write `TODO` or `FIXME` in any file. The CI will not be green until you either remove them or rewrite them as `TODO(yourname)`.
 
@@ -152,6 +192,23 @@ println!("{:-}, value"); // The `-` option stands for redaction.
 ```
 
 Look for `f.sign_minus()` in the code for where we handle this.
+
+## Python
+Prefer kw-args (key-word arguments) for non-obvious parameters, especially when there are many of them.
+
+* Bad: `def serve(ip: str, port: int = 80, token: str | None = None, timeout_sec: int = 8)`
+* Better: `def serve(ip: str, *, port: int = 80, token: str | None = None, timeout_sec: int = 8)`
+* Best: `def serve(*, ip: str, port: int = 80, token: str | None = None, timeout_sec: int = 8)`
+
+This forces the use of kw-args for everything following the `*`.
+
+kw-args have two big benefits:
+
+First, they make future API changes a lot easier. We can add or remove arguments without breaking the API (just log deprecation notices).
+
+Secondly, named arguments makes the caller code a lot more readable.
+
+Usually, we do NOT use kw-args for single-parameter functions, nor for functions where the first (or all) parameters are obvious from the caller. For instance, `def load_file(path: str) -> bytes`
 
 ## C++
 We use `clang-format` to enforce most style choices (see [`.clang-format`](.clang-format)).
@@ -249,6 +306,18 @@ Be terse when it doesn't hurt readability. BAD: `message_identifier`. GOOD: `msg
 Avoid negations in names. A lot of people struggle with double negations, so things like `non_blocking = false` and `if !non_blocking { … }` can become a source of confusion and will slow down most readers. So prefer `connected` over `disconnected`, `initialized` over `uninitialized` etc.
 
 For UI functions (functions taking an `&mut egui::Ui` argument), we use the name `ui` or `_ui` suffix, e.g. `blueprint_ui(…)` or `blueprint.ui(…)`.
+
+### Be over-explicit in stringly typed situations
+In weak/stringly typed situations, be extra careful. This includes Python, Bash, and CLI args.
+
+Avoid vague names like "address". Prefer one of:
+
+* `ip`
+* `ip_port`
+* `url`
+* `email`
+* …
+
 
 ### Units
 * When in doubt, be explicit (`duration_secs: f32` is better than `duration: f32`)

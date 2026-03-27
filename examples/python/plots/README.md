@@ -4,6 +4,7 @@ tags = ["2D", "Plots", "API example"]
 thumbnail = "https://static.rerun.io/plots/e8e51071f6409f61dc04a655d6b9e1caf8179226/480w.png"
 thumbnail_dimensions = [480, 480]
 channel = "main"
+include_in_manifest = true
 -->
 
 This example demonstrates how to log simple plots with the Rerun SDK. Charts can be created from 1-dimensional tensors, or from time-varying scalars.
@@ -46,7 +47,7 @@ def log_bar_chart() -> None:
 ### Curves
 The `log_parabola` function logs a parabola curve (sine and cosine functions) as a time series.
 
-It first sets up a time sequence using [`timelines`](https://www.rerun.io/docs/concepts/timelines), then calculates the y-value of the parabola at each time step, and logs it using [`Scalars`](https://www.rerun.io/docs/reference/types/archetypes/scalars) archetype.
+It first sets up a time sequence using [`timelines`](https://www.rerun.io/docs/concepts/logging-and-ingestion/timelines), then calculates the y-value of the parabola at each time step, and logs it using [`Scalars`](https://www.rerun.io/docs/reference/types/archetypes/scalars) archetype.
 It also adjusts the width and color of the plotted line based on the calculated y value using [`SeriesLines`](https://www.rerun.io/docs/reference/types/archetypes/series_lines) archetype.
 
 ```python

@@ -1,9 +1,10 @@
 use re_log_types::{EntityPath, Instance};
 use re_renderer::PickingLayerInstanceId;
 use re_renderer::renderer::{LineDrawDataError, LineStripFlags};
+use re_sdk_types::Archetype as _;
 use re_sdk_types::archetypes::GeoLineStrings;
-use re_sdk_types::components::{Color, Radius};
-use re_view::{DataResultQuery as _, RangeResultsExt as _};
+use re_sdk_types::components::{Color, GeoLineString, Radius};
+use re_view::{DataResultQuery as _, VisualizerInstructionQueryResults};
 use re_viewer_context::{
     IdentifiedViewSystem, ViewContext, ViewContextCollection, ViewHighlights, ViewQuery,
     ViewSystemExecutionError, VisualizerExecutionOutput, VisualizerQueryInfo, VisualizerSystem,
@@ -31,8 +32,14 @@ impl IdentifiedViewSystem for GeoLineStringsVisualizer {
 }
 
 impl VisualizerSystem for GeoLineStringsVisualizer {
-    fn visualizer_query_info(&self) -> VisualizerQueryInfo {
-        VisualizerQueryInfo::from_archetype::<GeoLineStrings>()
+    fn visualizer_query_info(
+        &self,
+        _app_options: &re_viewer_context::AppOptions,
+    ) -> VisualizerQueryInfo {
+        VisualizerQueryInfo::single_required_component::<GeoLineString>(
+            &GeoLineStrings::descriptor_line_strings(),
+            &GeoLineStrings::all_components(),
+        )
     }
 
     fn execute(
@@ -41,31 +48,35 @@ impl VisualizerSystem for GeoLineStringsVisualizer {
         view_query: &ViewQuery<'_>,
         _context_systems: &ViewContextCollection,
     ) -> Result<VisualizerExecutionOutput, ViewSystemExecutionError> {
-        for data_result in view_query.iter_visible_data_results(Self::identifier()) {
-            let results =
-                data_result.query_archetype_with_history::<GeoLineStrings>(ctx, view_query);
+        let output = VisualizerExecutionOutput::default();
+
+        for (data_result, instruction) in
+            view_query.iter_visualizer_instruction_for(Self::identifier())
+        {
+            let results = data_result.query_archetype_with_history::<GeoLineStrings>(
+                ctx,
+                view_query,
+                instruction,
+            );
+            let results = VisualizerInstructionQueryResults::new(instruction, &results, &output);
 
             let mut batch_data = GeoLineStringsBatch::default();
 
             // gather all relevant chunks
-            let timeline = view_query.timeline;
-            let all_lines = results.iter_as(
-                timeline,
-                GeoLineStrings::descriptor_line_strings().component,
-            );
-            let all_colors =
-                results.iter_as(timeline, GeoLineStrings::descriptor_colors().component);
-            let all_radii = results.iter_as(timeline, GeoLineStrings::descriptor_radii().component);
+            let all_lines =
+                results.iter_required(GeoLineStrings::descriptor_line_strings().component);
+            let all_colors = results.iter_optional(GeoLineStrings::descriptor_colors().component);
+            let all_radii = results.iter_optional(GeoLineStrings::descriptor_radii().component);
 
             // fallback component values
+            let query_context =
+                ctx.query_context(data_result, view_query.latest_at_query(), instruction.id);
             let fallback_color: Color = typed_fallback_for(
-                &ctx.query_context(data_result, &view_query.latest_at_query()),
+                &query_context,
                 GeoLineStrings::descriptor_colors().component,
             );
-            let fallback_radius: Radius = typed_fallback_for(
-                &ctx.query_context(data_result, &view_query.latest_at_query()),
-                GeoLineStrings::descriptor_radii().component,
-            );
+            let fallback_radius: Radius =
+                typed_fallback_for(&query_context, GeoLineStrings::descriptor_radii().component);
 
             // iterate over each chunk and find all relevant component slices
             for (_index, lines, colors, radii) in re_query::range_zip_1x2(
@@ -109,11 +120,7 @@ impl VisualizerSystem for GeoLineStringsVisualizer {
                 .push((data_result.entity_path.clone(), batch_data));
         }
 
-        Ok(VisualizerExecutionOutput::default())
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+        Ok(output)
     }
 }
 

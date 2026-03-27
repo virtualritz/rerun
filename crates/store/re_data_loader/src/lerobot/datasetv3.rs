@@ -2,21 +2,26 @@ use crate::lerobot::common::{
     LEROBOT_DATASET_IGNORED_COLUMNS, LeRobotDataset, load_and_stream_versioned,
     load_episode_depth_images, load_episode_images, load_scalar,
 };
-use crate::lerobot::{DType, EpisodeIndex, Feature, LeRobotDatasetTask, LeRobotError, TaskIndex};
+use crate::lerobot::{
+    DType, EpisodeIndex, Feature, LeRobotDatasetSubtask, LeRobotDatasetTask, LeRobotError,
+    SubtaskIndex, TaskIndex,
+};
 
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc::Sender};
+use std::sync::Arc;
 
 use ahash::HashMap;
 use anyhow::{Context as _, anyhow};
 use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::buffer::ScalarBuffer;
 use arrow::compute::concat_batches;
+use crossbeam::channel::Sender;
+use parking_lot::RwLock;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use re_chunk::{ArrowArray as _, ChunkId};
-use re_video::{StableIndexDeque, VideoDataDescription};
+use re_video::VideoDataDescription;
 use serde::{Deserialize, Serialize};
 
 use re_arrow_util::ArrowArrayDowncastRef as _;
@@ -73,8 +78,22 @@ use crate::{DataLoaderError, LoadedData};
 pub struct LeRobotDatasetV3 {
     pub path: PathBuf,
     pub metadata: LeRobotDatasetMetadataV3,
-    video_cache: parking_lot::RwLock<HashMap<PathBuf, Arc<[u8]>>>,
-    episode_data_cache: parking_lot::RwLock<HashMap<EpisodeIndex, Arc<RecordBatch>>>,
+    video_cache: RwLock<VideoBlobCache>,
+    episode_data_cache: RwLock<HashMap<EpisodeIndex, Arc<RecordBatch>>>,
+}
+
+/// Video blob cache with reference counting for automatic eviction.
+///
+/// Video blobs are lazily loaded from disk when first requested and automatically
+/// evicted when all episodes that reference them have been processed.
+#[derive(Default)]
+struct VideoBlobCache {
+    /// Cached video file contents, keyed by full file path.
+    blobs: HashMap<PathBuf, Arc<[u8]>>,
+
+    /// Number of episodes that still need each video file.
+    /// When a count reaches 0, the corresponding blob is evicted.
+    remaining_refs: HashMap<PathBuf, usize>,
 }
 
 /// Episode location within a Parquet file
@@ -96,11 +115,12 @@ impl LeRobotDatasetV3 {
         let dataset = Self {
             path: path.to_path_buf(),
             metadata,
-            video_cache: parking_lot::RwLock::new(HashMap::default()),
-            episode_data_cache: parking_lot::RwLock::new(HashMap::default()),
+            video_cache: RwLock::new(VideoBlobCache::default()),
+            episode_data_cache: RwLock::new(HashMap::default()),
         };
 
         dataset.load_all_episode_data_files()?;
+        dataset.init_video_ref_counts();
 
         Ok(dataset)
     }
@@ -130,6 +150,63 @@ impl LeRobotDatasetV3 {
         Ok(())
     }
 
+    /// Precompute reference counts for all video files across episodes.
+    fn init_video_ref_counts(&self) {
+        let video_features: Vec<&str> = self
+            .metadata
+            .info
+            .features
+            .iter()
+            .filter(|(_, feature)| feature.dtype == DType::Video)
+            .map(|(key, _)| key.as_str())
+            .collect();
+
+        if video_features.is_empty() {
+            return;
+        }
+
+        let mut cache = self.video_cache.write();
+        for episode_data in self.metadata.episodes.values() {
+            for feature_key in &video_features {
+                if let Ok(video_file) = self.metadata.info.video_path(feature_key, episode_data) {
+                    let video_path = self.path.join(video_file);
+                    *cache.remaining_refs.entry(video_path).or_insert(0) += 1;
+                }
+            }
+        }
+
+        re_log::debug!(
+            "Initialized video cache with {} unique video files across {} episodes",
+            cache.remaining_refs.len(),
+            self.metadata.episodes.len()
+        );
+    }
+
+    /// Release video blob references for a completed episode.
+    fn release_episode_videos(&self, episode: EpisodeIndex) {
+        let Some(episode_data) = self.metadata.get_episode_data(episode) else {
+            return;
+        };
+
+        let mut cache = self.video_cache.write();
+        for (feature_key, feature) in &self.metadata.info.features {
+            if feature.dtype != DType::Video {
+                continue;
+            }
+
+            if let Ok(video_file) = self.metadata.info.video_path(feature_key, episode_data) {
+                let video_path = self.path.join(video_file);
+                if let Some(count) = cache.remaining_refs.get_mut(&video_path) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        cache.blobs.remove(&video_path);
+                        cache.remaining_refs.remove(&video_path);
+                    }
+                }
+            }
+        }
+    }
+
     fn cache_episode_file(
         &self,
         file_metadata: &LeRobotEpisodeData,
@@ -151,7 +228,7 @@ impl LeRobotDatasetV3 {
         let episode_parquet_file = self.path.join(&episode_data_path);
 
         let file = File::open(&episode_parquet_file)
-            .map_err(|err| LeRobotError::IO(err, episode_parquet_file.clone()))?;
+            .map_err(|err| LeRobotError::io(err, episode_parquet_file.clone()))?;
 
         // Read all data at once
         let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
@@ -271,24 +348,24 @@ impl LeRobotDatasetV3 {
         // fast path, check whether we already have this video cached
         {
             let cache = self.video_cache.read();
-            if let Some(cached_contents) = cache.get(&videopath) {
+            if let Some(cached_contents) = cache.blobs.get(&videopath) {
                 return Ok(Arc::clone(cached_contents));
             }
         }
 
         let contents = {
             re_tracing::profile_scope!("fs::read");
-            std::fs::read(&videopath).map_err(|err| LeRobotError::IO(err, videopath.clone()))?
+            std::fs::read(&videopath).map_err(|err| LeRobotError::io(err, videopath.clone()))?
         };
 
-        // cache contents of big video blobs
+        // cache contents of big video blobs, it will be evicted when all episodes that reference it have been processed
         let mut cache = self.video_cache.write();
-        if let Some(cached_contents) = cache.get(&videopath) {
+        if let Some(cached_contents) = cache.blobs.get(&videopath) {
             return Ok(Arc::clone(cached_contents));
         }
 
         let contents: Arc<[u8]> = Arc::from(contents.into_boxed_slice());
-        cache.insert(videopath, contents.clone());
+        cache.blobs.insert(videopath, contents.clone());
 
         Ok(contents)
     }
@@ -296,6 +373,11 @@ impl LeRobotDatasetV3 {
     /// Retrieve the task using the provided task index.
     pub fn task_by_index(&self, task: TaskIndex) -> Option<&LeRobotDatasetTask> {
         self.metadata.tasks.tasks.get(&task)
+    }
+
+    /// Retrieve the subtask using the provided subtask index.
+    pub fn subtask_by_index(&self, subtask: SubtaskIndex) -> Option<&LeRobotDatasetSubtask> {
+        self.metadata.subtasks.as_ref()?.subtasks.get(&subtask)
     }
 
     /// Loads a single episode from a `LeRobot` dataset and converts it into a collection of Rerun chunks.
@@ -364,6 +446,11 @@ impl LeRobotDatasetV3 {
                     // this always refers to the task description in the dataset metadata.
                     chunks.extend(self.log_episode_task(&timeline, &data)?);
                 }
+                DType::Int64 if feature_key == "subtask_index" => {
+                    // special case int64 subtask_index columns
+                    // this always refers to the subtask description in the dataset metadata.
+                    chunks.extend(self.log_episode_subtask(&timeline, &data)?);
+                }
                 DType::Int16 | DType::Int64 | DType::Bool | DType::String => {
                     re_log::warn_once!(
                         "Loading LeRobot feature ({feature_key}) of dtype `{:?}` into Rerun is not yet implemented",
@@ -414,6 +501,41 @@ impl LeRobotDatasetV3 {
         Ok(std::iter::once(chunk.build()?))
     }
 
+    fn log_episode_subtask(
+        &self,
+        timeline: &Timeline,
+        data: &RecordBatch,
+    ) -> Result<impl ExactSizeIterator<Item = Chunk> + use<>, DataLoaderError> {
+        let subtask_indices = data
+            .column_by_name("subtask_index")
+            .and_then(|c| c.downcast_array_ref::<Int64Array>())
+            .with_context(|| "Failed to get subtask_index field from dataset!")?;
+
+        let mut chunk = Chunk::builder("subtask");
+        let mut row_id = RowId::new();
+
+        for (frame_idx, subtask_index_opt) in subtask_indices.iter().enumerate() {
+            let Some(subtask_idx) = subtask_index_opt
+                .and_then(|i| usize::try_from(i).ok())
+                .map(SubtaskIndex)
+            else {
+                continue;
+            };
+
+            if let Some(subtask) = self.subtask_by_index(subtask_idx) {
+                let frame_idx = i64::try_from(frame_idx)
+                    .map_err(|err| anyhow!("Frame index exceeds max value: {err}"))?;
+
+                let timepoint = TimePoint::default().with(*timeline, frame_idx);
+                let text = TextDocument::new(subtask.subtask.clone());
+                chunk = chunk.with_archetype(row_id, timepoint, &text);
+                row_id = row_id.next();
+            }
+        }
+
+        Ok(std::iter::once(chunk.build()?))
+    }
+
     /// Extract feature-specific timestamp metadata for a given episode and observation.
     ///
     /// Returns (`start_time`, `end_time`) in seconds, defaulting to (0.0, 0.0) if not found.
@@ -445,10 +567,15 @@ impl LeRobotDatasetV3 {
         let video_bytes: &[u8] = &contents;
 
         // Parse the video to get its structure
-        let video = VideoDataDescription::load_from_bytes(video_bytes, "video/mp4", observation)
-            .map_err(|err| {
-                anyhow!("Failed to read video data description for feature '{observation}': {err}")
-            })?;
+        let video = VideoDataDescription::load_from_bytes(
+            video_bytes,
+            "video/mp4",
+            observation,
+            re_log_types::external::re_tuid::Tuid::new(),
+        )
+        .map_err(|err| {
+            anyhow!("Failed to read video data description for feature '{observation}': {err}")
+        })?;
 
         let (start_time, end_time) = self.get_feature_timestamps(episode, observation);
 
@@ -467,26 +594,36 @@ impl LeRobotDatasetV3 {
         let end_video_time = re_video::Time::from_secs(end_time, timescale);
 
         // Find the GOPs that contain our time range
-        let start_gop = video
-            .gop_index_containing_presentation_timestamp(start_video_time)
+        let start_keyframe = video
+            .presentation_time_keyframe_index(start_video_time)
             .unwrap_or(0);
 
-        let end_gop = video
-            .gop_index_containing_presentation_timestamp(end_video_time)
-            .unwrap_or_else(|| video.gops.num_elements() - 1);
+        let end_keyframe = video
+            .presentation_time_keyframe_index(end_video_time)
+            .or_else(|| video.keyframe_indices.len().checked_sub(1))
+            .ok_or(DataLoaderError::Other(anyhow!("No keyframes in the video")))?;
 
         // Determine the sample range to extract from the video
-        let start_sample = video.gops[start_gop].sample_range.start;
-        let end_sample = video.gops[end_gop].sample_range.end;
+        let start_sample = video
+            .gop_sample_range_for_keyframe(start_keyframe)
+            .ok_or(DataLoaderError::Other(anyhow!("Bad video data")))?
+            .start;
+
+        let end_sample = video
+            .gop_sample_range_for_keyframe(end_keyframe)
+            .ok_or(DataLoaderError::Other(anyhow!("Bad video data")))?
+            .end;
 
         let sample_range = start_sample..end_sample;
 
         // Extract all video samples in this range
         let mut samples = Vec::with_capacity(sample_range.len());
-        let mut buffers = StableIndexDeque::new();
-        buffers.push_back(video_bytes);
 
         for (sample_idx, sample_meta) in video.samples.iter_index_range_clamped(&sample_range) {
+            let Some(sample_meta) = sample_meta.sample() else {
+                continue;
+            };
+
             // make sure we absolutely do not leak any samples from outside the requested time range
             if sample_meta.presentation_timestamp < start_video_time
                 || sample_meta.presentation_timestamp >= end_video_time
@@ -494,9 +631,11 @@ impl LeRobotDatasetV3 {
                 continue;
             }
 
-            let chunk = sample_meta.get(&buffers, sample_idx).ok_or_else(|| {
-                anyhow!("Sample {sample_idx} out of bounds for feature '{observation}'")
-            })?;
+            let chunk = sample_meta
+                .get(&|_| video_bytes, sample_idx)
+                .ok_or_else(|| {
+                    anyhow!("Sample {sample_idx} out of bounds for feature '{observation}'")
+                })?;
 
             let sample_bytes = video
             .sample_data_in_stream_format(&chunk)
@@ -566,7 +705,12 @@ impl LeRobotDataset for LeRobotDatasetV3 {
     }
 
     fn load_episode_chunks(&self, episode: EpisodeIndex) -> Result<Vec<Chunk>, DataLoaderError> {
-        self.load_episode(episode)
+        let result = self.load_episode(episode);
+
+        // Release video blob references for this episode regardless of success or failure to avoid leaking memory if we fail to load an episode after caching its video blobs.
+        self.release_episode_videos(episode);
+
+        result
     }
 }
 
@@ -577,6 +721,7 @@ impl LeRobotDataset for LeRobotDatasetV3 {
 pub struct LeRobotDatasetMetadataV3 {
     pub info: LeRobotDatasetInfoV3,
     pub tasks: LeRobotDatasetV3Tasks,
+    pub subtasks: Option<LeRobotDatasetV3Subtasks>,
     pub episodes: HashMap<EpisodeIndex, LeRobotEpisodeData>,
 }
 
@@ -607,6 +752,15 @@ impl LeRobotDatasetMetadataV3 {
         let info = LeRobotDatasetInfoV3::load_from_json_file(metadir.join("info.json"))?;
         let tasks = LeRobotDatasetV3Tasks::load_from_parquet_file(metadir.join("tasks.parquet"))?;
 
+        let subtasks_path = metadir.join("subtasks.parquet");
+        let subtasks = if subtasks_path.is_file() {
+            Some(LeRobotDatasetV3Subtasks::load_from_parquet_file(
+                subtasks_path,
+            )?)
+        } else {
+            None
+        };
+
         // Convert episode data Vec to HashMap for O(1) lookups
         let episodes = episode_data
             .into_iter()
@@ -616,6 +770,7 @@ impl LeRobotDatasetMetadataV3 {
         Ok(Self {
             info,
             tasks,
+            subtasks,
             episodes,
         })
     }
@@ -663,10 +818,8 @@ impl LeRobotEpisodeData {
         // Walk all subdirectories and load episode data files.
         let metadir = metadir.as_ref();
         let mut all_episodes = vec![];
-        for entry in
-            std::fs::read_dir(metadir).map_err(|err| LeRobotError::IO(err, metadir.to_owned()))?
-        {
-            let entry = entry.map_err(|err| LeRobotError::IO(err, metadir.to_owned()))?;
+        for entry in std::fs::read_dir(metadir).map_err(|err| LeRobotError::io(err, metadir))? {
+            let entry = entry.map_err(|err| LeRobotError::io(err, metadir))?;
             let path = entry.path();
             let path = path.as_path();
 
@@ -674,16 +827,15 @@ impl LeRobotEpisodeData {
 
             if path.is_dir() {
                 for chunk_entry in
-                    std::fs::read_dir(path).map_err(|err| LeRobotError::IO(err, path.to_owned()))?
+                    std::fs::read_dir(path).map_err(|err| LeRobotError::io(err, path))?
                 {
-                    let chunk_entry =
-                        chunk_entry.map_err(|err| LeRobotError::IO(err, path.to_owned()))?;
+                    let chunk_entry = chunk_entry.map_err(|err| LeRobotError::io(err, path))?;
                     let chunk_path = chunk_entry.path();
 
                     if chunk_path.is_file() {
                         let chunk_parquet = ParquetRecordBatchReaderBuilder::try_new(
                             File::open(&chunk_path)
-                                .map_err(|err| LeRobotError::IO(err, chunk_path.clone()))?,
+                                .map_err(|err| LeRobotError::io(err, chunk_path.clone()))?,
                         )?
                         .build()?;
 
@@ -887,7 +1039,7 @@ impl LeRobotDatasetInfoV3 {
     /// The `LeRobot` dataset info file is typically stored under `meta/info.json`.
     pub fn load_from_json_file(filepath: impl AsRef<Path>) -> Result<Self, LeRobotError> {
         let info_file = File::open(filepath.as_ref())
-            .map_err(|err| LeRobotError::IO(err, filepath.as_ref().to_owned()))?;
+            .map_err(|err| LeRobotError::io(err, filepath.as_ref()))?;
         let reader = BufReader::new(info_file);
 
         serde_json::from_reader(reader).map_err(|err| err.into())
@@ -979,7 +1131,7 @@ impl LeRobotDatasetV3Tasks {
     pub fn load_from_parquet_file(filepath: impl AsRef<Path>) -> Result<Self, LeRobotError> {
         let filepath = filepath.as_ref().to_owned();
         let parquet_data =
-            File::open(&filepath).map_err(|err| LeRobotError::IO(err, filepath.clone()))?;
+            File::open(&filepath).map_err(|err| LeRobotError::io(err, filepath.clone()))?;
 
         let reader = ParquetRecordBatchReaderBuilder::try_new(parquet_data)?.build()?;
 
@@ -1010,6 +1162,48 @@ impl LeRobotDatasetV3Tasks {
             .collect::<HashMap<_, _>>();
 
         Ok(Self { tasks })
+    }
+}
+
+pub struct LeRobotDatasetV3Subtasks {
+    pub subtasks: HashMap<SubtaskIndex, LeRobotDatasetSubtask>,
+}
+
+impl LeRobotDatasetV3Subtasks {
+    pub fn load_from_parquet_file(filepath: impl AsRef<Path>) -> Result<Self, LeRobotError> {
+        let filepath = filepath.as_ref().to_owned();
+        let parquet_data =
+            File::open(&filepath).map_err(|err| LeRobotError::io(err, filepath.clone()))?;
+
+        let reader = ParquetRecordBatchReaderBuilder::try_new(parquet_data)?.build()?;
+
+        let subtasks = reader
+            .filter_map(|record_batch| {
+                let b = record_batch.ok()?;
+                let subtask_index_col = b.column_by_name("subtask_index")?;
+                let subtask_col = b.column_by_name("subtask")?;
+                let subtask_index = subtask_index_col.as_any().downcast_ref::<Int64Array>()?;
+                let subtask = subtask_col.as_any().downcast_ref::<StringArray>()?;
+
+                let num_rows = b.num_rows();
+                Some(
+                    (0..num_rows)
+                        .map(move |i| {
+                            (
+                                SubtaskIndex(subtask_index.value(i) as usize),
+                                LeRobotDatasetSubtask {
+                                    index: SubtaskIndex(subtask_index.value(i) as usize),
+                                    subtask: subtask.value(i).to_owned(),
+                                },
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .flat_map(|e: Vec<(SubtaskIndex, LeRobotDatasetSubtask)>| e)
+            .collect::<HashMap<_, _>>();
+
+        Ok(Self { subtasks })
     }
 }
 

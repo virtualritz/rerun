@@ -1,5 +1,6 @@
 use proc_macro2::{Literal, TokenStream};
 use quote::{format_ident, quote};
+use re_log::debug_assert;
 
 use crate::codegen::rust::arrow::{
     ArrowDataTypeTokenizer, is_backed_by_scalar_buffer, quote_fqname_as_type_path,
@@ -86,29 +87,17 @@ pub fn quote_arrow_deserializer(
             InnerRepr::NativeIterable,
         );
 
-        let quoted_branches = obj.fields.iter().map(|obj_field| {
-            let quoted_obj_field_type = format_ident!("{}", obj_field.name);
-
-            // We should never hit this unwrap or it means the enum-processing at
-            // the fbs layer is totally broken.
-            let enum_value = obj_field.enum_or_union_variant_value.unwrap();
-            let quoted_enum_value = proc_macro2::Literal::u64_unsuffixed(enum_value);
-
-            quote! {
-                Some(#quoted_enum_value) => Ok(Some(Self::#quoted_obj_field_type))
-            }
-        });
-
-        // TODO(jleibs): We should be able to do this with try_from instead.
         let quoted_remapping = quote! {
             .map(|typ| {
                 match typ {
-                    // The actual enum variants
-                    #(#quoted_branches,)*
+                    Some(val) => {
+                        <Self as ::re_types_core::reflection::Enum>::try_from_integer(val).map(Some).ok_or_else(|| {
+                            DeserializationError::missing_union_arm(
+                                #quoted_self_datatype, "<invalid>", val as _,
+                            )
+                        })
+                    },
                     None => Ok(None),
-                    Some(invalid) => Err(DeserializationError::missing_union_arm(
-                        #quoted_self_datatype, "<invalid>", invalid as _,
-                    )),
                 }
             })
         };
@@ -698,7 +687,7 @@ fn quote_arrow_field_deserializer(
 
                                 // We're manually generating our own offsets in this case, thus length
                                 // must be correct.
-                                debug_assert!(end - start == #length);
+                                re_log::debug_assert!(end - start == #length);
 
                                 // NOTE: It is absolutely crucial we explicitly handle the
                                 // boundchecks manually first, otherwise rustc completely chokes

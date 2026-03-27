@@ -7,11 +7,12 @@ import argparse
 from collections import defaultdict
 from typing import Any
 
-import rerun as rr
-import rerun.blueprint as rrb
 import torch
 import umap
 from transformers import AutoModelForTokenClassification, AutoTokenizer, pipeline
+
+import rerun as rr
+import rerun.blueprint as rrb
 
 DEFAULT_TEXT = """
 In the bustling city of Brightport, nestled between rolling hills and a sparkling harbor, lived three friends: Maya, a spirited chef known for her spicy curries; Leo, a laid-back jazz musician with a penchant for saxophone solos; and Ava, a tech-savvy programmer who loved solving puzzles.
@@ -121,7 +122,7 @@ def run_llm_ner(text: str) -> None:
     # Initialize model
     tokenizer = AutoTokenizer.from_pretrained("dslim/bert-base-NER")
     model = AutoModelForTokenClassification.from_pretrained("dslim/bert-base-NER")
-    ner_pipeline = pipeline("ner", model=model, tokenizer=tokenizer)
+    ner_pipeline = pipeline("ner", model=model, tokenizer=tokenizer)  # type: ignore[call-overload]
 
     # Compute intermediate and final output
     token_ids = tokenizer.encode(text)

@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::str::FromStr as _;
 
 use ahash::HashMap;
 use egui::Ui;
@@ -8,7 +7,7 @@ use egui::text_selection::LabelSelectionState;
 use re_chunk::TimelineName;
 use re_chunk_store::LatestAtQuery;
 use re_entity_db::EntityDb;
-use re_log_channel::LogReceiverSet;
+use re_log_channel::{LogReceiverSet, LogSource};
 use re_log_types::{AbsoluteTimeRangeF, StoreId, TableId};
 use re_redap_browser::RedapServers;
 use re_redap_client::ConnectionRegistryHandle;
@@ -16,19 +15,18 @@ use re_sdk_types::blueprint::components::{PanelState, PlayState};
 use re_ui::{ContextExt as _, UiExt as _};
 use re_viewer_context::open_url::{self, ViewerOpenUrl};
 use re_viewer_context::{
-    AppOptions, ApplicationSelectionState, AsyncRuntimeHandle, AuthContext, BlueprintContext,
-    BlueprintUndoState, CommandSender, ComponentUiRegistry, DataQueryResult, DisplayMode,
-    DragAndDropManager, FallbackProviderRegistry, GlobalContext, Item, PerVisualizerInViewClass,
-    SelectionChange, StorageContext, StoreContext, StoreHub, SystemCommand,
+    ActiveStoreContext, AppBlueprintCtx, AppContext, AppOptions, ApplicationSelectionState,
+    AsyncRuntimeHandle, AuthContext, BlueprintContext, BlueprintUndoState, CommandSender,
+    ComponentUiRegistry, DragAndDropManager, FallbackProviderRegistry, Item, Route,
+    SelectionChange, StorageContext, StoreHub, StoreViewContext, SystemCommand,
     SystemCommandSender as _, TableStore, TimeControl, TimeControlCommand, ViewClassRegistry,
-    ViewId, ViewStates, ViewerContext, blueprint_timeline,
+    ViewStates, ViewerContext, blueprint_timeline,
 };
 use re_viewport::ViewportUi;
 use re_viewport_blueprint::ViewportBlueprint;
 use re_viewport_blueprint::ui::add_view_or_container_modal_ui;
 
 use crate::app_blueprint::AppBlueprint;
-use crate::app_blueprint_ctx::AppBlueprintCtx;
 use crate::navigation::Navigation;
 use crate::open_url_description::ViewerOpenUrlDescription;
 use crate::ui::settings_screen_ui;
@@ -85,7 +83,7 @@ pub struct AppState {
     #[serde(skip)]
     pub(crate) test_hook: Option<TestHookFn>,
 
-    /// A stack of display modes that represents tab-like navigation of the user.
+    /// A stack of [`Route`]s that represents tab-like navigation of the user.
     #[serde(skip)]
     pub(crate) navigation: Navigation,
 
@@ -108,7 +106,7 @@ pub struct AppState {
     /// Not serialized since on startup we have to typically discard it anyways since
     /// whatever data was selected before is no longer accessible.
     ///
-    /// For dataplatform use-cases this can even be rather irritating:
+    /// For Data Platform use-cases this can even be rather irritating:
     /// if previously a server was selected, then starting with a URL should no longer select it.
     #[serde(skip)]
     pub selection_state: ApplicationSelectionState,
@@ -164,6 +162,11 @@ pub(crate) struct WelcomeScreenState {
 }
 
 impl AppState {
+    /// The active recording [`StoreId`], if any, derived from the current [`Route`].
+    pub fn active_recording_id(&self) -> Option<&StoreId> {
+        self.navigation.current().recording_id()
+    }
+
     pub fn set_examples_manifest_url(&mut self, egui_ctx: &egui::Context, url: String) {
         self.welcome_screen.set_examples_manifest_url(egui_ctx, url);
     }
@@ -179,7 +182,7 @@ impl AppState {
     /// Currently selected section of time, if any.
     pub fn loop_selection(
         &self,
-        store_context: Option<&StoreContext<'_>>,
+        store_context: Option<&ActiveStoreContext<'_>>,
     ) -> Option<(TimelineName, AbsoluteTimeRangeF)> {
         let rec_id = store_context.as_ref()?.recording.store_id();
         let time_ctrl = self.time_controls.get(rec_id)?;
@@ -198,7 +201,9 @@ impl AppState {
         app_blueprint: &AppBlueprint<'_>,
         ui: &mut egui::Ui,
         render_ctx: &re_renderer::RenderContext,
-        store_context: &StoreContext<'_>,
+        // TODO(RR-3033): the viewer should be robust to not having a `StoreContext`.
+        // We should only have one if we are currently looking at a blueprint.
+        store_context: &ActiveStoreContext<'_>,
         storage_context: &StorageContext<'_>,
         reflection: &re_types_core::reflection::Reflection,
         component_ui_registry: &ComponentUiRegistry,
@@ -217,7 +222,7 @@ impl AppState {
         let is_any_popup_open = egui::Popup::is_any_open(ui.ctx());
 
         match self.navigation.current() {
-            DisplayMode::Settings(prior_mode) => {
+            Route::Settings { previous } => {
                 let mut show_settings_ui = true;
                 settings_screen_ui(
                     ui,
@@ -226,23 +231,58 @@ impl AppState {
                     &mut show_settings_ui,
                 );
                 if !show_settings_ui {
-                    self.navigation.replace((**prior_mode).clone());
+                    self.navigation.replace((**previous).clone());
                 }
+
+                self.share_modal
+                    .ui(None, ui, startup_options.web_viewer_base_url().as_ref());
             }
 
-            DisplayMode::ChunkStoreBrowser(prior_mode) => {
-                let should_datastore_ui_remain_active =
-                    self.datastore_ui
-                        .ui(store_context, ui, self.app_options.timestamp_format);
-                if !should_datastore_ui_remain_active {
-                    self.navigation.replace((**prior_mode).clone());
+            Route::ChunkStoreBrowser {
+                store_id,
+                selected_chunk,
+                previous,
+            } => {
+                let previous = previous.clone();
+                let store_id = store_id.clone();
+                let selected_chunk_before = *selected_chunk;
+
+                let result = self.datastore_ui.ui(
+                    store_context,
+                    storage_context,
+                    ui,
+                    self.app_options.timestamp_format,
+                    selected_chunk_before,
+                );
+                // Only reflect store/chunk changes back into the route when
+                // the route started with an explicit store_id. Otherwise the
+                // empty fallback recording would be written into the route,
+                // polluting the navigation history.
+                let result_store_id = store_id.as_ref().map(|_| result.recording_id.clone());
+                if !result.keep_open {
+                    self.navigation.replace((*previous).clone());
+                } else if result_store_id != store_id
+                    || result.selected_chunk != selected_chunk_before
+                {
+                    self.navigation.replace(Route::ChunkStoreBrowser {
+                        store_id: result_store_id.clone(),
+                        selected_chunk: if result_store_id != store_id {
+                            None
+                        } else {
+                            result.selected_chunk
+                        },
+                        previous,
+                    });
                 }
+
+                self.share_modal
+                    .ui(None, ui, startup_options.web_viewer_base_url().as_ref());
             }
 
-            // TODO(grtlr,ab): This needs to be further cleaned up and split into separately handled
-            // display modes. See https://www.notion.so/rerunio/Major-refactor-of-re_viewer-1d8b24554b198085a02dfe441db330b4
+            // TODO(RR-3033): This needs to be further cleaned up and split into separately handled routes.
             _ => {
                 let blueprint_query = self.blueprint_query_for_viewer(store_context.blueprint);
+                let route = self.navigation.current();
 
                 let Self {
                     app_options,
@@ -293,9 +333,10 @@ impl AppState {
                             return false;
                         }
 
-                        viewport_ui.blueprint.is_item_valid(storage_context, item)
+                        item.is_compatible_with_route(route)
+                            && viewport_ui.blueprint.is_item_valid(storage_context, item)
                     },
-                    Some(Item::StoreId(store_context.recording.store_id().clone())),
+                    route.item(),
                 );
 
                 if let SelectionChange::SelectionChanged(selection) = selection_change
@@ -314,69 +355,80 @@ impl AppState {
 
                 let recording = store_context.recording;
 
-                let visualizable_entities_per_visualizer = view_class_registry
-                    .visualizable_entities_for_visualizer_systems(recording.store_id());
+                let visualizable_entities_per_visualizer = store_context
+                    .caches
+                    .visualizable_entities_for_visualizer_systems();
                 let indicated_entities_per_visualizer =
-                    view_class_registry.indicated_entities_per_visualizer(recording.store_id());
+                    store_context.caches.indicated_entities_per_visualizer();
+
+                let app_blueprint_ctx = AppBlueprintCtx {
+                    command_sender,
+                    current_blueprint: store_context.blueprint,
+                    default_blueprint: store_context.default_blueprint,
+                    blueprint_query: blueprint_query.clone(),
+                };
+                let time_ctrl =
+                    create_time_control_for(time_controls, recording, &app_blueprint_ctx);
+                let active_timeline = time_ctrl.timeline();
 
                 // Execute the queries for every `View`
                 let query_results = {
-                    re_tracing::profile_scope!("query_results");
+                    re_tracing::profile_wait!("query_results");
+
+                    use rayon::iter::{IntoParallelIterator as _, ParallelIterator as _};
+
+                    for view in viewport_ui.blueprint.views.values() {
+                        view_states.ensure_state_exists(
+                            recording.store_id(),
+                            view.id,
+                            view.class(view_class_registry),
+                        );
+                    }
+
                     viewport_ui
                         .blueprint
                         .views
                         .values()
+                        .collect::<Vec<_>>()
+                        .into_par_iter()
                         .map(|view| {
-                            // Same logic as in `ViewerContext::collect_visualizable_entities_for_view_class`,
-                            // but we don't have access to `ViewerContext` just yet.
-                            let visualizable_entities = if let Some(view_class) =
-                                view_class_registry.class_entry(view.class_identifier())
-                            {
-                                PerVisualizerInViewClass {
-                                    view_class_identifier: view.class_identifier(),
-                                    per_visualizer: visualizable_entities_per_visualizer
-                                        .iter()
-                                        .filter_map(|(vis, ents)| {
-                                            view_class
-                                                .visualizer_system_ids
-                                                .contains(vis)
-                                                .then_some((*vis, ents.clone()))
-                                        })
-                                        .collect(),
-                                }
-                            } else {
-                                PerVisualizerInViewClass::empty(view.class_identifier())
-                            };
+                            re_tracing::profile_scope!("view", view.display_name_or_default().to_string().as_str());
+
+                            let view_state = view_states
+                                .get(recording.store_id(), view.id)
+                                .expect("View state should exist, we just called ensure_state_exists on it.");
+
+                            let query_range = view.query_range(
+                                app_blueprint_ctx.current_blueprint(),
+                                app_blueprint_ctx.blueprint_query(),
+                                active_timeline,
+                                view_class_registry,
+                                view_state,
+                            );
 
                             (
                                 view.id,
-                                view.contents.execute_query(
+                                view.contents.build_data_result_tree(
                                     store_context,
+                                    active_timeline,
                                     view_class_registry,
-                                    &blueprint_query,
-                                    &visualizable_entities,
+                                    app_blueprint_ctx.blueprint_query(),
+                                    &query_range,
+                                    &visualizable_entities_per_visualizer,
+                                    &indicated_entities_per_visualizer,
+                                    app_options,
                                 ),
                             )
                         })
                         .collect::<_>()
                 };
 
-                let app_blueprint_ctx = AppBlueprintCtx {
-                    command_sender,
-                    current_blueprint: store_context.blueprint,
-                    default_blueprint: store_context.default_blueprint,
-                    blueprint_query,
-                };
-                let time_ctrl =
-                    create_time_control_for(time_controls, recording, &app_blueprint_ctx);
-                let blueprint_query = app_blueprint_ctx.blueprint_query;
-
                 let egui_ctx = ui.ctx().clone();
-                let display_mode = self.navigation.current();
                 let ctx = ViewerContext {
-                    global_context: GlobalContext {
+                    app_ctx: AppContext {
                         is_test: app_env.is_test(),
 
+                        memory_limit: startup_options.memory_limit,
                         app_options,
                         reflection,
 
@@ -385,24 +437,28 @@ impl AppState {
                         command_sender,
 
                         connection_registry,
-                        display_mode,
+                        storage_context,
+                        active_store_context: Some(store_context),
+
+                        component_ui_registry,
+                        view_class_registry,
+                        component_fallback_registry,
+                        route,
+                        selection_state,
+                        focused_item,
+                        drag_and_drop_manager: &drag_and_drop_manager,
+                        active_time_ctrl: Some(time_ctrl),
+                        connected_receivers: rx_log,
                         auth_context: auth_state.as_ref(),
                     },
-                    component_ui_registry,
-                    component_fallback_registry,
-                    view_class_registry,
                     connected_receivers: rx_log,
                     store_context,
-                    storage_context,
                     visualizable_entities_per_visualizer: &visualizable_entities_per_visualizer,
                     indicated_entities_per_visualizer: &indicated_entities_per_visualizer,
                     query_results: &query_results,
                     time_ctrl,
                     blueprint_time_ctrl: blueprint_time_control,
-                    selection_state,
                     blueprint_query: &blueprint_query,
-                    focused_item,
-                    drag_and_drop_manager: &drag_and_drop_manager,
                 };
 
                 // enable the heuristics if we must this frame
@@ -415,48 +471,12 @@ impl AppState {
                 // Update the viewport. May spawn new views and handle queued requests (like screenshots).
                 viewport_ui.on_frame_start(&ctx);
 
-                let query_results = update_overrides(&ctx, &viewport_ui.blueprint, view_states);
-
-                // We need to recreate the context to appease the borrow checker. It is a bit annoying, but
-                // it's just a bunch of refs so not really that big of a deal in practice.
-                let ctx = ViewerContext {
-                    global_context: GlobalContext {
-                        is_test: app_env.is_test(),
-
-                        app_options,
-                        reflection,
-
-                        egui_ctx: &egui_ctx,
-                        render_ctx,
-                        command_sender,
-
-                        connection_registry,
-                        display_mode,
-                        auth_context: auth_state.as_ref(),
-                    },
-                    component_ui_registry,
-                    component_fallback_registry,
-                    view_class_registry,
-                    connected_receivers: rx_log,
-                    store_context,
-                    storage_context,
-                    visualizable_entities_per_visualizer: &visualizable_entities_per_visualizer,
-                    indicated_entities_per_visualizer: &indicated_entities_per_visualizer,
-                    query_results: &query_results,
-                    time_ctrl,
-                    blueprint_time_ctrl: blueprint_time_control,
-                    selection_state,
-                    blueprint_query: &blueprint_query,
-                    focused_item,
-                    drag_and_drop_manager: &drag_and_drop_manager,
-                };
-
                 //
                 // Blueprint time panel
                 //
 
                 if app_options.inspect_blueprint_timeline
-                    && matches!(display_mode, DisplayMode::LocalRecordings(_))
+                    && matches!(route, Route::LocalRecording { .. })
                 {
                     let blueprint_db = ctx.store_context.blueprint;
 
@@ -489,9 +509,8 @@ impl AppState {
 
                     blueprint_time_panel.show_panel(
                         &ctx,
+                        &ctx.blueprint_store_view_ctx(),
                         &viewport_ui.blueprint,
-                        blueprint_db,
-                        blueprint_time_control,
                         ui,
                         PanelState::Expanded,
                         // Give the blueprint time panel a distinct color from the normal time panel:
@@ -502,7 +521,7 @@ impl AppState {
                 }
 
                 // TODO(grtlr): We override the app blueprint, until we have proper blueprint support for tables.
-                let app_blueprint = if matches!(display_mode, DisplayMode::LocalTable(..)) {
+                let app_blueprint = if matches!(route, Route::LocalTable(..)) {
                     &AppBlueprint::new(
                         None,
                         &LatestAtQuery::latest(blueprint_timeline()),
@@ -517,12 +536,11 @@ impl AppState {
                 // Time panel
                 //
 
-                if display_mode.has_time_panel() {
+                if route.has_time_panel() {
                     time_panel.show_panel(
                         &ctx,
+                        &ctx.active_recording_store_view_context(),
                         &viewport_ui.blueprint,
-                        ctx.recording(),
-                        ctx.time_ctrl,
                         ui,
                         app_blueprint.time_panel_state(),
                         ui.tokens().bottom_panel_frame(),
@@ -533,7 +551,7 @@ impl AppState {
                 // Selection Panel
                 //
 
-                if display_mode.has_selection_panel() {
+                if route.has_selection_panel() {
                     selection_panel.show_panel(
                         &ctx,
                         &viewport_ui.blueprint,
@@ -547,16 +565,14 @@ impl AppState {
                 // Left panel (recordings and blueprint)
                 //
 
-                let left_panel = egui::SidePanel::left("blueprint_panel")
+                let left_panel = egui::Panel::left("blueprint_panel")
                     .resizable(true)
                     .frame(egui::Frame {
                         fill: ui.visuals().panel_fill,
                         ..Default::default()
                     })
-                    .min_width(120.0)
-                    .default_width(default_blueprint_panel_width(
-                        ui.ctx().content_rect().width(),
-                    ));
+                    .min_size(120.0)
+                    .default_size(default_blueprint_panel_width(ui.content_rect().width()));
 
                 let left_panel_response = left_panel.show_animated_inside(
                     ui,
@@ -566,14 +582,13 @@ impl AppState {
                         // before drawing the blueprint panel.
                         ui.spacing_mut().item_spacing.y = 0.0;
 
-                        match display_mode {
-                            DisplayMode::LocalRecordings(..)
-                            | DisplayMode::LocalTable(..)
-                            | DisplayMode::RedapEntry(..)
-                            | DisplayMode::RedapServer(..)
-                            | DisplayMode::Loading(..) => {
-                                let show_blueprints =
-                                    matches!(display_mode, DisplayMode::LocalRecordings(_));
+                        match route {
+                            Route::LocalRecording { .. }
+                            | Route::LocalTable(..)
+                            | Route::RedapEntry(..)
+                            | Route::RedapServer(..)
+                            | Route::Loading(..) => {
+                                let show_blueprints = matches!(route, Route::LocalRecording { .. });
                                 let resizable = show_blueprints;
                                 if resizable {
                                     // Ensure Blueprint panel has at least 150px minimum height, because now it doesn't autogrow (as it does without resizing=active)
@@ -587,13 +602,13 @@ impl AppState {
                                         - blueprint_min_height)
                                         .max(recordings_min_height);
 
-                                    egui::TopBottomPanel::top("recording_panel")
+                                    egui::Panel::top("recording_panel")
                                         .frame(egui::Frame::new())
                                         .resizable(resizable)
                                         .show_separator_line(false)
-                                        .min_height(recordings_min_height)
-                                        .max_height(max_recordings_height)
-                                        .default_height(160.0_f32.max(recordings_min_height))
+                                        .min_size(recordings_min_height)
+                                        .max_size(max_recordings_height)
+                                        .default_size(160.0_f32.max(recordings_min_height))
                                         .show_inside(ui, |ui| {
                                             self.recording_panel.show_panel(
                                                 &ctx,
@@ -621,7 +636,7 @@ impl AppState {
                                 }
                             }
 
-                            DisplayMode::ChunkStoreBrowser(_) | DisplayMode::Settings(_) => {} // handled above
+                            Route::ChunkStoreBrowser { .. } | Route::Settings { .. } => {} // handled above
                         }
                     },
                 );
@@ -643,10 +658,16 @@ impl AppState {
                 egui::CentralPanel::default()
                     .frame(viewport_frame)
                     .show_inside(ui, |ui| {
-                        match display_mode {
-                            DisplayMode::LocalTable(table_id) => {
-                                if let Some(store) = ctx.storage_context.tables.get(table_id) {
-                                    table_ui(&ctx, runtime, ui, table_id, store);
+                        match route {
+                            Route::LocalTable(table_id) => {
+                                if let Some(store) = ctx.table_stores().get(table_id) {
+                                    table_ui(
+                                        &ctx.active_recording_store_view_context(),
+                                        runtime,
+                                        ui,
+                                        table_id,
+                                        store,
+                                    );
                                 } else {
                                     re_log::error_once!(
                                         "Could not find batch store for table id {}",
@@ -655,26 +676,28 @@ impl AppState {
                                 }
                             }
 
-                            DisplayMode::LocalRecordings(_) => {
+                            Route::LocalRecording { .. } => {
                                 // If we are here and the "default" app id is selected,
                                 // we should instead switch to the welcome screen.
                                 if ctx.store_context.application_id()
-                                    == &StoreHub::welcome_screen_app_id()
+                                    == StoreHub::welcome_screen_app_id()
                                 {
-                                    ctx.command_sender().send_system(
-                                        SystemCommand::ChangeDisplayMode(DisplayMode::RedapServer(
-                                            re_redap_browser::EXAMPLES_ORIGIN.clone(),
-                                        )),
-                                    );
+                                    ctx.command_sender().send_system(SystemCommand::SetRoute(
+                                        Route::welcome_page(),
+                                    ));
                                 }
                                 viewport_ui.viewport_ui(ui, &ctx, view_states);
                             }
 
-                            DisplayMode::RedapEntry(entry) => {
-                                redap_servers.entry_ui(&ctx, ui, entry.entry_id);
+                            Route::RedapEntry(entry) => {
+                                redap_servers.entry_ui(
+                                    &ctx.active_recording_store_view_context(), // TODO(RR-1127): this makes no sense
+                                    ui,
+                                    entry.entry_id,
+                                );
                             }
 
-                            DisplayMode::RedapServer(origin) => {
+                            Route::RedapServer(origin) => {
                                 if origin == &*re_redap_browser::EXAMPLES_ORIGIN {
                                     let origin = redap_servers
                                         .iter_servers()
@@ -700,17 +723,21 @@ impl AppState {
                                     };
                                     welcome_screen.ui(
                                         ui,
-                                        &ctx.global_context,
+                                        &ctx.app_ctx,
                                         welcome_screen_state,
                                         &rx_log.sources(),
                                         &login_state,
                                     );
                                 } else {
-                                    redap_servers.server_central_panel_ui(&ctx, ui, origin);
+                                    redap_servers.server_central_panel_ui(
+                                        &ctx.active_recording_store_view_context(), // TODO(RR-3033): server_central_panel_ui should not know about any recording/blueprint
+                                        ui,
+                                        origin,
+                                    );
                                 }
                             }
 
-                            DisplayMode::Loading(source) => {
+                            Route::Loading(source) => {
                                 let source = if let Ok(url) =
                                     ViewerOpenUrl::from_data_source(source)
                                 {
@@ -722,7 +749,7 @@ impl AppState {
                                 ui.loading_screen("Loading data source:", &*source);
                             }
 
-                            DisplayMode::ChunkStoreBrowser(_) | DisplayMode::Settings(_) => {} // Handled above
+                            Route::ChunkStoreBrowser { .. } | Route::Settings { .. } => {} // Handled above
                         }
                     });
 
@@ -732,10 +759,13 @@ impl AppState {
                 // Process deferred layout operations and apply updates back to blueprint:
                 viewport_ui.save_to_blueprint_store(&ctx);
 
-                self.redap_servers.modals_ui(&ctx.global_context, ui);
+                self.redap_servers.modals_ui(&ctx.app_ctx, ui);
                 self.open_url_modal.ui(ui);
-                self.share_modal
-                    .ui(&ctx, ui, startup_options.web_viewer_base_url().as_ref());
+                self.share_modal.ui(
+                    Some(&ctx),
+                    ui,
+                    startup_options.web_viewer_base_url().as_ref(),
+                );
 
                 // Only in integration tests: call the test hook if any.
                 #[cfg(feature = "testing")]
@@ -750,7 +780,7 @@ impl AppState {
         //
 
         if WATERMARK {
-            ui.ctx().paint_watermark();
+            ui.paint_watermark();
         }
 
         // This must run after any ui code, or other code that tells egui to open an url:
@@ -766,7 +796,7 @@ impl AppState {
             .memory(|mem| mem.focused())
             .and_then(|id| TextEditState::load(ui.ctx(), id))
             .is_none()
-            && ui
+            && !ui
                 .ctx()
                 .plugin::<LabelSelectionState>()
                 .lock()
@@ -796,6 +826,7 @@ impl AppState {
         create_time_control_for(&mut self.time_controls, entity_db, blueprint_ctx)
     }
 
+    /// Remove dangling state
     pub fn cleanup(&mut self, store_hub: &StoreHub) {
         re_tracing::profile_function!();
 
@@ -851,80 +882,8 @@ impl AppState {
     }
 }
 
-/// Updates the query results for the given viewport UI.
-///
-/// Returns query results derived from the previous one.
-fn update_overrides(
-    ctx: &ViewerContext<'_>,
-    viewport_blueprint: &ViewportBlueprint,
-    view_states: &mut ViewStates,
-) -> HashMap<ViewId, DataQueryResult> {
-    use rayon::iter::{IntoParallelIterator as _, ParallelIterator as _};
-
-    struct OverridesUpdateTask<'a> {
-        view: &'a re_viewport_blueprint::ViewBlueprint,
-        view_state: &'a dyn re_viewer_context::ViewState,
-        query_result: DataQueryResult,
-    }
-
-    for view in viewport_blueprint.views.values() {
-        view_states.ensure_state_exists(view.id, view.class(ctx.view_class_registry));
-    }
-
-    let mut query_results = ctx.query_results.clone();
-
-    let work_items = viewport_blueprint
-        .views
-        .values()
-        .filter_map(|view| {
-            query_results.remove(&view.id).map(|query_result| {
-                let view_state = view_states
-                    .get(view.id)
-                    .expect("View state should exist, we just called ensure_state_exists on it.");
-                OverridesUpdateTask {
-                    view,
-                    view_state,
-                    query_result,
-                }
-            })
-        })
-        .collect::<Vec<_>>();
-
-    work_items
-        .into_par_iter()
-        .map(
-            |OverridesUpdateTask {
-                 view,
-                 view_state,
-                 mut query_result,
-             }| {
-                let visualizable_entities =
-                    ctx.collect_visualizable_entities_for_view_class(view.class_identifier());
-
-                let resolver = re_viewport_blueprint::DataQueryPropertyResolver::new(
-                    view,
-                    ctx.view_class_registry,
-                    &visualizable_entities,
-                    ctx.indicated_entities_per_visualizer,
-                );
-
-                resolver.update_overrides(
-                    ctx.store_context.blueprint,
-                    ctx.blueprint_query,
-                    ctx.time_ctrl.timeline(),
-                    ctx.view_class_registry,
-                    &mut query_result,
-                    view_state,
-                );
-
-                (view.id, query_result)
-            },
-        )
-        .collect()
-}
-
 fn table_ui(
-    ctx: &ViewerContext<'_>,
+    ctx: &StoreViewContext<'_>,
     runtime: &AsyncRuntimeHandle,
     ui: &mut Ui,
     table_id: &TableId,
@@ -944,33 +903,34 @@ pub(crate) fn create_time_control_for<'cfgs>(
         entity_db: &'_ EntityDb,
         blueprint_ctx: &'_ impl BlueprintContext,
     ) -> TimeControl {
-        let play_state = if let Some(data_source) = &entity_db.data_source {
+        let follow = if let Some(data_source) = &entity_db.data_source {
             match data_source {
-                // Play files from the start by default - it feels nice and alive.
-                // We assume the `RrdHttpStream` is a done recording.
-                re_log_channel::LogSource::File(_)
-                | re_log_channel::LogSource::RrdHttpStream { follow: false, .. }
-                | re_log_channel::LogSource::RedapGrpcStream { .. }
-                | re_log_channel::LogSource::RrdWebEvent => PlayState::Playing,
+                // Potentially live data:
+                LogSource::File { follow, .. } | LogSource::HttpStream { follow, .. } => *follow,
 
-                // Live data - follow it!
-                re_log_channel::LogSource::RrdHttpStream { follow: true, .. }
-                | re_log_channel::LogSource::Sdk
-                | re_log_channel::LogSource::MessageProxy { .. }
-                | re_log_channel::LogSource::Stdin
-                | re_log_channel::LogSource::JsChannel { .. } => PlayState::Following,
+                // Not live data:
+                LogSource::RedapGrpcStream { .. } | LogSource::RrdWebEvent => false,
+
+                // Live data:
+                LogSource::Sdk
+                | LogSource::MessageProxy { .. }
+                | LogSource::Stdin
+                | LogSource::JsChannel { .. } => true,
             }
         } else {
-            PlayState::Following // No known source 🤷‍♂️
+            true // No known source 🤷‍♂️
+        };
+
+        let play_state = if follow {
+            PlayState::Following
+        } else {
+            // Play files from the start by default - it feels nice and alive.
+            PlayState::Playing
         };
 
         let mut time_ctrl = TimeControl::from_blueprint(blueprint_ctx);
 
-        time_ctrl.set_play_state(
-            Some(entity_db.timeline_histograms()),
-            play_state,
-            Some(blueprint_ctx),
-        );
+        time_ctrl.set_play_state(Some(entity_db), play_state, Some(blueprint_ctx));
 
         time_ctrl
     }
@@ -989,11 +949,17 @@ fn check_for_clicked_hyperlinks(egui_ctx: &egui::Context, command_sender: &Comma
     egui_ctx.output_mut(|o| {
         o.commands.retain_mut(|command| {
             if let egui::OutputCommand::OpenUrl(open_url) = command {
-                if let Ok(url) = open_url::ViewerOpenUrl::from_str(&open_url.url) {
+                if let Ok(url) = open_url::ViewerOpenUrl::parse_with_options(
+                    &open_url.url,
+                    &re_data_source::FromUriOptions {
+                        accept_extensionless_http: false,
+                        ..Default::default()
+                    },
+                ) {
                     url.open(
                         egui_ctx,
                         &open_url::OpenUrlOptions {
-                            follow_if_http: false,
+                            follow: false,
                             select_redap_source_when_loaded: !open_url.new_tab,
                             show_loader: !open_url.new_tab,
                         },
@@ -1014,4 +980,18 @@ fn check_for_clicked_hyperlinks(egui_ctx: &egui::Context, command_sender: &Comma
 
 pub fn default_blueprint_panel_width(screen_width: f32) -> f32 {
     (0.35 * screen_width).min(200.0).round()
+}
+
+impl re_byte_size::MemUsageTreeCapture for AppState {
+    fn capture_mem_usage_tree(&self) -> re_byte_size::MemUsageTree {
+        use re_byte_size::SizeBytes as _;
+
+        let mut tree = re_byte_size::MemUsageNode::default();
+        tree.add(
+            "blueprint_undo_state",
+            self.blueprint_undo_state.total_size_bytes(),
+        );
+        tree.add("view_states", self.view_states.total_size_bytes());
+        tree.into_tree()
+    }
 }

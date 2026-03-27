@@ -4,12 +4,13 @@ use std::collections::HashSet;
 use std::fmt::Display;
 use std::fs::File;
 use std::io::BufReader;
-use std::sync::mpsc;
 
 use anyhow::Context as _;
 use cargo_metadata::semver::Version;
+use crossbeam::channel::Sender;
 use indicatif::ProgressBar;
 use rayon::prelude::{IntoParallelIterator as _, ParallelIterator as _};
+use re_quota_channel::send_crossbeam;
 use rustdoc_types::{Crate, Id as ItemId, Impl, Item, ItemEnum, Type, Use};
 
 use super::{Context, DocumentData, DocumentKind};
@@ -82,7 +83,7 @@ pub fn ingest(
         crates.push(krate);
     }
 
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = crossbeam::channel::bounded(1024);
     let version = ctx.release_version();
 
     ctx.finish_progress_bar(progress);
@@ -114,7 +115,7 @@ pub fn ingest(
 struct Visitor<'a> {
     progress: ProgressBar,
     visited: HashSet<ItemId>,
-    documents: &'a mpsc::Sender<DocumentData>,
+    documents: &'a Sender<DocumentData>,
     module_path: Vec<String>,
     krate: &'a Crate,
     base_url: String,
@@ -124,7 +125,7 @@ impl<'a> Visitor<'a> {
     fn new(
         progress: ProgressBar,
         version: &Version,
-        documents: &'a mpsc::Sender<DocumentData>,
+        documents: &'a Sender<DocumentData>,
         krate: &'a Crate,
     ) -> Self {
         let crate_name = krate.name();
@@ -173,13 +174,15 @@ impl<'a> Visitor<'a> {
             }
         };
 
-        self.documents
-            .send(document(
+        send_crossbeam(
+            self.documents,
+            document(
                 path.join("::"),
                 format!("{}/{}/{}", self.base_url, module_path.join("/"), item_path),
                 self.krate.index[id].docs.clone().unwrap_or_default(),
-            ))
-            .ok();
+            ),
+        )
+        .ok();
     }
 
     fn visit_root(&mut self) {
@@ -191,13 +194,15 @@ impl<'a> Visitor<'a> {
 
         let name = root_module_item.name.as_ref().unwrap().clone();
         let url = format!("{}/{name}/index.html", self.base_url);
-        self.documents
-            .send(document(
+        send_crossbeam(
+            self.documents,
+            document(
                 name.clone(),
                 url,
                 root_module_item.docs.clone().unwrap_or_default(),
-            ))
-            .ok();
+            ),
+        )
+        .ok();
 
         for item_id in &root_module.items {
             self.visit_item(false, item_id);

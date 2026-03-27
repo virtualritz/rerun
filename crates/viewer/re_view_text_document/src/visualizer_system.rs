@@ -1,4 +1,5 @@
 use re_chunk_store::LatestAtQuery;
+use re_sdk_types::Archetype as _;
 use re_sdk_types::archetypes::TextDocument;
 use re_sdk_types::components;
 use re_view::DataResultQuery as _;
@@ -28,8 +29,14 @@ impl IdentifiedViewSystem for TextDocumentSystem {
 }
 
 impl VisualizerSystem for TextDocumentSystem {
-    fn visualizer_query_info(&self) -> VisualizerQueryInfo {
-        VisualizerQueryInfo::from_archetype::<TextDocument>()
+    fn visualizer_query_info(
+        &self,
+        _app_options: &re_viewer_context::AppOptions,
+    ) -> VisualizerQueryInfo {
+        VisualizerQueryInfo::single_required_component::<components::Text>(
+            &TextDocument::descriptor_text(),
+            &TextDocument::all_components(),
+        )
     }
 
     fn execute(
@@ -40,12 +47,17 @@ impl VisualizerSystem for TextDocumentSystem {
     ) -> Result<VisualizerExecutionOutput, ViewSystemExecutionError> {
         let timeline_query = LatestAtQuery::new(view_query.timeline, view_query.latest_at);
 
-        for data_result in view_query.iter_visible_data_results(Self::identifier()) {
-            let results = data_result
-                .latest_at_with_blueprint_resolved_data::<TextDocument>(ctx, &timeline_query);
+        for (data_result, instruction) in
+            view_query.iter_visualizer_instruction_for(Self::identifier())
+        {
+            let results = data_result.latest_at_with_blueprint_resolved_data::<TextDocument>(
+                ctx,
+                &timeline_query,
+                Some(instruction),
+            );
 
-            let Some(text) = results
-                .get_required_mono::<components::Text>(TextDocument::descriptor_text().component)
+            let Some(text) =
+                results.get_mono::<components::Text>(TextDocument::descriptor_text().component)
             else {
                 continue;
             };
@@ -57,9 +69,5 @@ impl VisualizerSystem for TextDocumentSystem {
         }
 
         Ok(VisualizerExecutionOutput::default())
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }

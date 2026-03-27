@@ -112,7 +112,7 @@ impl<T> StableIndexDeque<T> {
     /// Beware of using `.iter().enumerate()` as it will not respect the index offset.
     /// Use [`Self::iter_indexed`] instead.
     #[inline]
-    pub fn iter(&self) -> impl Iterator<Item = &T> {
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &T> {
         self.vec.iter()
     }
 
@@ -133,9 +133,27 @@ impl<T> StableIndexDeque<T> {
     /// v.pop_front();
     /// assert_eq!(v.iter_indexed().collect::<Vec<_>>(), vec![(1, &1)]);
     /// ```
-    pub fn iter_indexed(&self) -> impl Iterator<Item = (usize, &T)> {
+    pub fn iter_indexed(&self) -> impl DoubleEndedIterator<Item = (usize, &T)> + ExactSizeIterator {
+        let offset = self.index_offset;
         self.vec
             .iter()
+            .enumerate()
+            .map(move |(i, v)| (i + offset, v))
+    }
+
+    /// Like `iter_mut().enumerate()` but with the index offset applied.
+    ///
+    /// ```
+    /// # use re_video::StableIndexDeque;
+    /// let mut v = (0..2).collect::<StableIndexDeque<i32>>();
+    /// v.pop_front();
+    /// assert_eq!(v.iter_indexed_mut().collect::<Vec<_>>(), vec![(1usize, &mut 1i32)]);
+    /// ```
+    pub fn iter_indexed_mut(
+        &mut self,
+    ) -> impl DoubleEndedIterator<Item = (usize, &mut T)> + ExactSizeIterator {
+        self.vec
+            .iter_mut()
             .enumerate()
             .map(|(i, v)| (i + self.index_offset, v))
     }
@@ -298,27 +316,41 @@ impl<T> StableIndexDeque<T> {
         self.vec.len()
     }
 
-    /// Returns the index of the latest element in a deque that is less than or equal to the given sorted key.
+    /// Replaces the elements in the given stable index range with the given replacement.
     ///
-    /// Returns the index of:
-    /// - The index of `needle` in `v`, if it exists
-    /// - The index of the first element in `v` that is lesser than `needle`, if it exists
-    /// - `None`, if `v` is empty OR `needle` is greater than all elements in `v`
-    pub fn latest_at_idx<K: Ord>(&self, key: impl Fn(&T) -> K, needle: &K) -> Option<usize> {
-        if self.is_empty() {
-            return None;
-        }
+    /// Indices after the range shift by the difference in length.
+    ///
+    /// # Panics
+    /// Panics if the range is out of bounds.
+    ///
+    /// ```
+    /// # use re_video::StableIndexDeque;
+    /// let mut v = (0..6).collect::<StableIndexDeque<i32>>();
+    /// v.pop_front(); // now contains [1,2,3,4,5] at indices 1..6
+    ///
+    /// // Replace indices 2..4 (values 2,3) with three new values:
+    /// v.replace(2..4, vec![20, 30, 40]);
+    /// // Now contains [1, 20, 30, 40, 4, 5] at indices 1..7
+    /// assert_eq!(v.get(1), Some(&1));
+    /// assert_eq!(v.get(2), Some(&20));
+    /// assert_eq!(v.get(4), Some(&40));
+    /// assert_eq!(v.get(5), Some(&4));
+    /// assert_eq!(v.get(6), Some(&5));
+    /// assert_eq!(v.num_elements(), 6);
+    /// ```
+    pub fn replace(&mut self, range: std::ops::Range<usize>, replacement: Vec<T>) {
+        let local_start = range.start - self.index_offset;
+        let local_end = range.end - self.index_offset;
 
-        let idx = self.partition_point(|x| key(x) <= *needle);
+        // Collect removed elements.
+        self.vec.drain(local_start..local_end);
 
-        if idx == self.min_index() {
-            // If idx is the smallest possible value, then all elements are greater than the needle
-            if &key(&self[idx]) > needle {
-                return None;
-            }
-        }
+        // Collect the tail (everything after the removed range).
+        let tail: Vec<T> = self.vec.drain(local_start..).collect();
 
-        Some(idx.saturating_sub(1))
+        // Insert the replacement, then re-append the tail.
+        self.vec.extend(replacement);
+        self.vec.extend(tail);
     }
 
     /// Iterates over an index range which is truncated to a valid range in the list.
@@ -332,13 +364,34 @@ impl<T> StableIndexDeque<T> {
     /// assert_eq!(v.iter_index_range_clamped(&(3..5)).collect::<Vec<_>>(), vec![(3, &3), (4, &4)]);
     /// ```
     #[inline]
-    pub fn iter_index_range_clamped(
-        &self,
+    pub fn iter_index_range_clamped<'a>(
+        &'a self,
         range: &std::ops::Range<usize>,
-    ) -> impl Iterator<Item = (usize, &T)> {
+    ) -> impl DoubleEndedIterator<Item = (usize, &'a T)> + ExactSizeIterator + use<'a, T> {
         let range_start = range.start.saturating_sub(self.index_offset);
         let num_elements = range.end - range.start;
         self.iter_indexed().skip(range_start).take(num_elements)
+    }
+
+    /// Mutably iterates over an index range which is truncated to a valid range in
+    /// the list.
+    ///
+    /// ```
+    /// # use re_video::StableIndexDeque;
+    /// let mut v = (0..5).collect::<StableIndexDeque<i32>>();
+    /// v.pop_front();
+    /// assert_eq!(v.iter_index_range_clamped_mut(&(0..5)).collect::<Vec<_>>(), vec![(1, &mut 1), (2, &mut 2), (3, &mut 3), (4, &mut 4)]);
+    /// assert_eq!(v.iter_index_range_clamped_mut(&(2..4)).collect::<Vec<_>>(), vec![(2, &mut 2), (3, &mut 3)]);
+    /// assert_eq!(v.iter_index_range_clamped_mut(&(3..5)).collect::<Vec<_>>(), vec![(3, &mut 3), (4, &mut 4)]);
+    /// ```
+    #[inline]
+    pub fn iter_index_range_clamped_mut<'a>(
+        &'a mut self,
+        range: &std::ops::Range<usize>,
+    ) -> impl DoubleEndedIterator<Item = (usize, &'a mut T)> + ExactSizeIterator + use<'a, T> {
+        let range_start = range.start.saturating_sub(self.index_offset);
+        let num_elements = range.end - range.start;
+        self.iter_indexed_mut().skip(range_start).take(num_elements)
     }
 }
 
@@ -400,36 +453,72 @@ mod tests {
     }
 
     #[test]
-    fn test_latest_at_idx() {
-        let mut v = (1..11).collect::<StableIndexDeque<i32>>();
-        assert_eq!(v.latest_at_idx(|v| *v, &0), None);
-        assert_eq!(v.latest_at_idx(|v| *v, &1), Some(0));
-        assert_eq!(v.latest_at_idx(|v| *v, &2), Some(1));
-        assert_eq!(v.latest_at_idx(|v| *v, &3), Some(2));
-        assert_eq!(v.latest_at_idx(|v| *v, &4), Some(3));
-        assert_eq!(v.latest_at_idx(|v| *v, &5), Some(4));
-        assert_eq!(v.latest_at_idx(|v| *v, &6), Some(5));
-        assert_eq!(v.latest_at_idx(|v| *v, &7), Some(6));
-        assert_eq!(v.latest_at_idx(|v| *v, &8), Some(7));
-        assert_eq!(v.latest_at_idx(|v| *v, &9), Some(8));
-        assert_eq!(v.latest_at_idx(|v| *v, &10), Some(9));
-        assert_eq!(v.latest_at_idx(|v| *v, &11), Some(9));
-        assert_eq!(v.latest_at_idx(|v| *v, &1000), Some(9));
+    fn test_replace_grow() {
+        // [0, 1, 2, 3, 4] at indices 0..5
+        let mut v = (0..5).collect::<StableIndexDeque<i32>>();
 
-        // Index offset should be respected.
-        v.pop_front();
-        assert_eq!(v.latest_at_idx(|v| *v, &0), None);
-        assert_eq!(v.latest_at_idx(|v| *v, &1), None);
-        assert_eq!(v.latest_at_idx(|v| *v, &2), Some(1));
-        assert_eq!(v.latest_at_idx(|v| *v, &3), Some(2));
-        assert_eq!(v.latest_at_idx(|v| *v, &4), Some(3));
-        assert_eq!(v.latest_at_idx(|v| *v, &5), Some(4));
-        assert_eq!(v.latest_at_idx(|v| *v, &6), Some(5));
-        assert_eq!(v.latest_at_idx(|v| *v, &7), Some(6));
-        assert_eq!(v.latest_at_idx(|v| *v, &8), Some(7));
-        assert_eq!(v.latest_at_idx(|v| *v, &9), Some(8));
-        assert_eq!(v.latest_at_idx(|v| *v, &10), Some(9));
-        assert_eq!(v.latest_at_idx(|v| *v, &11), Some(9));
-        assert_eq!(v.latest_at_idx(|v| *v, &1000), Some(9));
+        // Replace indices 1..3 (values 1,2) with three values:
+        v.replace(1..3, vec![10, 20, 30]);
+        // Now: [0, 10, 20, 30, 3, 4] at indices 0..6
+        assert_eq!(v.num_elements(), 6);
+        assert_eq!(v.get(0), Some(&0));
+        assert_eq!(v.get(1), Some(&10));
+        assert_eq!(v.get(2), Some(&20));
+        assert_eq!(v.get(3), Some(&30));
+        assert_eq!(v.get(4), Some(&3));
+        assert_eq!(v.get(5), Some(&4));
+    }
+
+    #[test]
+    fn test_replace_shrink() {
+        let mut v = (0..5).collect::<StableIndexDeque<i32>>();
+
+        // Replace indices 1..4 (values 1,2,3) with one value:
+        v.replace(1..4, vec![99]);
+        // Now: [0, 99, 4] at indices 0..3
+        assert_eq!(v.num_elements(), 3);
+        assert_eq!(v.get(0), Some(&0));
+        assert_eq!(v.get(1), Some(&99));
+        assert_eq!(v.get(2), Some(&4));
+    }
+
+    #[test]
+    fn test_replace_with_offset() {
+        let mut v = (0..6).collect::<StableIndexDeque<i32>>();
+        v.pop_front(); // offset=1, contains [1,2,3,4,5] at indices 1..6
+
+        v.replace(2..4, vec![20, 30, 40]);
+        // Now: [1, 20, 30, 40, 4, 5] at indices 1..7
+        assert_eq!(v.num_elements(), 6);
+        assert_eq!(v.min_index(), 1);
+        assert_eq!(v.next_index(), 7);
+        assert_eq!(v.get(0), None);
+        assert_eq!(v.get(1), Some(&1));
+        assert_eq!(v.get(2), Some(&20));
+        assert_eq!(v.get(5), Some(&4));
+        assert_eq!(v.get(6), Some(&5));
+    }
+
+    #[test]
+    fn test_replace_same_size() {
+        let mut v = (0..5).collect::<StableIndexDeque<i32>>();
+
+        v.replace(1..3, vec![10, 20]);
+        assert_eq!(v.num_elements(), 5);
+        assert_eq!(v.get(1), Some(&10));
+        assert_eq!(v.get(2), Some(&20));
+        assert_eq!(v.get(3), Some(&3));
+    }
+
+    #[test]
+    fn test_replace_empty_replacement() {
+        let mut v = (0..5).collect::<StableIndexDeque<i32>>();
+
+        v.replace(1..3, vec![]);
+        // Now: [0, 3, 4] at indices 0..3
+        assert_eq!(v.num_elements(), 3);
+        assert_eq!(v.get(0), Some(&0));
+        assert_eq!(v.get(1), Some(&3));
+        assert_eq!(v.get(2), Some(&4));
     }
 }

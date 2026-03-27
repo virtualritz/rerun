@@ -32,6 +32,11 @@ impl PyEntryId {
     pub fn __str__(&self) -> String {
         self.id.to_string()
     }
+
+    /// Return the raw 16-byte representation.
+    pub fn as_bytes<'py>(&self, py: Python<'py>) -> pyo3::Bound<'py, pyo3::types::PyBytes> {
+        pyo3::types::PyBytes::new(py, &self.id.id.as_bytes())
+    }
 }
 
 impl From<EntryId> for PyEntryId {
@@ -110,13 +115,13 @@ impl From<PyEntryKind> for EntryKind {
 
 // ---
 
-#[pyclass( // NOLINT: ignore[py-cls-eq] internal object, __eq__ not needed
+#[pyclass(
     name = "EntryDetailsInternal",
     module = "rerun_bindings.rerun_bindings"
 )]
 pub struct PyEntryDetails(pub EntryDetails);
 
-#[pymethods] // NOLINT: ignore[py-mthd-str] internal object, __str__ not needed
+#[pymethods] // NOLINT: ignore[py-mthd-str]
 impl PyEntryDetails {
     #[getter]
     fn id(&self) -> PyEntryId {
@@ -125,7 +130,7 @@ impl PyEntryDetails {
 
     #[getter]
     fn name(&self) -> &str {
-        &self.0.name
+        self.0.name.as_str()
     }
 
     /// The entry's kind.
@@ -157,17 +162,20 @@ impl PyEntryDetails {
 
 // ---
 
-pub fn update_entry(
+pub fn set_entry_name(
     py: Python<'_>,
-    name: Option<String>,
+    name: String,
     entry_details: &mut EntryDetails,
     client: &Py<PyCatalogClientInternal>,
 ) -> PyResult<()> {
     let entry_id = entry_details.id;
     let connection = client.borrow_mut(py).connection().clone();
 
-    let entry_details_update =
-        re_protos::cloud::v1alpha1::ext::EntryDetailsUpdate { name: name.clone() };
+    let entry_name = re_protos::EntryName::new(name)
+        .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))?;
+    let entry_details_update = re_protos::cloud::v1alpha1::ext::EntryDetailsUpdate {
+        name: Some(entry_name),
+    };
 
     let updated_entry_details = connection.update_entry(py, entry_id, entry_details_update)?;
     *entry_details = updated_entry_details;

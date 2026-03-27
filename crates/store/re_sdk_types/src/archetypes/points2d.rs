@@ -387,6 +387,13 @@ impl ::re_types_core::AsComponents for Points2D {
 
 impl ::re_types_core::ArchetypeReflectionMarker for Points2D {}
 
+impl crate::VisualizableArchetype for Points2D {
+    #[inline]
+    fn visualizer(&self) -> crate::Visualizer {
+        crate::Visualizer::new("Points2D").with_overrides(self)
+    }
+}
+
 impl Points2D {
     /// Create a new `Points2D`.
     #[inline]

@@ -1,19 +1,23 @@
-use egui::NumExt as _;
-use itertools::Itertools as _;
+use egui::{
+    Align, Atom, Button, Color32, Id, Image, Layout, NumExt as _, Popup, RichText, Sense,
+    include_image,
+};
+use emath::{Rect, RectAlign, Vec2};
 use re_format::format_uint;
-use re_log_channel::{LogReceiverSet, LogSource};
 use re_renderer::WgpuResourcePoolStatistics;
-use re_ui::{ContextExt as _, UICommand, UiExt as _};
-use re_viewer_context::{StoreContext, StoreHub};
+use re_sorbet::TimestampLocation;
+use re_ui::{ContextExt as _, UICommand, UiExt as _, icons};
+use re_viewer_context::{ActiveStoreContext, StoreHub, SystemCommand, SystemCommandSender as _};
 
 use crate::App;
 use crate::app_blueprint::AppBlueprint;
+use crate::latency_tracker::{LatencyResult, ServerLatencyTrackers};
 
 pub fn top_panel(
     frame: &eframe::Frame,
     app: &mut App,
     app_blueprint: &AppBlueprint<'_>,
-    store_context: Option<&StoreContext<'_>>,
+    store_context: Option<&ActiveStoreContext<'_>>,
     store_hub: &StoreHub,
     gpu_resource_stats: &WgpuResourcePoolStatistics,
     ui: &mut egui::Ui,
@@ -21,13 +25,13 @@ pub fn top_panel(
     re_tracing::profile_function!();
 
     let style_like_web = app.is_screenshotting() || app.app_env().is_test();
-    let top_bar_style = ui.ctx().top_bar_style(frame, style_like_web);
+    let top_bar_style = ui.top_bar_style(frame, style_like_web);
     let top_panel_frame = ui.tokens().top_panel_frame();
 
     let mut content = |ui: &mut egui::Ui, show_content: bool| {
         // React to dragging and double-clicking the top bar:
         #[cfg(not(target_arch = "wasm32"))]
-        if !re_ui::native_window_bar(ui.ctx().os()) {
+        if !re_ui::native_window_bar(ui.os()) {
             // Interact with background first, so that buttons in the top bar gets input priority
             // (last added widget has priority for input).
             let title_bar_response = ui.interact(
@@ -37,12 +41,11 @@ pub fn top_panel(
             );
             if title_bar_response.double_clicked() {
                 let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
-                ui.ctx()
-                    .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                ui.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
             } else if title_bar_response.is_pointer_button_down_on() {
                 // TODO(emilk): This should probably only run on `title_bar_response.drag_started_by(PointerButton::Primary)`,
                 // see https://github.com/emilk/egui/pull/4656
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                ui.send_viewport_cmd(egui::ViewportCommand::StartDrag);
             }
         }
 
@@ -64,14 +67,14 @@ pub fn top_panel(
         });
     };
 
-    let panel = egui::TopBottomPanel::top("top_bar")
+    let panel = egui::Panel::top("top_bar")
         .frame(top_panel_frame)
-        .exact_height(top_bar_style.height);
+        .exact_size(top_bar_style.height);
     let is_expanded = app_blueprint.top_panel_state().is_expanded();
 
     // On MacOS, we show the close/minimize/maximize buttons in the top panel.
     // We _always_ want to show the top panel in that case, and only hide its content.
-    if !re_ui::native_window_bar(ui.ctx().os()) {
+    if !re_ui::native_window_bar(ui.os()) {
         panel.show_inside(ui, |ui| content(ui, is_expanded));
     } else {
         panel.show_animated_inside(ui, is_expanded, |ui| content(ui, is_expanded));
@@ -82,7 +85,7 @@ fn top_bar_ui(
     frame: &eframe::Frame,
     app: &mut App,
     app_blueprint: &AppBlueprint<'_>,
-    store_context: Option<&StoreContext<'_>>,
+    store_context: Option<&ActiveStoreContext<'_>>,
     store_hub: &StoreHub,
     ui: &mut egui::Ui,
     gpu_resource_stats: &WgpuResourcePoolStatistics,
@@ -126,7 +129,7 @@ fn top_bar_ui(
 
                 // High enough to be concerning; low enough to be believable (and almost realtime).
                 let is_latency_interesting = latency_snapshot
-                    .e2e
+                    .e2e()
                     .is_some_and(|e2e| app.app_options().warn_e2e_latency < e2e && e2e < 60.0);
 
                 // Avoid flicker by showing the latency for 1 second since it was last deemed interesting:
@@ -164,8 +167,13 @@ fn top_bar_ui(
 
         panel_buttons_r2l(app, app_blueprint, ui, store_hub);
 
-        if !app.is_screenshotting() {
-            connection_status_ui(ui, app.msg_receive_set());
+        if app.app_options().show_metrics && !app.is_screenshotting() && !app.app_env().is_test() {
+            connection_status_ui(
+                ui,
+                &mut app.server_latency_trackers,
+                app.state.navigation.current(),
+                store_hub,
+            );
         }
     });
 }
@@ -234,7 +242,7 @@ fn software_rasterizer_warning_ui(ui: &mut egui::Ui, info: &wgpu::AdapterInfo) {
         egui::RichText::new("⚠ Software rasterizer")
             .small()
             .color(ui.visuals().warn_fg_color),
-        "https://www.rerun.io/docs/getting-started/troubleshooting#graphics-issues",
+        "https://www.rerun.io/docs/overview/installing-rerun/troubleshooting#graphics-issues",
     )
     .on_hover_ui(|ui| {
         ui.label("Software rasterizer detected - expect poor performance.");
@@ -258,12 +266,12 @@ fn software_rasterizer_warning_ui(ui: &mut egui::Ui, info: &wgpu::AdapterInfo) {
 /// An infrequent blinking of the dot (e.g. when opening a new panel) is expected,
 /// but it should not be sustained.
 fn multi_pass_warning_dot_ui(ui: &mut egui::Ui) {
-    let is_multi_pass = 0 < ui.ctx().current_pass_index();
+    let is_multi_pass = 0 < ui.current_pass_index();
 
     // Showing the dot just one frame is not enough (e.g. easily missed at 120Hz),
     // so we blink it up and then fade it out quickly.
 
-    let now = ui.ctx().input(|i| i.time);
+    let now = ui.input(|i| i.time);
     let last_multipass_time = ui.data_mut(|data| {
         let last_multipass_time = data
             .get_temp_mut_or_insert_with(egui::Id::new("last_multipass_time"), || {
@@ -290,7 +298,7 @@ fn multi_pass_warning_dot_ui(ui: &mut egui::Ui) {
         painter.circle_filled(response.rect.center(), radius, egui::Color32::ORANGE);
 
         // Make sure we ask for a repaint so we can animate the dot fading out:
-        ui.ctx().request_repaint();
+        ui.request_repaint();
     }
 
     response.on_hover_text(
@@ -300,64 +308,46 @@ fn multi_pass_warning_dot_ui(ui: &mut egui::Ui) {
     );
 }
 
-fn connection_status_ui(ui: &mut egui::Ui, rx: &LogReceiverSet) {
-    let sources = rx
-        .sources()
-        .into_iter()
-        .filter(|source| {
-            match source.as_ref() {
-                LogSource::File(_)
-                | LogSource::RrdHttpStream { .. }
-                | LogSource::RedapGrpcStream { .. }
-                | LogSource::Stdin => {
-                    false // These show up in the recordings panel as a "Loading…" in `recordings_panel.rs`
-                }
+fn connection_status_ui(
+    ui: &mut egui::Ui,
+    latency_trackers: &mut ServerLatencyTrackers,
+    route: &re_viewer_context::Route,
+    store_hub: &StoreHub,
+) {
+    if let Some(origin) = route.redap_origin(store_hub)
+        && origin != *re_redap_browser::EXAMPLES_ORIGIN
+    {
+        let latency = latency_trackers.origin_latency(&origin);
 
-                LogSource::RrdWebEvent
-                | LogSource::Sdk
-                | LogSource::MessageProxy { .. }
-                | LogSource::JsChannel { .. } => true,
+        let url = origin.format_host();
+        match latency {
+            LatencyResult::ToBeAssigned => {}
+            LatencyResult::NoConnection => {
+                ui.label(format!("no connection to {url}"));
             }
-        })
-        .collect_vec();
+            LatencyResult::MostRecent(duration) => {
+                let mut layout_job = egui::text::LayoutJob::default();
 
-    match sources.len() {
-        0 => return,
-        1 => {
-            source_label(ui, sources[0].as_ref());
-        }
-        n => {
-            // In practice we never get here
-            ui.label(format!("{n} sources connected"))
-                .on_hover_ui(|ui| {
-                    ui.vertical(|ui| {
-                        for source in &sources {
-                            source_label(ui, source.as_ref());
-                        }
-                    });
-                });
-        }
-    }
+                let ms = duration.as_millis();
 
-    fn source_label(ui: &mut egui::Ui, source: &LogSource) -> egui::Response {
-        let response = ui.label(source.status_string());
+                RichText::new(format!("{} ms", re_format::format_uint(ms)))
+                    .strong()
+                    .append_to(
+                        &mut layout_job,
+                        ui.style(),
+                        egui::FontSelection::Default,
+                        egui::Align::Center,
+                    );
 
-        let tooltip = match source {
-            LogSource::File(_)
-            | LogSource::Stdin
-            | LogSource::RrdHttpStream { .. }
-            | LogSource::RedapGrpcStream { .. }
-            | LogSource::RrdWebEvent
-            | LogSource::JsChannel { .. }
-            | LogSource::Sdk => None,
+                RichText::new(format!(" latency for {url}")).append_to(
+                    &mut layout_job,
+                    ui.style(),
+                    egui::FontSelection::Default,
+                    egui::Align::Center,
+                );
 
-            LogSource::MessageProxy { .. } => Some("Waiting for an SDK to connect".to_owned()),
-        };
-
-        if let Some(tooltip) = tooltip {
-            response.on_hover_text(tooltip)
-        } else {
-            response
+                ui.label(layout_job);
+            }
         }
     }
 }
@@ -369,7 +359,7 @@ fn panel_buttons_r2l(
     ui: &mut egui::Ui,
     store_hub: &StoreHub,
 ) {
-    let display_mode = app.state.navigation.current();
+    let route = app.state.navigation.current();
 
     #[cfg(target_arch = "wasm32")]
     if app.is_fullscreen_allowed() {
@@ -390,7 +380,7 @@ fn panel_buttons_r2l(
 
     // selection panel
     ui.add_enabled_ui(
-        display_mode.has_selection_panel() && !app_blueprint.selection_panel_overridden(),
+        route.has_selection_panel() && !app_blueprint.selection_panel_overridden(),
         |ui| {
             if ui
                 .medium_icon_toggle_button(
@@ -408,7 +398,7 @@ fn panel_buttons_r2l(
 
     // time panel
     ui.add_enabled_ui(
-        display_mode.has_time_panel() && !app_blueprint.time_panel_overridden(),
+        route.has_time_panel() && !app_blueprint.time_panel_overridden(),
         |ui| {
             if ui
                 .medium_icon_toggle_button(
@@ -426,7 +416,7 @@ fn panel_buttons_r2l(
 
     // blueprint panel
     ui.add_enabled_ui(
-        display_mode.has_blueprint_panel() && !app_blueprint.blueprint_panel_overridden(),
+        route.has_blueprint_panel() && !app_blueprint.blueprint_panel_overridden(),
         |ui| {
             if ui
                 .medium_icon_toggle_button(
@@ -445,15 +435,81 @@ fn panel_buttons_r2l(
     app.notifications.notification_toggle_button(ui);
 
     let selection = app.state.selection_state.selected_items();
-    let rec_cfg = store_hub
-        .active_store_id()
+    let time_ctrl = app
+        .active_recording_id()
         .and_then(|id| app.state.time_controls.get(id));
     app.state.share_modal.button_ui(
         ui,
         store_hub,
         app.state.navigation.current(),
-        rec_cfg,
+        time_ctrl,
         selection,
+    );
+
+    if let Some(auth) = &app.state.auth_state
+        && !app.is_screenshotting()
+    {
+        let rect_id = Id::new("user_icon_rect");
+        let user_icon_size = 16.0;
+        let response = Button::new((
+            Atom::custom(rect_id, Vec2::splat(user_icon_size)),
+            icons::DROPDOWN_ARROW
+                .as_image()
+                .tint(ui.visuals().text_color()),
+        ))
+        .atom_ui(ui);
+        if let Some(rect) = response.rect(rect_id) {
+            user_icon(&auth.email, rect, ui, user_icon_size / 2.0, 220);
+        }
+
+        Popup::menu(&response.response)
+            .align(RectAlign::BOTTOM_END)
+            .gap(3.0)
+            .show(|ui| {
+                ui.horizontal(|ui| {
+                    let user_icon_size = 32.0;
+                    let (rect, _) =
+                        ui.allocate_exact_size(Vec2::splat(user_icon_size), Sense::hover());
+                    user_icon(&auth.email, rect, ui, 8.0, 255);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.label(RichText::new(&auth.email).color(ui.tokens().text_default));
+                        if let Some(org_name) = &auth.org_name {
+                            ui.label(RichText::new(org_name).color(ui.tokens().text_subdued));
+                        }
+                    })
+                });
+
+                // Avoid increasing the width of the popup, ignore this button when egui calculates the size.
+                if !ui.is_sizing_pass() {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add(re_ui::ReButton::new("Log out").small().primary())
+                            .clicked()
+                        {
+                            app.command_sender.send_system(SystemCommand::Logout);
+                        }
+                    });
+                }
+            });
+    }
+}
+
+fn user_icon(email: &str, rect: Rect, ui: &egui::Ui, corner_radius: f32, tint: u8) {
+    // The color should not change based on theme, so it's fine to hard-code here
+    #[expect(clippy::disallowed_methods)]
+    let text_color = Color32::from_gray(tint);
+    Image::new(include_image!("../../data/user_image.jpg"))
+        .corner_radius(corner_radius)
+        .tint(text_color)
+        .paint_at(ui, rect);
+    let initial = email.chars().next().unwrap_or('?').to_ascii_uppercase();
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        initial,
+        egui::FontId::proportional(rect.height() * 0.6),
+        Color32::WHITE,
     );
 }
 
@@ -473,7 +529,7 @@ fn website_link_ui(ui: &mut egui::Ui) {
         .add(egui::Button::image(image))
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     if response.clicked() {
-        ui.ctx().open_url(egui::output::OpenUrl {
+        ui.open_url(egui::output::OpenUrl {
             url: url.to_owned(),
             new_tab: true,
         });
@@ -503,9 +559,9 @@ fn fps_ui(ui: &mut egui::Ui, app: &App) {
         let visuals = ui.visuals();
 
         // We only warn if we _suspect_ that we're in "continuous repaint mode".
-        let low_fps_right_now = fps < 20.0 && ui.ctx().has_requested_repaint();
+        let low_fps_right_now = fps < 20.0 && ui.has_requested_repaint();
 
-        let now = ui.ctx().input(|i| i.time);
+        let now = ui.input(|i| i.time);
         let warn_start_id = ui.id().with("fps_warning");
         let warn_start_time = ui.data_mut(|d| {
             if low_fps_right_now {
@@ -556,7 +612,7 @@ fn memory_use_label_ui(ui: &mut egui::Ui, gpu_resource_stats: &WgpuResourcePoolS
             .on_hover_ui(|ui| add_contents_on_hover(ui))
             .clicked()
         {
-            ui.ctx().copy_text(CODE.to_owned());
+            ui.copy_text(CODE.to_owned());
         }
     }
 
@@ -616,7 +672,7 @@ fn latency_snapshot_button_ui(
     ui: &mut egui::Ui,
     latency: re_entity_db::LatencySnapshot,
 ) -> Option<egui::Response> {
-    let Some(e2e) = latency.e2e else {
+    let Some(e2e) = latency.e2e() else {
         return None; // No e2e latency, nothing to show as a summary
     };
 
@@ -636,97 +692,52 @@ fn latency_snapshot_button_ui(
 }
 
 fn latency_details_ui(ui: &mut egui::Ui, latency: re_entity_db::LatencySnapshot) {
+    let Some(e2e) = latency.e2e() else {
+        ui.label("No latency data available.");
+        return;
+    };
+
     // The user is interested in the latency, so keep it updated.
-    ui.ctx().request_repaint();
+    ui.request_repaint();
 
     let e2e_hover_text = "End-to-end latency from when the data was logged by the SDK to when it is shown in the viewer.\n\
     This includes time for encoding, network latency, and decoding.\n\
     It is also affected by the framerate of the viewer.\n\
     This latency is inaccurate if the logging was done on a different machine, since it is clock-based.";
 
-    // Note: all times are in seconds.
-    let re_entity_db::LatencySnapshot {
-        e2e,
-        log2chunk,
-        chunk2encode,
-        transmission,
-        decode2ingest,
-    } = latency;
+    let re_entity_db::LatencySnapshot { secs_since_log } = latency;
 
-    if let (Some(log2chunk), Some(chunk2encode), Some(transmission), Some(decode2ingest)) =
-        (log2chunk, chunk2encode, transmission, decode2ingest)
-    {
-        // We have a full picture - use a nice vertical layout:
+    ui.horizontal(|ui| {
+        ui.label("end-to-end:").on_hover_text(e2e_hover_text);
+        latency_label(ui, e2e);
+    });
+    ui.separator();
 
-        if let Some(e2e) = e2e {
-            ui.horizontal(|ui| {
-                ui.label("end-to-end:").on_hover_text(e2e_hover_text);
-                latency_label(ui, e2e);
-            });
-            ui.separator();
+    ui.vertical_centered(|ui| {
+        fn small_and_weak(text: &str) -> egui::RichText {
+            egui::RichText::new(text).small().weak()
         }
 
-        ui.vertical_centered(|ui| {
-            fn small_and_weak(text: &str) -> egui::RichText {
-                egui::RichText::new(text).small().weak()
+        ui.spacing_mut().item_spacing.y = 0.0;
+
+        let mut previous = 0.0;
+
+        ui.label(TimestampLocation::Log.to_string());
+
+        for (&location, &latency_sec) in &secs_since_log {
+            if location == TimestampLocation::Log {
+                re_log::debug_assert_eq!(latency_sec, 0.0);
+            } else {
+                let latency_since_previous = latency_sec - previous;
+                previous = latency_sec;
+
+                ui.label(small_and_weak("↓"));
+                latency_label(ui, latency_since_previous);
+                ui.label(small_and_weak("|"));
+                ui.label(location.to_string());
             }
-
-            ui.spacing_mut().item_spacing.y = 0.0;
-            ui.label("log call");
-            ui.label(small_and_weak("|"));
-            latency_label(ui, log2chunk);
-            ui.label(small_and_weak("↓"));
-            ui.label("batch creation");
-            ui.label(small_and_weak("|"));
-            latency_label(ui, chunk2encode);
-            ui.label(small_and_weak("↓"));
-            ui.label("encode and transmit");
-            ui.label(small_and_weak("|"));
-            latency_label(ui, transmission);
-            ui.label(small_and_weak("↓"));
-            ui.label("receive and decode");
-            ui.label(small_and_weak("|"));
-            latency_label(ui, decode2ingest);
-            ui.label(small_and_weak("↓"));
-            ui.label("ingest into viewer");
-        });
-    } else {
-        // We have a partial picture - show only what we got:
-        egui::Grid::new("latency_snapshot")
-            .num_columns(2)
-            .striped(false)
-            .show(ui, |ui| {
-                if let Some(e2e) = e2e {
-                    ui.strong("log -> ingest (total end-to-end)")
-                        .on_hover_text(e2e_hover_text);
-                    latency_label(ui, e2e);
-                    ui.end_row();
-
-                    ui.end_row(); // Intentional extra blank line
-                }
-
-                if let Some(log2chunk) = log2chunk {
-                    ui.label("log -> chunk");
-                    latency_label(ui, log2chunk);
-                    ui.end_row();
-                }
-                if let Some(chunk2encode) = chunk2encode {
-                    ui.label("chunk -> encode");
-                    latency_label(ui, chunk2encode);
-                    ui.end_row();
-                }
-                if let Some(transmission) = transmission {
-                    ui.label("encode -> decode (transmission)");
-                    latency_label(ui, transmission);
-                    ui.end_row();
-                }
-                if let Some(decode2ingest) = decode2ingest {
-                    ui.label("decode -> ingest");
-                    latency_label(ui, decode2ingest);
-                    ui.end_row();
-                }
-            });
-    }
+        }
+    });
 }
 
 fn latency_label(ui: &mut egui::Ui, latency_sec: f32) -> egui::Response {

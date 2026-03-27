@@ -17,7 +17,7 @@ use re_sorbet::ComponentColumnDescriptor;
 use crate::cloud::v1alpha1::{
     EntryKind, FetchChunksRequest, GetDatasetSchemaResponse, QueryDatasetResponse,
     QueryTasksResponse, RegisterWithDatasetResponse, ScanDatasetManifestResponse,
-    ScanSegmentTableResponse, VectorDistanceMetric,
+    ScanSegmentTableResponse, UnregisterFromDatasetResponse, VectorDistanceMetric,
 };
 use crate::common::v1alpha1::ext::{DatasetHandle, IfDuplicateBehavior, SegmentId};
 use crate::common::v1alpha1::{ComponentDescriptor, DataframePart, TaskId};
@@ -31,6 +31,87 @@ macro_rules! lazy_field_ref {
         let field = FIELD.get_or_init(|| Arc::new($fld));
         Arc::clone(field)
     }};
+}
+
+// --- SegmentRegistrationStatus ---
+
+/// Registration status for a segment/layer in the dataset manifest.
+//
+// TODO(cmc): not the greatest name I guess... (rename in follow up?)
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerRegistrationStatus {
+    /// Registration for this layer has started, i.e. the synchronous phase is over.
+    Pending = 0,
+
+    /// Registration for this layer has completed successfully.
+    Done = 1,
+
+    /// Registration for this layer has failed.
+    Error = 2,
+
+    /// This layer has been removed.
+    Deleted = 3,
+}
+
+impl LayerRegistrationStatus {
+    const PENDING_STR: &str = "pending";
+    const DONE_STR: &str = "done";
+    const ERROR_STR: &str = "error";
+    const DELETED_STR: &str = "deleted";
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => Self::PENDING_STR,
+            Self::Done => Self::DONE_STR,
+            Self::Error => Self::ERROR_STR,
+            Self::Deleted => Self::DELETED_STR,
+        }
+    }
+}
+
+impl std::fmt::Display for LayerRegistrationStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for LayerRegistrationStatus {
+    type Err = crate::TypeConversionError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            Self::PENDING_STR => Ok(Self::Pending),
+            Self::DONE_STR => Ok(Self::Done),
+            Self::ERROR_STR => Ok(Self::Error),
+            Self::DELETED_STR => Ok(Self::Deleted),
+            _ => Err(crate::TypeConversionError::InvalidField {
+                package_name: "rerun.cloud.v1alpha1",
+                type_name: "SegmentRegistrationStatus",
+                field_name: "value",
+                reason: format!("invalid registration status: {s}"),
+            }),
+        }
+    }
+}
+
+impl TryFrom<u8> for LayerRegistrationStatus {
+    type Error = crate::TypeConversionError;
+
+    fn try_from(value: u8) -> Result<Self, <Self as TryFrom<u8>>::Error> {
+        match value {
+            0 => Ok(Self::Pending),
+            1 => Ok(Self::Done),
+            2 => Ok(Self::Error),
+            3 => Ok(Self::Deleted),
+            _ => Err(crate::TypeConversionError::InvalidField {
+                package_name: "rerun.cloud.v1alpha1",
+                type_name: "SegmentRegistrationStatus",
+                field_name: "value",
+                reason: format!("invalid registration status: {value}"),
+            }),
+        }
+    }
 }
 
 // --- CreateIndexRequest
@@ -57,7 +138,7 @@ impl TryFrom<crate::cloud::v1alpha1::CreateIndexRequest> for CreateIndexRequest 
 
 // --- RegisterWithDatasetRequest ---
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RegisterWithDatasetRequest {
     pub data_sources: Vec<DataSource>,
     pub on_duplicate: IfDuplicateBehavior,
@@ -91,6 +172,68 @@ impl From<RegisterWithDatasetRequest> for crate::cloud::v1alpha1::RegisterWithDa
             on_duplicate: crate::common::v1alpha1::IfDuplicateBehavior::from(value.on_duplicate)
                 as i32,
         }
+    }
+}
+
+// --- UnregisterFromDatasetRequest ---
+
+#[derive(Debug)]
+pub struct UnregisterFromDatasetRequest {
+    pub segments_to_drop: Vec<SegmentId>,
+    pub layers_to_drop: Vec<String>,
+    pub force: bool,
+}
+
+impl TryFrom<crate::cloud::v1alpha1::UnregisterFromDatasetRequest>
+    for UnregisterFromDatasetRequest
+{
+    type Error = TypeConversionError;
+
+    fn try_from(
+        value: crate::cloud::v1alpha1::UnregisterFromDatasetRequest,
+    ) -> Result<Self, Self::Error> {
+        let crate::cloud::v1alpha1::UnregisterFromDatasetRequest {
+            segments_to_drop,
+            layers_to_drop,
+            force,
+        } = value;
+
+        Ok(Self {
+            segments_to_drop: segments_to_drop
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<_>, _>>()?,
+            layers_to_drop,
+            force,
+        })
+    }
+}
+
+impl From<UnregisterFromDatasetRequest> for crate::cloud::v1alpha1::UnregisterFromDatasetRequest {
+    fn from(value: UnregisterFromDatasetRequest) -> Self {
+        Self {
+            segments_to_drop: value.segments_to_drop.into_iter().map(Into::into).collect(),
+            layers_to_drop: value.layers_to_drop,
+            force: value.force,
+        }
+    }
+}
+
+impl crate::cloud::v1alpha1::UnregisterFromDatasetRequest {
+    pub fn sanity_check(&self) -> tonic::Result<()> {
+        let Self {
+            segments_to_drop,
+            layers_to_drop,
+            force: _,
+        } = self;
+
+        if segments_to_drop.is_empty() && layers_to_drop.is_empty() {
+            return Err(tonic::Status::invalid_argument(
+                "must specify at least 1 segment ID or layer for removal",
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -539,12 +682,14 @@ impl crate::cloud::v1alpha1::EntryFilter {
     }
 }
 
+pub use crate::EntryName;
+
 // --- EntryDetails ---
 
 #[derive(Debug, Clone)]
 pub struct EntryDetails {
     pub id: re_log_types::EntryId,
-    pub name: String,
+    pub name: EntryName,
     pub kind: crate::cloud::v1alpha1::EntryKind,
     pub created_at: jiff::Timestamp,
     pub updated_at: jiff::Timestamp,
@@ -559,9 +704,11 @@ impl TryFrom<crate::cloud::v1alpha1::EntryDetails> for EntryDetails {
                 .id
                 .ok_or(missing_field!(crate::cloud::v1alpha1::EntryDetails, "id"))?
                 .try_into()?,
-            name: value
-                .name
-                .ok_or(missing_field!(crate::cloud::v1alpha1::EntryDetails, "name"))?,
+            name: EntryName::new(
+                value
+                    .name
+                    .ok_or(missing_field!(crate::cloud::v1alpha1::EntryDetails, "name"))?,
+            )?,
             kind: value.entry_kind.try_into()?,
             created_at: {
                 let ts = value.created_at.ok_or(missing_field!(
@@ -585,7 +732,7 @@ impl From<EntryDetails> for crate::cloud::v1alpha1::EntryDetails {
     fn from(value: EntryDetails) -> Self {
         Self {
             id: Some(value.id.into()),
-            name: Some(value.name),
+            name: Some(value.name.to_string()),
             entry_kind: value.kind as _,
             created_at: {
                 let ts = value.created_at;
@@ -704,7 +851,7 @@ impl From<DatasetEntry> for crate::cloud::v1alpha1::DatasetEntry {
 #[derive(Debug, Clone)]
 pub struct CreateDatasetEntryRequest {
     /// Entry name (must be unique in catalog).
-    pub name: String,
+    pub name: EntryName,
 
     /// Override, use at your own risk.
     pub id: Option<EntryId>,
@@ -713,7 +860,7 @@ pub struct CreateDatasetEntryRequest {
 impl From<CreateDatasetEntryRequest> for crate::cloud::v1alpha1::CreateDatasetEntryRequest {
     fn from(value: CreateDatasetEntryRequest) -> Self {
         Self {
-            name: Some(value.name),
+            name: Some(value.name.to_string()),
             id: value.id.map(Into::into),
         }
     }
@@ -725,12 +872,12 @@ impl TryFrom<crate::cloud::v1alpha1::CreateDatasetEntryRequest> for CreateDatase
     fn try_from(
         value: crate::cloud::v1alpha1::CreateDatasetEntryRequest,
     ) -> Result<Self, Self::Error> {
+        let name_str = value.name.ok_or(missing_field!(
+            crate::cloud::v1alpha1::CreateDatasetEntryRequest,
+            "name"
+        ))?;
         Ok(Self {
-            name: value.name.ok_or(missing_field!(
-                crate::cloud::v1alpha1::CreateDatasetEntryRequest,
-                "name"
-            ))?,
-
+            name: EntryName::new(name_str).map_err(TypeConversionError::InvalidEntryName)?,
             id: value.id.map(TryInto::try_into).transpose()?,
         })
     }
@@ -773,7 +920,7 @@ impl TryFrom<crate::cloud::v1alpha1::CreateDatasetEntryResponse> for CreateDatas
 
 #[derive(Debug, Clone)]
 pub struct CreateTableEntryRequest {
-    pub name: String,
+    pub name: EntryName,
     pub schema: Schema,
     pub provider_details: Option<ProviderDetails>,
 }
@@ -782,11 +929,36 @@ impl TryFrom<CreateTableEntryRequest> for crate::cloud::v1alpha1::CreateTableEnt
     type Error = TypeConversionError;
     fn try_from(value: CreateTableEntryRequest) -> Result<Self, Self::Error> {
         Ok(Self {
-            name: value.name,
+            name: value.name.to_string(),
             schema: Some((&value.schema).try_into()?),
             provider_details: value
                 .provider_details
                 .map(|d| (&d).try_into())
+                .transpose()?,
+        })
+    }
+}
+
+impl TryFrom<&crate::cloud::v1alpha1::CreateTableEntryRequest> for CreateTableEntryRequest {
+    type Error = TypeConversionError;
+    fn try_from(
+        value: &crate::cloud::v1alpha1::CreateTableEntryRequest,
+    ) -> Result<Self, Self::Error> {
+        Ok(Self {
+            name: EntryName::new(value.name.clone())
+                .map_err(TypeConversionError::InvalidEntryName)?,
+            schema: value
+                .schema
+                .as_ref()
+                .ok_or(missing_field!(
+                    crate::cloud::v1alpha1::CreateTableEntryRequest,
+                    "schema"
+                ))?
+                .try_into()?,
+            provider_details: value
+                .provider_details
+                .as_ref()
+                .map(|v| ProviderDetails::try_from(v))
                 .transpose()?,
         })
     }
@@ -797,20 +969,7 @@ impl TryFrom<crate::cloud::v1alpha1::CreateTableEntryRequest> for CreateTableEnt
     fn try_from(
         value: crate::cloud::v1alpha1::CreateTableEntryRequest,
     ) -> Result<Self, Self::Error> {
-        Ok(Self {
-            name: value.name,
-            schema: value
-                .schema
-                .ok_or(missing_field!(
-                    crate::cloud::v1alpha1::CreateTableEntryRequest,
-                    "schema"
-                ))?
-                .try_into()?,
-            provider_details: value
-                .provider_details
-                .map(|v| ProviderDetails::try_from(&v))
-                .transpose()?,
-        })
+        Self::try_from(&value)
     }
 }
 
@@ -976,20 +1135,28 @@ impl TryFrom<crate::cloud::v1alpha1::DeleteEntryRequest> for re_log_types::Entry
 
 #[derive(Debug, Clone, Default)]
 pub struct EntryDetailsUpdate {
-    pub name: Option<String>,
+    pub name: Option<EntryName>,
 }
 
 impl TryFrom<crate::cloud::v1alpha1::EntryDetailsUpdate> for EntryDetailsUpdate {
     type Error = TypeConversionError;
 
     fn try_from(value: crate::cloud::v1alpha1::EntryDetailsUpdate) -> Result<Self, Self::Error> {
-        Ok(Self { name: value.name })
+        Ok(Self {
+            name: value
+                .name
+                .map(EntryName::new)
+                .transpose()
+                .map_err(TypeConversionError::InvalidEntryName)?,
+        })
     }
 }
 
 impl From<EntryDetailsUpdate> for crate::cloud::v1alpha1::EntryDetailsUpdate {
     fn from(value: EntryDetailsUpdate) -> Self {
-        Self { name: value.name }
+        Self {
+            name: value.name.map(|name| name.to_string()),
+        }
     }
 }
 
@@ -1118,7 +1285,7 @@ impl TryFrom<crate::cloud::v1alpha1::ReadTableEntryResponse> for ReadTableEntryR
 
 #[derive(Debug, Clone)]
 pub struct RegisterTableRequest {
-    pub name: String,
+    pub name: EntryName,
     pub provider_details: ProviderDetails,
 }
 
@@ -1126,7 +1293,7 @@ impl TryFrom<RegisterTableRequest> for crate::cloud::v1alpha1::RegisterTableRequ
     type Error = TypeConversionError;
     fn try_from(value: RegisterTableRequest) -> Result<Self, Self::Error> {
         Ok(Self {
-            name: value.name,
+            name: value.name.to_string(),
             provider_details: Some((&value.provider_details).try_into()?),
         })
     }
@@ -1137,7 +1304,7 @@ impl TryFrom<crate::cloud::v1alpha1::RegisterTableRequest> for RegisterTableRequ
 
     fn try_from(value: crate::cloud::v1alpha1::RegisterTableRequest) -> Result<Self, Self::Error> {
         Ok(Self {
-            name: value.name,
+            name: EntryName::new(value.name).map_err(TypeConversionError::InvalidEntryName)?,
             provider_details: ProviderDetails::try_from(&value.provider_details.ok_or(
                 missing_field!(
                     crate::cloud::v1alpha1::RegisterTableRequest,
@@ -1343,7 +1510,6 @@ pub struct Query {
     pub latest_at: Option<QueryLatestAt>,
     pub range: Option<QueryRange>,
     pub columns_always_include_everything: bool,
-    pub columns_always_include_chunk_ids: bool,
     pub columns_always_include_byte_offsets: bool,
     pub columns_always_include_entity_paths: bool,
     pub columns_always_include_static_indexes: bool,
@@ -1416,7 +1582,6 @@ impl TryFrom<crate::cloud::v1alpha1::Query> for Query {
             latest_at,
             range,
             columns_always_include_byte_offsets: value.columns_always_include_byte_offsets,
-            columns_always_include_chunk_ids: value.columns_always_include_chunk_ids,
             columns_always_include_component_indexes: value
                 .columns_always_include_component_indexes,
             columns_always_include_entity_paths: value.columns_always_include_entity_paths,
@@ -1439,7 +1604,6 @@ impl From<Query> for crate::cloud::v1alpha1::Query {
                 index_range: Some(range.index_range.into()),
             }),
             columns_always_include_byte_offsets: value.columns_always_include_byte_offsets,
-            columns_always_include_chunk_ids: value.columns_always_include_chunk_ids,
             columns_always_include_component_indexes: value
                 .columns_always_include_component_indexes,
             columns_always_include_entity_paths: value.columns_always_include_entity_paths,
@@ -1569,6 +1733,21 @@ pub struct RegisterWithDatasetTaskDescriptor {
     pub segment_type: DataSourceKind,
     pub storage_url: url::Url,
     pub task_id: TaskId,
+}
+
+// --- UnregisterFromDatasetResponse ---
+
+impl UnregisterFromDatasetResponse {
+    pub fn schema() -> Schema {
+        ScanDatasetManifestResponse::schema()
+    }
+
+    pub fn data(&self) -> Result<&DataframePart, TypeConversionError> {
+        Ok(self
+            .data
+            .as_ref()
+            .ok_or_else(|| missing_field!(Self, "data"))?)
+    }
 }
 
 // --- ScanSegmentTableResponse --
@@ -1729,6 +1908,7 @@ impl ScanDatasetManifestResponse {
     pub const FIELD_NUM_CHUNKS: &str = "rerun_num_chunks";
     pub const FIELD_SIZE_BYTES: &str = "rerun_size_bytes";
     pub const FIELD_SCHEMA_SHA256: &str = "rerun_schema_sha256";
+    pub const FIELD_REGISTRATION_STATUS: &str = "rerun_registration_status";
 
     pub fn field_layer_name() -> FieldRef {
         lazy_field_ref!(Field::new(Self::FIELD_LAYER_NAME, DataType::Utf8, false))
@@ -1778,6 +1958,14 @@ impl ScanDatasetManifestResponse {
         ))
     }
 
+    pub fn field_registration_status() -> FieldRef {
+        lazy_field_ref!(Field::new(
+            Self::FIELD_REGISTRATION_STATUS,
+            DataType::Utf8,
+            false
+        ))
+    }
+
     pub fn fields() -> Vec<FieldRef> {
         vec![
             Self::field_layer_name(),
@@ -1789,6 +1977,7 @@ impl ScanDatasetManifestResponse {
             Self::field_num_chunks(),
             Self::field_size_bytes(),
             Self::field_schema_sha256(),
+            Self::field_registration_status(),
         ]
     }
 
@@ -1807,6 +1996,7 @@ impl ScanDatasetManifestResponse {
         num_chunks: Vec<u64>,
         size_bytes: Vec<u64>,
         schema_sha256s: Vec<[u8; 32]>,
+        registration_statuses: Vec<String>,
     ) -> arrow::error::Result<RecordBatch> {
         let row_count = segment_ids.len();
         let schema = Arc::new(Self::schema());
@@ -1826,6 +2016,7 @@ impl ScanDatasetManifestResponse {
             Arc::new(UInt64Array::from(num_chunks)),
             Arc::new(UInt64Array::from(size_bytes)),
             Arc::new(schema_sha256_builder.finish()),
+            Arc::new(StringArray::from(registration_statuses)),
         ];
 
         RecordBatch::try_new_with_options(
@@ -2515,6 +2706,27 @@ impl From<TableInsertMode> for crate::cloud::v1alpha1::TableInsertMode {
 
 // ---
 
+/// Ergonomic counterpart to the codegen'd [`crate::cloud::v1alpha1::VersionResponse`].
+pub struct VersionResponse {
+    pub build_info: Option<re_build_info::BuildInfo>,
+    pub version: String,
+    pub cloud_provider: Option<String>,
+    pub cloud_region: Option<String>,
+}
+
+impl From<crate::cloud::v1alpha1::VersionResponse> for VersionResponse {
+    fn from(value: crate::cloud::v1alpha1::VersionResponse) -> Self {
+        Self {
+            build_info: value.build_info.map(Into::into),
+            version: value.version,
+            cloud_provider: value.cloud_provider,
+            cloud_region: value.cloud_region,
+        }
+    }
+}
+
+// ---
+
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::ToByteSlice as _;
@@ -2576,6 +2788,7 @@ mod tests {
         let num_chunks = vec![1];
         let size_bytes = vec![2];
         let schema_sha256 = vec![[1; 32]];
+        let registration_status = vec![LayerRegistrationStatus::Done.to_string()];
 
         ScanDatasetManifestResponse::create_dataframe(
             layer_name,
@@ -2587,6 +2800,7 @@ mod tests {
             num_chunks,
             size_bytes,
             schema_sha256,
+            registration_status,
         )
         .unwrap();
     }

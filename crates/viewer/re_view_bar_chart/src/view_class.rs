@@ -1,5 +1,4 @@
 use egui::ahash::HashMap;
-use egui_plot::ColorConflictHandling;
 use re_log_types::EntityPath;
 use re_sdk_types::blueprint::archetypes::{PlotBackground, PlotLegend};
 use re_sdk_types::blueprint::components::{Corner2D, Enabled};
@@ -10,10 +9,10 @@ use re_ui::{Help, IconText, MouseButtonText, icons, list_item};
 use re_view::controls::SELECTION_RECT_ZOOM_BUTTON;
 use re_view::view_property_ui;
 use re_viewer_context::{
-    IdentifiedViewSystem as _, IndicatedEntities, PerVisualizer, PerVisualizerInViewClass,
+    IdentifiedViewSystem as _, IndicatedEntities, PerVisualizerType, RecommendedVisualizers,
     ViewClass, ViewClassExt as _, ViewClassRegistryError, ViewId, ViewQuery, ViewState,
-    ViewStateExt as _, ViewSystemExecutionError, ViewerContext, VisualizableEntities,
-    suggest_view_for_each_entity,
+    ViewStateExt as _, ViewSystemExecutionError, ViewSystemIdentifier, ViewerContext,
+    VisualizableReason, suggest_view_for_each_entity,
 };
 use re_viewport_blueprint::ViewProperty;
 
@@ -101,24 +100,24 @@ impl ViewClass for BarChartView {
         None
     }
 
-    fn choose_default_visualizers(
+    fn recommended_visualizers_for_entity(
         &self,
-        entity_path: &EntityPath,
-        visualizable_entities_per_visualizer: &PerVisualizerInViewClass<VisualizableEntities>,
-        _indicated_entities_per_visualizer: &PerVisualizer<IndicatedEntities>,
-    ) -> re_viewer_context::SmallVisualizerSet {
+        _entity_path: &EntityPath,
+        visualizers_with_reason: &[(ViewSystemIdentifier, &VisualizableReason)],
+        _indicated_entities_per_visualizer: &PerVisualizerType<&IndicatedEntities>,
+    ) -> RecommendedVisualizers {
         // Default implementation would not suggest the BarChart visualizer for tensors and 1D images,
         // since they're not indicated with a BarChart indicator.
         // (and as of writing, something needs to be both visualizable and indicated to be shown in a visualizer)
 
         // Keeping this implementation simple: We know there's only a single visualizer here.
-        if visualizable_entities_per_visualizer
-            .get(&BarChartVisualizerSystem::identifier())
-            .is_some_and(|entities| entities.contains_key(entity_path))
+        if visualizers_with_reason
+            .iter()
+            .any(|(viz, _)| *viz == BarChartVisualizerSystem::identifier())
         {
-            std::iter::once(BarChartVisualizerSystem::identifier()).collect()
+            RecommendedVisualizers::default(BarChartVisualizerSystem::identifier())
         } else {
-            Default::default()
+            RecommendedVisualizers::empty()
         }
     }
 
@@ -155,13 +154,13 @@ impl ViewClass for BarChartView {
     fn ui(
         &self,
         ctx: &ViewerContext<'_>,
+        _missing_chunk_reporter: &re_viewer_context::MissingChunkReporter,
         ui: &mut egui::Ui,
         state: &mut dyn ViewState,
-
         query: &ViewQuery<'_>,
         system_output: re_viewer_context::SystemExecutionOutput,
     ) -> Result<(), ViewSystemExecutionError> {
-        use egui_plot::{Bar, BarChart, Legend, Plot};
+        use egui_plot::{Bar, BarChart, Plot};
 
         let state = state.downcast_mut::<()>()?;
 
@@ -196,20 +195,21 @@ impl ViewClass for BarChartView {
         let legend_corner: Corner2D =
             plot_legend.component_or_fallback(&ctx, PlotLegend::descriptor_corner().component)?;
 
+        let legend_id = egui::Id::new(query.view_id).with("plot_legend");
+        let legend_hovered = ui
+            .ctx()
+            .read_response(re_ui::plot_legend::legend_frame_id(legend_id))
+            .is_some_and(|r| r.hovered());
+
         ui.scope(|ui| {
             let background_color = background_color.into();
             ui.style_mut().visuals.extreme_bg_color = background_color;
-            let mut plot = Plot::new("bar_chart_plot")
+            let plot = Plot::new("bar_chart_plot")
                 .show_grid(**show_grid)
-                .clamp_grid(true);
+                .clamp_grid(true)
+                .allow_scroll(!legend_hovered);
 
-            if *legend_visible.0 {
-                plot = plot.legend(
-                    Legend::default()
-                        .position(legend_corner.into())
-                        .color_conflict_handling(ColorConflictHandling::PickFirst),
-                );
-            }
+            // Legend is rendered separately after plot.show() using our LegendWidget.
 
             let mut plot_item_id_to_entity_path = HashMap::default();
 
@@ -310,7 +310,12 @@ impl ViewClass for BarChartView {
             let hovered_data_result = hovered_plot_item
                 .and_then(|hovered_plot_item| plot_item_id_to_entity_path.get(&hovered_plot_item))
                 .map(|entity_path| {
-                    re_viewer_context::Item::DataResult(query.view_id, entity_path.clone().into())
+                    re_viewer_context::Item::DataResult(
+                        re_viewer_context::DataResultInteractionAddress::from_entity_path(
+                            query.view_id,
+                            entity_path.clone(),
+                        ),
+                    )
                 })
                 .or_else(|| {
                     if response.hovered() {
@@ -322,6 +327,54 @@ impl ViewClass for BarChartView {
             if let Some(hovered) = hovered_data_result {
                 ctx.viewer_ctx
                     .handle_select_hover_drag_interactions(&response, hovered, false);
+            }
+
+            // Render our legend overlay.
+            if *legend_visible.0 {
+                let legend_widget =
+                    re_ui::plot_legend::LegendWidget::new(re_ui::plot_legend::LegendConfig {
+                        position: legend_corner.into(),
+                        id: legend_id,
+                    });
+                let plot_rect = response.rect;
+                let mut legend_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(plot_rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Min)),
+                );
+
+                let tree = &ctx.query_result.tree;
+                let legend_output = legend_widget.show_entries(
+                    &mut legend_ui,
+                    tree.iter_data_results()
+                        .filter(|dr| !dr.tree_prefix_only && charts.contains_key(&dr.entity_path))
+                        .map(|dr| {
+                            let id = egui::Id::new(dr.entity_path.hash());
+                            let color = charts
+                                .get(&dr.entity_path)
+                                .map(|cd| egui::Color32::from(cd.color.0))
+                                .unwrap_or(egui::Color32::GRAY);
+                            re_ui::plot_legend::LegendEntry {
+                                id,
+                                label: dr.entity_path.to_string(),
+                                color,
+                                visible: dr.is_visible(),
+                                hovered: false,
+                            }
+                        }),
+                );
+
+                // Persist visibility changes from legend clicks.
+                for dr in tree.iter_data_results() {
+                    if dr.tree_prefix_only {
+                        continue;
+                    }
+                    let id = egui::Id::new(dr.entity_path.hash());
+                    let new_visible = !legend_output.hidden_ids.contains(&id);
+                    if dr.is_visible() != new_visible {
+                        dr.save_visible(ctx.viewer_ctx, tree, new_visible);
+                    }
+                }
             }
         });
 

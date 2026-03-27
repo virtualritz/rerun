@@ -94,7 +94,7 @@ use crate::wgpu_resources::{
     RenderPipelineDesc,
 };
 use crate::{
-    DebugLabel, DepthOffset, DrawableCollector, LineDrawableBuilder, OutlineMaskPreference,
+    DepthOffset, DrawableCollector, Label, LineDrawableBuilder, OutlineMaskPreference,
     PickingLayerObjectId, PickingLayerProcessor, include_shader_module,
 };
 
@@ -267,7 +267,7 @@ bitflags! {
 
 /// Data that is valid for a batch of line strips.
 pub struct LineBatchInfo {
-    pub label: DebugLabel,
+    pub label: Label,
 
     /// Transformation applies to line positions
     ///
@@ -495,8 +495,7 @@ impl LineDrawData {
                 .into_iter();
 
             let mut start_vertex_for_next_batch = 0;
-            for (batch_info, uniform_buffer_binding) in
-                batches.iter().zip(uniform_buffer_bindings.into_iter())
+            for (batch_info, uniform_buffer_binding) in batches.iter().zip(uniform_buffer_bindings)
             {
                 let line_vertex_range_end = (start_vertex_for_next_batch
                     + batch_info.line_vertex_count)
@@ -549,7 +548,7 @@ impl LineRenderer {
     fn create_linestrip_batch(
         &self,
         ctx: &RenderContext,
-        label: DebugLabel,
+        label: Label,
         uniform_buffer_binding: BindGroupEntry,
         line_vertex_range: Range<u32>,
         active_phases: EnumSet<DrawPhase>,
@@ -759,8 +758,7 @@ impl Renderer for LineRenderer {
                 _ => unreachable!("We were called on a phase we weren't subscribed to: {phase:?}"),
             };
             let Some(bind_group_draw_data) = bind_group_draw_data else {
-                debug_assert!(
-                    false,
+                re_log::debug_panic!(
                     "Line data bind group for draw phase {phase:?} was not set despite being submitted for drawing."
                 );
                 continue;

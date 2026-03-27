@@ -107,27 +107,20 @@ impl std::fmt::Display for VideoType {
     }
 }
 
-fn image_diff_threshold(codec: VideoCodec) -> f32 {
+fn snapshot_options_for_codec(codec: VideoCodec, viewport_size: egui::Vec2) -> SnapshotOptions {
     match codec {
         // Despite version pinning, ffmpeg's results are quite different depending on the platform
         // and seemingly even between runs!
-        VideoCodec::H264 | VideoCodec::H265 => 2.2,
+        VideoCodec::H264 | VideoCodec::H265 => SnapshotOptions::new()
+            .threshold(2.2)
+            .failed_pixel_count_threshold(300),
+
         // AV1 has this problem as well but to a lesser extent.
-        VideoCodec::AV1 => 1.2,
+        VideoCodec::AV1 => SnapshotOptions::new()
+            .threshold(1.2)
+            .failed_pixel_count_threshold(100),
 
-        _ => SnapshotOptions::default().threshold,
-    }
-}
-
-fn image_failed_pixel_count_threshold(codec: VideoCodec) -> usize {
-    match codec {
-        // Despite version pinning, ffmpeg's results are quite different depending on the platform
-        // and seemingly even between runs!
-        VideoCodec::H264 | VideoCodec::H265 => 300,
-        // AV1 has this problem as well but to a lesser extent.
-        VideoCodec::AV1 => 100,
-
-        _ => SnapshotOptions::default().failed_pixel_count_threshold,
+        _ => re_ui::testing::default_snapshot_options_for_3d(viewport_size),
     }
 }
 
@@ -137,8 +130,8 @@ fn test_video(video_type: VideoType, codec: VideoCodec) {
     // Use pixi ffmpeg install if available.
     let pixi_ffmpeg_path = pixi_ffmpeg_path();
     if pixi_ffmpeg_path.exists() {
-        test_context.app_options.video_decoder_ffmpeg_path =
-            pixi_ffmpeg_path.to_str().unwrap().to_owned();
+        test_context.app_options.video.override_ffmpeg_path = true;
+        test_context.app_options.video.ffmpeg_path = pixi_ffmpeg_path.to_str().unwrap().to_owned();
 
         re_log::info!("Using pixi ffmpeg at {pixi_ffmpeg_path:?}");
     } else {
@@ -178,10 +171,12 @@ fn test_video(video_type: VideoType, codec: VideoCodec) {
             let blob_bytes =
                 datatypes::Blob::serialized_blob_as_slice(video_asset.blob.as_ref().unwrap())
                     .unwrap();
+            let tuid = re_log_types::external::re_tuid::Tuid::new();
             let video_data_description = VideoDataDescription::load_from_bytes(
                 blob_bytes,
                 MediaType::mp4().as_str(),
                 video_path.to_str().unwrap(),
+                tuid,
             )
             .unwrap();
 
@@ -193,7 +188,6 @@ fn test_video(video_type: VideoType, codec: VideoCodec) {
             );
 
             let mut annexb_stream_state = re_video::AnnexBStreamState::default();
-            let samples_buffers = std::iter::once(blob_bytes).collect();
 
             for (sample_idx, sample) in video_data_description.samples.iter().enumerate() {
                 let (codec, sample_bytes) = match video_data_description.codec {
@@ -212,7 +206,11 @@ fn test_video(video_type: VideoType, codec: VideoCodec) {
                         re_video::write_avc_chunk_to_nalu_stream(
                             avcc,
                             &mut sample_bytes,
-                            &sample.get(&samples_buffers, sample_idx).unwrap(),
+                            &sample
+                                .sample()
+                                .unwrap()
+                                .get(&|_| blob_bytes, sample_idx)
+                                .unwrap(),
                             &mut annexb_stream_state,
                         )
                         .unwrap();
@@ -235,7 +233,11 @@ fn test_video(video_type: VideoType, codec: VideoCodec) {
                         re_video::write_hevc_chunk_to_nalu_stream(
                             hvcc,
                             &mut sample_bytes,
-                            &sample.get(&samples_buffers, sample_idx).unwrap(),
+                            &sample
+                                .sample()
+                                .unwrap()
+                                .get(&|_| blob_bytes, sample_idx)
+                                .unwrap(),
                             &mut annexb_stream_state,
                         )
                         .unwrap();
@@ -244,7 +246,12 @@ fn test_video(video_type: VideoType, codec: VideoCodec) {
                     }
                     VideoCodec::AV1 => {
                         // Extract raw sample bytes, under av1 they're OBUs already!
-                        let sample_bytes = sample.get(&samples_buffers, sample_idx).unwrap().data;
+                        let sample_bytes = sample
+                            .sample()
+                            .unwrap()
+                            .get(&|_| blob_bytes, sample_idx)
+                            .unwrap()
+                            .data;
                         (components::VideoCodec::AV1, sample_bytes)
                     }
                     VideoCodec::VP9 => panic!("VP9 is not supported for video streams"),
@@ -252,6 +259,8 @@ fn test_video(video_type: VideoType, codec: VideoCodec) {
                 };
 
                 let time_ns = sample
+                    .sample()
+                    .unwrap()
                     .presentation_timestamp
                     .into_nanos(video_data_description.timescale.unwrap());
 
@@ -293,8 +302,9 @@ fn test_video(video_type: VideoType, codec: VideoCodec) {
     let step_dt_seconds = 1.0 / 4.0; // This is also the current egui_kittest default, but let's be explicit since we use `try_run_realtime`.
     let max_total_time_seconds = 60.0;
 
+    let viewport_size = [300.0, 200.0].into();
     let mut harness = test_context
-        .setup_kittest_for_rendering_3d([300.0, 200.0])
+        .setup_kittest_for_rendering_3d(viewport_size)
         .with_step_dt(step_dt_seconds)
         .with_max_steps((max_total_time_seconds / step_dt_seconds) as u64)
         .build_ui(|ui| {
@@ -320,9 +330,7 @@ fn test_video(video_type: VideoType, codec: VideoCodec) {
         harness.try_run_realtime().unwrap();
         harness.snapshot_options(
             format!("video_{video_type}_{codec:?}_{}", seek_location.get_label()),
-            &SnapshotOptions::new()
-                .threshold(image_diff_threshold(codec))
-                .failed_pixel_count_threshold(image_failed_pixel_count_threshold(codec)),
+            &snapshot_options_for_codec(codec, viewport_size),
         );
     }
 }

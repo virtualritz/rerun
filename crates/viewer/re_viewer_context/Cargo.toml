@@ -20,6 +20,7 @@ default = []
 testing = []
 
 [dependencies]
+re_lenses_core.workspace = true
 re_arrow_ui.workspace = true
 re_arrow_util.workspace = true
 re_byte_size.workspace = true
@@ -35,7 +36,10 @@ re_log_channel.workspace = true
 re_log_encoding = { workspace = true, features = ["decoder", "encoder", "stream_from_http"] }
 re_log_types = { workspace = true, features = ["serde"] }
 re_log.workspace = true
+re_memory.workspace = true
+re_mutex.workspace = true
 re_query.workspace = true
+re_quota_channel.workspace = true
 re_redap_client.workspace = true
 re_renderer = { workspace = true, features = ["serde"] }
 re_string_interner.workspace = true
@@ -50,9 +54,9 @@ re_video = { workspace = true, features = ["serde"] }
 ahash.workspace = true
 anyhow.workspace = true
 arrow.workspace = true
-bit-vec.workspace = true
 bitflags.workspace = true
 bytemuck.workspace = true
+camino.workspace = true
 crossbeam.workspace = true
 datafusion.workspace = true
 directories.workspace = true
@@ -91,3 +95,6 @@ tokio.workspace = true
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-futures.workspace = true
 web-sys = { workspace = true, features = ["Window"] }
+
+[dev-dependencies]
+rand = { workspace = true, features = ["std_rng"] }

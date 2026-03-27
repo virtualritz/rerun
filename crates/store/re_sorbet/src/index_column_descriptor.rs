@@ -24,6 +24,17 @@ pub struct IndexColumnDescriptor {
     pub is_sorted: bool,
 }
 
+impl re_byte_size::SizeBytes for IndexColumnDescriptor {
+    fn heap_size_bytes(&self) -> u64 {
+        let Self {
+            timeline,
+            datatype,
+            is_sorted: _,
+        } = self;
+        timeline.heap_size_bytes() + datatype.heap_size_bytes()
+    }
+}
+
 impl PartialOrd for IndexColumnDescriptor {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
@@ -117,8 +128,7 @@ impl IndexColumnDescriptor {
             metadata.insert("rerun:is_sorted".to_owned(), "true".to_owned());
         }
 
-        ArrowField::new(timeline.name().to_string(), datatype.clone(), nullable)
-            .with_metadata(metadata)
+        ArrowField::new(self.column_name(), datatype.clone(), nullable).with_metadata(metadata)
     }
 }
 

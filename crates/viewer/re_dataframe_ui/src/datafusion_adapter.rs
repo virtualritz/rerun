@@ -1,17 +1,18 @@
 use std::mem;
 use std::sync::Arc;
-use std::sync::mpsc::TryRecvError;
 
 use arrow::datatypes::{DataType, SchemaRef};
+use crossbeam::channel::{Receiver, TryRecvError};
 use datafusion::common::{DataFusionError, TableReference};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::functions::expr_fn::concat;
 use datafusion::logical_expr::{binary_expr, col as datafusion_col, lit};
 use datafusion::prelude::{SessionContext, cast, encode};
 use futures::{StreamExt as _, TryStreamExt as _};
-use parking_lot::Mutex;
 use re_log::{error, warn};
 use re_log_types::Timestamp;
+use re_mutex::Mutex;
+use re_quota_channel::send_crossbeam;
 use re_sorbet::{BatchType, SorbetBatch, SorbetSchema};
 use re_viewer_context::AsyncRuntimeHandle;
 
@@ -203,11 +204,8 @@ impl DataFusionQuery {
     ///
     /// Note: the future returned by this function must be `'static`, so it takes `self`. Use
     /// `clone()` as required.
-    fn execute_streaming(
-        self,
-        runtime: &AsyncRuntimeHandle,
-    ) -> std::sync::mpsc::Receiver<QueryEvent> {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1000);
+    fn execute_streaming(self, runtime: &AsyncRuntimeHandle) -> Receiver<QueryEvent> {
+        let (tx, rx) = crate::create_channel(1000);
         runtime.spawn_future(async move {
             if let Ok(stream) = self.batch_stream().await {
                 let schema = stream.schema();
@@ -228,18 +226,26 @@ impl DataFusionQuery {
                             if !sent_schemas {
                                 let sorbet_schema = batch.sorbet_schema().clone();
                                 let original_schema = Arc::clone(&schema);
-                                tx.send(QueryEvent::Schema {
-                                    original_schema,
-                                    sorbet_schema,
-                                })
-                                .ok();
+                                if send_crossbeam(
+                                    &tx,
+                                    QueryEvent::Schema {
+                                        original_schema,
+                                        sorbet_schema,
+                                    },
+                                )
+                                .is_err()
+                                {
+                                    return; // Receiver dropped, stop streaming
+                                }
                                 sent_schemas = true;
                             }
-                            tx.send(QueryEvent::Batch(batch)).ok();
+                            if send_crossbeam(&tx, QueryEvent::Batch(batch)).is_err() {
+                                return; // Receiver dropped, stop streaming
+                            }
                         }
                         Err(err) => {
                             sent_error = true;
-                            tx.send(QueryEvent::Error(err)).ok();
+                            send_crossbeam(&tx, QueryEvent::Error(err)).ok();
                         }
                     }
                 }
@@ -249,15 +255,21 @@ impl DataFusionQuery {
                     let sorbet_schema = SorbetSchema::try_from_raw_arrow_schema(schema.clone());
                     match sorbet_schema {
                         Ok(sorbet_schema) => {
-                            tx.send(QueryEvent::Schema {
-                                original_schema: schema,
-                                sorbet_schema,
-                            })
+                            send_crossbeam(
+                                &tx,
+                                QueryEvent::Schema {
+                                    original_schema: schema,
+                                    sorbet_schema,
+                                },
+                            )
                             .ok();
                         }
                         Err(err) => {
-                            tx.send(QueryEvent::Error(DataFusionError::External(err.into())))
-                                .ok();
+                            send_crossbeam(
+                                &tx,
+                                QueryEvent::Error(DataFusionError::External(err.into())),
+                            )
+                            .ok();
                         }
                     }
                 }
@@ -310,7 +322,7 @@ pub struct DataFusionAdapter {
 
     // TODO(ab, lucasmerlin): this `Mutex` is only needed because of the `Clone` bound in egui
     // so we should clean that up if the bound is lifted.
-    pub rx: Arc<Mutex<std::sync::mpsc::Receiver<QueryEvent>>>,
+    pub rx: Arc<Mutex<Receiver<QueryEvent>>>,
 
     pub results: Option<Result<DataFusionQueryResult, Arc<DataFusionError>>>,
 

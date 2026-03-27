@@ -1,29 +1,25 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, overload
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, overload
 
-from typing_extensions import deprecated
-
+from rerun.error_utils import _send_warning_or_raise
 from rerun_bindings import (
     CatalogClientInternal,
 )
 
 from ..error_utils import RerunIncompatibleDependencyVersionError, RerunMissingDependencyError
-from . import EntryId, TableInsertMode
+from . import EntryId
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
     import datafusion
     import pyarrow as pa
-    from pyarrow import RecordBatch, RecordBatchReader
 
     from . import DatasetEntry, TableEntry
 
-
 # Known FFI compatible releases of Datafusion.
 DATAFUSION_MAJOR_VERSION_COMPATIBILITY_SETS = [
-    {49, 50},
+    {52},
 ]
 
 
@@ -54,6 +50,20 @@ def _compatible_datafusion_version(version: int) -> list[int]:
     return [version]
 
 
+@dataclass(frozen=True)
+class VersionInfo:
+    """Version and deployment information from a Rerun server."""
+
+    version: str
+    """The version string of the server."""
+
+    cloud_provider: str | None
+    """The cloud provider name (e.g. "aws", "azure"). None if not deployed on cloud."""
+
+    cloud_region: str | None
+    """The cloud region (e.g. "us-west-2", "eastus"). None if not deployed on cloud."""
+
+
 class CatalogClient:
     """
     Client for a remote Rerun catalog server.
@@ -64,7 +74,29 @@ class CatalogClient:
 
     __slots__ = ("_internal",)
 
-    def __init__(self, address: str, token: str | None = None) -> None:
+    def __init__(self, url: str, *, token: str | None = None, addr: str | None = None) -> None:
+        """
+        Connect to a remote Rerun catalog server.
+
+        Parameters
+        ----------
+        url:
+            The URL of the catalog server to connect to.
+        token:
+            An optional authentication token to use when connecting to the server.
+        addr:
+            Deprecated: Renamed to `url`
+
+        """
+
+        if addr is not None:
+            url = addr
+            _send_warning_or_raise(
+                "The `addr` parameter is deprecated in Rerun 0.29, and has been renamed to `url`.",
+                depth_to_user_code=1,
+                warning_type=DeprecationWarning,
+            )
+
         from importlib.metadata import version
         from importlib.util import find_spec
 
@@ -84,7 +116,7 @@ class CatalogClient:
                 "datafusion", datafusion_version, _compatible_datafusion_version(expected_df_version)
             )
 
-        self._internal = CatalogClientInternal(address, token)
+        self._internal = CatalogClientInternal(url, token)
 
     @classmethod
     def _from_internal(cls, internal: CatalogClientInternal) -> CatalogClient:
@@ -104,6 +136,16 @@ class CatalogClient:
     def url(self) -> str:
         """Returns the catalog URL."""
         return self._internal.url
+
+    def version_info(self) -> VersionInfo:
+        """
+        Returns version and deployment information from the server.
+
+        Returns a `VersionInfo` object with `version`, `cloud_provider`, and `cloud_region` fields.
+        Cloud fields are `None` if the server is not deployed on a cloud provider.
+        """
+        version, cloud_provider, cloud_region = self._internal.version_info()
+        return VersionInfo(version=version, cloud_provider=cloud_provider, cloud_region=cloud_region)
 
     def entries(self, *, include_hidden: bool = False) -> list[DatasetEntry | TableEntry]:
         """
@@ -144,24 +186,6 @@ class CatalogClient:
         from . import TableEntry
 
         return [TableEntry(internal) for internal in self._internal.tables(include_hidden=include_hidden)]
-
-    # ---
-
-    @deprecated("Use entries() instead")
-    def all_entries(self) -> list[DatasetEntry | TableEntry]:
-        """Returns a list of all entries in the catalog."""
-
-        return self.entries()
-
-    @deprecated("Use datasets() instead")
-    def dataset_entries(self) -> list[DatasetEntry]:
-        """Returns a list of all dataset entries in the catalog."""
-        return self.datasets()
-
-    @deprecated("Use tables() instead")
-    def table_entries(self) -> list[TableEntry]:
-        """Returns a list of all dataset entries in the catalog."""
-        return self.tables()
 
     # ---
 
@@ -253,20 +277,13 @@ class CatalogClient:
 
     # ---
 
-    @deprecated("Use get_dataset() instead")
-    def get_dataset_entry(self, *, id: EntryId | str | None = None, name: str | None = None) -> DatasetEntry:
-        """Returns a dataset by its ID or name."""
-        return self.get_dataset(name=name, id=id)  # type: ignore[call-overload, no-any-return]
-
-    @deprecated("Use get_table() instead")
-    def get_table_entry(self, *, id: EntryId | str | None = None, name: str | None = None) -> TableEntry:
-        """Returns a table by its ID or name."""
-        return self.get_table(name=name, id=id)  # type: ignore[call-overload, no-any-return]
-
-    # ---
-
     def create_dataset(self, name: str) -> DatasetEntry:
-        """Creates a new dataset with the given name."""
+        """
+        Creates a new dataset with the given name.
+
+        Entry names may only contain ASCII alphanumeric characters, underscores, hyphens, dots, colons and spaces,
+        and must be at most 180 characters long.
+        """
 
         from . import DatasetEntry
 
@@ -281,6 +298,9 @@ class CatalogClient:
         name
             The name of the table entry to create. It must be unique within all entries in the catalog. An exception
             will be raised if an entry with the same name already exists.
+
+            Entry names may only contain ASCII alphanumeric characters, underscores, hyphens, dots, colons and spaces,
+            and must be at most 180 characters long.
 
         url
             The URL of the Lance table to register.
@@ -300,111 +320,21 @@ class CatalogClient:
             The name of the table entry to create. It must be unique within all entries in the catalog. An exception
             will be raised if an entry with the same name already exists.
 
+            Entry names may only contain ASCII alphanumeric characters, underscores, hyphens, dots, colons and spaces,
+            and must be at most 180 characters long.
+
         schema
             The schema of the table to create.
 
         url
-            The URL of the directory for where to store the Lance table.
+            The URL of the directory for where to store the Lance table. If provided, the table will be stored in a
+            globally unique subdirectory. If not provided, the server will use an automatically generated URL based on
+            its configured writable storage.
 
         """
         from . import TableEntry
 
         return TableEntry(self._internal.create_table(name, schema, url))
-
-    @deprecated("Use create_table() instead")
-    def create_table_entry(self, name: str, schema: pa.Schema, url: str) -> TableEntry:
-        """Create and register a new table."""
-        return self.create_table(name, schema, url)
-
-    @deprecated("Use TableEntry.append(), overwrite(), or upsert() instead")
-    def write_table(
-        self,
-        name: str,
-        batches: RecordBatchReader | RecordBatch | Sequence[RecordBatch] | Sequence[Sequence[RecordBatch]],
-        insert_mode: TableInsertMode,
-    ) -> None:
-        """
-        Writes record batches into an existing table.
-
-        Parameters
-        ----------
-        name
-            The name of the table entry to write to. This table must already exist.
-
-        batches
-            One or more record batches to write into the table. For convenience, you can
-            pass in a record batch, list of record batches, list of list of batches, or
-            a [`pyarrow.RecordBatchReader`].
-
-        insert_mode
-            Determines how rows should be added to the existing table.
-
-        """
-        table = self.get_table(name=name)
-        if insert_mode == TableInsertMode.APPEND:
-            table.append(batches)
-        elif insert_mode == TableInsertMode.OVERWRITE:
-            table.overwrite(batches)
-        elif insert_mode == TableInsertMode.REPLACE:
-            table.upsert(batches)
-
-    @deprecated("Use TableEntry.append() instead")
-    def append_to_table(
-        self,
-        table_name: str,
-        batches: RecordBatchReader
-        | RecordBatch
-        | Sequence[RecordBatch]
-        | Sequence[Sequence[RecordBatch]]
-        | None = None,
-        **named_params: Any,
-    ) -> None:
-        """
-        Append record batches to an existing table.
-
-        Parameters
-        ----------
-        table_name
-            The name of the table entry to write to. This table must already exist.
-
-        batches
-            One or more record batches to write into the table.
-
-        **named_params
-            Named parameters to write to the table as columns.
-
-        """
-        table = self.get_table(name=table_name)
-        table.append(batches, **named_params)
-
-    @deprecated("Use TableEntry.upsert() instead")
-    def update_table(
-        self,
-        table_name: str,
-        batches: RecordBatchReader
-        | RecordBatch
-        | Sequence[RecordBatch]
-        | Sequence[Sequence[RecordBatch]]
-        | None = None,
-        **named_params: Any,
-    ) -> None:
-        """
-        Upsert record batches to an existing table.
-
-        Parameters
-        ----------
-        table_name
-            The name of the table entry to write to. This table must already exist.
-
-        batches
-            One or more record batches to write into the table.
-
-        **named_params
-            Named parameters to write to the table as columns.
-
-        """
-        table = self.get_table(name=table_name)
-        table.upsert(batches, **named_params)
 
     def do_global_maintenance(self) -> None:
         """Perform maintenance tasks on the whole system."""
@@ -426,7 +356,8 @@ class CatalogClient:
                 raise ValueError("Either 'id' or 'name' must be provided.")
 
             case (EntryId(), None):
-                return id
+                # TODO(astral-sh/ty/#2538)
+                return id  # ty: ignore[invalid-return-type]
 
             case (str(id), None):
                 return EntryId(id)

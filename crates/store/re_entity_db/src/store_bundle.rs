@@ -1,4 +1,3 @@
-use itertools::Itertools as _;
 use re_log_types::{StoreId, StoreKind};
 
 use crate::EntityDb;
@@ -38,7 +37,7 @@ impl StoreBundle {
 
         for msg in decoder {
             let msg = msg?;
-            slf.entry(msg.store_id()).add(&msg)?;
+            slf.entry(msg.store_id()).add_log_msg(&msg)?;
         }
         Ok(slf)
     }
@@ -84,7 +83,7 @@ impl StoreBundle {
     ///
     /// Like [`Self::entry`] but also sets `StoreInfo` to a default value.
     pub fn blueprint_entry(&mut self, id: &StoreId) -> &mut EntityDb {
-        debug_assert!(id.is_blueprint());
+        re_log::debug_assert!(id.is_blueprint());
 
         self.recording_store.entry(id.clone()).or_insert_with(|| {
             // TODO(jleibs): If the blueprint doesn't exist this probably means we are
@@ -119,6 +118,13 @@ impl StoreBundle {
             .filter(|log| log.store_kind() == StoreKind::Recording)
     }
 
+    /// In insertion order.
+    pub fn recordings_mut(&mut self) -> impl Iterator<Item = &mut EntityDb> {
+        self.recording_store
+            .values_mut()
+            .filter(|log| log.store_kind() == StoreKind::Recording)
+    }
+
     // --
 
     pub fn retain(&mut self, mut f: impl FnMut(&EntityDb) -> bool) {
@@ -128,20 +134,5 @@ impl StoreBundle {
     /// In insertion order.
     pub fn drain_entity_dbs(&mut self) -> impl Iterator<Item = EntityDb> + '_ {
         self.recording_store.drain(..).map(|(_, store)| store)
-    }
-
-    // --
-
-    /// Returns the [`StoreId`] of the oldest modified recording, according to [`EntityDb::last_modified_at`].
-    pub fn find_oldest_modified_recording(&self) -> Option<StoreId> {
-        let mut entity_dbs = self
-            .recording_store
-            .values()
-            .filter(|db| db.store_kind() == StoreKind::Recording)
-            .collect_vec();
-
-        entity_dbs.sort_by_key(|db| db.last_modified_at());
-
-        entity_dbs.first().map(|db| db.store_id().clone())
     }
 }

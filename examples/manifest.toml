@@ -34,6 +34,7 @@ examples = [
   # display order, most interesting first
   "droid_dataset",
   "animated_urdf",
+  "rerun_export",
   "ros_node",
   "chess_robby_fischer",
   "nuscenes_dataset",
@@ -46,6 +47,10 @@ examples = [
   "rgbd",
   "nv12",
   "imu_signals",
+  "mcap",
+  "eye_control",
+  "ros_tf",
+  "any_scalar",
 ]
 
 [categories.generative-vision]
@@ -78,10 +83,9 @@ examples = [
   "detect_and_track_objects",
   "face_tracking",
   "annotation_gradio",
+  "sam3d_body",
   "prompt_depth_anything",
   "sam2_depthanything",
-  "human_pose_tracking",
-  "gesture_detection",
   "ocr",
   "live_camera_edge_detection",
   "segment_anything_model",
@@ -133,6 +137,8 @@ examples = [
   "blueprint_stocks",
   "arflow",
   "air_traffic_data",
+  "mcap",
+  "ros_tf",
 ]
 
 [categories.feature-showcase]
@@ -161,6 +167,9 @@ examples = [
   "raw_mesh",
   "air_traffic_data",
   "imu_signals",
+  "eye_control",
+  "webpage",
+  "any_scalar",
 ]
 
 # These are examples that we explicitly exclude from our website. You can check that all examples are either included
@@ -169,11 +178,13 @@ examples = [
 examples = [
   "_empty_rerun_sdk",
   "all_examples",
+  "blueprint", # Not very pretty
   "custom_callback",
   "custom_collection_adapter",
   "custom_data_loader",
   "custom_store_subscriber",
   "custom_view",
+  "custom_visualizer",
   "dataframe_query",
   "drone_lidar",
   "extend_viewer_ui",
@@ -181,7 +192,6 @@ examples = [
   "graph_lattice",
   "incremental_logging",
   "lenses",
-  "mcap_protobuf",
   "minimal_serve",
   "server_tables",
   "shared_recording",
@@ -190,4 +200,8 @@ examples = [
   "table_zoo",
   "template",
   "viewer_callbacks",
+
+  # TODO(jleibs): We want to bring them back once opentelemtry is fixed
+  "human_pose_tracking",
+  "gesture_detection",
 ]

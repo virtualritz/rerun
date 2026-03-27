@@ -443,6 +443,13 @@ impl ::re_types_core::AsComponents for Capsules3D {
 
 impl ::re_types_core::ArchetypeReflectionMarker for Capsules3D {}
 
+impl crate::VisualizableArchetype for Capsules3D {
+    #[inline]
+    fn visualizer(&self) -> crate::Visualizer {
+        crate::Visualizer::new("Capsules3D").with_overrides(self)
+    }
+}
+
 impl Capsules3D {
     /// Create a new `Capsules3D`.
     #[inline]

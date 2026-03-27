@@ -8,9 +8,10 @@ from typing import Any, Final
 
 import matplotlib
 import numpy as np
+from nuscenes import nuscenes
+
 import rerun as rr
 import rerun.blueprint as rrb
-from nuscenes import nuscenes
 
 from .download_dataset import MINISPLIT_SCENES, download_minisplit
 from .export_gps import derive_latlon
@@ -331,7 +332,7 @@ def main() -> None:
                     origin="world",
                     # Set the image plane distance to 5m for all camera visualizations.
                     defaults=[rr.Pinhole.from_fields(image_plane_distance=5.0)],
-                    overrides={"world/anns": rr.Boxes3D.from_fields(fill_mode="solid")},
+                    overrides={"world/anns": rr.Boxes3D(fill_mode="solid")},
                 ),
                 rrb.Vertical(
                     rrb.TextDocumentView(origin="description", name="Description"),

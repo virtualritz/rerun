@@ -1,5 +1,6 @@
 use std::panic::Location;
 
+use re_chunk::ChunkId;
 use re_chunk::EntityPath;
 use re_chunk_store::external::re_chunk::Chunk;
 use re_data_source::LogDataSource;
@@ -8,7 +9,7 @@ use re_log_types::StoreId;
 use re_ui::{UICommand, UICommandSender};
 
 use crate::time_control::TimeControlCommand;
-use crate::{AuthContext, RecordingOrTable};
+use crate::{AuthContext, RecordingOrTable, Route, ScreenshotTarget, ViewId};
 
 // ----------------------------------------------------------------------------
 
@@ -36,16 +37,19 @@ pub enum SystemCommand {
     /// Open a modal to edit this redap server.
     EditRedapServerModal(EditRedapServerModalCommand),
 
-    ChangeDisplayMode(crate::DisplayMode),
-
-    /// Activates the setting display mode.
+    /// Activates the setting route.
     OpenSettings,
 
-    /// Activates the chunk store display mode.
-    OpenChunkStoreBrowser,
+    /// Activates the chunk store route.
+    OpenChunkStoreBrowser {
+        store_id: Option<StoreId>,
+        selected_chunk: Option<ChunkId>,
+    },
 
-    /// Sets the display mode to what it is at startup.
-    ResetDisplayMode,
+    SetRoute(Route),
+
+    /// Sets the route to what it is at startup.
+    ResetRoute,
 
     /// Reset the `Viewer` to the default state
     ResetViewer,
@@ -67,9 +71,6 @@ pub enum SystemCommand {
     /// The final outcome of this is to set the active blueprint to the heuristics. This command
     /// does not affect the default blueprint if any was set.
     ClearActiveBlueprintAndEnableHeuristics,
-
-    /// Switch to this [`RecordingOrTable`].
-    ActivateRecordingOrTable(RecordingOrTable),
 
     /// Close an [`RecordingOrTable`] and free its memory.
     CloseRecordingOrTable(RecordingOrTable),
@@ -142,6 +143,10 @@ pub enum SystemCommand {
     /// Show a notification to the user
     ShowNotification(re_ui::notifications::Notification),
 
+    /// Start polling a texture we're reading back from the gpu, and then prompt
+    /// the user to save a png of the texture.
+    ReadbackAndSaveTexture(re_renderer::texture_readback::TextureReadbackId),
+
     /// Add a task, run on a background thread, that saves something to disk.
     #[cfg(not(target_arch = "wasm32"))]
     FileSaver(Box<dyn FnOnce() -> anyhow::Result<std::path::PathBuf> + Send + 'static>),
@@ -157,6 +162,16 @@ pub enum SystemCommand {
 
     /// Logout from rerun cloud
     Logout,
+
+    /// Save a screenshot to a file.
+    SaveScreenshot {
+        /// Where to save the screenshot.
+        target: ScreenshotTarget,
+
+        /// Optional view id to screenshot a specific view.
+        /// If None, screenshots the entire viewer.
+        view_id: Option<ViewId>,
+    },
 }
 
 impl SystemCommand {
@@ -206,6 +221,13 @@ impl<T: Into<crate::ItemCollection>> From<T> for SetSelection {
     }
 }
 
+impl SystemCommand {
+    /// A short debug name for this command.
+    pub fn debug_name(&self) -> &'static str {
+        self.into()
+    }
+}
+
 impl std::fmt::Debug for SystemCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // not all variant contents can be made `Debug`, so we only output the variant name
@@ -225,14 +247,14 @@ pub type StaticLocation = &'static Location<'static>;
 /// Sender that queues up the execution of commands.
 #[derive(Clone)]
 pub struct CommandSender {
-    system_sender: std::sync::mpsc::Sender<(StaticLocation, SystemCommand)>,
-    ui_sender: std::sync::mpsc::Sender<UICommand>,
+    system_sender: crossbeam::channel::Sender<(StaticLocation, SystemCommand)>,
+    ui_sender: crossbeam::channel::Sender<UICommand>,
 }
 
 /// Receiver for the [`CommandSender`]
 pub struct CommandReceiver {
-    system_receiver: std::sync::mpsc::Receiver<(StaticLocation, SystemCommand)>,
-    ui_receiver: std::sync::mpsc::Receiver<UICommand>,
+    system_receiver: crossbeam::channel::Receiver<(StaticLocation, SystemCommand)>,
+    ui_receiver: crossbeam::channel::Receiver<UICommand>,
 }
 
 impl CommandReceiver {
@@ -255,8 +277,11 @@ impl CommandReceiver {
 
 /// Creates a new command channel.
 pub fn command_channel() -> (CommandSender, CommandReceiver) {
-    let (system_sender, system_receiver) = std::sync::mpsc::channel();
-    let (ui_sender, ui_receiver) = std::sync::mpsc::channel();
+    // We need an unbounded channel here, because we often send messages on the same
+    // thread as we receive them on (the main GUI thread).
+    #![cfg_attr(not(target_arch = "wasm32"), expect(clippy::disallowed_methods))]
+    let (system_sender, system_receiver) = crossbeam::channel::unbounded();
+    let (ui_sender, ui_receiver) = crossbeam::channel::unbounded();
     (
         CommandSender {
             system_sender,
@@ -276,7 +301,7 @@ impl SystemCommandSender for CommandSender {
     #[track_caller]
     fn send_system(&self, command: SystemCommand) {
         // The only way this can fail is if the receiver has been dropped.
-        self.system_sender.send((Location::caller(), command)).ok();
+        re_quota_channel::send_crossbeam(&self.system_sender, (Location::caller(), command)).ok();
     }
 }
 
@@ -284,7 +309,7 @@ impl UICommandSender for CommandSender {
     /// Send a command to be executed.
     fn send_ui(&self, command: UICommand) {
         // The only way this can fail is if the receiver has been dropped.
-        self.ui_sender.send(command).ok();
+        re_quota_channel::send_crossbeam(&self.ui_sender, command).ok();
     }
 }
 
@@ -292,6 +317,7 @@ impl UICommandSender for CommandSender {
 ///
 /// This exists as a separate struct to make it convenient to funnel it through the redap browser
 /// command system.
+#[derive(Debug)]
 pub struct EditRedapServerModalCommand {
     /// Which server should be edited?
     pub origin: re_uri::Origin,

@@ -346,6 +346,13 @@ impl ::re_types_core::AsComponents for LineStrips2D {
 
 impl ::re_types_core::ArchetypeReflectionMarker for LineStrips2D {}
 
+impl crate::VisualizableArchetype for LineStrips2D {
+    #[inline]
+    fn visualizer(&self) -> crate::Visualizer {
+        crate::Visualizer::new("Lines2D").with_overrides(self)
+    }
+}
+
 impl LineStrips2D {
     /// Create a new `LineStrips2D`.
     #[inline]

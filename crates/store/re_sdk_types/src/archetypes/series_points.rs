@@ -148,13 +148,13 @@ impl SeriesPoints {
 
     /// Returns the [`ComponentDescriptor`] for [`Self::visible_series`].
     ///
-    /// The corresponding component is [`crate::components::SeriesVisible`].
+    /// The corresponding component is [`crate::components::Visible`].
     #[inline]
     pub fn descriptor_visible_series() -> ComponentDescriptor {
         ComponentDescriptor {
             archetype: Some("rerun.archetypes.SeriesPoints".into()),
             component: "SeriesPoints:visible_series".into(),
-            component_type: Some("rerun.components.SeriesVisible".into()),
+            component_type: Some("rerun.components.Visible".into()),
         }
     }
 
@@ -289,6 +289,13 @@ impl ::re_types_core::AsComponents for SeriesPoints {
 
 impl ::re_types_core::ArchetypeReflectionMarker for SeriesPoints {}
 
+impl crate::VisualizableArchetype for SeriesPoints {
+    #[inline]
+    fn visualizer(&self) -> crate::Visualizer {
+        crate::Visualizer::new("SeriesPoints").with_overrides(self)
+    }
+}
+
 impl SeriesPoints {
     /// Create a new `SeriesPoints`.
     #[inline]
@@ -326,7 +333,7 @@ impl SeriesPoints {
                 Self::descriptor_names(),
             )),
             visible_series: Some(SerializedComponentBatch::new(
-                crate::components::SeriesVisible::arrow_empty(),
+                crate::components::Visible::arrow_empty(),
                 Self::descriptor_visible_series(),
             )),
             marker_sizes: Some(SerializedComponentBatch::new(
@@ -443,7 +450,7 @@ impl SeriesPoints {
     #[inline]
     pub fn with_visible_series(
         mut self,
-        visible_series: impl IntoIterator<Item = impl Into<crate::components::SeriesVisible>>,
+        visible_series: impl IntoIterator<Item = impl Into<crate::components::Visible>>,
     ) -> Self {
         self.visible_series =
             try_serialize_field(Self::descriptor_visible_series(), visible_series);

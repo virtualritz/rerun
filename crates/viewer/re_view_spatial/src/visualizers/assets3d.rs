@@ -2,9 +2,10 @@ use re_chunk_store::RowId;
 use re_log_types::hash::Hash64;
 use re_log_types::{Instance, TimeInt};
 use re_renderer::renderer::GpuMeshInstance;
+use re_sdk_types::Archetype as _;
 use re_sdk_types::ArrowString;
 use re_sdk_types::archetypes::Asset3D;
-use re_sdk_types::components::AlbedoFactor;
+use re_sdk_types::components::{AlbedoFactor, Blob};
 use re_viewer_context::{
     IdentifiedViewSystem, QueryContext, ViewContext, ViewContextCollection, ViewQuery,
     ViewSystemExecutionError, VisualizerExecutionOutput, VisualizerQueryInfo, VisualizerSystem,
@@ -12,7 +13,7 @@ use re_viewer_context::{
 
 use super::SpatialViewVisualizerData;
 use crate::caches::{AnyMesh, MeshCache, MeshCacheKey};
-use crate::contexts::SpatialSceneEntityContext;
+use crate::contexts::SpatialSceneVisualizerInstructionContext;
 use crate::view_kind::SpatialViewKind;
 
 pub struct Asset3DVisualizer(SpatialViewVisualizerData);
@@ -41,7 +42,7 @@ impl Asset3DVisualizer {
         &mut self,
         ctx: &QueryContext<'_>,
         instances: &mut Vec<GpuMeshInstance>,
-        ent_context: &SpatialSceneEntityContext<'_>,
+        ent_context: &SpatialSceneVisualizerInstructionContext<'_>,
         data: impl Iterator<Item = Asset3DComponentData<'a>>,
     ) {
         let entity_path = ctx.target_entity_path;
@@ -53,7 +54,7 @@ impl Asset3DVisualizer {
 
             // TODO(#5974): this is subtly wrong, the key should actually be a hash of everything that got
             // cached, which includes the media type…
-            let mesh = ctx.store_ctx().caches.entry(|c: &mut MeshCache| {
+            let mesh = ctx.store_ctx().memoizer(|c: &mut MeshCache| {
                 let key = MeshCacheKey {
                     versioned_instance_path_hash: picking_instance_hash.versioned(primary_row_id),
                     query_result_hash: data.query_result_hash,
@@ -93,6 +94,8 @@ impl Asset3DVisualizer {
                                 picking_instance_hash,
                             ),
                             additive_tint: re_renderer::Color32::BLACK,
+                            // TODO(andreas): honor the culling settings from the mesh file if any.
+                            cull_mode: Default::default(),
                         }
                     }));
 
@@ -111,8 +114,14 @@ impl IdentifiedViewSystem for Asset3DVisualizer {
 }
 
 impl VisualizerSystem for Asset3DVisualizer {
-    fn visualizer_query_info(&self) -> VisualizerQueryInfo {
-        VisualizerQueryInfo::from_archetype::<Asset3D>()
+    fn visualizer_query_info(
+        &self,
+        _app_options: &re_viewer_context::AppOptions,
+    ) -> VisualizerQueryInfo {
+        VisualizerQueryInfo::single_required_component::<Blob>(
+            &Asset3D::descriptor_blob(),
+            &Asset3D::all_components(),
+        )
     }
 
     fn execute(
@@ -121,37 +130,32 @@ impl VisualizerSystem for Asset3DVisualizer {
         view_query: &ViewQuery<'_>,
         context_systems: &ViewContextCollection,
     ) -> Result<VisualizerExecutionOutput, ViewSystemExecutionError> {
-        let mut output = VisualizerExecutionOutput::default();
+        let output = VisualizerExecutionOutput::default();
         let preferred_view_kind = self.0.preferred_view_kind;
         let mut instances = Vec::new();
 
-        use super::entity_iterator::{iter_slices, process_archetype};
+        use super::entity_iterator::process_archetype;
         process_archetype::<Self, Asset3D, _>(
             ctx,
             view_query,
             context_systems,
-            &mut output,
+            &output,
             preferred_view_kind,
             |ctx, spatial_ctx, results| {
-                use re_view::RangeResultsExt as _;
-
-                let Some(all_blob_chunks) =
-                    results.get_required_chunks(Asset3D::descriptor_blob().component)
-                else {
+                let all_blobs = results.iter_required(Asset3D::descriptor_blob().component);
+                if all_blobs.is_empty() {
                     return Ok(());
-                };
+                }
 
-                let timeline = ctx.query.timeline();
-                let all_blobs_indexed = iter_slices::<&[u8]>(&all_blob_chunks, timeline);
                 let all_media_types =
-                    results.iter_as(timeline, Asset3D::descriptor_media_type().component);
+                    results.iter_optional(Asset3D::descriptor_media_type().component);
                 let all_albedo_factors =
-                    results.iter_as(timeline, Asset3D::descriptor_albedo_factor().component);
+                    results.iter_optional(Asset3D::descriptor_albedo_factor().component);
 
                 let query_result_hash = results.query_result_hash();
 
                 let data = re_query::range_zip_1x2(
-                    all_blobs_indexed,
+                    all_blobs.slice::<&[u8]>(),
                     all_media_types.slice::<String>(),
                     all_albedo_factors.slice::<u32>(),
                 )
@@ -187,9 +191,5 @@ impl VisualizerSystem for Asset3DVisualizer {
 
     fn data(&self) -> Option<&dyn std::any::Any> {
         Some(self.0.as_any())
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }

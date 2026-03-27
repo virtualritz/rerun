@@ -4,6 +4,7 @@ tags = ["2D"]
 thumbnail= "https://static.rerun.io/rrt-star/fbbda33bdbbfa469ec95c905178ac3653920473a/480w.png"
 thumbnail_dimensions = [480, 480]
 channel = "main"
+include_in_manifest = true
 -->
 
 This example visualizes the path finding algorithm RRT\* in a simple environment.
@@ -67,7 +68,11 @@ rr.log("map/new/new_edge", rr.LineStrips2D([(closest_node.pos, new_point)], colo
 
 #### Vertices
 ```python
-rr.log("map/tree/vertices", rr.Points2D([node.pos for node in tree], radii=0.002), rr.AnyValues(cost=[float(node.cost) for node in tree]))
+rr.log(
+    "map/tree/vertices",
+    rr.Points2D([node.pos for node in tree], radii=0.002),
+    rr.AnyValues(cost=[float(node.cost) for node in tree]),
+)
 ```
 
 #### Close nodes

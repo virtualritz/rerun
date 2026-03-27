@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Self
 
 from rerun import server as _server
 
@@ -12,26 +12,26 @@ if TYPE_CHECKING:
 
 
 class Server:
-    address = _server.Server.address
+    host = _server.Server.host
     is_running = _server.Server.is_running
     shutdown = _server.Server.shutdown
 
     def __init__(
         self,
         *,
-        address: str = "0.0.0.0",
+        host: str = "0.0.0.0",
         port: int | None = None,
         datasets: dict[str, PathLike[str]] | None = None,
         tables: dict[str, PathLike[str]] | None = None,
     ) -> None:
         self._internal = _server.Server(
-            address=address,
+            host=host,
             port=port,
             datasets=datasets,
             tables=tables,
         )
 
-    def __enter__(self) -> Server:
+    def __enter__(self) -> Self:
         self._internal.__enter__()
         return self
 
@@ -43,5 +43,9 @@ class Server:
     ) -> None:
         self._internal.__exit__(exc_type, exc_value, traceback)
 
+    def url(self) -> str:
+        """Get the URL of the server to which clients can connect."""
+        return self._internal.url()
+
     def client(self) -> CatalogClient:
-        return CatalogClient(address=self.address())
+        return CatalogClient(self.url())

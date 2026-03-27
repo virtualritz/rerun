@@ -19,13 +19,13 @@ use crate::codegen::rust::deserializer::{
 use crate::codegen::rust::serializer::quote_arrow_serializer;
 use crate::codegen::rust::util::{is_tuple_struct_from_obj, quote_doc_line};
 use crate::codegen::{Target, autogen_warning};
-use crate::objects::{EnumIntegerType, ObjectClass};
+use crate::objects::ObjectClass;
 use crate::{
     ATTR_DEFAULT, ATTR_RERUN_COMPONENT_OPTIONAL, ATTR_RERUN_COMPONENT_RECOMMENDED,
-    ATTR_RERUN_COMPONENT_REQUIRED, ATTR_RERUN_VIEW_IDENTIFIER, ATTR_RUST_CUSTOM_CLAUSE,
-    ATTR_RUST_DERIVE, ATTR_RUST_DERIVE_ONLY, ATTR_RUST_NEW_PUB_CRATE, ATTR_RUST_REPR,
-    CodeGenerator, ElementType, Object, ObjectField, ObjectKind, Objects, Reporter, Type,
-    TypeRegistry, format_path,
+    ATTR_RERUN_COMPONENT_REQUIRED, ATTR_RERUN_VIEW_IDENTIFIER, ATTR_RERUN_VISUALIZER,
+    ATTR_RUST_CUSTOM_CLAUSE, ATTR_RUST_DERIVE, ATTR_RUST_DERIVE_ONLY, ATTR_RUST_NEW_PUB_CRATE,
+    ATTR_RUST_REPR, CodeGenerator, ElementType, Object, ObjectField, ObjectKind, Objects, Reporter,
+    Type, TypeRegistry, format_path,
 };
 
 // ---
@@ -604,12 +604,46 @@ fn quote_enum(
         quote!(Self::#quoted_name => #docstring_md)
     });
 
-    let repr_type = match obj.enum_integer_type() {
-        Some(EnumIntegerType::U8) => quote!(u8),
-        Some(EnumIntegerType::U16) => quote!(u16),
-        Some(EnumIntegerType::U32) => quote!(u32),
-        Some(EnumIntegerType::U64) => quote!(u64),
-        None => unreachable!("enums must have an integer type"),
+    let enum_int_type = obj
+        .enum_integer_type()
+        .expect("enums must have an integer type");
+    let repr_type = format_ident!("{}", enum_int_type.type_str());
+
+    // Check if enum variants are sequentially numbered starting at 1
+    // (we assign enum values starting at 1, 0 is reserved).
+    // If so, we can optimize try_from by indexing into the variants() array.
+    let is_sequential_from_one = fields.iter().enumerate().all(|(i, field)| {
+        field
+            .enum_or_union_variant_value
+            .is_some_and(|v| v == (i as u64) + 1)
+    });
+
+    let quoted_try_from_body = if is_sequential_from_one {
+        quote! {
+            Self::variants()
+                .get((value as usize).wrapping_sub(1))
+                .copied()
+        }
+    } else {
+        let try_from_match_arms = fields.iter().map(|field| {
+            let variant_name = format_ident!("{}", field.name);
+            let enum_value = field
+                .enum_or_union_variant_value
+                .expect("enum variants must have values");
+            let value_literal = proc_macro2::Literal::from_str(
+                &obj.enum_integer_type()
+                    .expect("enums must have an integer type")
+                    .format_value(enum_value),
+            )
+            .unwrap();
+            quote!(#value_literal => Some(Self::#variant_name))
+        });
+        quote! {
+            match value {
+                #(#try_from_match_arms,)*
+                _ => None,
+            }
+        }
     };
 
     let tokens = quote! {
@@ -634,6 +668,7 @@ fn quote_enum(
         }
 
         impl ::re_types_core::reflection::Enum for #name {
+            type Repr = #repr_type;
 
             #[inline]
             fn variants() -> &'static [Self] {
@@ -645,6 +680,11 @@ fn quote_enum(
                 match self {
                     #(#docstring_md_match_arms,)*
                 }
+            }
+
+            #[inline]
+            fn try_from_integer(value: #repr_type) -> Option<Self> {
+                #quoted_try_from_body
             }
         }
 
@@ -1037,7 +1077,11 @@ fn quote_trait_impls_for_datatype_or_component(
 
 fn quote_trait_impls_for_archetype(reporter: &Reporter, obj: &Object) -> TokenStream {
     let Object {
-        fqname, name, kind, ..
+        fqname,
+        name,
+        kind,
+        attrs,
+        ..
     } = obj;
 
     assert_eq!(kind, &ObjectKind::Archetype);
@@ -1115,6 +1159,17 @@ fn quote_trait_impls_for_archetype(reporter: &Reporter, obj: &Object) -> TokenSt
             }
         })
         .collect_vec();
+
+    let visualizer_trait_impl = attrs.get_string(ATTR_RERUN_VISUALIZER).map(|visualizer| {
+        quote! {
+            impl crate::VisualizableArchetype for #name {
+                #[inline]
+                fn visualizer(&self) -> crate::Visualizer {
+                    crate::Visualizer::new(#visualizer).with_overrides(self)
+                }
+            }
+        }
+    });
 
     let (num_required_descriptors, required_descriptors) =
         compute_component_descriptors(obj, ATTR_RERUN_COMPONENT_REQUIRED);
@@ -1253,6 +1308,8 @@ fn quote_trait_impls_for_archetype(reporter: &Reporter, obj: &Object) -> TokenSt
         }
 
         impl ::re_types_core::ArchetypeReflectionMarker for #name { }
+
+        #visualizer_trait_impl
     }
 }
 

@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use dav1d::{PixelLayout, PlanarImageComponent};
+use re_log::debug_assert;
 
 use super::async_decoder_wrapper::SyncDecoder;
 use super::{
@@ -10,7 +11,7 @@ use super::{
     YuvPixelLayout, YuvRange,
 };
 use crate::decode::FrameResult;
-use crate::{Time, VideoDataDescription};
+use crate::{Sender, Time, VideoDataDescription};
 
 pub struct SyncDav1dDecoder {
     decoder: dav1d::Decoder,
@@ -22,7 +23,7 @@ impl SyncDecoder for SyncDav1dDecoder {
         &mut self,
         should_stop: &AtomicBool,
         chunk: Chunk,
-        output_sender: &crossbeam::channel::Sender<FrameResult>,
+        output_sender: &Sender<FrameResult>,
     ) {
         re_tracing::profile_function!();
         self.submit_chunk(chunk, output_sender);
@@ -81,11 +82,7 @@ impl SyncDav1dDecoder {
         })
     }
 
-    fn submit_chunk(
-        &mut self,
-        chunk: Chunk,
-        output_sender: &crossbeam::channel::Sender<FrameResult>,
-    ) {
+    fn submit_chunk(&mut self, chunk: Chunk, output_sender: &Sender<FrameResult>) {
         re_tracing::profile_function!();
         econtext::econtext_function_data!(format!(
             "chunk timestamp: {:?}",
@@ -114,7 +111,7 @@ impl SyncDav1dDecoder {
     fn output_frames(
         &mut self,
         should_stop: &AtomicBool,
-        output_sender: &crossbeam::channel::Sender<FrameResult>,
+        output_sender: &Sender<FrameResult>,
     ) -> usize {
         re_tracing::profile_function!();
         let mut count = 0;
@@ -147,7 +144,7 @@ fn create_frame(debug_name: &str, picture: &dav1d::Picture) -> FrameResult {
 
     let bits_per_component = picture
         .bits_per_component()
-        .map_or(picture.bit_depth(), |bpc| bpc.0);
+        .map_or_else(|| picture.bit_depth(), |bpc| bpc.0);
 
     let bytes_per_component = if bits_per_component == 8 {
         1

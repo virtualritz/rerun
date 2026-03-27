@@ -64,9 +64,18 @@ pub(crate) mod oauth {
         }
     }
 
+    /// Listen for changes to the authentication state.
+    ///
+    /// NOTE: You must call [`CliCredentialsProvider::get_token`] once after subscribing to get the
+    /// initial state.
     pub fn subscribe_auth_changes(callback: impl Fn(Option<oauth::User>) + Send + 'static) {
         let mut subscribers = AUTH_SUBSCRIBERS.lock();
         subscribers.push(Box::new(callback));
+    }
+
+    /// Clear the credentials cache
+    pub(crate) fn clear_cache() {
+        *CACHE.blocking_write() = None;
     }
 
     /// Provider which uses `OAuth` credentials stored on the user's machine.

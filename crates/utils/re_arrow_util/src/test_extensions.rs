@@ -32,6 +32,8 @@ pub trait RecordBatchTestExt {
     /// logical order, and it's nice to keep it in the snapshots while we can.
     fn sort_property_columns(&self) -> Self;
 
+    fn sort_index_columns(&self) -> Self;
+
     fn sort_rows_by(&self, columns: &[&str]) -> Result<Self, DataFusionError>
     where
         Self: Sized;
@@ -110,6 +112,26 @@ impl RecordBatchTestExt for arrow::array::RecordBatch {
             .sort_columns_by(|f1, f2| {
                 if f1.name().starts_with("property:") && f2.name().starts_with("property:") {
                     f1.name().cmp(f2.name())
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .expect("should be able to sort")
+    }
+
+    fn sort_index_columns(&self) -> Self {
+        self.clone()
+            .sort_columns_by(|f1, f2| {
+                if let Some(idx1) = f1.metadata().get("rerun:index")
+                    && let Some(idx2) = f2.metadata().get("rerun:index")
+                    && let Some(marker1) = f1.metadata().get("rerun:index_marker")
+                    && let Some(marker2) = f2.metadata().get("rerun:index_marker")
+                {
+                    if idx1 == idx2 {
+                        marker1.cmp(marker2)
+                    } else {
+                        idx1.cmp(idx2)
+                    }
                 } else {
                     std::cmp::Ordering::Equal
                 }
@@ -246,6 +268,10 @@ impl RecordBatchTestExt for arrow::array::RecordBatch {
                     arrays
                         .push(redact_array!(array, arrow::array::Int64Array, |opt| opt.map(|_| 0)));
                 }
+                arrow::datatypes::DataType::UInt64 => {
+                    arrays
+                        .push(redact_array!(array, arrow::array::UInt64Array, |opt| opt.map(|_| 0)));
+                }
                 arrow::datatypes::DataType::List(field) => {
                     let list_array = array
                         .try_downcast_array_ref::<arrow::array::ListArray>()
@@ -364,15 +390,15 @@ impl SchemaTestExt for arrow::datatypes::Schema {
                 format!(
                     "{}: {}{}",
                     field.name(),
-                    if field.is_nullable() { "nullable " } else { "" },
-                    crate::format_data_type(field.data_type())
+                    if field.is_nullable() { "" } else { "non-null " },
+                    field.data_type()
                 )
             } else {
                 format!(
                     "{}: {}{} [\n    {}\n]",
                     field.name(),
-                    if field.is_nullable() { "nullable " } else { "" },
-                    crate::format_data_type(field.data_type()),
+                    if field.is_nullable() { "" } else { "non-null " },
+                    field.data_type(),
                     field
                         .metadata()
                         .iter()

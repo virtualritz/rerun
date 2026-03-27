@@ -11,17 +11,16 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 include = [
-    "../../Cargo.lock",
-    "../../LICENSE-APACHE",
-    "../../LICENSE-MIT",
-    "**/*.rs",
-    "Cargo.toml",
-    "shader/*",
+  "../../Cargo.lock",
+  "../../LICENSE-APACHE",
+  "../../LICENSE-MIT",
+  "**/*.rs",
+  "Cargo.toml",
+  "shader/*",
 ]
 
-# native
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-notify.workspace = true
+[lints]
+workspace = true
 
 [package.metadata.docs.rs]
 all-features = true
@@ -29,60 +28,48 @@ targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
 
 [package.metadata.cargo-shear]
 ignored = [
-    "profiling",
-    # Needed to hook up wgpu, see below at dependency setup.
-    "js-sys",
-    # Needed for wasm builds
-    "getrandom",
-    "wasm-bindgen",
+  "profiling", # Needed to hook up wgpu, see below at dependency setup.
+  "js-sys", # Needed for wasm builds
+  "getrandom",
+  "wasm-bindgen",
 ]
 
+
 [features]
-default = ["import-obj", "import-gltf", "import-stl", "video"]
+default = ["import-dae", "import-gltf", "import-obj", "import-stl"]
 
-## Enable memory sizing helpers.
-memory-stats = ["dep:re_byte_size"]
-
-## Support importing .obj files
-import-obj = ["dep:tobj"]
+## Support importing .dae files
+import-dae = ["dep:dae-parser"]
 
 ## Support importing .gltf and .glb files
 import-gltf = ["dep:gltf"]
 
+## Support importing .obj files
+import-obj = ["dep:tobj"]
+
 ## Support importing binary & ascii .stl files
 import-stl = ["dep:stl_io"]
-
-## Enable video decoding/playback.
-video = ["dep:re_video"]
 
 ## Enable (de)serialization using serde.
 serde = ["dep:serde"]
 
-# web
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { workspace = true, features = [
-  "wasm_js",
-] } # getrandom needs the `js` feature to be enabled. It is dragged in indirectly.
-js-sys.workspace = true
-wasm-bindgen.workspace = true
-wasm-bindgen-futures.workspace = true
-web-sys.workspace = true
-
 [dependencies]
-# Rerun
-re_byte_size = { workspace = true, optional = true }
+re_byte_size.workspace = true
 re_error.workspace = true
 re_log.workspace = true
+re_mutex.workspace = true
+re_quota_channel.workspace = true
 re_tracing.workspace = true
-re_video = { workspace = true, default-features = true, optional = true }
+re_tuid.workspace = true
+re_video = { workspace = true, default-features = true }
 
-# External
 ahash.workspace = true
 anyhow.workspace = true
 bitflags.workspace = true
 bytemuck.workspace = true
 clean-path.workspace = true
 crossbeam.workspace = true
+dae-parser = { workspace = true, optional = true }
 document-features.workspace = true
 ecolor = { workspace = true, features = ["bytemuck"] }
 enumset.workspace = true
@@ -96,19 +83,46 @@ parking_lot.workspace = true
 # wgpu uses the `profiling` crate for its profiling scopes.
 # This will hook them up to the puffin profiler as backend:
 profiling = { workspace = true, features = ["profile-with-puffin"] }
+regex-lite.workspace = true
 slotmap.workspace = true
 smallvec.workspace = true
 static_assertions.workspace = true
 thiserror.workspace = true
 type-map.workspace = true
-web-time.workspace = true
 wgpu.workspace = true
 
-# External (optional)
+# optional
 gltf = { workspace = true, optional = true }
-serde = { workspace = true, features = ["derive"], optional = true }
 stl_io = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"], optional = true }
 tobj = { workspace = true, optional = true }
+
+# native
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+notify.workspace = true
+
+# web
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = [
+  "wasm_js",
+] } # getrandom needs the `js` feature to be enabled. It is dragged in indirectly.
+js-sys.workspace = true
+web-sys.workspace = true
+wasm-bindgen.workspace = true
+
+
+[dev-dependencies]
+re_log = { workspace = true, features = ["setup"] }
+criterion.workspace = true
+pollster.workspace = true
+unindent.workspace = true
+
+[lib]
+bench = false
+
+[[bench]]
+name = "bench_bounding_box"
+harness = false
 
 # For build.rs:
 [build-dependencies]
@@ -121,14 +135,3 @@ cfg_aliases.workspace = true
 clean-path.workspace = true
 pathdiff.workspace = true
 walkdir.workspace = true
-
-[dev-dependencies]
-# Rerun
-re_log = { workspace = true, features = ["setup"] }
-
-# External
-pollster.workspace = true
-unindent.workspace = true
-
-[lints]
-workspace = true

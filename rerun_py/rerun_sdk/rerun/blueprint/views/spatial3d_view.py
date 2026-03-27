@@ -9,7 +9,7 @@ __all__ = ["Spatial3DView"]
 
 
 from .. import archetypes as blueprint_archetypes, components as blueprint_components
-from ..api import View, ViewContentsLike
+from ..api import View, ViewContentsLike, VisualizerLike
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
@@ -32,9 +32,10 @@ class Spatial3DView(View):
     -------
     ### Use a blueprint to customize a Spatial3DView.:
     ```python
+    from numpy.random import default_rng
+
     import rerun as rr
     import rerun.blueprint as rrb
-    from numpy.random import default_rng
 
     rr.init("rerun_example_spatial_3d", spawn=True)
 
@@ -103,11 +104,7 @@ class Spatial3DView(View):
         name: Utf8Like | None = None,
         visible: datatypes.BoolLike | None = None,
         defaults: Iterable[AsComponents | Iterable[DescribedComponentBatch]] | None = None,
-        overrides: Mapping[
-            EntityPathLike,
-            AsComponents | Iterable[DescribedComponentBatch | AsComponents | Iterable[DescribedComponentBatch]],
-        ]
-        | None = None,
+        overrides: Mapping[EntityPathLike, VisualizerLike | Iterable[VisualizerLike]] | None = None,
         background: blueprint_archetypes.Background
         | datatypes.Rgba32Like
         | blueprint_components.BackgroundKindLike
@@ -146,10 +143,12 @@ class Spatial3DView(View):
             Note that an archetype's required components typically don't have any effect.
             It is recommended to use the archetype's `from_fields` method instead and only specify the fields that you need.
         overrides:
-            Dictionary of overrides to apply to the view. The key is the path to the entity where the override
-            should be applied. The value is a list of archetypes or (described) component batches to apply to the entity.
+            Dictionary of visualizer overrides to apply to the view. The key is the path to the entity where the override
+            should be applied. The value is a list of visualizers which should be enabled for that entity, or a single visualizer.
 
-            It is recommended to use the archetype's `from_fields` method instead and only specify the fields that you need.
+            Each visualizer can be configured with arbitrary overrides and mappings.
+
+            For any entity mentioned in this map, visualizers are no longer added automatically based on the entity's components.
 
             Important note: the path must be a fully qualified entity path starting at the root. The override paths
             do not yet support `$origin` relative paths or glob expressions.

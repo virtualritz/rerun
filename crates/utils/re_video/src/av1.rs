@@ -46,20 +46,32 @@ pub fn detect_av1_keyframe_start(data: &[u8]) -> Result<GopStartDetection, Detec
                 let seq = SequenceHeaderObu::parse(header, &mut cursor)
                     .map_err(DetectGopStartError::Av1ParserError)?;
 
+                let profile = seq.seq_profile;
+                let bit_depth = seq.color_config.bit_depth as u8;
+
+                // Use the first operating point's level and tier for the codec string.
+                // Format: av01.P.LLT.DD
+                // See https://aomediacodec.github.io/av1-isobmff/#codecsparam
+                let (level, tier) = seq
+                    .operating_points
+                    .first()
+                    .map(|op| (op.seq_level_idx, if op.seq_tier { "H" } else { "M" }))
+                    .unwrap_or((1, "M"));
+
                 video_encoding_details = Some(VideoEncodingDetails {
-                    codec_string: "av01".to_owned(),
+                    codec_string: format!("av01.{profile}.{level:02}{tier}.{bit_depth:02}"),
                     coded_dimensions: [seq.max_frame_width as u16, seq.max_frame_height as u16],
-                    bit_depth: Some(seq.color_config.bit_depth as u8),
+                    bit_depth: Some(bit_depth),
                     chroma_subsampling: Some(chroma_mode_from_color_config(&seq.color_config)),
                     stsd: None,
                 });
 
                 continue;
             }
-            ObuType::Frame | ObuType::FrameHeader => {
-                if is_keyframe(&mut cursor).map_err(DetectGopStartError::Av1ParserError)? {
-                    keyframe_found = true;
-                }
+            ObuType::Frame | ObuType::FrameHeader
+                if is_keyframe(&mut cursor).map_err(DetectGopStartError::Av1ParserError)? =>
+            {
+                keyframe_found = true;
             }
             _ => {
                 // Skip other OBUs
@@ -129,27 +141,35 @@ fn chroma_mode_from_color_config(config: &scuffle_av1::seq::ColorConfig) -> Chro
     }
 }
 
+/// Small 64x64 AV1 keyframe for testing (generated with ffmpeg)
+///
+/// This contains a Sequence Header OBU followed by a keyframe
+pub const AV1_TEST_KEYFRAME: &[u8] = &[
+    0x12, 0x00, 0x0A, 0x0A, 0x00, 0x00, 0x00, 0x02, 0xAF, 0xFF, 0x9F, 0xFF, 0x30, 0x08, 0x32, 0x14,
+    0x10, 0x00, 0xC0, 0x00, 0x00, 0x02, 0x80, 0x00, 0x00, 0x0A, 0x05, 0x76, 0xA4, 0xD6, 0x2F, 0x1F,
+    0xFA, 0x1E, 0x3C, 0xD8,
+];
+
+/// AV1 inter-frame (non-keyframe) for testing (generated with ffmpeg)
+///
+/// This contains temporal Delimiter OBU + Frame OBU with inter-frame
+pub const AV1_TEST_INTER_FRAME: &[u8] = &[
+    0x12, 0x00, 0x32, 0x12, 0x30, 0x03, 0xC0, 0x80, 0x00, 0x00, 0x06, 0xC0, 0x00, 0x00, 0x02, 0x80,
+    0x00, 0x00, 0x80, 0x00, 0x99, 0x10,
+];
+
 #[cfg(test)]
 mod test {
     use super::{GopStartDetection, detect_av1_keyframe_start};
 
     #[test]
     fn test_detect_av1_keyframe_start() {
-        // Small 64x64 AV1 keyframe for testing (generated with ffmpeg)
-        // This contains a Sequence Header OBU followed by a keyframe
-        #[rustfmt::skip]
-        let sample_data = &[
-            0x12, 0x00, 0x0A, 0x0A, 0x00, 0x00, 0x00, 0x02, 0xAF, 0xFF, 0x9F, 0xFF, 0x30, 0x08, 0x32, 0x14,
-            0x10, 0x00, 0xC0, 0x00, 0x00, 0x02, 0x80, 0x00, 0x00, 0x0A, 0x05, 0x76, 0xA4, 0xD6, 0x2F, 0x1F,
-            0xFA, 0x1E, 0x3C, 0xD8,
-        ];
-
-        let result = detect_av1_keyframe_start(sample_data);
+        let result = detect_av1_keyframe_start(super::AV1_TEST_KEYFRAME);
 
         match result {
             Ok(GopStartDetection::StartOfGop(details)) => {
                 // Verify we got expected details from the AV1 stream
-                assert_eq!(details.codec_string, "av01");
+                assert_eq!(details.codec_string, "av01.0.00M.08");
                 assert_eq!(details.coded_dimensions, [64, 64]);
 
                 assert_eq!(details.bit_depth, Some(8));
@@ -178,13 +198,7 @@ mod test {
 
     #[test]
     fn test_detect_av1_non_keyframe() {
-        // This would need a valid AV1 sequence with a non-keyframe
-        // For now, we just test that invalid/incomplete data doesn't panic
-        let data = &[
-            // Just a sequence header without a keyframe
-            0x0A, 0x0B, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00,
-        ];
-        let result = detect_av1_keyframe_start(data);
+        let result = detect_av1_keyframe_start(super::AV1_TEST_INTER_FRAME);
 
         // Should return a `NotStartOfGop` or error
         match result {

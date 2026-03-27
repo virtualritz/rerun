@@ -10,7 +10,7 @@
 #include "../components/marker_shape.hpp"
 #include "../components/marker_size.hpp"
 #include "../components/name.hpp"
-#include "../components/series_visible.hpp"
+#include "../components/visible.hpp"
 #include "../result.hpp"
 
 #include <cstdint>
@@ -40,7 +40,7 @@ namespace rerun::archetypes {
     ///
     /// constexpr float TAU = 6.28318530717958647692528676655900577f;
     ///
-    /// int main() {
+    /// int main(int argc, char* argv[]) {
     ///     const auto rec = rerun::RecordingStream("rerun_example_series_point_style");
     ///     rec.spawn().exit_on_failure();
     ///
@@ -123,7 +123,7 @@ namespace rerun::archetypes {
         /// `ComponentDescriptor` for the `visible_series` field.
         static constexpr auto Descriptor_visible_series = ComponentDescriptor(
             ArchetypeName, "SeriesPoints:visible_series",
-            Loggable<rerun::components::SeriesVisible>::ComponentType
+            Loggable<rerun::components::Visible>::ComponentType
         );
         /// `ComponentDescriptor` for the `marker_sizes` field.
         static constexpr auto Descriptor_marker_sizes = ComponentDescriptor(
@@ -191,7 +191,7 @@ namespace rerun::archetypes {
         ///
         /// May change over time.
         SeriesPoints with_visible_series(
-            const Collection<rerun::components::SeriesVisible>& _visible_series
+            const Collection<rerun::components::Visible>& _visible_series
         ) && {
             visible_series =
                 ComponentBatch::from_loggable(_visible_series, Descriptor_visible_series)

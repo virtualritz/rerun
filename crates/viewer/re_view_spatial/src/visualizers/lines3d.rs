@@ -2,7 +2,7 @@ use re_log_types::Instance;
 use re_renderer::PickingLayerInstanceId;
 use re_renderer::renderer::LineStripFlags;
 use re_sdk_types::archetypes::LineStrips3D;
-use re_sdk_types::components::{ClassId, Color, Radius, ShowLabels};
+use re_sdk_types::components::{ClassId, Color, LineStrip3D, Radius, ShowLabels};
 use re_sdk_types::{Archetype as _, ArrowString};
 use re_view::{process_annotation_slices, process_color_slice};
 use re_viewer_context::{
@@ -12,7 +12,7 @@ use re_viewer_context::{
 };
 
 use super::{SpatialViewVisualizerData, process_radius_slice};
-use crate::contexts::SpatialSceneEntityContext;
+use crate::contexts::SpatialSceneVisualizerInstructionContext;
 use crate::view_kind::SpatialViewKind;
 use crate::visualizers::utilities::{LabeledBatch, process_labels_3d};
 
@@ -38,7 +38,7 @@ impl Lines3DVisualizer {
         ctx: &QueryContext<'_>,
         line_builder: &mut re_renderer::LineDrawableBuilder<'_>,
         query: &ViewQuery<'_>,
-        ent_context: &SpatialSceneEntityContext<'_>,
+        ent_context: &SpatialSceneVisualizerInstructionContext<'_>,
         data: impl Iterator<Item = Lines3DComponentData<'a>>,
     ) {
         let entity_path = ctx.target_entity_path;
@@ -56,10 +56,13 @@ impl Lines3DVisualizer {
                 &ent_context.annotations,
             );
 
-            // Has not custom fallback for radius, so we use the default.
-            // TODO(andreas): It would be nice to have this handle this fallback as part of the query.
-            let radii =
-                process_radius_slice(entity_path, num_instances, data.radii, Radius::default());
+            let radii = process_radius_slice(
+                ctx,
+                entity_path,
+                num_instances,
+                data.radii,
+                LineStrips3D::descriptor_radii().component,
+            );
             let colors = process_color_slice(
                 ctx,
                 LineStrips3D::descriptor_colors().component,
@@ -108,7 +111,7 @@ impl Lines3DVisualizer {
 
                 num_rendered_strips += 1;
             }
-            debug_assert_eq!(
+            re_log::debug_assert_eq!(
                 data.strips.len(),
                 num_rendered_strips,
                 "the number of renderer strips after all post-processing is done should be equal to {} (got {num_rendered_strips} instead)",
@@ -121,6 +124,7 @@ impl Lines3DVisualizer {
             self.data.ui_labels.extend(process_labels_3d(
                 LabeledBatch {
                     entity_path,
+                    visualizer_instruction: ent_context.visualizer_instruction,
                     num_instances,
                     overall_position: obj_space_bounding_box.center(),
                     instance_positions: data.strips.iter().map(|strip| {
@@ -167,8 +171,14 @@ impl IdentifiedViewSystem for Lines3DVisualizer {
 }
 
 impl VisualizerSystem for Lines3DVisualizer {
-    fn visualizer_query_info(&self) -> VisualizerQueryInfo {
-        VisualizerQueryInfo::from_archetype::<LineStrips3D>()
+    fn visualizer_query_info(
+        &self,
+        _app_options: &re_viewer_context::AppOptions,
+    ) -> VisualizerQueryInfo {
+        VisualizerQueryInfo::single_required_component::<LineStrip3D>(
+            &LineStrips3D::descriptor_strips(),
+            &LineStrips3D::all_components(),
+        )
     }
 
     fn execute(
@@ -177,30 +187,29 @@ impl VisualizerSystem for Lines3DVisualizer {
         view_query: &ViewQuery<'_>,
         context_systems: &ViewContextCollection,
     ) -> Result<VisualizerExecutionOutput, ViewSystemExecutionError> {
-        let mut output = VisualizerExecutionOutput::default();
+        let output = VisualizerExecutionOutput::default();
 
         let mut line_builder = re_renderer::LineDrawableBuilder::new(ctx.viewer_ctx.render_ctx());
         line_builder.radius_boost_in_ui_points_for_outlines(
             re_view::SIZE_BOOST_IN_POINTS_FOR_LINE_OUTLINES,
         );
 
-        use super::entity_iterator::{iter_slices, process_archetype};
+        use super::entity_iterator::process_archetype;
         process_archetype::<Self, LineStrips3D, _>(
             ctx,
             view_query,
             context_systems,
-            &mut output,
+            &output,
             self.data.preferred_view_kind,
             |ctx, spatial_ctx, results| {
-                use re_view::RangeResultsExt as _;
-
-                let Some(all_strip_chunks) =
-                    results.get_required_chunks(LineStrips3D::descriptor_strips().component)
-                else {
+                let all_strips = results.iter_required(LineStrips3D::descriptor_strips().component);
+                if all_strips.is_empty() {
                     return Ok(());
-                };
+                }
 
-                let num_strips = all_strip_chunks
+                // TODO(andreas): Introduce a utility for this?
+                let num_strips = all_strips
+                    .chunks()
                     .iter()
                     .flat_map(|chunk| chunk.iter_slices::<&[[f32; 3]]>())
                     .map(|strips| strips.len())
@@ -210,28 +219,23 @@ impl VisualizerSystem for Lines3DVisualizer {
                 }
                 line_builder.reserve_strips(num_strips)?;
 
-                let num_vertices = all_strip_chunks
+                let num_vertices = all_strips
+                    .chunks()
                     .iter()
                     .flat_map(|chunk| chunk.iter_slices::<&[[f32; 3]]>())
                     .map(|strips| strips.iter().map(|strip| strip.len()).sum::<usize>())
                     .sum::<usize>();
                 line_builder.reserve_vertices(num_vertices)?;
-
-                let timeline = ctx.query.timeline();
-                let all_strips_indexed = iter_slices::<&[[f32; 3]]>(&all_strip_chunks, timeline);
-                let all_colors =
-                    results.iter_as(timeline, LineStrips3D::descriptor_colors().component);
-                let all_radii =
-                    results.iter_as(timeline, LineStrips3D::descriptor_radii().component);
-                let all_labels =
-                    results.iter_as(timeline, LineStrips3D::descriptor_labels().component);
+                let all_colors = results.iter_optional(LineStrips3D::descriptor_colors().component);
+                let all_radii = results.iter_optional(LineStrips3D::descriptor_radii().component);
+                let all_labels = results.iter_optional(LineStrips3D::descriptor_labels().component);
                 let all_class_ids =
-                    results.iter_as(timeline, LineStrips3D::descriptor_class_ids().component);
+                    results.iter_optional(LineStrips3D::descriptor_class_ids().component);
                 let all_show_labels =
-                    results.iter_as(timeline, LineStrips3D::descriptor_show_labels().component);
+                    results.iter_optional(LineStrips3D::descriptor_show_labels().component);
 
                 let data = re_query::range_zip_1x5(
-                    all_strips_indexed,
+                    all_strips.slice::<&[[f32; 3]]>(),
                     all_colors.slice::<u32>(),
                     all_radii.slice::<f32>(),
                     all_labels.slice::<String>(),
@@ -265,9 +269,5 @@ impl VisualizerSystem for Lines3DVisualizer {
 
     fn data(&self) -> Option<&dyn std::any::Any> {
         Some(self.data.as_any())
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }

@@ -176,6 +176,13 @@ impl ::re_types_core::AsComponents for GraphEdges {
 
 impl ::re_types_core::ArchetypeReflectionMarker for GraphEdges {}
 
+impl crate::VisualizableArchetype for GraphEdges {
+    #[inline]
+    fn visualizer(&self) -> crate::Visualizer {
+        crate::Visualizer::new("GraphEdges").with_overrides(self)
+    }
+}
+
 impl GraphEdges {
     /// Create a new `GraphEdges`.
     #[inline]

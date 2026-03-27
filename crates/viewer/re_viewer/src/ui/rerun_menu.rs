@@ -6,7 +6,7 @@ use egui::containers::menu::{MenuButton, MenuConfig};
 use egui::{Button, NumExt as _, ScrollArea};
 use re_ui::menu::menu_style;
 use re_ui::{UICommand, UICommandSender as _, UiExt as _};
-use re_viewer_context::StoreContext;
+use re_viewer_context::ActiveStoreContext;
 
 use crate::App;
 
@@ -16,7 +16,7 @@ impl App {
     pub fn rerun_menu_button_ui(
         &mut self,
         render_state: Option<&egui_wgpu::RenderState>,
-        _store_context: Option<&StoreContext<'_>>,
+        _store_context: Option<&ActiveStoreContext<'_>>,
         ui: &mut egui::Ui,
     ) {
         let desired_icon_height = if ui.max_rect().height() <= 24.0 {
@@ -38,21 +38,22 @@ impl App {
         MenuButton::from_button(Button::image(image))
             .config(MenuConfig::new().style(menu_style()))
             .ui(ui, |ui| {
-                ui.set_max_height(ui.ctx().content_rect().height());
+                ui.set_max_height(ui.content_rect().height());
                 ScrollArea::vertical()
-                    .max_height(ui.ctx().content_rect().height() - 16.0)
+                    .max_height(ui.content_rect().height() - 16.0)
                     .show(ui, |ui| {
                         self.rerun_menu_ui(ui, render_state, _store_context);
                     });
             });
     }
 
-    pub fn navigation_buttons(&mut self, ui: &mut egui::Ui) {
-        let history = &mut self.state.history;
+    pub fn navigation_buttons(&self, ui: &mut egui::Ui) {
+        let has_back = self.state.history.has_back();
+        let has_forward = self.state.history.has_forward();
 
         if ui
             .add_enabled(
-                history.has_back(),
+                has_back,
                 ui.small_icon_button_widget(&re_ui::icons::ARROW_LEFT, "go back"),
             )
             .on_hover_ui(|ui| UICommand::NavigateBack.tooltip_ui(ui))
@@ -63,7 +64,7 @@ impl App {
 
         if ui
             .add_enabled(
-                history.has_forward(),
+                has_forward,
                 ui.small_icon_button_widget(&re_ui::icons::ARROW_RIGHT, "go forward"),
             )
             .on_hover_ui(|ui| UICommand::NavigateForward.tooltip_ui(ui))
@@ -77,7 +78,7 @@ impl App {
         &mut self,
         ui: &mut egui::Ui,
         render_state: Option<&egui_wgpu::RenderState>,
-        _store_context: Option<&StoreContext<'_>>,
+        _store_context: Option<&ActiveStoreContext<'_>>,
     ) {
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
         // no wrapping: make as wide as needed
@@ -95,13 +96,14 @@ impl App {
 
         UICommand::Open.menu_button_ui(ui, &self.command_sender);
         UICommand::OpenUrl.menu_button_ui(ui, &self.command_sender);
+        UICommand::AddRedapServer.menu_button_ui(ui, &self.command_sender);
         UICommand::Import.menu_button_ui(ui, &self.command_sender);
 
         self.save_buttons_ui(ui, _store_context);
 
         UICommand::SaveBlueprint.menu_button_ui(ui, &self.command_sender);
 
-        let has_recording = _store_context.is_some_and(|ctx| !ctx.recording.is_empty());
+        let has_recording = _store_context.is_some();
         ui.add_enabled_ui(has_recording, |ui| {
             UICommand::CloseCurrentRecording.menu_button_ui(ui, &self.command_sender);
         });
@@ -111,7 +113,7 @@ impl App {
         #[cfg(not(target_arch = "wasm32"))]
         {
             // On the web the browser controls the zoom
-            let zoom_factor = ui.ctx().zoom_factor();
+            let zoom_factor = ui.zoom_factor();
             re_ui::menu::align_non_button_menu_items(ui, |ui| {
                 ui.weak(format!("Current zoom: {:.0}%", zoom_factor * 100.0))
                     .on_hover_text(
@@ -161,10 +163,7 @@ impl App {
                 debug_menu_options_ui(ui, &mut self.state.app_options, &self.command_sender);
 
                 ui.label("egui debug options:");
-                ui.weak(format!(
-                    "pixels_per_point: {:?}",
-                    ui.ctx().pixels_per_point()
-                ));
+                ui.weak(format!("pixels_per_point: {:?}", ui.pixels_per_point()));
                 egui_debug_options_ui(ui);
             });
 
@@ -235,7 +234,7 @@ impl App {
         }
     }
 
-    fn save_buttons_ui(&self, ui: &mut egui::Ui, store_ctx: Option<&StoreContext<'_>>) {
+    fn save_buttons_ui(&self, ui: &mut egui::Ui, store_ctx: Option<&ActiveStoreContext<'_>>) {
         use re_ui::UICommandSender as _;
 
         let file_save_in_progress = self.background_tasks.is_file_save_in_progress();
@@ -247,15 +246,16 @@ impl App {
             ui.add_enabled_ui(false, |ui| {
                 ui.horizontal(|ui| {
                     ui.add(save_recording_button);
-                    ui.spinner();
+                    ui.loading_indicator("Saving recording");
                 });
                 ui.horizontal(|ui| {
                     ui.add(save_selection_button);
-                    ui.spinner();
+                    ui.loading_indicator("Saving selection");
                 });
             });
         } else {
-            let entity_db_is_nonempty = store_ctx.is_some_and(|ctx| !ctx.recording.is_empty());
+            let entity_db_is_nonempty =
+                store_ctx.is_some_and(|ctx| 0 < ctx.recording.num_physical_chunks());
             ui.add_enabled_ui(entity_db_is_nonempty, |ui| {
                 if ui
                     .add(save_recording_button)
@@ -297,9 +297,13 @@ fn render_state_ui(ui: &mut egui::Ui, render_state: &egui_wgpu::RenderState) {
             vendor,
             device,
             device_type,
+            device_pci_bus_id: _,
             driver,
             driver_info,
             backend,
+            subgroup_min_size: _,
+            subgroup_max_size: _,
+            transient_saves_memory: _,
         } = &info;
 
         // Example values:
@@ -422,9 +426,9 @@ fn egui_debug_options_ui(ui: &mut egui::Ui) {
         .changed();
 
     if any_clicked {
-        let mut style = (*ui.ctx().style()).clone();
+        let mut style = (*ui.global_style()).clone();
         style.debug = debug;
-        ui.ctx().set_style(style);
+        ui.set_global_style(style);
     }
 }
 
@@ -449,10 +453,8 @@ fn debug_menu_options_ui(
         if ui.button("Mobile size").clicked() {
             // let size = egui::vec2(375.0, 812.0); // iPhone 12 mini
             let size = egui::vec2(375.0, 667.0); //  iPhone SE 2nd gen
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            ui.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            ui.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
             ui.close();
         }
     }

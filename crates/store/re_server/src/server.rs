@@ -1,7 +1,7 @@
 #![expect(clippy::let_underscore_untyped)]
 #![expect(clippy::let_underscore_must_use)]
 
-use std::net::{SocketAddr, ToSocketAddrs as _};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs as _};
 
 use tokio::net::TcpListener;
 use tokio::sync::oneshot::Sender;
@@ -14,12 +14,6 @@ use tracing::{error, info};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ServerError {
-    #[error("Ready channel closed unexpectedly")]
-    ReadyChannelClosedUnexpectedly,
-
-    #[error("Failed channel closed unexpectedly")]
-    FailedChannelClosedUnexpectedly,
-
     #[error("Server failed to start: {reason}")]
     ServerFailedToStart { reason: String },
 }
@@ -30,6 +24,8 @@ pub enum ServerError {
 pub struct Server {
     addr: SocketAddr,
     routes: Routes,
+    artificial_latency: std::time::Duration,
+    bandwidth_limit: Option<u64>,
 }
 
 /// `ServerHandle` is a tiny helper abstraction that enables us to
@@ -38,6 +34,7 @@ pub struct ServerHandle {
     shutdown: Option<Sender<()>>,
     ready: mpsc::Receiver<SocketAddr>,
     failed: mpsc::Receiver<String>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl ServerHandle {
@@ -50,15 +47,30 @@ impl ServerHandle {
                         info!("Ready for connections.");
                         Ok(local_addr)
                     },
-                    None => Err(ServerError::ReadyChannelClosedUnexpectedly)
-
+                    None => Err(ServerError::ServerFailedToStart {
+                        reason: "ready channel closed unexpectedly".into(),
+                    }),
                 }
             }
             failed = self.failed.recv() => {
                 match failed {
                     Some(reason) => Err(ServerError::ServerFailedToStart { reason }),
-                    None => Err(ServerError::FailedChannelClosedUnexpectedly)
-
+                    None => Err(ServerError::ServerFailedToStart {
+                        reason: "failed channel closed unexpectedly".into(),
+                    }),
+                }
+            }
+            result = &mut self.task => {
+                match result {
+                    Ok(()) => Err(ServerError::ServerFailedToStart {
+                        reason: "server task exited without signaling ready or failed".into(),
+                    }),
+                    Err(join_err) if join_err.is_panic() => Err(ServerError::ServerFailedToStart {
+                        reason: format!("server task panicked: {join_err}"),
+                    }),
+                    Err(join_err) => Err(ServerError::ServerFailedToStart {
+                        reason: format!("server task was cancelled: {join_err}"),
+                    }),
                 }
             }
         }
@@ -82,26 +94,45 @@ impl Server {
     /// Starts the server and return `ServerHandle` so that caller can manage
     /// the server lifecycle.
     pub fn start(self) -> ServerHandle {
+        let Self {
+            addr,
+            routes,
+            artificial_latency,
+            bandwidth_limit,
+        } = self;
+
         let (ready_tx, ready_rx) = mpsc::channel(1);
         let (failed_tx, failed_rx) = mpsc::channel(1);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-        tokio::spawn(async move {
-            let listener = if let Ok(listener) = TcpListener::bind(self.addr).await {
+        let task = tokio::spawn(async move {
+            let listener = if let Ok(listener) = TcpListener::bind(addr).await {
                 #[expect(clippy::unwrap_used)]
-                let local_addr = listener.local_addr().unwrap();
+                let bind_addr = listener.local_addr().unwrap();
+
+                let mut connect_addr = bind_addr;
+
+                if connect_addr.ip().is_unspecified() {
+                    // We usually cannot connect to "0.0.0.0" so we swap it for 127.0.0.1:
+                    if connect_addr.is_ipv4() {
+                        connect_addr.set_ip(Ipv4Addr::LOCALHOST.into());
+                    } else {
+                        connect_addr.set_ip(Ipv6Addr::LOCALHOST.into());
+                    }
+                }
+
                 info!(
-                    "Listening on {local_addr}. To connect the Rerun Viewer, use the following address: rerun+http://{local_addr}"
+                    "Listening on {bind_addr}. To connect the Rerun Viewer, use the following address: rerun+http://{connect_addr}"
                 );
 
                 #[expect(clippy::unwrap_used)]
-                ready_tx.send(local_addr).await.unwrap();
+                ready_tx.send(connect_addr).await.unwrap();
                 listener
             } else {
-                error!("Failed to bind to address {}", self.addr);
+                error!("Failed to bind to address {addr}");
                 #[expect(clippy::unwrap_used)]
                 failed_tx
-                    .send(format!("Failed to bind to address {}", self.addr))
+                    .send(format!("Failed to bind to address {addr}"))
                     .await
                     .unwrap();
                 return;
@@ -125,6 +156,8 @@ impl Server {
                     re_protos::headers::new_rerun_headers_layer(name, version, is_client)
                 })
                 .layer(tower_http::cors::CorsLayer::permissive()) // Allow CORS for all origins (to support web clients)
+                .layer(crate::latency_layer::LatencyLayer::new(artificial_latency))
+                .layer(crate::bandwidth_layer::BandwidthLayer::new(bandwidth_limit))
                 // NOTE: GrpcWebLayer is applied directly to gRPC routes in ServerBuilder::build()
                 // to avoid rejecting regular HTTP requests
                 .into_inner();
@@ -139,7 +172,7 @@ impl Server {
                 .layer(middlewares);
 
             let _ = builder
-                .add_routes(self.routes)
+                .add_routes(routes)
                 .serve_with_incoming_shutdown(incoming, async {
                     shutdown_rx.await.ok();
                 })
@@ -156,6 +189,7 @@ impl Server {
             shutdown: Some(shutdown_tx),
             ready: ready_rx,
             failed: failed_rx,
+            task,
         }
     }
 }
@@ -168,6 +202,8 @@ pub struct ServerBuilder {
     addr: Option<SocketAddr>,
     routes_builder: RoutesBuilder,
     axum_routes: axum::Router,
+    artificial_latency: std::time::Duration,
+    bandwidth_limit: Option<u64>,
 }
 
 impl ServerBuilder {
@@ -200,8 +236,28 @@ impl ServerBuilder {
         self
     }
 
+    /// Add fake latency to simulate a remote server.
+    pub fn with_artificial_latency(mut self, artificial_latency: std::time::Duration) -> Self {
+        self.artificial_latency = artificial_latency;
+        self
+    }
+
+    /// Limit response bandwidth in bytes per second.
+    pub fn with_bandwidth_limit(mut self, bytes_per_second: Option<u64>) -> Self {
+        self.bandwidth_limit = bytes_per_second;
+        self
+    }
+
     pub fn build(self) -> Server {
-        let grpc_routes = self.routes_builder.routes();
+        let Self {
+            addr,
+            routes_builder,
+            axum_routes,
+            artificial_latency,
+            bandwidth_limit,
+        } = self;
+
+        let grpc_routes = routes_builder.routes();
         let grpc_routes = grpc_routes.into_axum_router();
 
         // Apply GrpcWebLayer only to gRPC routes, not HTTP routes
@@ -209,7 +265,7 @@ impl ServerBuilder {
 
         let routes =
             grpc_routes
-                .merge(self.axum_routes)
+                .merge(axum_routes)
                 .fallback(|_req: axum::extract::Request| async {
                     use axum::response::IntoResponse as _;
                     http::StatusCode::NOT_FOUND.into_response()
@@ -217,10 +273,11 @@ impl ServerBuilder {
 
         Server {
             #[expect(clippy::unwrap_used)]
-            addr: self
-                .addr
+            addr: addr
                 .unwrap_or_else(|| DEFAULT_ADDRESS.to_socket_addrs().unwrap().next().unwrap()),
             routes: routes.into(),
+            artificial_latency,
+            bandwidth_limit,
         }
     }
 }

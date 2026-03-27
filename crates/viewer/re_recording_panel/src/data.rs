@@ -14,7 +14,7 @@ use re_log_types::{ApplicationId, EntryId, TableId, natural_ordering};
 use re_redap_browser::{Entries, EntryInner, RedapServers};
 use re_sdk_types::archetypes::RecordingInfo;
 use re_sdk_types::components::{Name, Timestamp};
-use re_viewer_context::{DisplayMode, Item, ViewerContext};
+use re_viewer_context::{Item, Route, ViewerContext};
 
 /// Short-lived structure containing all the data that will be displayed in the recording panel.
 #[derive(Debug)]
@@ -53,8 +53,7 @@ impl<'a> RecordingPanelData<'a> {
             HashMap::default();
 
         let sources_with_stores: ahash::HashSet<LogSource> = ctx
-            .storage_context
-            .bundle
+            .store_bundle()
             .recordings()
             .filter_map(|store| store.data_source.clone())
             .collect();
@@ -65,7 +64,7 @@ impl<'a> RecordingPanelData<'a> {
             }
 
             match source.as_ref() {
-                LogSource::File(_) | LogSource::RrdHttpStream { .. } => {
+                LogSource::File { .. } | LogSource::HttpStream { .. } => {
                     loading_receivers.push(source);
                 }
 
@@ -99,7 +98,7 @@ impl<'a> RecordingPanelData<'a> {
         let mut local_apps: BTreeMap<ApplicationId, Vec<&EntityDb>> = Default::default();
         let mut examples_apps: BTreeMap<ApplicationId, Vec<&EntityDb>> = Default::default();
 
-        for entity_db in ctx.storage_context.bundle.entity_dbs() {
+        for entity_db in ctx.store_bundle().entity_dbs() {
             let app_id = entity_db.application_id();
             match entity_db.store_class() {
                 EntityDbClass::LocalRecording => local_apps
@@ -137,13 +136,7 @@ impl<'a> RecordingPanelData<'a> {
             && !hide_examples
             || !example_apps.is_empty();
 
-        let local_tables = ctx
-            .storage_context
-            .tables
-            .keys()
-            .sorted()
-            .cloned()
-            .collect();
+        let local_tables = ctx.table_stores().keys().sorted().cloned().collect();
 
         Self {
             servers,
@@ -267,8 +260,12 @@ pub struct RecordingData<'a> {
 #[cfg_attr(feature = "testing", derive(serde::Serialize))]
 pub struct ServerData<'a> {
     pub origin: re_uri::Origin,
-    pub is_active: bool,
+
+    /// This is what is selected
     pub is_selected: bool,
+
+    /// What is selected is a subset of this thing
+    pub is_active: bool,
 
     pub entries_data: ServerEntriesData<'a>,
 }
@@ -284,8 +281,8 @@ impl<'a> ServerData<'a> {
 
         let is_selected = ctx.is_selected_or_loading(&item);
         let is_active = matches!(
-            ctx.display_mode(),
-            DisplayMode::RedapServer(current_origin)
+            ctx.route(),
+            Route::RedapServer(current_origin)
             if current_origin == origin
         );
 
@@ -311,7 +308,10 @@ impl<'a> ServerData<'a> {
 pub enum ServerEntriesData<'a> {
     Loading,
 
-    Error(String),
+    Error {
+        message: String,
+        is_auth_error: bool,
+    },
 
     Loaded {
         dataset_entries: Vec<DatasetData<'a>>,
@@ -337,7 +337,7 @@ impl<'a> ServerEntriesData<'a> {
                     let entry_data = EntryData {
                         origin: origin.clone(),
                         entry_id: entry.id(),
-                        name: entry.name().to_owned(),
+                        name: entry.name().clone(),
                         icon: entry.icon(),
                         is_selected: ctx.is_selected_or_loading(&Item::RedapEntry(
                             re_uri::EntryUri {
@@ -351,8 +351,7 @@ impl<'a> ServerEntriesData<'a> {
                     match entry.inner() {
                         Ok(EntryInner::Dataset(_dataset)) => {
                             let mut displayed_segments: Vec<SegmentData<'_>> = ctx
-                                .storage_context
-                                .bundle
+                                .store_bundle()
                                 .entity_dbs()
                                 .filter_map(|entity_db| {
                                     if let EntityDbClass::DatasetSegment(uri) =
@@ -383,11 +382,11 @@ impl<'a> ServerEntriesData<'a> {
 
                             displayed_segments.sort_by_key(|segment| match segment {
                                 SegmentData::Loading { receiver } => {
-                                    ctx.storage_context.hub.data_source_order(receiver)
+                                    ctx.store_hub().data_source_order(receiver)
                                 }
                                 SegmentData::Loaded { entity_db } => {
                                     if let Some(data_source) = &entity_db.data_source {
-                                        ctx.storage_context.hub.data_source_order(data_source)
+                                        ctx.store_hub().data_source_order(data_source)
                                     } else {
                                         u64::MAX
                                     }
@@ -418,7 +417,10 @@ impl<'a> ServerEntriesData<'a> {
                 }
             }
 
-            Poll::Ready(Err(err)) => Self::Error(err.to_string()),
+            Poll::Ready(Err(err)) => Self::Error {
+                message: err.to_string(),
+                is_auth_error: err.is_client_credentials_error(),
+            },
 
             Poll::Pending => Self::Loading,
         }
@@ -430,7 +432,7 @@ impl<'a> ServerEntriesData<'a> {
                 dataset_entries, ..
             } => Either::Left(dataset_entries.iter()),
 
-            Self::Error(..) | Self::Loading => Either::Right(iter::empty()),
+            Self::Error { .. } | Self::Loading => Either::Right(iter::empty()),
         }
     }
 }
@@ -480,7 +482,7 @@ pub struct EntryData {
     pub origin: re_uri::Origin,
     pub entry_id: re_log_types::EntryId,
 
-    pub name: String,
+    pub name: re_log_types::EntryName,
 
     #[cfg_attr(feature = "testing", serde(serialize_with = "serialize_icon"))]
     pub icon: re_ui::icons::Icon,

@@ -13,9 +13,11 @@ mod index_columns;
 mod indexes;
 mod registration_handle;
 mod schema;
+mod segment_url_udf;
 mod table_entry;
 mod table_provider_adapter;
 mod trace_context;
+mod type_aliases;
 
 use errors::{AlreadyExistsError, NotFoundError};
 use pyo3::prelude::*;
@@ -36,8 +38,10 @@ pub use self::indexes::{
 };
 pub use self::registration_handle::{PyRegistrationHandleInternal, PyRegistrationIterator};
 pub use self::schema::PySchemaInternal;
-pub use self::table_entry::{PyTableEntryInternal, PyTableInsertMode};
+pub use self::segment_url_udf::PySegmentUrlUdfInternal;
+pub use self::table_entry::{PyTableEntryInternal, PyTableInsertModeInternal};
 pub use self::table_provider_adapter::PyTableProviderAdapterInternal;
+pub use self::type_aliases::{AnyComponentColumn, IndexValuesLike, PyIndexValuesLikeInternal};
 
 /// Register the `rerun.catalog` module.
 pub(crate) fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -48,10 +52,11 @@ pub(crate) fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
     m.add_class::<PyEntryDetails>()?;
     m.add_class::<PyDatasetEntryInternal>()?;
     m.add_class::<PyTableEntryInternal>()?;
-    m.add_class::<PyTableInsertMode>()?;
+    m.add_class::<PyTableInsertModeInternal>()?;
     m.add_class::<PyRegistrationHandleInternal>()?;
     m.add_class::<PyRegistrationIterator>()?;
     m.add_class::<PyTableProviderAdapterInternal>()?;
+    m.add_class::<PySegmentUrlUdfInternal>()?;
     m.add_class::<PyDatasetViewInternal>()?;
     m.add_class::<PyRerunHtmlTable>()?;
 
@@ -67,6 +72,9 @@ pub(crate) fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
     m.add_class::<PyIndexConfig>()?;
     m.add_class::<PyIndexProperties>()?;
     m.add_class::<PyVectorDistanceMetric>()?;
+
+    // testing
+    m.add_class::<PyIndexValuesLikeInternal>()?;
 
     // register exceptions generated with the [`pyo3::create_exception!`] macro
     m.add("NotFoundError", _py.get_type::<NotFoundError>())?;

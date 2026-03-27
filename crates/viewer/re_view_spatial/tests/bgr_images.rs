@@ -37,9 +37,11 @@ fn run_bgr_test<T: ImageChannelType>(
     let view_id = test_context.setup_viewport_blueprint(|ctx, blueprint| {
         let view =
             ViewBlueprint::new_with_root_wildcard(re_view_spatial::SpatialView2D::identifier());
+        let engine = ctx.store_context.blueprint.storage_engine();
+        let blueprint_tree = engine.store().entity_tree();
         let property_path = re_viewport_blueprint::entity_path_for_view_property(
             view.id,
-            ctx.store_context.blueprint.tree(),
+            blueprint_tree,
             re_sdk_types::blueprint::archetypes::Background::name(),
         );
         ctx.save_blueprint_archetype(
@@ -61,7 +63,7 @@ fn run_bgr_test<T: ImageChannelType>(
     snapshot_results.add(test_context.run_view_ui_and_save_snapshot(
         view_id,
         &snapshot_name,
-        egui::vec2(160.0, 120.0),
+        egui::vec2(300.0, 200.0),
         None,
     ));
 }

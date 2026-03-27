@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 
 use re_byte_size::SizeBytes;
-use re_log_channel::DataSourceMessage;
+use re_log_channel::{DataSourceMessage, DataSourceUiCommand};
 use re_log_encoding::{ToApplication as _, ToTransport as _};
 use re_log_types::TableMsg;
 use re_protos::common::v1alpha1::{
@@ -16,12 +16,13 @@ use re_protos::common::v1alpha1::{
 use re_protos::log_msg::v1alpha1::LogMsg as LogMsgProto;
 use re_protos::sdk_comms::v1alpha1::{
     ReadMessagesRequest, ReadMessagesResponse, ReadTablesRequest, ReadTablesResponse,
-    WriteMessagesRequest, WriteMessagesResponse, WriteTableRequest, WriteTableResponse,
-    message_proxy_service_server,
+    SaveScreenshotRequest, SaveScreenshotResponse, WriteMessagesRequest, WriteMessagesResponse,
+    WriteTableRequest, WriteTableResponse, message_proxy_service_server,
 };
+use re_quota_channel::{async_broadcast_channel, async_mpsc_channel};
+use std::task::{Context, Poll};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc, oneshot};
-use tokio_stream::wrappers::BroadcastStream;
+use tokio::sync::oneshot;
 use tokio_stream::{Stream, StreamExt as _};
 use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
@@ -39,10 +40,12 @@ pub const DEFAULT_SERVER_PORT: u16 = 9876;
 pub const MAX_DECODING_MESSAGE_SIZE: usize = u32::MAX as usize;
 pub const MAX_ENCODING_MESSAGE_SIZE: usize = MAX_DECODING_MESSAGE_SIZE;
 
-// Channel capacity is completely arbitrary, e just want something large enough
-// to handle bursts of messages. This is roughly 16 MiB of `Msg` (excluding their contents).
-const MESSAGE_QUEUE_CAPACITY: usize =
-    (16 * 1024 * 1024 / std::mem::size_of::<LogOrTableMsgProto>()).next_power_of_two();
+/// Maximum number of messages in the input queue.
+const CHANNEL_SIZE_MESSAGES: usize = 1024; // TODO(emilk): move into `ServerOptions` after the patch release.
+
+/// Make sure we can handle a quick burst of messages without blocking,
+/// even if the server has a [`ServerOptions::memory_limit`] of zero.
+const CHANNEL_SIZE_BYTES: u64 = 128 * 1024 * 1024; // TODO(emilk): move into `ServerOptions` after the patch release.
 
 /// Options for the gRPC Proxy Server
 #[derive(Clone, Copy, Debug)]
@@ -50,19 +53,17 @@ pub struct ServerOptions {
     /// When a client connect, should they be sent the oldest data first, or the newest?
     pub playback_behavior: PlaybackBehavior,
 
-    /// Start garbage collecting old data when we reach this.
+    /// Limit on how much history the server saves.
     ///
-    /// If server & client are running on the same machine and all clients are expected to connect before
-    /// any data is sent, it is highly recommended that you set the memory limit to `0B`,
-    /// otherwise you're potentially doubling your memory usage!
-    pub memory_limit: MemoryLimit,
+    /// It will start garbage collecting old data when we reach this.
+    pub memory_limit: MemoryLimit, // TODO(emilk): rename `history_limit`
 }
 
 impl Default for ServerOptions {
     fn default() -> Self {
         Self {
             playback_behavior: PlaybackBehavior::OldestFirst,
-            memory_limit: MemoryLimit::UNLIMITED,
+            memory_limit: MemoryLimit::from_bytes(1024 * 1024 * 1024), // Be very conservative by default
         }
     }
 }
@@ -146,25 +147,63 @@ pub async fn serve(
     options: ServerOptions,
     shutdown: shutdown::Shutdown,
 ) -> anyhow::Result<()> {
-    serve_impl(addr, MessageProxy::new(options), shutdown).await
+    serve_impl(addr, options, MessageProxy::new(options), shutdown).await
 }
 
 async fn serve_impl(
     addr: SocketAddr,
+    options: ServerOptions,
     message_proxy: MessageProxy,
     shutdown: shutdown::Shutdown,
 ) -> anyhow::Result<()> {
-    let tcp_listener = TcpListener::bind(addr).await?;
-    let incoming = TcpIncoming::from(tcp_listener).with_nodelay(Some(true));
+    // TODO(rust-lang/rust#130668): When listening on `::` we want to listen to both ipv6 `::` and ipv4 `0.0.0.0`
+    // On Mac & Linux this happens automatically since all sockets are dual-stack by default.
+    // On Windows, the dual stack behavior is opt-in, but `TcpListener::bind` does not expose the option.
+    // To work around this, we explicitly listen on both ipv4 & ipv6 if an unspecified ipv6 address is used.
+    let dual_stack_windows = cfg!(target_os = "windows")
+        && matches!(addr.ip(), std::net::IpAddr::V6(ipv6) if ipv6.is_unspecified());
 
-    let connect_addr = if addr.ip().is_loopback() || addr.ip().is_unspecified() {
-        format!("rerun+http://127.0.0.1:{}/proxy", addr.port())
+    let incoming: Pin<Box<dyn Stream<Item = _> + Send>> = if dual_stack_windows {
+        let ipv6_addr = addr;
+        let ipv4_addr = SocketAddr::V4(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::UNSPECIFIED,
+            addr.port(),
+        ));
+
+        let tcp_listener_ipv6 = TcpListener::bind(ipv6_addr).await?;
+        let tcp_listener_ipv4 = TcpListener::bind(ipv4_addr).await?;
+
+        let incoming_ipv6 = TcpIncoming::from(tcp_listener_ipv6).with_nodelay(Some(true));
+        let incoming_ipv4 = TcpIncoming::from(tcp_listener_ipv4).with_nodelay(Some(true));
+
+        // Merge both streams into a single stream
+        let merged = tokio_stream::StreamExt::merge(incoming_ipv6, incoming_ipv4);
+
+        let connect_addr = format!("rerun+http://127.0.0.1:{}/proxy", addr.port());
+
+        re_log::info!(
+            "Listening for gRPC connections on {ipv6_addr} and {ipv4_addr}. Connect by running `rerun --connect {connect_addr}`",
+        );
+
+        Box::pin(merged)
     } else {
-        format!("rerun+http://{addr}/proxy")
+        let tcp_listener = TcpListener::bind(addr).await?;
+        let incoming = TcpIncoming::from(tcp_listener).with_nodelay(Some(true));
+
+        let connect_addr = if addr.ip().is_loopback() || addr.ip().is_unspecified() {
+            format!("rerun+http://127.0.0.1:{}/proxy", addr.port())
+        } else {
+            format!("rerun+http://{addr}/proxy")
+        };
+
+        re_log::info!(
+            "Listening for gRPC connections on {addr}. Connect by running `rerun --connect {connect_addr}`",
+        );
+
+        Box::pin(incoming)
     };
-    re_log::info!(
-        "Listening for gRPC connections on {addr}. Connect by running `rerun --connect {connect_addr}`"
-    );
+
+    re_log::debug!("Server memory limit set at {}", options.memory_limit);
 
     let cors = CorsLayer::very_permissive();
     let grpc_web = tonic_web::GrpcWebLayer::new();
@@ -264,7 +303,7 @@ pub async fn serve_from_channel(
         }
     });
 
-    if let Err(err) = serve_impl(addr, message_proxy, shutdown).await {
+    if let Err(err) = serve_impl(addr, options, message_proxy, shutdown).await {
         re_log::error!("message proxy server crashed: {err}");
     }
 }
@@ -287,7 +326,7 @@ pub fn spawn_from_rx_set(
     let event_tx = message_proxy.event_tx.clone();
 
     tokio::spawn(async move {
-        if let Err(err) = serve_impl(addr, message_proxy, shutdown).await {
+        if let Err(err) = serve_impl(addr, options, message_proxy, shutdown).await {
             re_log::error!("message proxy server crashed: {err}");
         }
     });
@@ -380,7 +419,7 @@ pub fn spawn_with_recv(
     let (message_proxy, mut broadcast_log_rx) = MessageProxy::new_with_recv(options);
 
     tokio::spawn(async move {
-        if let Err(err) = serve_impl(addr, message_proxy, shutdown).await {
+        if let Err(err) = serve_impl(addr, options, message_proxy, shutdown).await {
             re_log::error!("message proxy server crashed: {err}");
         }
     });
@@ -390,50 +429,52 @@ pub fn spawn_with_recv(
 
         loop {
             let msg: anyhow::Result<DataSourceMessage> = match broadcast_log_rx.recv().await {
-                Ok(LogOrTableMsgProto::LogMsg(msg)) => match msg.msg {
-                    Some(msg) => msg
-                        .to_application((&mut app_id_cache, None))
-                        .map(DataSourceMessage::LogMsg)
-                        .map_err(|err| err.into()),
-                    None => Err(re_protos::missing_field!(
-                        re_protos::log_msg::v1alpha1::LogMsg,
-                        "msg"
-                    )
-                    .into()),
+                Ok(inner) => match inner {
+                    LogOrTableMsgProto::LogMsg(msg) => match msg.msg {
+                        Some(msg) => msg
+                            .to_application((&mut app_id_cache, None))
+                            .map(DataSourceMessage::LogMsg)
+                            .map_err(|err| err.into()),
+                        None => Err(re_protos::missing_field!(
+                            re_protos::log_msg::v1alpha1::LogMsg,
+                            "msg"
+                        )
+                        .into()),
+                    },
+
+                    LogOrTableMsgProto::Table(msg) => match msg.data.try_into() {
+                        Ok(data) => Ok(DataSourceMessage::TableMsg(TableMsg {
+                            id: msg.id.into(),
+                            data,
+                        })),
+                        Err(err) => {
+                            re_log::error!("Dropping LogMsg::Table due to failed decode: {err}");
+                            continue;
+                        }
+                    },
+
+                    LogOrTableMsgProto::UiCommand(cmd) => Ok(DataSourceMessage::UiCommand(cmd)),
                 },
 
-                Ok(LogOrTableMsgProto::Table(msg)) => match msg.data.try_into() {
-                    Ok(data) => Ok(DataSourceMessage::TableMsg(TableMsg {
-                        id: msg.id.into(),
-                        data,
-                    })),
-                    Err(err) => {
-                        re_log::error!("Dropping LogMsg::Table due to failed decode: {err}");
-                        continue;
-                    }
-                },
-
-                Err(broadcast::error::RecvError::Closed) => {
+                Err(async_broadcast_channel::RecvError::Closed) => {
                     re_log::debug!("message proxy server shut down, closing receiver");
                     channel_log_tx.quit(None).ok();
                     break;
                 }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    re_log::warn!(
-                        "message proxy receiver dropped {n} messages due to backpressure"
-                    );
-                    continue;
-                }
             };
             match msg {
                 Ok(mut log_msg) => {
-                    // Insert the timestamp metadata into the Arrow message for accurate e2e latency measurements.
-                    // Note that this function is only called by the viewer
-                    // (that's what the message-receiver is connected to).
-                    log_msg.insert_arrow_record_batch_metadata(
-                        re_sorbet::timestamp_metadata::KEY_TIMESTAMP_VIEWER_IPC_DECODED.to_owned(),
-                        re_sorbet::timestamp_metadata::now_timestamp(),
-                    );
+                    if let Some(metadata_key) =
+                        re_sorbet::TimestampLocation::IPCDecode.metadata_key()
+                    {
+                        // Insert the timestamp metadata into the Arrow message for accurate e2e latency measurements.
+                        // Note that this function is only called by the viewer
+                        // (that's what the message-receiver is connected to).
+                        log_msg.insert_arrow_record_batch_metadata(
+                            metadata_key.to_owned(),
+                            re_sorbet::timestamp_metadata::now_timestamp(),
+                        );
+                    }
 
                     if channel_log_tx.send(log_msg).is_err() {
                         re_log::debug!(
@@ -457,7 +498,7 @@ enum Event {
     NewClient(
         oneshot::Sender<(
             Vec<LogOrTableMsgProto>,
-            broadcast::Receiver<LogOrTableMsgProto>,
+            async_broadcast_channel::Receiver<LogOrTableMsgProto>,
         )>,
     ),
 
@@ -470,20 +511,21 @@ struct TableMsgProto {
     id: TableIdProto,
     data: DataframePartProto,
 }
-
 // -----------------------------------------------------------------------------------
 
 #[derive(Clone)]
 enum LogOrTableMsgProto {
     LogMsg(LogMsgProto),
     Table(TableMsgProto),
+    UiCommand(DataSourceUiCommand),
 }
 
-impl LogOrTableMsgProto {
-    fn total_size_bytes(&self) -> u64 {
+impl SizeBytes for LogOrTableMsgProto {
+    fn heap_size_bytes(&self) -> u64 {
         match self {
-            Self::LogMsg(log_msg) => log_msg.total_size_bytes(),
-            Self::Table(table) => table.total_size_bytes(),
+            Self::LogMsg(log_msg) => log_msg.heap_size_bytes(),
+            Self::Table(table) => table.heap_size_bytes(),
+            Self::UiCommand(cmd) => cmd.heap_size_bytes(),
         }
     }
 }
@@ -497,6 +539,12 @@ impl From<LogMsgProto> for LogOrTableMsgProto {
 impl From<TableMsgProto> for LogOrTableMsgProto {
     fn from(value: TableMsgProto) -> Self {
         Self::Table(value)
+    }
+}
+
+impl From<DataSourceUiCommand> for LogOrTableMsgProto {
+    fn from(value: DataSourceUiCommand) -> Self {
+        Self::UiCommand(value)
     }
 }
 
@@ -607,6 +655,9 @@ impl MessageBuffer {
             LogOrTableMsgProto::Table(msg) => {
                 self.disposable.push_back(msg.into());
             }
+            LogOrTableMsgProto::UiCommand(msg) => {
+                self.disposable.push_back(msg.into());
+            }
         }
     }
 
@@ -655,7 +706,7 @@ impl MessageBuffer {
 
         re_tracing::profile_scope!("Drop messages");
         re_log::info_once!(
-            "Memory limit ({}) exceeded. Dropping old log messages from the gRPC proxy server. Clients connecting after this will not see the full history.",
+            "Exceeded gRPC proxy server memory limit ({}). Dropping the oldest log messages. Clients connecting after this will not see the full history.",
             re_format::format_bytes(max_bytes as _)
         );
 
@@ -671,7 +722,7 @@ impl MessageBuffer {
 
         if max_bytes < self.size_bytes() {
             re_log::info_once!(
-                "Memory limit ({}) exceeded. Dropping old *static* log messages as well. Clients connecting after this will no longer see the complete set of static data.",
+                "Exceeded gRPC proxy server memory limit ({}). Dropping old *static* log messages as well. Clients connecting after this will no longer see the complete set of static data.",
                 re_format::format_bytes(max_bytes as _)
             );
             while self.static_.pop_front().is_some() {
@@ -700,6 +751,37 @@ impl MessageBuffer {
 
 // -----------------------------------------------------------------------------------
 
+/// A wrapper that converts an `async_broadcast_channel::Receiver` into a `Stream`.
+///
+/// This uses `async_stream` internally to bridge the async recv method to Stream.
+/// The stream yields the inner value (unwrapped from `Tracked`).
+struct BackPressureReceiverStream<T: Clone + SizeBytes + Send + Sync + 'static> {
+    inner: Pin<Box<dyn Stream<Item = Result<T, async_broadcast_channel::RecvError>> + Send>>,
+}
+
+impl<T: Clone + SizeBytes + Send + Sync + 'static> BackPressureReceiverStream<T> {
+    fn new(mut receiver: async_broadcast_channel::Receiver<T>) -> Self {
+        let stream = async_stream::stream! {
+            while let Ok(value) = receiver.recv().await {
+                yield Ok(value);
+            }
+        };
+        Self {
+            inner: Box::pin(stream),
+        }
+    }
+}
+
+impl<T: Clone + SizeBytes + Send + Sync + 'static> Stream for BackPressureReceiverStream<T> {
+    type Item = Result<T, async_broadcast_channel::RecvError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+// -----------------------------------------------------------------------------------
+
 /// Main event loop for the server, which runs in its own task.
 ///
 /// Handles message history, and broadcasts messages to clients.
@@ -707,25 +789,27 @@ struct EventLoop {
     options: ServerOptions,
 
     /// New log messages are broadcast to all clients.
-    broadcast_log_tx: broadcast::Sender<LogOrTableMsgProto>,
+    /// Uses a back-pressure channel that blocks senders when the byte limit is exceeded.
+    broadcast_log_tx: async_broadcast_channel::Sender<LogOrTableMsgProto>,
 
     /// Channel for incoming events.
-    event_rx: mpsc::Receiver<Event>,
+    event_rx: async_mpsc_channel::Receiver<Event>,
 
-    messages: MessageBuffer,
+    /// All messages received so far, minus those that have been garbage collected.
+    history: MessageBuffer,
 }
 
 impl EventLoop {
     fn new(
         options: ServerOptions,
-        event_rx: mpsc::Receiver<Event>,
-        broadcast_log_tx: broadcast::Sender<LogOrTableMsgProto>,
+        event_rx: async_mpsc_channel::Receiver<Event>,
+        broadcast_log_tx: async_broadcast_channel::Sender<LogOrTableMsgProto>,
     ) -> Self {
         Self {
             options,
             broadcast_log_tx,
             event_rx,
-            messages: Default::default(),
+            history: Default::default(),
         }
     }
 
@@ -739,40 +823,38 @@ impl EventLoop {
                 Event::NewClient(channel) => {
                     channel
                         .send((
-                            self.messages.all(self.options.playback_behavior),
+                            self.history.all(self.options.playback_behavior),
                             self.broadcast_log_tx.subscribe(),
                         ))
                         .ok();
                 }
-                Event::Message(msg) => self.handle_msg(msg),
+                Event::Message(msg) => self.handle_msg(msg).await,
             }
         }
     }
 
-    fn handle_msg(&mut self, msg: LogOrTableMsgProto) {
-        self.broadcast_log_tx.send(msg.clone()).ok();
+    async fn handle_msg(&mut self, msg: LogOrTableMsgProto) {
+        // This will block if the broadcast channel is full, applying back-pressure
+        self.broadcast_log_tx.send_async(msg.clone()).await.ok();
 
-        if self.is_history_disabled() {
+        if !self.is_history_enabled() {
             // no need to gc or maintain history
             return;
         }
 
         self.gc_if_using_too_much_ram();
 
-        self.messages.add_msg(msg);
+        self.history.add_msg(msg);
     }
 
-    fn is_history_disabled(&self) -> bool {
-        self.options.memory_limit.max_bytes.is_some_and(|b| b == 0)
+    fn is_history_enabled(&self) -> bool {
+        self.options.memory_limit != MemoryLimit::ZERO
     }
 
     fn gc_if_using_too_much_ram(&mut self) {
-        let Some(max_bytes) = self.options.memory_limit.max_bytes else {
-            // Unlimited memory!
-            return;
-        };
-
-        self.messages.gc(max_bytes);
+        if self.options.memory_limit.is_limited() {
+            self.history.gc(self.options.memory_limit.as_bytes());
+        }
     }
 }
 
@@ -786,7 +868,7 @@ impl SizeBytes for TableMsgProto {
 pub struct MessageProxy {
     options: ServerOptions,
     _queue_task_handle: tokio::task::JoinHandle<()>,
-    event_tx: mpsc::Sender<Event>,
+    event_tx: async_mpsc_channel::Sender<Event>,
 }
 
 impl MessageProxy {
@@ -794,9 +876,20 @@ impl MessageProxy {
         Self::new_with_recv(options).0
     }
 
-    fn new_with_recv(options: ServerOptions) -> (Self, broadcast::Receiver<LogOrTableMsgProto>) {
-        let (event_tx, event_rx) = mpsc::channel(MESSAGE_QUEUE_CAPACITY);
-        let (broadcast_log_tx, broadcast_log_rx) = broadcast::channel(MESSAGE_QUEUE_CAPACITY);
+    fn new_with_recv(
+        options: ServerOptions,
+    ) -> (Self, async_broadcast_channel::Receiver<LogOrTableMsgProto>) {
+        let (broadcast_log_tx, broadcast_log_rx) = async_broadcast_channel::channel(
+            "re_grpc_server broadcast",
+            CHANNEL_SIZE_MESSAGES,
+            CHANNEL_SIZE_BYTES,
+        );
+
+        let (event_tx, event_rx) = {
+            // TODO(emilk): this could also use a size-based backpressure mechanism.
+            let message_queue_capacity = 32; // Apply backpressure early
+            async_mpsc_channel::channel("re_grpc_server events", message_queue_capacity)
+        };
 
         let task_handle = tokio::spawn(async move {
             EventLoop::new(options, event_rx, broadcast_log_tx)
@@ -814,12 +907,9 @@ impl MessageProxy {
         )
     }
 
-    async fn push_log_msg(&self, msg: LogMsgProto) {
-        self.event_tx.send(Event::Message(msg.into())).await.ok();
-    }
-
-    async fn push_table_msg(&self, table: TableMsgProto) {
-        self.event_tx.send(Event::Message(table.into())).await.ok();
+    async fn push_message(&self, message: impl Into<LogOrTableMsgProto>) {
+        let message = message.into();
+        self.event_tx.send(Event::Message(message)).await.ok();
     }
 
     async fn new_client_message_stream(&self) -> ReadMsgStream {
@@ -842,10 +932,12 @@ impl MessageProxy {
                 .map(ReadLogOrTableMsgResponse::from)
                 .map(Ok),
         );
-        let channel = BroadcastStream::new(msg_channel).map(|result| {
+
+        // Convert our backpressure receiver into a Stream
+        let channel = BackPressureReceiverStream::new(msg_channel).map(|result| {
             result.map(ReadLogOrTableMsgResponse::from).map_err(|err| {
                 re_log::error!("Error reading message from broadcast channel: {err}");
-                tonic::Status::internal("internal channel error")
+                tonic::Status::internal(format!("internal channel error: {err}"))
             })
         });
 
@@ -865,6 +957,10 @@ impl MessageProxy {
                         re_log::warn_once!("A log stream got a TableMsg");
                         None
                     }
+                    Ok(ReadLogOrTableMsgResponse::UiCommand) => {
+                        re_log::warn_once!("A log stream got a UiCommandMsg");
+                        None
+                    }
                     Err(err) => Some(Err(err)),
                 }),
         )
@@ -880,6 +976,10 @@ impl MessageProxy {
                         None
                     }
                     Ok(ReadLogOrTableMsgResponse::TableMsg(msg)) => Some(Ok(msg)),
+                    Ok(ReadLogOrTableMsgResponse::UiCommand) => {
+                        re_log::warn_once!("A log stream got a UiCommandMsg");
+                        None
+                    }
                     Err(err) => Some(Err(err)),
                 }),
         )
@@ -889,6 +989,7 @@ impl MessageProxy {
 enum ReadLogOrTableMsgResponse {
     LogMsg(ReadMessagesResponse),
     TableMsg(ReadTablesResponse),
+    UiCommand,
 }
 
 impl From<LogOrTableMsgProto> for ReadLogOrTableMsgResponse {
@@ -901,6 +1002,7 @@ impl From<LogOrTableMsgProto> for ReadLogOrTableMsgResponse {
                 id: Some(table_msg.id),
                 data: Some(table_msg.data),
             }),
+            LogOrTableMsgProto::UiCommand(_ui_command) => Self::UiCommand,
         }
     }
 }
@@ -922,7 +1024,7 @@ impl message_proxy_service_server::MessageProxyService for MessageProxy {
                 Ok(Some(WriteMessagesRequest {
                     log_msg: Some(log_msg),
                 })) => {
-                    self.push_log_msg(log_msg).await;
+                    self.push_message(log_msg).await;
                 }
 
                 Ok(Some(WriteMessagesRequest { log_msg: None })) => {
@@ -964,7 +1066,7 @@ impl message_proxy_service_server::MessageProxyService for MessageProxy {
             data: Some(data),
         } = request.into_inner()
         {
-            self.push_table_msg(TableMsgProto { id, data }).await;
+            self.push_message(TableMsgProto { id, data }).await;
         } else {
             re_log::warn!("malformed `WriteTableRequest`");
         }
@@ -977,6 +1079,20 @@ impl message_proxy_service_server::MessageProxyService for MessageProxy {
         _: tonic::Request<ReadTablesRequest>,
     ) -> tonic::Result<tonic::Response<Self::ReadTablesStream>> {
         Ok(tonic::Response::new(self.new_client_table_stream().await))
+    }
+
+    async fn save_screenshot(
+        &self,
+        request: tonic::Request<SaveScreenshotRequest>,
+    ) -> tonic::Result<tonic::Response<SaveScreenshotResponse>> {
+        let SaveScreenshotRequest { view_id, file_path } = request.into_inner();
+        self.push_message(DataSourceUiCommand::SaveScreenshot {
+            file_path: file_path.into(),
+            view_id,
+        })
+        .await;
+
+        Ok(tonic::Response::new(SaveScreenshotResponse {}))
     }
 }
 

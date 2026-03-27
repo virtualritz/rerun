@@ -9,7 +9,7 @@ __all__ = ["DataframeView"]
 
 
 from .. import archetypes as blueprint_archetypes
-from ..api import View, ViewContentsLike
+from ..api import View, ViewContentsLike, VisualizerLike
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
@@ -26,7 +26,9 @@ class DataframeView(View):
     """
     **View**: A view to display any data in a tabular form.
 
-    Any data from the store can be shown, using a flexibly, user-configurable query.
+    Any data from the store can be shown, using a flexible, user-configurable query.
+
+    See [Dataframe queries](https://rerun.io/docs/concepts/query-and-transform/dataframe-queries) to learn more about the query model.
 
     ⚠️ **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**
 
@@ -60,6 +62,8 @@ class DataframeView(View):
                 filter_by_range=(rr.TimeInt(seconds=0), rr.TimeInt(seconds=20)),
                 filter_is_not_null="/trig/tan_sparse:Scalar",
                 select=["t", "log_tick", "/trig/sin:Scalar", "/trig/cos:Scalar", "/trig/tan_sparse:Scalar"],
+                entity_order=["/trig/cos", "/trig/sin", "/trig/tan_sparse"],
+                auto_scroll=True,
             ),
         ),
     )
@@ -86,11 +90,7 @@ class DataframeView(View):
         name: Utf8Like | None = None,
         visible: datatypes.BoolLike | None = None,
         defaults: Iterable[AsComponents | Iterable[DescribedComponentBatch]] | None = None,
-        overrides: Mapping[
-            EntityPathLike,
-            AsComponents | Iterable[DescribedComponentBatch | AsComponents | Iterable[DescribedComponentBatch]],
-        ]
-        | None = None,
+        overrides: Mapping[EntityPathLike, VisualizerLike | Iterable[VisualizerLike]] | None = None,
         query: blueprint_archetypes.DataframeQuery | None = None,
     ) -> None:
         """
@@ -119,10 +119,12 @@ class DataframeView(View):
             Note that an archetype's required components typically don't have any effect.
             It is recommended to use the archetype's `from_fields` method instead and only specify the fields that you need.
         overrides:
-            Dictionary of overrides to apply to the view. The key is the path to the entity where the override
-            should be applied. The value is a list of archetypes or (described) component batches to apply to the entity.
+            Dictionary of visualizer overrides to apply to the view. The key is the path to the entity where the override
+            should be applied. The value is a list of visualizers which should be enabled for that entity, or a single visualizer.
 
-            It is recommended to use the archetype's `from_fields` method instead and only specify the fields that you need.
+            Each visualizer can be configured with arbitrary overrides and mappings.
+
+            For any entity mentioned in this map, visualizers are no longer added automatically based on the entity's components.
 
             Important note: the path must be a fully qualified entity path starting at the root. The override paths
             do not yet support `$origin` relative paths or glob expressions.

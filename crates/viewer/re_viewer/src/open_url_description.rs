@@ -30,12 +30,12 @@ impl ViewerOpenUrlDescription {
                 target_short: item.entity_path().map(|p| p.to_string()),
             },
 
-            ViewerOpenUrl::RrdHttpUrl(url) => {
+            ViewerOpenUrl::HttpUrl(url) => {
                 let path = url.path();
                 let rrd_file_name = path.split('/').next_back().map(|s| s.to_owned());
 
                 Self {
-                    category: "RRD from link",
+                    category: "From http link",
                     target_short: rrd_file_name,
                 }
             }
@@ -87,7 +87,7 @@ impl ViewerOpenUrlDescription {
                 target_short: None,
             },
 
-            ViewerOpenUrl::ChunkStoreBrowser => Self {
+            ViewerOpenUrl::ChunkStoreBrowser { .. } => Self {
                 category: "Chunk store browser",
                 target_short: None,
             },
@@ -96,9 +96,14 @@ impl ViewerOpenUrlDescription {
 }
 
 pub fn command_palette_parse_url(url: &str) -> Option<CommandPaletteUrl> {
-    let Ok(open_url) = url.parse::<ViewerOpenUrl>() else {
-        return None;
-    };
+    let open_url = ViewerOpenUrl::parse_with_options(
+        url,
+        &re_data_source::FromUriOptions {
+            accept_extensionless_http: true,
+            ..Default::default()
+        },
+    )
+    .ok()?;
 
     Some(CommandPaletteUrl {
         url: url.to_owned(),

@@ -7,8 +7,10 @@ from .active_tab import ActiveTab, ActiveTabBatch
 from .angular_speed import AngularSpeed, AngularSpeedBatch
 from .apply_latest_at import ApplyLatestAt, ApplyLatestAtBatch
 from .auto_layout import AutoLayout, AutoLayoutBatch
+from .auto_scroll import AutoScroll, AutoScrollBatch
 from .auto_views import AutoViews, AutoViewsBatch
 from .background_kind import BackgroundKind, BackgroundKindArrayLike, BackgroundKindBatch, BackgroundKindLike
+from .column_order import ColumnOrder, ColumnOrderArrayLike, ColumnOrderBatch, ColumnOrderLike
 from .column_share import ColumnShare, ColumnShareBatch
 from .component_column_selector import ComponentColumnSelector, ComponentColumnSelectorBatch
 from .container_kind import ContainerKind, ContainerKindArrayLike, ContainerKindBatch, ContainerKindLike
@@ -49,7 +51,9 @@ from .view_origin import ViewOrigin, ViewOriginBatch
 from .viewer_recommendation_hash import ViewerRecommendationHash, ViewerRecommendationHashBatch
 from .visible_time_range import VisibleTimeRange, VisibleTimeRangeBatch
 from .visual_bounds2d import VisualBounds2D, VisualBounds2DBatch
-from .visualizer_override import VisualizerOverride, VisualizerOverrideBatch
+from .visualizer_component_mapping import VisualizerComponentMapping, VisualizerComponentMappingBatch
+from .visualizer_instruction_id import VisualizerInstructionId, VisualizerInstructionIdBatch
+from .visualizer_type import VisualizerType, VisualizerTypeBatch
 from .zoom_level import ZoomLevel, ZoomLevelBatch
 
 __all__ = [
@@ -63,12 +67,18 @@ __all__ = [
     "ApplyLatestAtBatch",
     "AutoLayout",
     "AutoLayoutBatch",
+    "AutoScroll",
+    "AutoScrollBatch",
     "AutoViews",
     "AutoViewsBatch",
     "BackgroundKind",
     "BackgroundKindArrayLike",
     "BackgroundKindBatch",
     "BackgroundKindLike",
+    "ColumnOrder",
+    "ColumnOrderArrayLike",
+    "ColumnOrderBatch",
+    "ColumnOrderLike",
     "ColumnShare",
     "ColumnShareBatch",
     "ComponentColumnSelector",
@@ -167,8 +177,12 @@ __all__ = [
     "VisibleTimeRangeBatch",
     "VisualBounds2D",
     "VisualBounds2DBatch",
-    "VisualizerOverride",
-    "VisualizerOverrideBatch",
+    "VisualizerComponentMapping",
+    "VisualizerComponentMappingBatch",
+    "VisualizerInstructionId",
+    "VisualizerInstructionIdBatch",
+    "VisualizerType",
+    "VisualizerTypeBatch",
     "ZoomLevel",
     "ZoomLevelBatch",
 ]

@@ -10,10 +10,10 @@ use re_arrow_util::ArrowArrayDowncastRef as _;
 use re_chunk_store::QueryExpression;
 use re_datafusion::query_from_query_expression;
 use re_log::external::log::warn;
-use re_log_types::EntryId;
+use re_log_types::{EntryId, EntryName};
 use re_protos::cloud::v1alpha1::ext::{
     DataSource, DatasetDetails, DatasetEntry, EntryDetails, QueryDatasetRequest,
-    RegisterWithDatasetTaskDescriptor, TableEntry,
+    RegisterWithDatasetTaskDescriptor, TableEntry, VersionResponse,
 };
 use re_protos::cloud::v1alpha1::{EntryFilter, QueryDatasetResponse, QueryTasksResponse};
 use re_protos::common::v1alpha1::TaskId;
@@ -23,7 +23,7 @@ use re_protos::{invalid_schema, missing_field};
 use re_redap_client::{ApiError, ConnectionClient, ConnectionRegistryHandle};
 use tracing::Instrument as _;
 
-use crate::catalog::table_entry::PyTableInsertMode;
+use crate::catalog::table_entry::PyTableInsertModeInternal;
 use crate::catalog::to_py_err;
 use crate::utils::wait_for_future;
 
@@ -60,6 +60,15 @@ impl ConnectionHandle {
 }
 
 impl ConnectionHandle {
+    #[tracing::instrument(level = "info", skip_all)]
+    pub fn version_info(&self, py: Python<'_>) -> PyResult<VersionResponse> {
+        wait_for_future(
+            py,
+            async { self.client().await?.version_info().await.map_err(to_py_err) }
+                .in_current_span(),
+        )
+    }
+
     #[tracing::instrument(level = "info", skip_all)]
     pub fn find_entries(&self, py: Python<'_>, filter: EntryFilter) -> PyResult<Vec<EntryDetails>> {
         wait_for_future(
@@ -187,7 +196,7 @@ impl ConnectionHandle {
     pub fn register_table(
         &self,
         py: Python<'_>,
-        name: String,
+        name: EntryName,
         url: url::Url,
     ) -> PyResult<TableEntry> {
         wait_for_future(
@@ -207,7 +216,7 @@ impl ConnectionHandle {
     pub fn create_table_entry(
         &self,
         py: Python<'_>,
-        name: String,
+        name: &EntryName,
         schema: SchemaRef,
         url: Option<url::Url>,
     ) -> PyResult<TableEntry> {
@@ -216,7 +225,7 @@ impl ConnectionHandle {
             async {
                 self.client()
                     .await?
-                    .create_table_entry(&name, url, schema)
+                    .create_table_entry(name.clone(), url, schema)
                     .await
                     .map_err(to_py_err)
             }
@@ -247,7 +256,7 @@ impl ConnectionHandle {
         py: Python<'_>,
         entry_id: EntryId,
         stream: ArrowArrayStreamReader,
-        insert_mode: PyTableInsertMode,
+        insert_mode: PyTableInsertModeInternal,
     ) -> PyResult<()> {
         wait_for_future(
             py,
@@ -306,6 +315,7 @@ impl ConnectionHandle {
         dataset_id: EntryId,
         recording_uris: Vec<String>,
         recording_layers: Vec<String>,
+        on_duplicate: IfDuplicateBehavior,
     ) -> PyResult<Vec<RegisterWithDatasetTaskDescriptor>> {
         let last_layer = recording_layers
             .last()
@@ -328,8 +338,47 @@ impl ConnectionHandle {
             async {
                 self.client()
                     .await?
-                    //TODO(ab): expose `on_duplicate` as a method argument
-                    .register_with_dataset(dataset_id, data_sources, IfDuplicateBehavior::Error)
+                    .register_with_dataset(dataset_id, data_sources, on_duplicate)
+                    .await
+                    .map_err(to_py_err)
+            }
+            .in_current_span(),
+        )
+    }
+
+    /// Unregisters segments and layers from the dataset.
+    ///
+    /// Excluding IO errors, this will always succeed as long the target dataset exists.
+    /// Corollary: unregistering data that doesn't exist is a no-op.
+    ///
+    /// This always returns a subset of the data from `ScanDatasetManifest`, and therefore the data will
+    /// also follow the schema returned by [`Self::get_dataset_manifest_schema`].
+    ///
+    /// This method acts as a *product* filter:
+    /// * empty `segments_to_drop` + empty `layers_to_drop`: invalid argument error
+    /// * empty `segments_to_drop` + non-empty `layers_to_drop`: remove specified layers for *all* segments
+    /// * non-empty `segments_to_drop` + empty `layers_to_drop`: remove *all* layers for specified segments
+    /// * non-empty `segments_to_drop` + non-empty `layers_to_drop`: delete *all* specified layers for *all* specified segments
+    ///
+    /// If `force`, deletion will go through regardless of the segments/layers' current statuses.
+    /// This is only useful in the very specific, catatrophic scenario where the contents of the
+    /// task queue were lost and some tasks are now stuck in `status=pending` forever.
+    /// Do not use this unless you know exactly what you're doing.
+    #[tracing::instrument(level = "info", skip_all)]
+    pub fn unregister_from_dataset(
+        &self,
+        py: Python<'_>,
+        dataset_id: EntryId,
+        segments_to_drop: Vec<String>,
+        layers_to_drop: Vec<String>,
+        force: bool,
+    ) -> PyResult<Vec<RecordBatch>> {
+        wait_for_future(
+            py,
+            async {
+                self.client()
+                    .await?
+                    .unregister_from_dataset(dataset_id, segments_to_drop, layers_to_drop, force)
                     .await
                     .map_err(to_py_err)
             }
@@ -348,12 +397,11 @@ impl ConnectionHandle {
         py: Python<'_>,
         dataset_id: EntryId,
         recordings_prefix: String,
-        recordings_layer: Option<String>,
+        recordings_layer: String,
+        on_duplicate: IfDuplicateBehavior,
     ) -> PyResult<Vec<RegisterWithDatasetTaskDescriptor>> {
-        let layer = recordings_layer.unwrap_or_else(|| DataSource::DEFAULT_LAYER.to_owned());
-
-        let data_source =
-            DataSource::new_rrd_layer_prefix(layer, recordings_prefix).map_err(to_py_err)?;
+        let data_source = DataSource::new_rrd_layer_prefix(recordings_layer, recordings_prefix)
+            .map_err(to_py_err)?;
         let data_sources = vec![data_source];
 
         wait_for_future(
@@ -361,8 +409,7 @@ impl ConnectionHandle {
             async {
                 self.client()
                     .await?
-                    //TODO(ab): expose `on_duplicate` as a method argument
-                    .register_with_dataset(dataset_id, data_sources, IfDuplicateBehavior::Error)
+                    .register_with_dataset(dataset_id, data_sources, on_duplicate)
                     .await
                     .map_err(to_py_err)
             }
@@ -475,7 +522,7 @@ impl ConnectionHandle {
                         .data
                         .ok_or_else(|| {
                             let err = missing_field!(QueryTasksResponse, "data");
-                            let err = ApiError::serialization(
+                            let err = ApiError::serialization_with_source(
                                 err,
                                 "failed waiting for tasks done: received item without data",
                             );
@@ -490,7 +537,7 @@ impl ConnectionHandle {
                     let schema = item.schema();
                     if !schema.contains(&QueryTasksResponse::schema()) {
                         let err = invalid_schema!(QueryTasksResponse);
-                        let err = ApiError::serialization(
+                        let err = ApiError::serialization_with_source(
                             err,
                             "failed waiting for tasks done: received item with invalid schema",
                         );
@@ -506,7 +553,7 @@ impl ConnectionHandle {
                     .map(|name| schema.index_of(name))
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|err| {
-                        to_py_err(ApiError::serialization(
+                        to_py_err(ApiError::serialization_with_source(
                             err,
                             "failed waiting for tasks done: missing column on item",
                         ))

@@ -9,8 +9,9 @@ use arrow::buffer::ScalarBuffer;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::error::ArrowError;
 use lance::deps::arrow_array::UInt8Array;
+use lance_index::DatasetIndexExt as _;
 use re_chunk_store::Chunk;
-use re_log_types::{EntityPath, TimelineName};
+use re_log_types::{ComponentPath, EntityPath, TimelineName};
 use re_protos::cloud::v1alpha1::ext::{IndexConfig, IndexProperties};
 use re_protos::common::v1alpha1::ext::SegmentId;
 use re_types_core::ComponentIdentifier;
@@ -93,6 +94,93 @@ impl super::Index {
             Err(StoreError::IndexingError(
                 "Cannot determine indexed data schema".to_owned(),
             ))?;
+        }
+
+        Ok(())
+    }
+
+    /// Remove layers from the index.
+    pub async fn remove_layers(
+        &self,
+        layers: &[(SegmentId, String)],
+        checkout_latest: bool,
+    ) -> Result<(), StoreError> {
+        let mut lance: lance::Dataset = self.lance_dataset.cloned();
+
+        let predicate = if cfg!(false) {
+            // TODO(cmc): The following fails in Lance for reasons that escape me.
+
+            use datafusion::prelude::*;
+
+            /// Creates a _balanced_ chain of binary expressions.
+            fn balanced_binary_exprs(
+                mut exprs: Vec<datafusion::logical_expr::Expr>,
+                op: datafusion::logical_expr::Operator,
+            ) -> Option<datafusion::logical_expr::Expr> {
+                while exprs.len() > 1 {
+                    let mut exprs_next = Vec::with_capacity(exprs.len() / 2 + 1);
+                    let mut exprs_prev = exprs.into_iter();
+
+                    while let Some(left) = exprs_prev.next() {
+                        if let Some(right) = exprs_prev.next() {
+                            exprs_next.push(datafusion::prelude::binary_expr(left, op, right));
+                        } else {
+                            exprs_next.push(left);
+                        }
+                    }
+
+                    exprs = exprs_next;
+                }
+
+                exprs.into_iter().next()
+            }
+
+            let predicates = layers
+                .iter()
+                .map(|(segment, layer)| {
+                    (cast(col(FIELD_RERUN_SEGMENT_ID), DataType::Utf8).eq(lit(&segment.id)))
+                        .and(cast(col(FIELD_RERUN_SEGMENT_LAYER), DataType::Utf8).eq(lit(layer)))
+                })
+                .collect();
+
+            let Some(predicate) =
+                balanced_binary_exprs(predicates, datafusion::logical_expr::Operator::Or)
+            else {
+                if checkout_latest {
+                    lance.checkout_latest().await?;
+                    self.lance_dataset.replace(lance);
+                }
+                return Ok(());
+            };
+
+            datafusion::sql::unparser::expr_to_sql(&predicate)?.to_string()
+        } else {
+            layers
+                .iter()
+                .map(|(segment, layer)| {
+                    format!(
+                        "(CAST({} AS string) = '{}' AND CAST({} AS string) = '{}')",
+                        FIELD_RERUN_SEGMENT_ID,
+                        segment.id.replace('\'', "''"),
+                        FIELD_RERUN_SEGMENT_LAYER,
+                        layer.replace('\'', "''"),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        };
+
+        lance.delete(&predicate).await?;
+        lance
+            .optimize_indices(&lance_index::optimize::OptimizeOptions::append())
+            .await?;
+
+        // TODO(swallez) we should call optimize_indices and compact_files sometimes.
+        // We can either do it every X insertions or use a debouncer to enforce a max frequency.
+
+        if checkout_latest {
+            lance.checkout_latest().await?;
+            self.lance_dataset.replace(lance);
         }
 
         Ok(())
@@ -245,9 +333,9 @@ pub async fn create_index(
         &config.time_index,
     )
     .ok_or_else(|| {
-        StoreError::EntryNameNotFound(format!(
-            "{}#{}",
-            config.column.entity_path, config.column.descriptor.component
+        StoreError::ComponentPathNotFound(ComponentPath::new(
+            config.column.entity_path.clone(),
+            config.column.descriptor.component,
         ))
     })?;
 
@@ -405,7 +493,7 @@ fn find_datatypes(
     for segment in dataset.segments().values() {
         for layer in segment.layers().values() {
             let chunk_store = layer.store_handle().read();
-            for chunk in chunk_store.iter_chunks() {
+            for chunk in chunk_store.iter_physical_chunks() {
                 if chunk.entity_path() == entity_path
                     && let Some(component) = chunk.components().0.get(component)
                     && let Some(timeline) = chunk.timelines().get(timeline_name)

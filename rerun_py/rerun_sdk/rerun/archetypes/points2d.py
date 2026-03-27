@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, ClassVar
+
 import numpy as np
 import pyarrow as pa
 from attrs import define, field
@@ -13,15 +15,20 @@ from .. import components, datatypes
 from .._baseclasses import (
     Archetype,
     ComponentColumnList,
+    ComponentDescriptor,
 )
+from ..blueprint import VisualizableArchetype, Visualizer
 from ..error_utils import catch_and_log_exceptions
 from .points2d_ext import Points2DExt
+
+if TYPE_CHECKING:
+    from ..blueprint.datatypes import VisualizerComponentMappingLike
 
 __all__ = ["Points2D"]
 
 
 @define(str=False, repr=False, init=False)
-class Points2D(Points2DExt, Archetype):
+class Points2D(Points2DExt, Archetype, VisualizableArchetype):
     """
     **Archetype**: A 2D point cloud with positions and optional colors, radii, labels, etc.
 
@@ -29,9 +36,10 @@ class Points2D(Points2DExt, Archetype):
     --------
     ### Randomly distributed 2D points with varying color and radius:
     ```python
+    from numpy.random import default_rng
+
     import rerun as rr
     import rerun.blueprint as rrb
-    from numpy.random import default_rng
 
     rr.init("rerun_example_points2d_random", spawn=True)
     rng = default_rng(12345)
@@ -100,6 +108,8 @@ class Points2D(Points2DExt, Archetype):
     </center>
 
     """
+
+    NAME: ClassVar[str] = "rerun.archetypes.Points2D"
 
     # __init__ can be found in points2d_ext.py
 
@@ -211,6 +221,70 @@ class Points2D(Points2DExt, Archetype):
         """Clear all the fields of a `Points2D`."""
         return cls.from_fields(clear_unset=True)
 
+    @staticmethod
+    def descriptor_positions() -> ComponentDescriptor:
+        return ComponentDescriptor(
+            "Points2D:positions",
+            archetype=Points2D.NAME,
+            component_type=components.Position2DBatch._COMPONENT_TYPE,
+        )
+
+    @staticmethod
+    def descriptor_radii() -> ComponentDescriptor:
+        return ComponentDescriptor(
+            "Points2D:radii",
+            archetype=Points2D.NAME,
+            component_type=components.RadiusBatch._COMPONENT_TYPE,
+        )
+
+    @staticmethod
+    def descriptor_colors() -> ComponentDescriptor:
+        return ComponentDescriptor(
+            "Points2D:colors",
+            archetype=Points2D.NAME,
+            component_type=components.ColorBatch._COMPONENT_TYPE,
+        )
+
+    @staticmethod
+    def descriptor_labels() -> ComponentDescriptor:
+        return ComponentDescriptor(
+            "Points2D:labels",
+            archetype=Points2D.NAME,
+            component_type=components.TextBatch._COMPONENT_TYPE,
+        )
+
+    @staticmethod
+    def descriptor_show_labels() -> ComponentDescriptor:
+        return ComponentDescriptor(
+            "Points2D:show_labels",
+            archetype=Points2D.NAME,
+            component_type=components.ShowLabelsBatch._COMPONENT_TYPE,
+        )
+
+    @staticmethod
+    def descriptor_draw_order() -> ComponentDescriptor:
+        return ComponentDescriptor(
+            "Points2D:draw_order",
+            archetype=Points2D.NAME,
+            component_type=components.DrawOrderBatch._COMPONENT_TYPE,
+        )
+
+    @staticmethod
+    def descriptor_class_ids() -> ComponentDescriptor:
+        return ComponentDescriptor(
+            "Points2D:class_ids",
+            archetype=Points2D.NAME,
+            component_type=components.ClassIdBatch._COMPONENT_TYPE,
+        )
+
+    @staticmethod
+    def descriptor_keypoint_ids() -> ComponentDescriptor:
+        return ComponentDescriptor(
+            "Points2D:keypoint_ids",
+            archetype=Points2D.NAME,
+            component_type=components.KeypointIdBatch._COMPONENT_TYPE,
+        )
+
     @classmethod
     def columns(
         cls,
@@ -310,17 +384,21 @@ class Points2D(Points2DExt, Archetype):
             if pa.types.is_primitive(arrow_array.type) or pa.types.is_fixed_size_list(arrow_array.type):
                 param = kwargs[batch.component_descriptor().component]  # type: ignore[index]
                 shape = np.shape(param)  # type: ignore[arg-type]
-                elem_flat_len = int(np.prod(shape[1:])) if len(shape) > 1 else 1  # type: ignore[redundant-expr,misc]
-
-                if pa.types.is_fixed_size_list(arrow_array.type) and arrow_array.type.list_size == elem_flat_len:
-                    # If the product of the last dimensions of the shape are equal to the size of the fixed size list array,
-                    # we have `num_rows` single element batches (each element is a fixed sized list).
-                    # (This should have been already validated by conversion to the arrow_array)
-                    batch_length = 1
-                else:
-                    batch_length = shape[1] if len(shape) > 1 else 1  # type: ignore[redundant-expr,misc]
-
                 num_rows = shape[0] if len(shape) >= 1 else 1  # type: ignore[redundant-expr,misc]
+
+                if pa.types.is_fixed_size_list(arrow_array.type):
+                    elem_flat_len = int(np.prod(shape[1:])) if len(shape) > 1 else 1  # type: ignore[redundant-expr,misc]
+                    if arrow_array.type.list_size == elem_flat_len:
+                        # The product of the last dimensions of the shape are equal to the size of the fixed size list array,
+                        # so we have `num_rows` single element batches (each element is a fixed sized list).
+                        batch_length = 1
+                    else:
+                        batch_length = shape[1] if len(shape) > 1 else 1  # type: ignore[redundant-expr,misc]
+                else:
+                    # For primitive types, derive batch_length from the actual arrow array length
+                    # since the input shape can be misleading (e.g. colors [R,G,B] -> single uint32).
+                    batch_length = len(arrow_array) // num_rows if num_rows > 0 else 1
+
                 sizes = batch_length * np.ones(num_rows)
             else:
                 # For non-primitive types, default to partitioning each element separately.
@@ -425,3 +503,18 @@ class Points2D(Points2DExt, Archetype):
 
     __str__ = Archetype.__str__
     __repr__ = Archetype.__repr__  # type: ignore[assignment]
+
+    def visualizer(self, *, mappings: list[VisualizerComponentMappingLike] | None = None) -> Visualizer:
+        """
+        Creates a visualizer for this archetype, using all currently set values as overrides.
+
+        Parameters
+        ----------
+        mappings:
+            Optional component mappings to control how the visualizer sources its data.
+
+            ⚠️ **Experimental**: Component mappings are an experimental feature and may change.
+            See https://github.com/rerun-io/rerun/issues/10631 for more information.
+
+        """
+        return Visualizer("Points2D", overrides=self.as_component_batches(), mappings=mappings)
