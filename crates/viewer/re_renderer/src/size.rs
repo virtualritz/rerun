@@ -12,6 +12,7 @@ use re_log::debug_assert;
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct Size(pub f32);
 
+#[cfg(feature = "memory-stats")]
 impl re_byte_size::SizeBytes for Size {
     #[inline]
     fn heap_size_bytes(&self) -> u64 {

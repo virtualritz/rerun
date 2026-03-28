@@ -102,6 +102,7 @@ pub struct PickingLayerObjectId(pub u64);
 #[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod, Default, Debug, PartialEq, Eq)]
 pub struct PickingLayerInstanceId(pub u64);
 
+#[cfg(feature = "memory-stats")]
 impl re_byte_size::SizeBytes for PickingLayerInstanceId {
     #[inline]
     fn heap_size_bytes(&self) -> u64 {
