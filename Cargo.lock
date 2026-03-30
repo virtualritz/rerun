@@ -4137,6 +4137,12 @@ name = "glam"
 version = "0.30.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19fc433e8437a212d1b6f1e68c7824af3aed907da60afa994e7f542d18d12aa9"
+
+[[package]]
+name = "glam"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f70749695b063ecbf6b62949ccccde2e733ec3ecbbd71d467dca4e5c6c97cca0"
 dependencies = [
  "bytemuck",
  "serde_core",
@@ -4443,7 +4449,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29a164ceff4500f2a72b1d21beaa8aa8ad83aec2b641844c659b190cb3ea2e0b"
 dependencies = [
  "constgebra",
- "glam",
+ "glam 0.30.10",
  "tinyvec",
 ]
 
@@ -5902,7 +5908,7 @@ dependencies = [
  "anyhow",
  "clap",
  "emath",
- "glam",
+ "glam 0.32.1",
  "rand 0.9.2",
  "re_tracing",
  "rerun",
@@ -6034,10 +6040,9 @@ dependencies = [
 [[package]]
 name = "macaw"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c96b82556b0d4aa25cd4771b64ef9bde7c120afb588a083fcb242bf01e4a09b"
+source = "git+https://github.com/virtualritz/macaw.git#3fb00325e0832b54dca911f2e73b651f15096416"
 dependencies = [
- "glam",
+ "glam 0.32.1",
  "num-traits",
  "serde",
 ]
@@ -6240,7 +6245,7 @@ version = "0.31.0-alpha.1+dev"
 dependencies = [
  "anyhow",
  "clap",
- "glam",
+ "glam 0.32.1",
  "rerun",
 ]
 
@@ -6970,7 +6975,7 @@ version = "0.31.0-alpha.1+dev"
 dependencies = [
  "anyhow",
  "clap",
- "glam",
+ "glam 0.32.1",
  "prost",
  "prost-build",
  "protoc-prebuilt",
@@ -8362,7 +8367,7 @@ version = "0.31.0-alpha.1+dev"
 dependencies = [
  "arrow",
  "ecolor",
- "glam",
+ "glam 0.32.1",
  "half",
  "insta",
  "parking_lot",
@@ -9415,7 +9420,7 @@ dependencies = [
  "ecolor",
  "enumset",
  "getrandom 0.3.4",
- "glam",
+ "glam 0.32.1",
  "gltf",
  "half",
  "itertools 0.14.0",
@@ -9461,7 +9466,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "console_error_panic_hook",
- "glam",
+ "glam 0.32.1",
  "image",
  "itertools 0.14.0",
  "macaw",
@@ -9548,7 +9553,7 @@ dependencies = [
  "ecolor",
  "egui_plot",
  "emath",
- "glam",
+ "glam 0.32.1",
  "half",
  "image",
  "indexmap 2.13.0",
@@ -9768,7 +9773,7 @@ dependencies = [
  "arrow",
  "bitflags 2.11.0",
  "criterion",
- "glam",
+ "glam 0.32.1",
  "insta",
  "itertools 0.14.0",
  "mimalloc",
@@ -10005,7 +10010,7 @@ version = "0.31.0-alpha.1+dev"
 dependencies = [
  "ahash",
  "egui",
- "glam",
+ "glam 0.32.1",
  "itertools 0.14.0",
  "nohash-hasher",
  "re_chunk_store",
@@ -10106,7 +10111,7 @@ version = "0.31.0-alpha.1+dev"
 dependencies = [
  "bytemuck",
  "egui",
- "glam",
+ "glam 0.32.1",
  "itertools 0.14.0",
  "macaw",
  "re_data_ui",
@@ -10135,7 +10140,7 @@ dependencies = [
  "bitflags 2.11.0",
  "bytemuck",
  "egui",
- "glam",
+ "glam 0.32.1",
  "half",
  "hexasphere",
  "image",
@@ -10289,7 +10294,7 @@ dependencies = [
  "egui_plot",
  "ehttp",
  "emath",
- "glam",
+ "glam 0.32.1",
  "image",
  "insta",
  "itertools 0.14.0",
@@ -10391,7 +10396,7 @@ dependencies = [
  "egui-wgpu",
  "egui_tiles",
  "emath",
- "glam",
+ "glam 0.32.1",
  "half",
  "home",
  "image",
@@ -12077,7 +12082,7 @@ version = "0.31.0-alpha.1+dev"
 dependencies = [
  "anyhow",
  "clap",
- "glam",
+ "glam 0.32.1",
  "re_log",
  "rerun",
 ]

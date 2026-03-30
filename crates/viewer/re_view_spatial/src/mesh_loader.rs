@@ -190,6 +190,7 @@ impl LoadedMesh {
             vertex_colors,
             vertex_normals,
             vertex_texcoords,
+            vertex_element_ids: None,
             materials: smallvec::smallvec![re_renderer::mesh::Material {
                 label: name.clone().into(),
                 index_range: 0..num_indices as _,

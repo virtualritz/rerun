@@ -41,6 +41,9 @@ struct VertexOut {
 
     @location(5) @interpolate(flat)
     picking_layer_id: vec4u,
+
+    @location(6) @interpolate(flat)
+    element_id: u32,
 };
 
 @vertex
@@ -66,6 +69,7 @@ fn vs_main(in_vertex: VertexIn, in_instance: InstanceIn) -> VertexOut {
                                     in_instance.additive_tint_srgba.a);
     out.outline_mask_ids = in_instance.outline_mask_ids;
     out.picking_layer_id = in_instance.picking_layer_id;
+    out.element_id = in_vertex.element_id;
 
     return out;
 }
@@ -106,6 +110,9 @@ fn fs_main_shaded(in: VertexOut) -> @location(0) vec4f {
 
 @fragment
 fn fs_main_picking_layer(in: VertexOut) -> @location(0) vec4u {
+    if in.element_id != 0u {
+        return vec4u(in.element_id, 0u, 0u, 0u);
+    }
     return in.picking_layer_id;
 }
 

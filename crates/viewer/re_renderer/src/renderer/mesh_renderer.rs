@@ -693,6 +693,11 @@ impl Renderer for MeshRenderer {
                     vertex_buffer_combined
                         .slice(mesh_batch.mesh.vertex_buffer_texcoord_range.clone()),
                 );
+                pass.set_vertex_buffer(
+                    5,
+                    vertex_buffer_combined
+                        .slice(mesh_batch.mesh.vertex_buffer_element_ids_range.clone()),
+                );
                 pass.set_index_buffer(
                     index_buffer.slice(mesh_batch.mesh.index_buffer_range.clone()),
                     wgpu::IndexFormat::Uint32,
@@ -837,6 +842,7 @@ mod tests {
             vertex_colors: vec![Rgba32Unmul::WHITE; 3],
             vertex_normals: vec![glam::Vec3::new(0.0, 0.0, 1.0); 3],
             vertex_texcoords: vec![glam::Vec2::ZERO; 3],
+            vertex_element_ids: None,
             materials,
             bbox,
         };

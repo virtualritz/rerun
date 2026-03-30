@@ -284,6 +284,7 @@ fn import_mesh(
         vertex_colors,
         vertex_normals,
         vertex_texcoords,
+        vertex_element_ids: None,
         materials,
         bbox,
     };

@@ -74,6 +74,7 @@ pub fn load_stl_from_buffer(
         // STL has neither colors nor texcoords.
         vertex_colors: vec![crate::Rgba32Unmul::WHITE; num_vertices],
         vertex_texcoords: vec![glam::Vec2::ZERO; num_vertices],
+        vertex_element_ids: None,
 
         materials: smallvec![material],
 

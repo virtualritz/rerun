@@ -86,6 +86,7 @@ pub fn load_obj_from_buffer(
             vertex_colors,
             vertex_normals,
             vertex_texcoords,
+            vertex_element_ids: None,
             bbox,
 
             // TODO(andreas): proper material loading
