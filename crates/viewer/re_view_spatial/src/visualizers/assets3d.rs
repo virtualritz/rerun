@@ -96,6 +96,7 @@ impl Asset3DVisualizer {
                             additive_tint: re_renderer::Color32::BLACK,
                             // TODO(andreas): honor the culling settings from the mesh file if any.
                             cull_mode: Default::default(),
+                            hover_element_id: 0,
                         }
                     }));
 

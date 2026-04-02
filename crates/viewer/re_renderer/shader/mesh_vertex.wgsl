@@ -19,5 +19,6 @@ struct InstanceIn {
     @location(10) world_from_mesh_normal_row_2: vec3f,
     @location(11) additive_tint_srgba: vec4f,
     @location(12) picking_layer_id: vec4u,
-    @location(13) outline_mask_ids: vec2u,
+    @location(13) hover_element_id: u32,
+    @location(14) outline_mask_ids: vec2u,
 };

@@ -44,6 +44,9 @@ struct VertexOut {
 
     @location(6) @interpolate(flat)
     element_id: u32,
+
+    @location(7) @interpolate(flat)
+    hover_element_id: u32,
 };
 
 @vertex
@@ -70,6 +73,7 @@ fn vs_main(in_vertex: VertexIn, in_instance: InstanceIn) -> VertexOut {
     out.outline_mask_ids = in_instance.outline_mask_ids;
     out.picking_layer_id = in_instance.picking_layer_id;
     out.element_id = in_vertex.element_id;
+    out.hover_element_id = in_instance.hover_element_id;
 
     return out;
 }
@@ -105,15 +109,29 @@ fn fs_main_shaded(in: VertexOut) -> @location(0) vec4f {
     matcap_color += in.additive_tint_rgba.rgb;
     matcap_color *= in.additive_tint_rgba.a;
 
+    // Hover tint: brighten the face under the cursor.
+    if in.hover_element_id != 0u && in.element_id == in.hover_element_id {
+        matcap_color = matcap_color * 1.35 + vec3f(0.08, 0.08, 0.12);
+    }
+
     return vec4f(matcap_color, matcap_sample.a);
 }
 
 @fragment
 fn fs_main_picking_layer(in: VertexOut) -> @location(0) vec4u {
+    // Sentinel 0xFFFFFFFF = discard (suppress face IDs for edge/vertex modes).
+    if in.picking_layer_id.x == 0xFFFFFFFFu {
+        discard;
+    }
+    // Non-zero picking_layer_id overrides element_id (used for body mode).
+    if in.picking_layer_id.x != 0u {
+        return vec4u(in.picking_layer_id.x, 0u, 0u, 0u);
+    }
+    // Per-vertex element_id (face mode).
     if in.element_id != 0u {
         return vec4u(in.element_id, 0u, 0u, 0u);
     }
-    return in.picking_layer_id;
+    discard;
 }
 
 @fragment

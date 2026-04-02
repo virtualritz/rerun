@@ -51,7 +51,13 @@ mod gpu_data {
 
         pub picking_layer_id: [u32; 4],
 
+        /// Element ID of the currently hovered face (0 = no hover).
+        /// Compared per-fragment against in_vertex.element_id to apply a tint.
+        pub hover_element_id: u32,
+
         // Need only the first two bytes, but we want to keep everything aligned to at least 4 bytes.
+        // This field must be last in the struct because its vertex format (Uint8x2)
+        // reads only 2 bytes, which would cause offset misalignment for any following attribute.
         pub outline_mask_ids: [u8; 4],
     }
 
@@ -78,8 +84,11 @@ mod gpu_data {
                         // Picking id.
                         // Again this adds overhead for non-picking passes, more this time. Consider moving this elsewhere.
                         wgpu::VertexFormat::Uint32x4,
+                        // Hover element id for face-level hover tinting.
+                        wgpu::VertexFormat::Uint32,
                         // Outline mask.
                         // This adds a tiny bit of overhead to all instances during non-outline pass, but the alternative is having yet another vertex buffer.
+                        // MUST be last: Uint8x2 only reads 2 bytes but the struct field is 4 bytes.
                         wgpu::VertexFormat::Uint8x2,
                     ]
                     .into_iter(),
@@ -159,6 +168,10 @@ pub struct GpuMeshInstance {
     /// Controls face culling for this instance.
     /// `None` means no culling (show both faces), matching `wgpu::PrimitiveState::cull_mode`.
     pub cull_mode: Option<wgpu::Face>,
+
+    /// Element ID of the currently hovered face (0 = no hover).
+    /// When non-zero, the fragment shader tints fragments whose `element_id` matches.
+    pub hover_element_id: u32,
 }
 
 impl GpuMeshInstance {
@@ -171,6 +184,7 @@ impl GpuMeshInstance {
             outline_mask_ids: OutlineMaskPreference::NONE,
             picking_layer_id: PickingLayerId::default(),
             cull_mode: None,
+            hover_element_id: 0,
         }
     }
 }
@@ -332,11 +346,12 @@ impl MeshDrawData {
                         world_from_mesh_normal_row_1: world_from_mesh_normal.row(1).to_array(),
                         world_from_mesh_normal_row_2: world_from_mesh_normal.row(2).to_array(),
                         additive_tint: instance.additive_tint,
+                        picking_layer_id: instance.picking_layer_id.into(),
+                        hover_element_id: instance.hover_element_id,
                         outline_mask_ids: instance
                             .outline_mask_ids
                             .0
                             .map_or([0, 0, 0, 0], |mask| [mask[0], mask[1], 0, 0]),
-                        picking_layer_id: instance.picking_layer_id.into(),
                     })?;
 
                     // Transparent instances can not be batched.
@@ -890,6 +905,7 @@ mod tests {
             outline_mask_ids: OutlineMaskPreference::NONE,
             picking_layer_id: PickingLayerId::default(),
             cull_mode: None,
+            hover_element_id: 0,
         }
     }
 

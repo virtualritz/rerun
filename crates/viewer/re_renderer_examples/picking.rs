@@ -183,6 +183,7 @@ impl framework::Example for Picking {
                 },
                 outline_mask_ids: Default::default(),
                 cull_mode: None,
+                hover_element_id: 0,
             })
             .collect_vec();
 

@@ -49,6 +49,7 @@ fn build_mesh_instances(
                     outline_mask_ids: Default::default(),
                     picking_layer_id: Default::default(),
                     cull_mode: None,
+                    hover_element_id: 0,
                 },
             )
         })
