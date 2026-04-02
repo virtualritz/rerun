@@ -310,6 +310,11 @@ pub struct LineBatchInfo {
     /// This controls how wide the triangle/arrow-head is orthogonal to the line's direction.
     /// (defaults to 2.0)
     pub triangle_cap_width_factor: f32,
+
+    /// When true, this batch only participates in the picking layer pass,
+    /// not the opaque pass. Prevents picking-only geometry from rendering
+    /// visibly.
+    pub picking_only: bool,
 }
 
 impl Default for LineBatchInfo {
@@ -324,6 +329,7 @@ impl Default for LineBatchInfo {
             depth_offset: 0,
             triangle_cap_length_factor: 4.0,
             triangle_cap_width_factor: 2.0,
+            picking_only: false,
         }
     }
 }
@@ -500,7 +506,11 @@ impl LineDrawData {
                 let line_vertex_range_end = (start_vertex_for_next_batch
                     + batch_info.line_vertex_count)
                     .min(max_num_vertices as u32);
-                let mut active_phases = enum_set![DrawPhase::Opaque | DrawPhase::PickingLayer];
+                let mut active_phases = if batch_info.picking_only {
+                    enum_set![DrawPhase::PickingLayer]
+                } else {
+                    enum_set![DrawPhase::Opaque | DrawPhase::PickingLayer]
+                };
                 // Does the entire batch participate in the outline mask phase?
                 if batch_info.overall_outline_mask_ids.is_some() {
                     active_phases.insert(DrawPhase::OutlineMask);
@@ -689,13 +699,21 @@ impl Renderer for LineRenderer {
         };
         let render_pipeline_color =
             render_pipelines.get_or_create(ctx, &render_pipeline_desc_color);
+        // Lines in the picking pass ignore depth (draw on top of faces).
+        // Back-face culling is done on CPU via normal dot product.
         let render_pipeline_picking_layer = render_pipelines.get_or_create(
             ctx,
             &RenderPipelineDesc {
                 label: "LineRenderer::render_pipeline_picking_layer".into(),
                 fragment_entrypoint: "fs_main_picking_layer".into(),
                 render_targets: smallvec![Some(PickingLayerProcessor::PICKING_LAYER_FORMAT.into())],
-                depth_stencil: PickingLayerProcessor::PICKING_LAYER_DEPTH_STATE,
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: PickingLayerProcessor::PICKING_LAYER_DEPTH_FORMAT,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
                 multisample: PickingLayerProcessor::PICKING_LAYER_MSAA_STATE,
                 ..render_pipeline_desc_color.clone()
             },

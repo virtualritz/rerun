@@ -173,6 +173,12 @@ fn fs_main_picking_layer(in: VertexOut) -> @location(0) vec4u {
     if cov <= 0.5 {
         discard;
     }
+    if batch.picking_layer_object_id.x == 0u && batch.picking_layer_object_id.y == 0u {
+        if in.picking_instance_id.x == 0u && in.picking_instance_id.y == 0u {
+            discard;
+        }
+        return vec4u(in.picking_instance_id, 0u, 0u);
+    }
     return vec4u(batch.picking_layer_object_id, in.picking_instance_id);
 }
 

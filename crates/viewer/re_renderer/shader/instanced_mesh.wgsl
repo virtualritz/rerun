@@ -20,6 +20,9 @@ struct MaterialUniformBuffer {
 @group(1) @binding(1)
 var<uniform> material: MaterialUniformBuffer;
 
+@group(2) @binding(0)
+var<storage, read> selected_ids: array<u32>;
+
 struct VertexOut {
     @builtin(position)
     position: vec4f,
@@ -47,17 +50,6 @@ struct VertexOut {
 
     @location(7) @interpolate(flat)
     hover_element_id: u32,
-
-    @location(8) @interpolate(flat)
-    selected_element_count: u32,
-    @location(9) @interpolate(flat)
-    selected_ids_0: vec4u,
-    @location(10) @interpolate(flat)
-    selected_ids_1: vec4u,
-    @location(11) @interpolate(flat)
-    selected_ids_2: vec4u,
-    @location(12) @interpolate(flat)
-    selected_ids_3: vec4u,
 };
 
 @vertex
@@ -85,21 +77,18 @@ fn vs_main(in_vertex: VertexIn, in_instance: InstanceIn) -> VertexOut {
     out.picking_layer_id = in_instance.picking_layer_id;
     out.element_id = in_vertex.element_id;
     out.hover_element_id = in_instance.hover_element_id;
-    out.selected_element_count = in_instance.selected_element_count;
-    out.selected_ids_0 = in_instance.selected_element_ids_0;
-    out.selected_ids_1 = in_instance.selected_element_ids_1;
-    out.selected_ids_2 = in_instance.selected_element_ids_2;
-    out.selected_ids_3 = in_instance.selected_element_ids_3;
 
     return out;
 }
 
-/// Linear search for `element_id` in up to 16 packed selection IDs.
-fn is_selected(element_id: u32, count: u32, ids0: vec4u, ids1: vec4u, ids2: vec4u, ids3: vec4u) -> bool {
-    for (var i = 0u; i < min(count, 4u); i++) { if ids0[i] == element_id { return true; } }
-    for (var i = 0u; i < min(max(count, 4u) - 4u, 4u); i++) { if ids1[i] == element_id { return true; } }
-    for (var i = 0u; i < min(max(count, 8u) - 8u, 4u); i++) { if ids2[i] == element_id { return true; } }
-    for (var i = 0u; i < min(max(count, 12u) - 12u, 4u); i++) { if ids3[i] == element_id { return true; } }
+/// Check if element_id is in the selection SSBO.
+fn is_selected(element_id: u32) -> bool {
+    let len = arrayLength(&selected_ids);
+    for (var i = 0u; i < len; i++) {
+        if selected_ids[i] == element_id {
+            return true;
+        }
+    }
     return false;
 }
 
@@ -135,7 +124,7 @@ fn fs_main_shaded(in: VertexOut) -> @location(0) vec4f {
     matcap_color *= in.additive_tint_rgba.a;
 
     // Selection tint: blue-ish tint for selected faces.
-    if in.element_id != 0u && in.selected_element_count > 0u && is_selected(in.element_id, in.selected_element_count, in.selected_ids_0, in.selected_ids_1, in.selected_ids_2, in.selected_ids_3) {
+    if in.element_id != 0u && is_selected(in.element_id) {
         matcap_color = matcap_color * vec3f(0.6, 0.85, 1.3);
     }
 

@@ -129,9 +129,9 @@ pub use self::file_system::{FileSystem, get_filesystem};
 use self::file_system::OsFileSystem;
 
 pub mod external {
-    pub use {anyhow, bytemuck, smallvec, wgpu};
     #[cfg(feature = "video")]
     pub use re_video;
+    pub use {anyhow, bytemuck, smallvec, wgpu};
 }
 
 // ---------------------------------------------------------------------------

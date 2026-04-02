@@ -782,17 +782,6 @@ impl ViewBuilder {
         if let Some(picking_processor) = &self.picking_processor {
             {
                 let mut pass = picking_processor.begin_render_pass(&setup.name, &mut encoder);
-                // PickingProcessor has as custom frame uniform buffer.
-                //
-                // TODO(andreas): Formalize this somehow.
-                // Maybe just every processor should have its own and gets abstract information from the view builder to set it up?
-                // … or we change this whole thing again so slice things differently:
-                // 0: Truly view Global: Samplers, time, point conversions, etc.
-                // 1: Phase global (camera & projection goes here)
-                // 2: Specific renderer
-                // 3: Draw call in renderer.
-                //
-                //pass.set_bind_group(0, &setup.bind_group_0, &[]);
                 self.draw_phase_manager.draw(
                     &renderers,
                     &pipelines,

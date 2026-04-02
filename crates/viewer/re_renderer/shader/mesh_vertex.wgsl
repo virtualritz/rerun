@@ -20,10 +20,5 @@ struct InstanceIn {
     @location(11) additive_tint_srgba: vec4f,
     @location(12) picking_layer_id: vec4u,
     @location(13) hover_element_id: u32,
-    @location(14) selected_element_count: u32,
-    @location(15) selected_element_ids_0: vec4u,
-    @location(16) selected_element_ids_1: vec4u,
-    @location(17) selected_element_ids_2: vec4u,
-    @location(18) selected_element_ids_3: vec4u,
-    @location(19) outline_mask_ids: vec2u,
+    @location(14) outline_mask_ids: vec2u,
 };
