@@ -316,6 +316,8 @@ impl<'ctx> ProcMeshDrawableBuilder<'ctx> {
                         None
                     },
                     hover_element_id: 0,
+                    selected_element_ids: [0; 16],
+                    selected_element_count: 0,
                 });
             }
         }

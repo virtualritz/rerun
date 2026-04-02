@@ -98,6 +98,8 @@ impl Mesh3DVisualizer {
                             additive_tint: re_renderer::Color32::BLACK,
                             cull_mode: data.cull_mode,
                             hover_element_id: 0,
+                            selected_element_ids: [0; 16],
+                            selected_element_count: 0,
                         }
                     }));
 

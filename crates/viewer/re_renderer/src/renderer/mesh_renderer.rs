@@ -55,6 +55,13 @@ mod gpu_data {
         /// Compared per-fragment against in_vertex.element_id to apply a tint.
         pub hover_element_id: u32,
 
+        /// Number of valid entries in `selected_element_ids` (max 16).
+        pub selected_element_count: u32,
+
+        /// Element IDs of the currently selected faces (up to 16).
+        /// The shader linear-searches these for per-fragment selection tinting.
+        pub selected_element_ids: [u32; 16],
+
         // Need only the first two bytes, but we want to keep everything aligned to at least 4 bytes.
         // This field must be last in the struct because its vertex format (Uint8x2)
         // reads only 2 bytes, which would cause offset misalignment for any following attribute.
@@ -86,6 +93,16 @@ mod gpu_data {
                         wgpu::VertexFormat::Uint32x4,
                         // Hover element id for face-level hover tinting.
                         wgpu::VertexFormat::Uint32,
+                        // Selected element count.
+                        wgpu::VertexFormat::Uint32,
+                        // Selected element ids [0..4].
+                        wgpu::VertexFormat::Uint32x4,
+                        // Selected element ids [4..8].
+                        wgpu::VertexFormat::Uint32x4,
+                        // Selected element ids [8..12].
+                        wgpu::VertexFormat::Uint32x4,
+                        // Selected element ids [12..16].
+                        wgpu::VertexFormat::Uint32x4,
                         // Outline mask.
                         // This adds a tiny bit of overhead to all instances during non-outline pass, but the alternative is having yet another vertex buffer.
                         // MUST be last: Uint8x2 only reads 2 bytes but the struct field is 4 bytes.
@@ -172,6 +189,13 @@ pub struct GpuMeshInstance {
     /// Element ID of the currently hovered face (0 = no hover).
     /// When non-zero, the fragment shader tints fragments whose `element_id` matches.
     pub hover_element_id: u32,
+
+    /// Element IDs of the currently selected faces (up to 16).
+    /// Overflow gracefully degrades (unhighlighted).
+    pub selected_element_ids: [u32; 16],
+
+    /// Number of valid entries in `selected_element_ids`.
+    pub selected_element_count: u32,
 }
 
 impl GpuMeshInstance {
@@ -185,6 +209,8 @@ impl GpuMeshInstance {
             picking_layer_id: PickingLayerId::default(),
             cull_mode: None,
             hover_element_id: 0,
+            selected_element_ids: [0; 16],
+            selected_element_count: 0,
         }
     }
 }
@@ -348,6 +374,8 @@ impl MeshDrawData {
                         additive_tint: instance.additive_tint,
                         picking_layer_id: instance.picking_layer_id.into(),
                         hover_element_id: instance.hover_element_id,
+                        selected_element_count: instance.selected_element_count,
+                        selected_element_ids: instance.selected_element_ids,
                         outline_mask_ids: instance
                             .outline_mask_ids
                             .0
@@ -906,6 +934,8 @@ mod tests {
             picking_layer_id: PickingLayerId::default(),
             cull_mode: None,
             hover_element_id: 0,
+            selected_element_ids: [0; 16],
+            selected_element_count: 0,
         }
     }
 

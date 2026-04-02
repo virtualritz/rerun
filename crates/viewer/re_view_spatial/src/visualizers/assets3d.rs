@@ -97,6 +97,8 @@ impl Asset3DVisualizer {
                             // TODO(andreas): honor the culling settings from the mesh file if any.
                             cull_mode: Default::default(),
                             hover_element_id: 0,
+                            selected_element_ids: [0; 16],
+                            selected_element_count: 0,
                         }
                     }));
 
