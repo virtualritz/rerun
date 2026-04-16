@@ -50,6 +50,9 @@ struct VertexOut {
 
     @location(7) @interpolate(flat)
     hover_element_id: u32,
+
+    @location(8) @interpolate(flat)
+    selection_tint: vec3f,
 };
 
 @vertex
@@ -77,6 +80,7 @@ fn vs_main(in_vertex: VertexIn, in_instance: InstanceIn) -> VertexOut {
     out.picking_layer_id = in_instance.picking_layer_id;
     out.element_id = in_vertex.element_id;
     out.hover_element_id = in_instance.hover_element_id;
+    out.selection_tint = in_instance.selection_tint;
 
     return out;
 }
@@ -123,14 +127,14 @@ fn fs_main_shaded(in: VertexOut) -> @location(0) vec4f {
     matcap_color += in.additive_tint_rgba.rgb;
     matcap_color *= in.additive_tint_rgba.a;
 
-    // Selection tint: blue-ish tint for selected faces.
+    // Selection tint: blend towards geometry type color.
     if in.element_id != 0u && is_selected(in.element_id) {
-        matcap_color = matcap_color * vec3f(0.6, 0.85, 1.3);
+        matcap_color = mix(matcap_color, in.selection_tint, 0.4);
     }
 
-    // Hover tint: brighten the face under the cursor.
+    // Hover tint: stronger blend towards geometry type color.
     if in.hover_element_id != 0u && in.element_id == in.hover_element_id {
-        matcap_color = matcap_color * 1.35 + vec3f(0.08, 0.08, 0.12);
+        matcap_color = mix(matcap_color, in.selection_tint * 1.3, 0.5);
     }
 
     return vec4f(matcap_color, matcap_sample.a);

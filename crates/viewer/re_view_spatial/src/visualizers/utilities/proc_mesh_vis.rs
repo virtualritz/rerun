@@ -316,7 +316,8 @@ impl<'ctx> ProcMeshDrawableBuilder<'ctx> {
                         None
                     },
                     hover_element_id: 0,
-                                                        });
+                    selection_tint: [0.0; 3],
+                });
             }
         }
 

@@ -184,7 +184,8 @@ impl framework::Example for Picking {
                 outline_mask_ids: Default::default(),
                 cull_mode: None,
                 hover_element_id: 0,
-                                            })
+                selection_tint: [0.0; 3],
+            })
             .collect_vec();
 
         view_builder.queue_draw(
