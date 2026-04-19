@@ -99,6 +99,7 @@ impl framework::Example for Outlines {
                     spacing: 0.1,
                     thickness_ui: 1.0,
                     plane: macaw::Plane3::ZX,
+                    camera_radius: 0.0, // Use default behavior
                 },
             ),
         );

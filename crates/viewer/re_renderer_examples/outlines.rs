@@ -117,6 +117,8 @@ impl framework::Example for Outlines {
                         picking_layer_id: Default::default(),
                         additive_tint: Color32::BLACK,
                         cull_mode: None,
+                        hover_element_id: 0,
+                        selection_tint: [0.0; 3],
                     })
             })
             .collect_vec();

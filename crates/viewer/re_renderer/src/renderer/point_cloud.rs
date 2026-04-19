@@ -199,6 +199,9 @@ pub struct PointCloudBatchInfo {
 
     /// Depth offset applied after projection.
     pub depth_offset: DepthOffset,
+
+    /// When true, this batch only participates in the picking layer pass.
+    pub picking_only: bool,
 }
 
 impl Default for PointCloudBatchInfo {
@@ -213,6 +216,7 @@ impl Default for PointCloudBatchInfo {
             additional_outline_mask_ids_vertex_ranges: Vec::new(),
             picking_object_id: Default::default(),
             depth_offset: 0,
+            picking_only: false,
         }
     }
 }
@@ -264,6 +268,7 @@ impl PointCloudDrawData {
             additional_outline_mask_ids_vertex_ranges: Vec::new(),
             picking_object_id: Default::default(),
             depth_offset: 0,
+            picking_only: false,
         }];
         let batches = if batches.is_empty() {
             &fallback_batches
@@ -387,7 +392,11 @@ impl PointCloudDrawData {
             for (batch_info, uniform_buffer_binding) in batches.iter().zip(uniform_buffer_bindings)
             {
                 let point_vertex_range_end = start_point_for_next_batch + batch_info.point_count;
-                let mut active_phases = enum_set![DrawPhase::Opaque | DrawPhase::PickingLayer];
+                let mut active_phases = if batch_info.picking_only {
+                    enum_set![DrawPhase::PickingLayer]
+                } else {
+                    enum_set![DrawPhase::Opaque | DrawPhase::PickingLayer]
+                };
                 // Does the entire batch participate in the outline mask phase?
                 if batch_info.overall_outline_mask_ids.is_some() {
                     active_phases.insert(DrawPhase::OutlineMask);
@@ -591,13 +600,21 @@ impl Renderer for PointCloudRenderer {
         };
         let render_pipeline_color =
             render_pipelines.get_or_create(ctx, &render_pipeline_desc_color);
+        // Points in the picking pass ignore depth (draw on top of everything).
+        // Back-face culling is done on CPU via normal dot product.
         let render_pipeline_picking_layer = render_pipelines.get_or_create(
             ctx,
             &RenderPipelineDesc {
                 label: "PointCloudRenderer::render_pipeline_picking_layer".into(),
                 fragment_entrypoint: "fs_main_picking_layer".into(),
                 render_targets: smallvec![Some(PickingLayerProcessor::PICKING_LAYER_FORMAT.into())],
-                depth_stencil: PickingLayerProcessor::PICKING_LAYER_DEPTH_STATE,
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: PickingLayerProcessor::PICKING_LAYER_DEPTH_FORMAT,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
                 multisample: PickingLayerProcessor::PICKING_LAYER_MSAA_STATE,
                 ..render_pipeline_desc_color.clone()
             },

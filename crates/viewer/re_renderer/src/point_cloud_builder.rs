@@ -284,6 +284,13 @@ impl PointCloudBatchBuilder<'_, '_> {
         self
     }
 
+    /// Mark this batch as picking-only (skip opaque pass).
+    #[inline]
+    pub fn picking_only(mut self, picking_only: bool) -> Self {
+        self.batch_mut().picking_only = picking_only;
+        self
+    }
+
     /// Pushes additional outline mask ids for a specific range of points.
     /// The range is relative to this batch.
     ///

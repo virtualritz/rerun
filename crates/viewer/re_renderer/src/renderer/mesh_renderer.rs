@@ -17,8 +17,9 @@ use crate::mesh::{GpuMesh, mesh_vertices};
 use crate::renderer::{DrawDataDrawable, DrawInstruction, DrawableCollectionViewInfo};
 use crate::view_builder::ViewBuilder;
 use crate::wgpu_resources::{
-    BindGroupLayoutDesc, BufferDesc, GpuBindGroupLayoutHandle, GpuBuffer, GpuRenderPipelineHandle,
-    GpuRenderPipelinePoolAccessor, PipelineLayoutDesc, RenderPipelineDesc,
+    BindGroupDesc, BindGroupEntry, BindGroupLayoutDesc, BufferDesc, GpuBindGroup,
+    GpuBindGroupLayoutHandle, GpuBuffer, GpuRenderPipelineHandle, GpuRenderPipelinePoolAccessor,
+    PipelineLayoutDesc, RenderPipelineDesc,
 };
 use crate::{
     Color32, CpuWriteGpuReadError, DrawableCollector, OutlineMaskPreference, PickingLayerId,
@@ -51,7 +52,17 @@ mod gpu_data {
 
         pub picking_layer_id: [u32; 4],
 
+        /// Element ID of the currently hovered face (0 = no hover).
+        /// Compared per-fragment against in_vertex.element_id to apply a tint.
+        pub hover_element_id: u32,
+
+        /// RGB tint color for selection/hover highlighting.
+        /// Applied to selected and hovered fragments (geometry type color).
+        pub selection_tint: [f32; 3],
+
         // Need only the first two bytes, but we want to keep everything aligned to at least 4 bytes.
+        // This field must be last in the struct because its vertex format (Uint8x2)
+        // reads only 2 bytes, which would cause offset misalignment for any following attribute.
         pub outline_mask_ids: [u8; 4],
     }
 
@@ -78,8 +89,13 @@ mod gpu_data {
                         // Picking id.
                         // Again this adds overhead for non-picking passes, more this time. Consider moving this elsewhere.
                         wgpu::VertexFormat::Uint32x4,
+                        // Hover element id for face-level hover tinting.
+                        wgpu::VertexFormat::Uint32,
+                        // Selection tint RGB color.
+                        wgpu::VertexFormat::Float32x3,
                         // Outline mask.
                         // This adds a tiny bit of overhead to all instances during non-outline pass, but the alternative is having yet another vertex buffer.
+                        // MUST be last: Uint8x2 only reads 2 bytes but the struct field is 4 bytes.
                         wgpu::VertexFormat::Uint8x2,
                     ]
                     .into_iter(),
@@ -119,6 +135,8 @@ pub struct MeshDrawData {
     // instance range on every instanced draw call!
     instance_buffer: Option<GpuBuffer>,
     batches: Vec<MeshBatch>,
+    /// Bind group for the selection SSBO (group 2). Contains selected element IDs.
+    selection_bind_group: Option<GpuBindGroup>,
 }
 
 impl DrawData for MeshDrawData {
@@ -159,6 +177,13 @@ pub struct GpuMeshInstance {
     /// Controls face culling for this instance.
     /// `None` means no culling (show both faces), matching `wgpu::PrimitiveState::cull_mode`.
     pub cull_mode: Option<wgpu::Face>,
+
+    /// Element ID of the currently hovered face (0 = no hover).
+    /// When non-zero, the fragment shader tints fragments whose `element_id` matches.
+    pub hover_element_id: u32,
+
+    /// RGB tint color for selection/hover highlighting (geometry type color).
+    pub selection_tint: [f32; 3],
 }
 
 impl GpuMeshInstance {
@@ -171,6 +196,8 @@ impl GpuMeshInstance {
             outline_mask_ids: OutlineMaskPreference::NONE,
             picking_layer_id: PickingLayerId::default(),
             cull_mode: None,
+            hover_element_id: 0,
+            selection_tint: [0.0; 3],
         }
     }
 }
@@ -228,6 +255,7 @@ impl MeshDrawData {
             return Ok(Self {
                 batches: Vec::new(),
                 instance_buffer: None,
+                selection_bind_group: None,
             });
         }
 
@@ -332,11 +360,13 @@ impl MeshDrawData {
                         world_from_mesh_normal_row_1: world_from_mesh_normal.row(1).to_array(),
                         world_from_mesh_normal_row_2: world_from_mesh_normal.row(2).to_array(),
                         additive_tint: instance.additive_tint,
+                        picking_layer_id: instance.picking_layer_id.into(),
+                        hover_element_id: instance.hover_element_id,
+                        selection_tint: instance.selection_tint,
                         outline_mask_ids: instance
                             .outline_mask_ids
                             .0
                             .map_or([0, 0, 0, 0], |mask| [mask[0], mask[1], 0, 0]),
-                        picking_layer_id: instance.picking_layer_id.into(),
                     })?;
 
                     // Transparent instances can not be batched.
@@ -407,7 +437,53 @@ impl MeshDrawData {
         Ok(Self {
             batches,
             instance_buffer: Some(instance_buffer),
+            selection_bind_group: None,
         })
+    }
+
+    /// Create draw data with a selection SSBO for per-face selection tinting.
+    ///
+    /// `selected_ids` contains encoded pick IDs of selected faces. The shader
+    /// searches this buffer to determine if a fragment should be tinted.
+    pub fn new_with_selection(
+        ctx: &RenderContext,
+        instances: &[GpuMeshInstance],
+        selected_ids: &[u32],
+    ) -> Result<Self, CpuWriteGpuReadError> {
+        let mut draw_data = Self::new(ctx, instances)?;
+
+        if !selected_ids.is_empty() {
+            let mesh_renderer = ctx.renderer::<MeshRenderer>();
+
+            // Create and upload the selection buffer.
+            let buffer = ctx.gpu_resources.buffers.alloc(
+                &ctx.device,
+                &BufferDesc {
+                    label: "MeshDrawData::selection_buffer".into(),
+                    size: (selected_ids.len() * std::mem::size_of::<u32>()) as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                },
+            );
+            ctx.queue
+                .write_buffer(&buffer, 0, bytemuck::cast_slice(selected_ids));
+
+            draw_data.selection_bind_group = Some(ctx.gpu_resources.bind_groups.alloc(
+                &ctx.device,
+                &ctx.gpu_resources,
+                &BindGroupDesc {
+                    label: "MeshDrawData::selection_bind_group".into(),
+                    entries: smallvec![BindGroupEntry::Buffer {
+                        handle: buffer.handle,
+                        offset: 0,
+                        size: None,
+                    }],
+                    layout: mesh_renderer.selection_bind_group_layout,
+                },
+            ));
+        }
+
+        Ok(draw_data)
     }
 }
 
@@ -428,6 +504,9 @@ pub struct MeshRenderer {
     rp_outline_mask_cull_front: GpuRenderPipelineHandle,
 
     pub bind_group_layout: GpuBindGroupLayoutHandle,
+    pub selection_bind_group_layout: GpuBindGroupLayoutHandle,
+    /// Default empty selection bind group (single zero u32).
+    default_selection_bind_group: GpuBindGroup,
 }
 
 impl Renderer for MeshRenderer {
@@ -468,11 +547,57 @@ impl Renderer for MeshRenderer {
                 ],
             },
         );
+        // Selection SSBO bind group (group 2): storage buffer of selected element IDs.
+        let selection_bind_group_layout = ctx.gpu_resources.bind_group_layouts.get_or_create(
+            &ctx.device,
+            &BindGroupLayoutDesc {
+                label: "MeshRenderer::selection_bind_group_layout".into(),
+                entries: vec![wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(4),
+                    },
+                    count: None,
+                }],
+            },
+        );
+
+        // Default empty selection buffer (single zero).
+        let empty_selection_buffer = ctx.gpu_resources.buffers.alloc(
+            &ctx.device,
+            &BufferDesc {
+                label: "MeshRenderer::empty_selection_buffer".into(),
+                size: 4,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            },
+        );
+        let default_selection_bind_group = ctx.gpu_resources.bind_groups.alloc(
+            &ctx.device,
+            &ctx.gpu_resources,
+            &BindGroupDesc {
+                label: "MeshRenderer::default_selection_bind_group".into(),
+                entries: smallvec![BindGroupEntry::Buffer {
+                    handle: empty_selection_buffer.handle,
+                    offset: 0,
+                    size: None,
+                }],
+                layout: selection_bind_group_layout,
+            },
+        );
+
         let pipeline_layout = ctx.gpu_resources.pipeline_layouts.get_or_create(
             ctx,
             &PipelineLayoutDesc {
                 label: "MeshRenderer::pipeline_layout".into(),
-                entries: vec![ctx.global_bindings.layout, bind_group_layout],
+                entries: vec![
+                    ctx.global_bindings.layout,
+                    bind_group_layout,
+                    selection_bind_group_layout,
+                ],
             },
         );
 
@@ -637,6 +762,8 @@ impl Renderer for MeshRenderer {
             rp_outline_mask_cull_back,
             rp_outline_mask_cull_front,
             bind_group_layout,
+            selection_bind_group_layout,
+            default_selection_bind_group,
         }
     }
 
@@ -667,6 +794,13 @@ impl Renderer for MeshRenderer {
             };
             pass.set_vertex_buffer(0, instance_buffer.slice(..));
 
+            // Set selection SSBO bind group (group 2).
+            let selection_bg = draw_data
+                .selection_bind_group
+                .as_ref()
+                .unwrap_or(&self.default_selection_bind_group);
+            pass.set_bind_group(2, selection_bg, &[]);
+
             for drawable in *drawables {
                 let mesh_batch = &draw_data.batches[drawable.draw_data_payload as usize];
 
@@ -692,6 +826,11 @@ impl Renderer for MeshRenderer {
                     4,
                     vertex_buffer_combined
                         .slice(mesh_batch.mesh.vertex_buffer_texcoord_range.clone()),
+                );
+                pass.set_vertex_buffer(
+                    5,
+                    vertex_buffer_combined
+                        .slice(mesh_batch.mesh.vertex_buffer_element_ids_range.clone()),
                 );
                 pass.set_index_buffer(
                     index_buffer.slice(mesh_batch.mesh.index_buffer_range.clone()),
@@ -837,6 +976,7 @@ mod tests {
             vertex_colors: vec![Rgba32Unmul::WHITE; 3],
             vertex_normals: vec![glam::Vec3::new(0.0, 0.0, 1.0); 3],
             vertex_texcoords: vec![glam::Vec2::ZERO; 3],
+            vertex_element_ids: None,
             materials,
             bbox,
         };
@@ -884,6 +1024,8 @@ mod tests {
             outline_mask_ids: OutlineMaskPreference::NONE,
             picking_layer_id: PickingLayerId::default(),
             cull_mode: None,
+            hover_element_id: 0,
+            selection_tint: [0.0; 3],
         }
     }
 

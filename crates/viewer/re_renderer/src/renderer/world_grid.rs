@@ -23,6 +23,11 @@ pub struct WorldGridConfiguration {
 
     /// How thick the lines are in UI units.
     pub thickness_ui: f32,
+
+    /// Camera orbit radius (distance from camera to focus point).
+    /// Used for stable grid scaling that doesn't change with camera tilt.
+    /// If 0.0, falls back to camera height above plane.
+    pub camera_radius: f32,
 }
 
 mod gpu_data {
@@ -43,7 +48,10 @@ mod gpu_data {
         /// Radius of the lines in UI units.
         pub thickness_ui: f32,
 
-        pub _padding: [f32; 2],
+        /// Camera orbit radius for stable grid scaling.
+        pub camera_radius: f32,
+
+        pub _padding: f32,
         pub end_padding: [wgpu_buffer_types::PaddingRow; 16 - 3],
     }
 }
@@ -93,6 +101,7 @@ impl WorldGridDrawData {
                 plane: config.plane.as_vec4().into(),
                 spacing: config.spacing,
                 thickness_ui: config.thickness_ui,
+                camera_radius: config.camera_radius,
                 _padding: Default::default(),
                 end_padding: Default::default(),
             },

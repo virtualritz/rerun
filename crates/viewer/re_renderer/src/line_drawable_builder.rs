@@ -111,6 +111,13 @@ impl<'ctx> LineBatchBuilder<'_, 'ctx> {
             .expect("batch should have been added on PointCloudBatchBuilder creation")
     }
 
+    /// Mark this batch as picking-only (skip opaque pass).
+    #[inline]
+    pub fn picking_only(mut self, picking_only: bool) -> Self {
+        self.batch_mut().picking_only = picking_only;
+        self
+    }
+
     fn add_vertices(
         &mut self,
         points: impl ExactSizeIterator<Item = glam::Vec3>,

@@ -86,6 +86,7 @@ pub fn load_obj_from_buffer(
             vertex_colors,
             vertex_normals,
             vertex_texcoords,
+            vertex_element_ids: None,
             bbox,
 
             // TODO(andreas): proper material loading
@@ -94,6 +95,7 @@ pub fn load_obj_from_buffer(
                 index_range: 0..mesh.indices.len() as u32,
                 albedo: texture.clone(),
                 albedo_factor: crate::Rgba::WHITE,
+                use_matcap: false,
             }],
         };
 

@@ -588,6 +588,7 @@ fn generate_solid(key: &ProcMeshKey, render_ctx: &RenderContext) -> Result<Solid
                 // Colors are black so that the instance `additive_tint` can set per-instance color.
                 vertex_colors: vec![re_renderer::Rgba32Unmul::BLACK; num_vertices],
                 vertex_texcoords: vec![glam::Vec2::ZERO; num_vertices],
+                vertex_element_ids: None,
 
                 materials,
 
@@ -741,6 +742,7 @@ fn mesh_from_mesh_gen(
         // Colors are black so that the instance `additive_tint` can set per-instance color.
         vertex_colors: vec![re_renderer::Rgba32Unmul::BLACK; num_vertices],
         vertex_texcoords: vec![glam::Vec2::ZERO; num_vertices],
+        vertex_element_ids: None,
         bbox,
     }
 }

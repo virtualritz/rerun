@@ -268,6 +268,7 @@ fn import_mesh(
             index_range: index_offset..triangle_indices.len() as u32 * 3,
             albedo,
             albedo_factor,
+            use_matcap: false,
         });
     }
     if vertex_positions.is_empty() || triangle_indices.is_empty() {
@@ -283,6 +284,7 @@ fn import_mesh(
         vertex_colors,
         vertex_normals,
         vertex_texcoords,
+        vertex_element_ids: None,
         materials,
         bbox,
     };

@@ -222,6 +222,7 @@ fn import_geometry(
             index_range: vertex_offset..vertex_offset + group_vertex_count,
             albedo: ctx.texture_manager_2d.white_texture_unorm_handle().clone(),
             albedo_factor,
+            use_matcap: false,
         });
     }
 
@@ -236,6 +237,7 @@ fn import_geometry(
         vertex_normals: bytemuck::cast_vec(normals),
         vertex_colors: vec![Rgba32Unmul::WHITE; num_vertices],
         vertex_texcoords: bytemuck::cast_vec(texcoords),
+        vertex_element_ids: None,
         materials,
         bbox,
     };
