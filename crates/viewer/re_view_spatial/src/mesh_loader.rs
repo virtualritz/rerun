@@ -183,6 +183,7 @@ impl LoadedMesh {
             vertex_colors,
             vertex_normals,
             vertex_texcoords,
+            vertex_element_ids: None,
             materials: smallvec::smallvec![re_renderer::mesh::Material {
                 label: name.to_owned().into(),
                 index_range: re_span::Span::from_start_len(0, num_indices as _),

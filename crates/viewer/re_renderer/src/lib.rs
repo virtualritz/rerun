@@ -44,6 +44,7 @@ pub mod renderer;
 pub mod resource_managers;
 pub mod texture_info;
 pub mod texture_readback;
+#[cfg(feature = "video")]
 pub mod video;
 pub mod view_builder;
 pub mod wgpu_buffer_types;
@@ -149,7 +150,9 @@ pub use self::file_system::{FileSystem, get_filesystem};
 use self::file_system::OsFileSystem;
 
 pub mod external {
-    pub use {anyhow, bytemuck, re_video, smallvec, wgpu};
+    #[cfg(feature = "video")]
+    pub use re_video;
+    pub use {anyhow, bytemuck, smallvec, wgpu};
 }
 
 // ---------------------------------------------------------------------------

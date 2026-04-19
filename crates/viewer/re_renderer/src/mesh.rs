@@ -1,5 +1,5 @@
-use re_span::Span;
 use std::mem::size_of;
+use std::ops::Range;
 
 use ecolor::Rgba;
 use smallvec::{SmallVec, smallvec};
@@ -26,6 +26,7 @@ pub mod mesh_vertices {
                 wgpu::VertexFormat::Unorm8x4,  // RGBA
                 wgpu::VertexFormat::Float32x3, // normal
                 wgpu::VertexFormat::Float32x2, // texcoord
+                wgpu::VertexFormat::Uint32,    // element_id (for picking)
             ]
             .into_iter(),
         )
@@ -66,6 +67,11 @@ pub struct CpuMesh {
     /// Must be equal in length to [`Self::vertex_positions`].
     pub vertex_texcoords: Vec<glam::Vec2>,
 
+    /// Optional per-vertex element ID for face-level picking.
+    /// When `Some`, must be equal in length to [`Self::vertex_positions`].
+    /// A value of 0 means "no element ID" and falls back to instance picking.
+    pub vertex_element_ids: Option<Vec<u32>>,
+
     pub materials: SmallVec<[Material; 1]>,
 
     /// Object space bounding box.
@@ -84,6 +90,7 @@ impl CpuMesh {
             vertex_colors,
             vertex_normals,
             vertex_texcoords,
+            vertex_element_ids,
             materials: _,
             bbox,
         } = self;
@@ -107,6 +114,14 @@ impl CpuMesh {
                 num_pos,
                 num_texcoords,
             });
+        }
+        if let Some(element_ids) = vertex_element_ids {
+            if num_pos != element_ids.len() {
+                return Err(MeshError::WrongNumberOfElementIds {
+                    num_pos,
+                    num_element_ids: element_ids.len(),
+                });
+            }
         }
         if self.vertex_positions.is_empty() {
             return Err(MeshError::ZeroVertices);
@@ -154,6 +169,14 @@ pub enum MeshError {
         num_texcoords: usize,
     },
 
+    #[error(
+        "Number of vertex positions {num_pos} differed from the number of vertex element IDs {num_element_ids}"
+    )]
+    WrongNumberOfElementIds {
+        num_pos: usize,
+        num_element_ids: usize,
+    },
+
     #[error("Mesh has no vertices.")]
     ZeroVertices,
 
@@ -168,9 +191,6 @@ pub enum MeshError {
 
     #[error(transparent)]
     CpuWriteGpuReadError(#[from] crate::allocator::CpuWriteGpuReadError),
-
-    #[error(transparent)]
-    Renderer(#[from] crate::RendererRegistrationError),
 }
 
 const _: () = assert!(
@@ -183,14 +203,19 @@ pub struct Material {
     pub label: Label,
 
     /// Index range within the owning [`CpuMesh`] that should be rendered with this material.
-    pub index_range: Span<u32>,
+    pub index_range: Range<u32>,
 
     /// Base color texture, also known as albedo.
+    /// When `use_matcap` is true, this should be a matcap texture.
     /// (not optional, needs to be at least a 1pix texture with a color!)
     pub albedo: GpuTexture2D,
 
     /// Factor applied to the decoded albedo color.
     pub albedo_factor: Rgba,
+
+    /// If true, uses the albedo texture as a matcap for view-dependent lighting.
+    /// The texture is sampled using view-space normals instead of UV coordinates.
+    pub use_matcap: bool,
 }
 
 #[derive(Clone)]
@@ -202,12 +227,13 @@ pub struct GpuMesh {
     /// Buffer for all vertex data, subdivided in several sections for different vertex buffer bindings.
     /// See [`mesh_vertices`]
     pub vertex_buffer_combined: GpuBuffer,
-    pub vertex_buffer_positions_range: Span<u64>,
-    pub vertex_buffer_colors_range: Span<u64>,
-    pub vertex_buffer_normals_range: Span<u64>,
-    pub vertex_buffer_texcoord_range: Span<u64>,
+    pub vertex_buffer_positions_range: Range<u64>,
+    pub vertex_buffer_colors_range: Range<u64>,
+    pub vertex_buffer_normals_range: Range<u64>,
+    pub vertex_buffer_texcoord_range: Range<u64>,
+    pub vertex_buffer_element_ids_range: Range<u64>,
 
-    pub index_buffer_range: Span<u64>,
+    pub index_buffer_range: Range<u64>,
 
     /// Every mesh has at least one material.
     pub materials: SmallVec<[GpuMaterial; 1]>,
@@ -228,7 +254,7 @@ impl GpuMesh {
 #[derive(Clone)]
 pub struct GpuMaterial {
     /// Index range within the owning [`CpuMesh`] that should be rendered with this material.
-    pub index_range: Span<u32>,
+    pub index_range: Range<u32>,
 
     pub bind_group: GpuBindGroup,
 
@@ -255,14 +281,26 @@ pub(crate) mod gpu_data {
     pub struct MaterialUniformBuffer {
         albedo_factor: ecolor::Rgba,
         texture_format: wgpu_buffer_types::U32RowPadded,
-        end_padding: [wgpu_buffer_types::PaddingRow; 16 - 2],
+        /// 1 = use matcap texture for lighting, 0 = use standard shading
+        use_matcap: wgpu_buffer_types::U32RowPadded,
+        end_padding: [wgpu_buffer_types::PaddingRow; 16 - 3],
     }
 
     impl MaterialUniformBuffer {
+        #[allow(dead_code)]
         pub fn new(albedo_factor: ecolor::Rgba, texture_format: TextureFormat) -> Self {
+            Self::with_matcap(albedo_factor, texture_format, false)
+        }
+
+        pub fn with_matcap(
+            albedo_factor: ecolor::Rgba,
+            texture_format: TextureFormat,
+            use_matcap: bool,
+        ) -> Self {
             Self {
                 albedo_factor,
                 texture_format: (texture_format as u32).into(),
+                use_matcap: (use_matcap as u32).into(),
                 end_padding: Default::default(),
             }
         }
@@ -288,9 +326,14 @@ impl GpuMesh {
         let vb_color_size = (data.vertex_colors.len() * size_of::<Rgba32Unmul>()) as u64;
         let vb_normals_size = (data.vertex_normals.len() * size_of::<glam::Vec3>()) as u64;
         let vb_texcoords_size = (data.vertex_texcoords.len() * size_of::<glam::Vec2>()) as u64;
+        // Always allocate space for element IDs (zeros when not present) to keep buffer layout consistent.
+        let vb_element_ids_size = (data.vertex_positions.len() * size_of::<u32>()) as u64;
 
-        let vb_combined_size =
-            vb_positions_size + vb_color_size + vb_normals_size + vb_texcoords_size;
+        let vb_combined_size = vb_positions_size
+            + vb_color_size
+            + vb_normals_size
+            + vb_texcoords_size
+            + vb_element_ids_size;
 
         let pools = &ctx.gpu_resources;
         let device = &ctx.device;
@@ -315,6 +358,12 @@ impl GpuMesh {
             staging_buffer.extend_from_slice(bytemuck::cast_slice(&data.vertex_colors))?;
             staging_buffer.extend_from_slice(bytemuck::cast_slice(&data.vertex_normals))?;
             staging_buffer.extend_from_slice(bytemuck::cast_slice(&data.vertex_texcoords))?;
+            if let Some(element_ids) = &data.vertex_element_ids {
+                staging_buffer.extend_from_slice(bytemuck::cast_slice(element_ids))?;
+            } else {
+                let zeros = vec![0u32; data.vertex_positions.len()];
+                staging_buffer.extend_from_slice(bytemuck::cast_slice(&zeros))?;
+            }
             staging_buffer.copy_to_buffer(
                 ctx.active_frame.before_view_builder_encoder.lock().get(),
                 &vertex_buffer_combined,
@@ -354,13 +403,14 @@ impl GpuMesh {
                 ctx,
                 format!("{} - material uniforms", data.label).into(),
                 data.materials.iter().map(|material| {
-                    gpu_data::MaterialUniformBuffer::new(
+                    gpu_data::MaterialUniformBuffer::with_matcap(
                         material.albedo_factor,
                         if material.albedo.texture.format().components() == 1 {
                             gpu_data::TextureFormat::Grayscale
                         } else {
                             gpu_data::TextureFormat::Rgba
                         },
+                        material.use_matcap,
                     )
                 }),
             );
@@ -368,10 +418,10 @@ impl GpuMesh {
             let mut materials = SmallVec::with_capacity(data.materials.len());
 
             // The bind group layout must be in sync with the mesh renderer.
-            let mesh_bind_group_layout = ctx.renderer::<MeshRenderer>()?.bind_group_layout;
+            let mesh_bind_group_layout = ctx.renderer::<MeshRenderer>().bind_group_layout;
 
             for (material, uniform_buffer_binding) in
-                std::iter::zip(&data.materials, uniform_buffer_bindings)
+                data.materials.iter().zip(uniform_buffer_bindings)
             {
                 let bind_group = pools.bind_groups.alloc(
                     device,
@@ -390,7 +440,7 @@ impl GpuMesh {
                 let is_transparent = material.albedo_factor.a() < 1.0;
 
                 materials.push(GpuMaterial {
-                    index_range: material.index_range,
+                    index_range: material.index_range.clone(),
                     bind_group,
                     has_transparency: is_transparent,
                 });
@@ -401,15 +451,17 @@ impl GpuMesh {
         let vb_colors_start = vb_positions_size;
         let vb_normals_start = vb_colors_start + vb_color_size;
         let vb_texcoord_start = vb_normals_start + vb_normals_size;
+        let vb_element_ids_start = vb_texcoord_start + vb_texcoords_size;
 
         Ok(Self {
             index_buffer,
             vertex_buffer_combined,
-            vertex_buffer_positions_range: Span::from_start_end(0, vb_positions_size),
-            vertex_buffer_colors_range: Span::from_start_end(vb_colors_start, vb_normals_start),
-            vertex_buffer_normals_range: Span::from_start_end(vb_normals_start, vb_texcoord_start),
-            vertex_buffer_texcoord_range: Span::from_start_end(vb_texcoord_start, vb_combined_size),
-            index_buffer_range: Span::from_start_end(0, index_buffer_size),
+            vertex_buffer_positions_range: 0..vb_positions_size,
+            vertex_buffer_colors_range: vb_colors_start..vb_normals_start,
+            vertex_buffer_normals_range: vb_normals_start..vb_texcoord_start,
+            vertex_buffer_texcoord_range: vb_texcoord_start..vb_element_ids_start,
+            vertex_buffer_element_ids_range: vb_element_ids_start..vb_combined_size,
+            index_buffer_range: 0..index_buffer_size,
             materials,
             bbox: data.bbox,
         })

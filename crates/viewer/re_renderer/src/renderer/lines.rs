@@ -76,10 +76,10 @@
 //!
 
 use std::num::NonZeroU64;
+use std::ops::Range;
 
 use bitflags::bitflags;
 use enumset::{EnumSet, enum_set};
-use re_span::Span;
 use re_tracing::profile_function;
 use smallvec::smallvec;
 
@@ -153,15 +153,7 @@ pub mod gpu_data {
     #[repr(C)]
     #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
     pub struct DrawDataUniformBuffer {
-        pub radius_boost_in_ui_points: f32,
-
-        /// Bitmask of [`super::LineDrawDataFlags`].
-        ///
-        /// Keep in sync with the `FLAG_*` constants in `lines.wgsl`.
-        pub flags: u32,
-
-        pub _padding: [u32; 2],
-
+        pub radius_boost_in_ui_points: wgpu_buffer_types::F32RowPadded,
         pub end_padding: [wgpu_buffer_types::PaddingRow; 16 - 1],
     }
 
@@ -186,7 +178,7 @@ pub mod gpu_data {
 #[derive(Clone)]
 struct LineStripBatch {
     bind_group: GpuBindGroup,
-    vertex_range: Span<u32>,
+    vertex_range: Range<u32>,
     active_phases: EnumSet<DrawPhase>,
 }
 
@@ -207,7 +199,7 @@ impl DrawData for LineDrawData {
         _view_info: &DrawableCollectionViewInfo,
         collector: &mut DrawableCollector<'_>,
     ) {
-        // TODO(#1611): transparency, split drawables for some semblance of transparency ordering.
+        // TODO(#1611): transparency, split drawables for some semblence of transparency ordering.
         // TODO(#1025, #4787): Better handling of 2D objects.
 
         for (batch_idx, batch) in self.batches.iter().enumerate() {
@@ -216,7 +208,6 @@ impl DrawData for LineDrawData {
                 DrawDataDrawable {
                     // TODO(andreas): Don't have distance information yet. For now just always draw lines last since they're quite expensive.
                     distance_sort_key: f32::MAX,
-                    secondary_sort_key: 0.0,
                     draw_data_payload: batch_idx as _,
                 },
             );
@@ -232,29 +223,29 @@ bitflags! {
     #[derive(Copy, Clone, Default, bytemuck::Pod, bytemuck::Zeroable)]
     pub struct LineStripFlags : u8 {
         /// Puts a equilateral triangle at the end of the line strip (excludes other end caps).
-        const STRIP_FLAG_CAP_END_TRIANGLE = 0b0000_0001;
+        const FLAG_CAP_END_TRIANGLE = 0b0000_0001;
 
         /// Adds a round cap at the end of a line strip (excludes other end caps).
-        const STRIP_FLAG_CAP_END_ROUND = 0b0000_0010;
+        const FLAG_CAP_END_ROUND = 0b0000_0010;
 
         /// By default, line caps end at the last/first position of the line strip.
         /// This flag makes end caps extend outwards.
-        const STRIP_FLAG_CAP_END_EXTEND_OUTWARDS = 0b0000_0100;
+        const FLAG_CAP_END_EXTEND_OUTWARDS = 0b0000_0100;
 
         /// Puts a equilateral triangle at the start of the line strip (excludes other start caps).
-        const STRIP_FLAG_CAP_START_TRIANGLE = 0b0000_1000;
+        const FLAG_CAP_START_TRIANGLE = 0b0000_1000;
 
         /// Adds a round cap at the start of a line strip (excludes other start caps).
-        const STRIP_FLAG_CAP_START_ROUND = 0b0001_0000;
+        const FLAG_CAP_START_ROUND = 0b0001_0000;
 
         /// By default, line caps end at the last/first position of the line strip.
         /// This flag makes end caps extend outwards.
-        const STRIP_FLAG_CAP_START_EXTEND_OUTWARDS = 0b0010_0000;
+        const FLAG_CAP_START_EXTEND_OUTWARDS = 0b0010_0000;
 
         /// Enable color gradient across the line.
         ///
         /// TODO(andreas): Could be moved to per batch flags.
-        const STRIP_FLAG_COLOR_GRADIENT = 0b0100_0000;
+        const FLAG_COLOR_GRADIENT = 0b0100_0000;
 
         /// Forces spanning the line's quads as-if the camera was orthographic.
         ///
@@ -263,30 +254,14 @@ bitflags! {
         /// Note that since distances to the camera are computed differently in orthographic mode, this changes how screen space sizes are computed.
         ///
         /// TODO(andreas): Could be moved to per batch flags.
-        const STRIP_FLAG_FORCE_ORTHO_SPANNING = 0b1000_0000;
+        const FLAG_FORCE_ORTHO_SPANNING = 0b1000_0000;
 
         /// Combination of flags to extend lines outwards with round caps.
-        const STRIP_FLAGS_OUTWARD_EXTENDING_ROUND_CAPS =
-            LineStripFlags::STRIP_FLAG_CAP_START_ROUND.bits() |
-            LineStripFlags::STRIP_FLAG_CAP_END_ROUND.bits() |
-            LineStripFlags::STRIP_FLAG_CAP_START_EXTEND_OUTWARDS.bits() |
-            LineStripFlags::STRIP_FLAG_CAP_END_EXTEND_OUTWARDS.bits();
-    }
-}
-
-bitflags! {
-    /// Flags that apply to a whole [`LineDrawData`] (i.e. one builder's worth of lines).
-    ///
-    /// Needs to be kept in sync with `lines.wgsl`.
-    #[repr(C)]
-    #[derive(Copy, Clone, Default, bytemuck::Pod, bytemuck::Zeroable)]
-    pub struct LineDrawDataFlags : u32 {
-        /// The fragment shader emits premultiplied alpha (`rgb * coverage`, `alpha * coverage`)
-        /// instead of the alpha-to-coverage form (`rgb`, `coverage`).
-        ///
-        /// Used together with the alpha-blended pipeline; see
-        /// [`LineDrawableBuilder::enable_alpha_blending`].
-        const DRAW_FLAG_PREMULTIPLIED_ALPHA = 0b0000_0001;
+        const FLAGS_OUTWARD_EXTENDING_ROUND_CAPS =
+            LineStripFlags::FLAG_CAP_START_ROUND.bits() |
+            LineStripFlags::FLAG_CAP_END_ROUND.bits() |
+            LineStripFlags::FLAG_CAP_START_EXTEND_OUTWARDS.bits() |
+            LineStripFlags::FLAG_CAP_END_EXTEND_OUTWARDS.bits();
     }
 }
 
@@ -316,7 +291,7 @@ pub struct LineBatchInfo {
     /// Having many of these individual outline masks can be slow as they require each their own uniform buffer & draw call.
     /// This feature is meant for a limited number of "extra selections"
     /// If an overall mask is defined as well, the per-vertex-range masks is overwriting the overall mask.
-    pub additional_outline_mask_ids_vertex_ranges: Vec<(Span<u32>, OutlineMaskPreference)>,
+    pub additional_outline_mask_ids_vertex_ranges: Vec<(Range<u32>, OutlineMaskPreference)>,
 
     /// Picking object id that applies for the entire batch.
     pub picking_object_id: PickingLayerObjectId,
@@ -335,6 +310,11 @@ pub struct LineBatchInfo {
     /// This controls how wide the triangle/arrow-head is orthogonal to the line's direction.
     /// (defaults to 2.0)
     pub triangle_cap_width_factor: f32,
+
+    /// When true, this batch only participates in the picking layer pass,
+    /// not the opaque pass. Prevents picking-only geometry from rendering
+    /// visibly.
+    pub picking_only: bool,
 }
 
 impl Default for LineBatchInfo {
@@ -349,6 +329,7 @@ impl Default for LineBatchInfo {
             depth_offset: 0,
             triangle_cap_length_factor: 4.0,
             triangle_cap_width_factor: 2.0,
+            picking_only: false,
         }
     }
 }
@@ -366,9 +347,6 @@ pub enum LineDrawDataError {
 
     #[error(transparent)]
     DataTextureSourceWriteError(#[from] crate::allocator::DataTextureSourceWriteError),
-
-    #[error(transparent)]
-    Renderer(#[from] crate::RendererRegistrationError),
 }
 
 impl LineDrawData {
@@ -386,10 +364,9 @@ impl LineDrawData {
             strips_buffer,
             picking_instance_ids_buffer,
             radius_boost_in_ui_points_for_outlines,
-            alpha_blending,
         } = line_builder;
 
-        let line_renderer = ctx.renderer::<LineRenderer>()?;
+        let line_renderer = ctx.renderer::<LineRenderer>();
 
         if strips_buffer.is_empty() || vertices_buffer.is_empty() {
             return Ok(Self {
@@ -428,25 +405,16 @@ impl LineDrawData {
             "LineDrawData::picking_instance_id_texture",
         )?;
 
-        let draw_data_flags = if alpha_blending {
-            LineDrawDataFlags::DRAW_FLAG_PREMULTIPLIED_ALPHA
-        } else {
-            LineDrawDataFlags::empty()
-        };
         let draw_data_uniform_buffer_bindings = create_and_fill_uniform_buffer_batch(
             ctx,
             "LineDrawData::DrawDataUniformBuffer".into(),
             [
                 gpu_data::DrawDataUniformBuffer {
-                    radius_boost_in_ui_points: 0.0,
-                    flags: draw_data_flags.bits(),
-                    _padding: Default::default(),
+                    radius_boost_in_ui_points: 0.0.into(),
                     end_padding: Default::default(),
                 },
                 gpu_data::DrawDataUniformBuffer {
-                    radius_boost_in_ui_points: radius_boost_in_ui_points_for_outlines,
-                    flags: draw_data_flags.bits(),
-                    _padding: Default::default(),
+                    radius_boost_in_ui_points: radius_boost_in_ui_points_for_outlines.into(),
                     end_padding: Default::default(),
                 },
             ]
@@ -532,19 +500,17 @@ impl LineDrawData {
                 )
                 .into_iter();
 
-            let color_phase = if alpha_blending {
-                DrawPhase::Transparent
-            } else {
-                DrawPhase::Opaque
-            };
             let mut start_vertex_for_next_batch = 0;
-            for (batch_info, uniform_buffer_binding) in
-                std::iter::zip(&batches, uniform_buffer_bindings)
+            for (batch_info, uniform_buffer_binding) in batches.iter().zip(uniform_buffer_bindings)
             {
                 let line_vertex_range_end = (start_vertex_for_next_batch
                     + batch_info.line_vertex_count)
                     .min(max_num_vertices as u32);
-                let mut active_phases = enum_set![DrawPhase::PickingLayer] | color_phase;
+                let mut active_phases = if batch_info.picking_only {
+                    enum_set![DrawPhase::PickingLayer]
+                } else {
+                    enum_set![DrawPhase::Opaque | DrawPhase::PickingLayer]
+                };
                 // Does the entire batch participate in the outline mask phase?
                 if batch_info.overall_outline_mask_ids.is_some() {
                     active_phases.insert(DrawPhase::OutlineMask);
@@ -554,7 +520,7 @@ impl LineDrawData {
                     ctx,
                     batch_info.label.clone(),
                     uniform_buffer_binding,
-                    Span::from_start_end(start_vertex_for_next_batch, line_vertex_range_end),
+                    start_vertex_for_next_batch..line_vertex_range_end,
                     active_phases,
                 ));
 
@@ -563,7 +529,7 @@ impl LineDrawData {
                         ctx,
                         format!("{} strip-only {range:?}", batch_info.label).into(),
                         uniform_buffer_bindings_mask_only_batches.next().unwrap(),
-                        *range,
+                        range.clone(),
                         enum_set![DrawPhase::OutlineMask],
                     ));
                 }
@@ -581,8 +547,7 @@ impl LineDrawData {
 }
 
 pub struct LineRenderer {
-    render_pipeline_color_opaque: GpuRenderPipelineHandle,
-    render_pipeline_color_alpha_blended: GpuRenderPipelineHandle,
+    render_pipeline_color: GpuRenderPipelineHandle,
     render_pipeline_picking_layer: GpuRenderPipelineHandle,
     render_pipeline_outline_mask: GpuRenderPipelineHandle,
     bind_group_layout_all_lines: GpuBindGroupLayoutHandle,
@@ -595,7 +560,7 @@ impl LineRenderer {
         ctx: &RenderContext,
         label: Label,
         uniform_buffer_binding: BindGroupEntry,
-        line_vertex_range: Span<u32>,
+        line_vertex_range: Range<u32>,
         active_phases: EnumSet<DrawPhase>,
     ) -> LineStripBatch {
         // TODO(andreas): There should be only a single bindgroup with dynamic indices for all batches.
@@ -615,7 +580,7 @@ impl LineRenderer {
             // We spawn a quad for every line skeleton vertex. Naturally, this yields one extra quad in total.
             // Which is rather convenient because we need to ensure there are start and end triangles,
             // so just from a number-of=vertices perspective this is correct already and the shader can take care of offsets.
-            vertex_range: line_vertex_range.scale(6),
+            vertex_range: (line_vertex_range.start * 6)..(line_vertex_range.end * 6),
             active_phases,
         }
     }
@@ -666,7 +631,7 @@ impl Renderer for LineRenderer {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 3,
-                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                        visibility: wgpu::ShaderStages::VERTEX,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
@@ -716,9 +681,8 @@ impl Renderer for LineRenderer {
             .shader_modules
             .get_or_create(ctx, &include_shader_module!("../../shader/lines.wgsl"));
 
-        // Opaque variant: relies on alpha-to-coverage MSAA for edge anti-aliasing.
-        let render_pipeline_desc_color_opaque = RenderPipelineDesc {
-            label: "LineRenderer::render_pipeline_color_opaque".into(),
+        let render_pipeline_desc_color = RenderPipelineDesc {
+            label: "LineRenderer::render_pipeline_color".into(),
             pipeline_layout,
             vertex_entrypoint: "vs_main".into(),
             vertex_handle: shader_module,
@@ -733,37 +697,25 @@ impl Renderer for LineRenderer {
             depth_stencil: Some(ViewBuilder::MAIN_TARGET_DEFAULT_DEPTH_STATE),
             multisample: ViewBuilder::main_target_default_msaa_state(ctx.render_config(), true),
         };
-        let render_pipeline_color_opaque =
-            render_pipelines.get_or_create(ctx, &render_pipeline_desc_color_opaque);
-
-        // Alpha-blended variant: premultiplied alpha blending of the shader's coverage value,
-        // giving smooth edges without relying on MSAA.
-        let render_pipeline_color_alpha_blended = render_pipelines.get_or_create(
-            ctx,
-            &RenderPipelineDesc {
-                label: "LineRenderer::render_pipeline_color_alpha_blended".into(),
-                render_targets: smallvec![Some(wgpu::ColorTargetState {
-                    format: ViewBuilder::MAIN_TARGET_COLOR_FORMAT,
-                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                depth_stencil: Some(ViewBuilder::MAIN_TARGET_DEFAULT_DEPTH_STATE_NO_WRITE),
-                multisample: ViewBuilder::main_target_default_msaa_state(
-                    ctx.render_config(),
-                    false,
-                ),
-                ..render_pipeline_desc_color_opaque.clone()
-            },
-        );
+        let render_pipeline_color =
+            render_pipelines.get_or_create(ctx, &render_pipeline_desc_color);
+        // Lines in the picking pass ignore depth (draw on top of faces).
+        // Back-face culling is done on CPU via normal dot product.
         let render_pipeline_picking_layer = render_pipelines.get_or_create(
             ctx,
             &RenderPipelineDesc {
                 label: "LineRenderer::render_pipeline_picking_layer".into(),
                 fragment_entrypoint: "fs_main_picking_layer".into(),
                 render_targets: smallvec![Some(PickingLayerProcessor::PICKING_LAYER_FORMAT.into())],
-                depth_stencil: PickingLayerProcessor::PICKING_LAYER_DEPTH_STATE,
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: PickingLayerProcessor::PICKING_LAYER_DEPTH_FORMAT,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
                 multisample: PickingLayerProcessor::PICKING_LAYER_MSAA_STATE,
-                ..render_pipeline_desc_color_opaque.clone()
+                ..render_pipeline_desc_color.clone()
             },
         );
         let render_pipeline_outline_mask = render_pipelines.get_or_create(
@@ -788,8 +740,7 @@ impl Renderer for LineRenderer {
         );
 
         Self {
-            render_pipeline_color_opaque,
-            render_pipeline_color_alpha_blended,
+            render_pipeline_color,
             render_pipeline_picking_layer,
             render_pipeline_outline_mask,
             bind_group_layout_all_lines,
@@ -804,19 +755,15 @@ impl Renderer for LineRenderer {
         pass: &mut wgpu::RenderPass<'_>,
         draw_instructions: &[DrawInstruction<'_, Self::RendererDrawData>],
     ) -> Result<(), DrawError> {
-        // Each phase uses a single pipeline shared across all draw_data:
-        //   - Opaque: opaque pipeline (uses alpha-to-coverage MSAA for edge anti-aliasing).
-        //   - Transparent: alpha-blended pipeline (premultiplied alpha blending).
-        // A given LineDrawData participates in exactly one of Opaque/Transparent based on
-        // `alpha_blending`; see `LineDrawData::new`.
         let pipeline_handle = match phase {
             DrawPhase::OutlineMask => self.render_pipeline_outline_mask,
+            DrawPhase::Opaque => self.render_pipeline_color,
             DrawPhase::PickingLayer => self.render_pipeline_picking_layer,
-            DrawPhase::Opaque => self.render_pipeline_color_opaque,
-            DrawPhase::Transparent => self.render_pipeline_color_alpha_blended,
             _ => unreachable!("We were called on a phase we weren't subscribed to: {phase:?}"),
         };
-        pass.set_pipeline(render_pipelines.get(pipeline_handle)?);
+
+        let pipeline = render_pipelines.get(pipeline_handle)?;
+        pass.set_pipeline(pipeline);
 
         for DrawInstruction {
             draw_data,
@@ -825,9 +772,7 @@ impl Renderer for LineRenderer {
         {
             let bind_group_draw_data = match phase {
                 DrawPhase::OutlineMask => &draw_data.bind_group_all_lines_outline_mask,
-                DrawPhase::Opaque | DrawPhase::Transparent | DrawPhase::PickingLayer => {
-                    &draw_data.bind_group_all_lines
-                }
+                DrawPhase::Opaque | DrawPhase::PickingLayer => &draw_data.bind_group_all_lines,
                 _ => unreachable!("We were called on a phase we weren't subscribed to: {phase:?}"),
             };
             let Some(bind_group_draw_data) = bind_group_draw_data else {
@@ -841,7 +786,7 @@ impl Renderer for LineRenderer {
             for drawable in *drawables {
                 let batch = &draw_data.batches[drawable.draw_data_payload as usize];
                 pass.set_bind_group(2, &batch.bind_group, &[]);
-                pass.draw(batch.vertex_range.range(), 0..1);
+                pass.draw(batch.vertex_range.clone(), 0..1);
             }
         }
 
@@ -852,8 +797,8 @@ impl Renderer for LineRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Rgba;
     use crate::view_builder::TargetConfiguration;
-    use crate::{Rgba, ViewBuilderId};
 
     // Regression test for https://github.com/rerun-io/rerun/issues/8639
     #[test]
@@ -862,13 +807,10 @@ mod tests {
         re_log::PanicOnWarnScope::new();
 
         RenderContext::new_test().execute_test_frame(|ctx| {
-            let mut view =
-                ViewBuilder::new(ctx, TargetConfiguration::default(), ViewBuilderId::new(0))
-                    .unwrap();
+            let mut view = ViewBuilder::new(ctx, TargetConfiguration::default()).unwrap();
 
             let empty = LineDrawableBuilder::new(ctx);
-            view.queue_draw(ctx, empty.into_draw_data().unwrap())
-                .unwrap();
+            view.queue_draw(ctx, empty.into_draw_data().unwrap());
 
             // This is the case that triggered
             // https://github.com/rerun-io/rerun/issues/8639
@@ -877,8 +819,7 @@ mod tests {
             empty_batch
                 .batch("empty batch")
                 .add_strip(std::iter::empty());
-            view.queue_draw(ctx, empty_batch.into_draw_data().unwrap())
-                .unwrap();
+            view.queue_draw(ctx, empty_batch.into_draw_data().unwrap());
 
             let mut empty_batch_between_non_empty = LineDrawableBuilder::new(ctx);
             empty_batch_between_non_empty
@@ -890,8 +831,7 @@ mod tests {
             empty_batch_between_non_empty
                 .batch("non-empty batch")
                 .add_strip([glam::Vec3::ZERO, glam::Vec3::ZERO].into_iter());
-            view.queue_draw(ctx, empty_batch_between_non_empty.into_draw_data().unwrap())
-                .unwrap();
+            view.queue_draw(ctx, empty_batch_between_non_empty.into_draw_data().unwrap());
 
             [view.draw(ctx, Rgba::BLACK).unwrap()]
         });

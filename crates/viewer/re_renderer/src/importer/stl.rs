@@ -51,6 +51,7 @@ pub fn load_stl_from_buffer(
         index_range: re_span::Span::from_start_len(0, num_vertices as u32),
         albedo: ctx.texture_manager_2d.white_texture_unorm_handle().clone(),
         albedo_factor: crate::Rgba::WHITE,
+        use_matcap: false,
     };
 
     let vertex_positions = bytemuck::cast_vec(triangles);
@@ -72,6 +73,7 @@ pub fn load_stl_from_buffer(
         // STL has neither colors nor texcoords.
         vertex_colors: vec![crate::Rgba32Unmul::WHITE; num_vertices],
         vertex_texcoords: vec![glam::Vec2::ZERO; num_vertices],
+        vertex_element_ids: None,
 
         materials: smallvec![material],
 

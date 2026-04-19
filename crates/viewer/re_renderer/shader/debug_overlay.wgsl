@@ -51,6 +51,48 @@ fn main_vs(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return out;
 }
 
+// Pick ID encoding: bits [31:30] = type (0=body,1=face,2=edge,3=vertex),
+// bits [29:0] = 1-indexed element ID.
+const TYPE_SHIFT: u32 = 30u;
+const ID_MASK: u32 = 0x3FFFFFFFu;
+
+// HSV to RGB.
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> vec3f {
+    let c = v * s;
+    let x = c * (1.0 - abs(((h / 60.0) % 2.0) - 1.0));
+    let m = v - c;
+    var rgb: vec3f;
+    if h < 60.0 { rgb = vec3f(c, x, 0.0); }
+    else if h < 120.0 { rgb = vec3f(x, c, 0.0); }
+    else if h < 180.0 { rgb = vec3f(0.0, c, x); }
+    else if h < 240.0 { rgb = vec3f(0.0, x, c); }
+    else if h < 300.0 { rgb = vec3f(x, 0.0, c); }
+    else { rgb = vec3f(c, 0.0, x); }
+    return rgb + vec3f(m, m, m);
+}
+
+// Decode a pick ID and map to a color.
+// Hue from element ID (golden-angle), saturation/value from type.
+fn pick_id_to_rgb(raw: u32) -> vec3f {
+    let element_id = raw & ID_MASK;
+    let pick_type = raw >> TYPE_SHIFT;
+    let hue = f32(element_id) * 137.508;
+    // Type-based saturation/value: face=warm, edge=cool, vertex=bright, body=gray.
+    if pick_type == 1u {
+        // Face: high saturation, warm.
+        return hsv_to_rgb(hue % 360.0, 0.8, 0.9);
+    } else if pick_type == 2u {
+        // Edge: shifted hue, cooler.
+        return hsv_to_rgb((hue + 180.0) % 360.0, 0.9, 0.95);
+    } else if pick_type == 3u {
+        // Vertex: bright, high value.
+        return hsv_to_rgb((hue + 90.0) % 360.0, 0.6, 1.0);
+    } else {
+        // Body: desaturated.
+        return hsv_to_rgb(hue % 360.0, 0.3, 0.7);
+    }
+}
+
 @fragment
 fn main_fs(in: VertexOutput) -> @location(0) vec4f {
     if uniforms.mode == ShowFloatTexture {
@@ -59,10 +101,17 @@ fn main_fs(in: VertexOutput) -> @location(0) vec4f {
         let coords = vec2i(in.texcoord * vec2f(textureDimensions(debug_texture_uint).xy));
         let raw_values = textureLoad(debug_texture_uint, coords, 0);
 
-        let num_color_levels = 20u;
-        let mapped_values = vec4f(raw_values % num_color_levels) / f32(num_color_levels - 1u);
-
-        return vec4f(mapped_values.rgb, 1.0);
+        let id = raw_values.r;
+        if id == 0u {
+            // Magenta checkerboard for "no data" -- easy to distinguish from broken overlay.
+            let checker = (coords.x / 8 + coords.y / 8) % 2;
+            if checker == 0 {
+                return vec4f(0.15, 0.0, 0.15, 1.0);
+            } else {
+                return vec4f(0.25, 0.0, 0.25, 1.0);
+            }
+        }
+        return vec4f(pick_id_to_rgb(id), 0.85);
     } else {
         return vec4f(1.0, 0.0, 1.0, 1.0);
     }
