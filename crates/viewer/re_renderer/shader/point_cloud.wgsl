@@ -142,9 +142,8 @@ fn circle_quad_coverage(world_position: vec3f, radius: f32, circle_center: vec3f
 fn coverage(world_position: vec3f, radius: f32, point_center: vec3f) -> f32 {
     if is_camera_orthographic() || has_any_flag(batch.flags, FLAG_DRAW_AS_CIRCLES) {
         return circle_quad_coverage(world_position, radius, point_center);
-    } else {
-        return sphere_quad_coverage(world_position, radius, point_center);
     }
+    return sphere_quad_coverage(world_position, radius, point_center);
 }
 
 

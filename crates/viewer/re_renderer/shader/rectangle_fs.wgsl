@@ -10,9 +10,8 @@ fn is_magnifying(pixel_coord: vec2f) -> bool {
 fn tex_filter(pixel_coord: vec2f) -> u32 {
     if is_magnifying(pixel_coord) {
         return rect_info.magnification_filter;
-    } else {
-        return rect_info.minification_filter;
     }
+    return rect_info.minification_filter;
 }
 
 fn normalize_range(sampled_value: vec4f) -> vec4f {

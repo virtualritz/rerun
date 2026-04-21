@@ -87,10 +87,9 @@ fn pick_id_to_rgb(raw: u32) -> vec3f {
     } else if pick_type == 3u {
         // Vertex: bright, high value.
         return hsv_to_rgb((hue + 90.0) % 360.0, 0.6, 1.0);
-    } else {
-        // Body: desaturated.
-        return hsv_to_rgb(hue % 360.0, 0.3, 0.7);
     }
+    // Body: desaturated.
+    return hsv_to_rgb(hue % 360.0, 0.3, 0.7);
 }
 
 @fragment
@@ -107,12 +106,10 @@ fn main_fs(in: VertexOutput) -> @location(0) vec4f {
             let checker = (coords.x / 8 + coords.y / 8) % 2;
             if checker == 0 {
                 return vec4f(0.15, 0.0, 0.15, 1.0);
-            } else {
-                return vec4f(0.25, 0.0, 0.25, 1.0);
             }
+            return vec4f(0.25, 0.0, 0.25, 1.0);
         }
         return vec4f(pick_id_to_rgb(id), 0.85);
-    } else {
-        return vec4f(1.0, 0.0, 1.0, 1.0);
     }
+    return vec4f(1.0, 0.0, 1.0, 1.0);
 }

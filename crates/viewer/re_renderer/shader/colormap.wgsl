@@ -37,9 +37,8 @@ fn colormap_srgb(which: u32, t_unsaturated: f32) -> vec3f {
         return colormap_spectral_srgb(t);
     } else if which == COLORMAP_TWILIGHT {
         return colormap_twilight_srgb(t);
-    } else {
-        return ERROR_RGBA.rgb;
     }
+    return ERROR_RGBA.rgb;
 }
 
 /// Returns a linear-space sRGB in 0-1 range.
