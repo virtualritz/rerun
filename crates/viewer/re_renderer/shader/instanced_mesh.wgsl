@@ -155,6 +155,9 @@ fn fs_main_picking_layer(in: VertexOut) -> @location(0) vec4u {
         return vec4u(in.element_id, 0u, 0u, 0u);
     }
     discard;
+    // Unreachable after `discard`, but WGSL's browser validator requires
+    // a return on every path.
+    return vec4u(0u, 0u, 0u, 0u);
 }
 
 @fragment
