@@ -39,9 +39,8 @@ fn camera_ray_to_world_pos_orthographic(world_pos: vec3f) -> Ray {
 fn camera_ray_to_world_pos(world_pos: vec3f) -> Ray {
     if is_camera_perspective() {
         return camera_ray_to_world_pos_perspective(world_pos);
-    } else {
-        return camera_ray_to_world_pos_orthographic(world_pos);
     }
+    return camera_ray_to_world_pos_orthographic(world_pos);
 }
 
 // Transforms a view-space vector to world-space.

@@ -46,9 +46,8 @@ fn colormap_srgba(which: u32, t_unsaturated: f32) -> vec4f {
         return colormap_rviz_costmap_srgba(t);
     } else if which == COLORMAP_COSTMAP {
         return colormap_costmap_srgba(t);
-    } else {
-        return ERROR_RGBA;
     }
+    return ERROR_RGBA;
 }
 
 /// Returns a linear-space RGBA in 0-1 range.
