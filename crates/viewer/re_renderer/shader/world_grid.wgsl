@@ -142,10 +142,10 @@ fn main_fs(in: VertexOutput) -> @location(0) vec4f {
 
     let intensity_combined = max(cardinal_and_regular.x, cardinal_and_regular.y);
 
-    return config.color * intensity_combined;
-
     // Useful debugging visualizations:
     //return vec4f(in.next_cardinality_interpolation, 0.0, 0.0, 1.0);
     //return vec4f(intensity_combined);
     //return vec4f(grid_closeness_fade, cardinal_grid_closeness_fade, 0.0, 1.0);
+
+    return config.color * intensity_combined;
 }
