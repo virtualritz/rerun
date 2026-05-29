@@ -1,3 +1,7 @@
+use std::sync::Arc;
+
+use re_mutex::RwLock;
+
 use crate::allocator::{GpuReadbackIdentifier, create_and_fill_uniform_buffer};
 use crate::context::RenderContext;
 use crate::draw_phases::{
@@ -18,9 +22,6 @@ pub enum ViewBuilderError {
 
     #[error(transparent)]
     InvalidDebugOverlay(#[from] crate::renderer::DebugOverlayError),
-
-    #[error(transparent)]
-    Renderer(#[from] crate::RendererRegistrationError),
 }
 
 /// The highest level rendering block in `re_renderer`.
@@ -35,22 +36,8 @@ pub struct ViewBuilder {
     picking_processor: Option<PickingLayerProcessor>,
 }
 
-/// Stable identity of a rendered view.
-///
-/// Reuse the same id when draw data is shared across frames so per-view renderer caches remain
-/// associated with the correct camera.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, re_byte_size::SizeBytes)]
-pub struct ViewBuilderId(u64);
-
-impl ViewBuilderId {
-    pub const fn new(id: u64) -> Self {
-        Self(id)
-    }
-}
-
 struct ViewTargetSetup {
     name: Label,
-    view_id: ViewBuilderId,
 
     camera_position: glam::Vec3A,
 
@@ -61,9 +48,15 @@ struct ViewTargetSetup {
     /// If MSAA is disabled, this is the same as `main_target_msaa`.
     main_target_resolved: GpuTexture,
     depth_buffer: GpuTexture,
+    depth_load_op: wgpu::LoadOp<f32>,
 
     resolution_in_pixel: [u32; 2],
 }
+
+/// [`ViewBuilder`] that can be shared between threads.
+///
+/// Innermost field is an Option, so it can be consumed for `composite`.
+pub type SharedViewBuilder = Arc<RwLock<Option<ViewBuilder>>>;
 
 /// Configures the camera placement in the orthographic frustum,
 /// as well as the coordinate system convention.
@@ -123,8 +116,7 @@ pub enum Projection {
 }
 
 impl Projection {
-    /// Returns the matrix that maps view space to NDC (normalized device coordinates).
-    pub fn projection_from_view(self, resolution_in_pixel: [u32; 2]) -> glam::Mat4 {
+    fn projection_from_view(self, resolution_in_pixel: [u32; 2]) -> glam::Mat4 {
         match self {
             Self::Perspective {
                 vertical_fov,
@@ -204,30 +196,6 @@ pub enum RenderMode {
     Deterministic,
 }
 
-/// How the `composite` step combines a view's render result with the background.
-///
-/// Discriminants are passed directly to `composite.wgsl` as a `u32` uniform — keep in sync.
-#[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum BlendWithBackground {
-    /// Don't blend; the view's result fully overwrites whatever was there before.
-    #[default]
-    No = 0,
-
-    /// Blend with the background, applying a workaround for alpha-to-coverage MSAA.
-    ///
-    /// Use this for views whose content relies on alpha-to-coverage for anti-aliasing
-    /// (e.g. 3D views with line/point primitives that use ATC).
-    /// See [`ViewBuilder::MAIN_TARGET_ALPHA_TO_COVERAGE_COLOR_STATE`] for context.
-    AlphaToCoverage = 1,
-
-    /// Blend with the background, treating the view's result as already premultiplied alpha.
-    ///
-    /// Use this for views whose content uses regular alpha blending and does not depend on
-    /// alpha-to-coverage (e.g. 2D plots rendered in screen space).
-    Premultiplied = 2,
-}
-
 /// Basic configuration for a target view.
 #[derive(Debug)]
 pub struct TargetConfiguration {
@@ -263,8 +231,14 @@ pub struct TargetConfiguration {
 
     pub outline_config: Option<OutlineConfig>,
 
-    /// How the `composite` step combines the view's result with the background.
-    pub blend_with_background: BlendWithBackground,
+    /// If true, the `composite` step will blend the image with the background.
+    ///
+    /// Otherwise, this step will overwrite whatever was there before, drawing the view builder's result
+    /// as an opaque rectangle.
+    pub blend_with_background: bool,
+
+    /// If true, blended main target colors are already premultiplied.
+    pub blend_source_is_premultiplied: bool,
 
     /// Configuration for the picking layer if any.
     ///
@@ -288,7 +262,8 @@ impl Default for TargetConfiguration {
             viewport_transformation: RectTransform::IDENTITY,
             pixels_per_point: 1.0,
             outline_config: None,
-            blend_with_background: BlendWithBackground::No,
+            blend_with_background: false,
+            blend_source_is_premultiplied: false,
             picking_config: None,
         }
     }
@@ -317,6 +292,55 @@ pub struct ViewPickingConfiguration {
 }
 
 impl ViewBuilder {
+    fn main_target_depth_texture_desc(
+        name: &Label,
+        resolution_in_pixel: [u32; 2],
+        sample_count: u32,
+    ) -> TextureDesc {
+        TextureDesc {
+            label: format!("{name:?} - depth buffer").into(),
+            size: wgpu::Extent3d {
+                width: resolution_in_pixel[0],
+                height: resolution_in_pixel[1],
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count,
+            dimension: wgpu::TextureDimension::D2,
+            format: Self::MAIN_TARGET_DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        }
+    }
+
+    fn debug_validate_main_target_depth_texture(
+        texture: &GpuTexture,
+        size: wgpu::Extent3d,
+        sample_count: u32,
+    ) {
+        re_log::debug_assert_eq!(
+            texture.creation_desc.format,
+            Self::MAIN_TARGET_DEPTH_FORMAT,
+            "external depth texture format must match ViewBuilder::MAIN_TARGET_DEPTH_FORMAT",
+        );
+        re_log::debug_assert_eq!(
+            texture.creation_desc.size,
+            size,
+            "external depth texture size must match TargetConfiguration::resolution_in_pixel",
+        );
+        re_log::debug_assert_eq!(
+            texture.creation_desc.sample_count,
+            sample_count,
+            "external depth texture sample count must match the active RenderConfig",
+        );
+        re_log::debug_assert!(
+            texture
+                .creation_desc
+                .usage
+                .contains(wgpu::TextureUsages::RENDER_ATTACHMENT),
+            "external depth texture must support wgpu::TextureUsages::RENDER_ATTACHMENT",
+        );
+    }
+
     /// Color format used for the main target of the view builder.
     ///
     /// Eventually we'll want to make this an HDR format and apply tonemapping during composite.
@@ -432,11 +456,28 @@ impl ViewBuilder {
             ..Self::MAIN_TARGET_DEFAULT_DEPTH_STATE
         };
 
-    /// Creates a view with an identity that can remain stable across builder instances.
-    pub fn new(
+    pub fn new(ctx: &RenderContext, config: TargetConfiguration) -> Result<Self, ViewBuilderError> {
+        Self::new_internal(ctx, config, None)
+    }
+
+    /// Creates a view builder that reuses a caller-supplied depth target for the main pass.
+    ///
+    /// The texture must match [`ViewBuilder::MAIN_TARGET_DEPTH_FORMAT`], the target
+    /// resolution, the current render config's sample count, and include
+    /// `wgpu::TextureUsages::RENDER_ATTACHMENT` in its usage flags.
+    /// This contract is checked with debug assertions.
+    pub fn new_with_external_depth(
         ctx: &RenderContext,
         config: TargetConfiguration,
-        view_id: ViewBuilderId,
+        external_depth_texture: GpuTexture,
+    ) -> Result<Self, ViewBuilderError> {
+        Self::new_internal(ctx, config, Some(external_depth_texture))
+    }
+
+    fn new_internal(
+        ctx: &RenderContext,
+        config: TargetConfiguration,
+        external_depth_texture: Option<GpuTexture>,
     ) -> Result<Self, ViewBuilderError> {
         re_tracing::profile_function!();
 
@@ -446,6 +487,7 @@ impl ViewBuilder {
 
         let render_cfg = ctx.render_config();
         let msaa_enabled = render_cfg.msaa_mode != MsaaMode::Off;
+        let depth_sample_count = render_cfg.msaa_mode.sample_count();
         let size = wgpu::Extent3d {
             width: config.resolution_in_pixel[0],
             height: config.resolution_in_pixel[1],
@@ -491,18 +533,29 @@ impl ViewBuilder {
             main_target_msaa.clone()
         };
 
-        let depth_buffer = ctx.gpu_resources.textures.alloc(
-            &ctx.device,
-            &TextureDesc {
-                label: format!("{:?} - depth buffer", config.name).into(),
+        let has_external_depth = external_depth_texture.is_some();
+        let depth_buffer = if let Some(external_depth_texture) = external_depth_texture {
+            Self::debug_validate_main_target_depth_texture(
+                &external_depth_texture,
                 size,
-                mip_level_count: 1,
-                sample_count: render_cfg.msaa_mode.sample_count(),
-                dimension: wgpu::TextureDimension::D2,
-                format: Self::MAIN_TARGET_DEPTH_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            },
-        );
+                depth_sample_count,
+            );
+            external_depth_texture
+        } else {
+            ctx.gpu_resources.textures.alloc(
+                &ctx.device,
+                &Self::main_target_depth_texture_desc(
+                    &config.name,
+                    config.resolution_in_pixel,
+                    depth_sample_count,
+                ),
+            )
+        };
+        let depth_load_op = if has_external_depth {
+            wgpu::LoadOp::Load
+        } else {
+            Self::DEFAULT_DEPTH_CLEAR
+        };
 
         let projection_from_view = config
             .projection_from_view
@@ -570,10 +623,6 @@ impl ViewBuilder {
         let camera_position = config.view_from_world.inverse().translation();
         let camera_forward = -view_from_world.row(2).truncate();
         let projection_from_world = projection_from_view * view_from_world;
-        let framebuffer_resolution = glam::vec2(
-            config.resolution_in_pixel[0] as _,
-            config.resolution_in_pixel[1] as _,
-        );
 
         // Setup frame uniform buffer
         let frame_uniform_buffer_content = FrameUniformBuffer {
@@ -590,8 +639,11 @@ impl ViewBuilder {
                 RenderMode::Beautiful => 0,
                 RenderMode::Deterministic => 1,
             },
-            framebuffer_resolution,
-            focal_length_in_pixels: framebuffer_resolution / (2.0 * tan_half_fov),
+            framebuffer_resolution: glam::vec2(
+                config.resolution_in_pixel[0] as _,
+                config.resolution_in_pixel[1] as _,
+            )
+            .into(),
         };
         let frame_uniform_buffer = create_and_fill_uniform_buffer(
             ctx,
@@ -644,7 +696,8 @@ impl ViewBuilder {
         };
 
         let active_draw_phases = {
-            let mut active_draw_phases = DrawPhase::Opaque
+            let mut active_draw_phases = DrawPhase::DepthPrepass
+                | DrawPhase::Opaque
                 | DrawPhase::Background
                 | DrawPhase::Transparent
                 | DrawPhase::Compositing;
@@ -667,12 +720,12 @@ impl ViewBuilder {
 
         let setup = ViewTargetSetup {
             name: config.name,
-            view_id,
             camera_position: camera_position.into(),
             bind_group_0,
             main_target_msaa,
             main_target_resolved,
             depth_buffer,
+            depth_load_op,
             resolution_in_pixel: config.resolution_in_pixel,
         };
 
@@ -699,11 +752,12 @@ impl ViewBuilder {
                     .map(|p| p.final_voronoi_texture()),
                 config.outline_config.as_ref(),
                 config.blend_with_background,
-            )?,
-        )?;
+                config.blend_source_is_premultiplied,
+            ),
+        );
 
         for debug_overlay in debug_overlays {
-            view_builder.queue_draw(ctx, debug_overlay)?;
+            view_builder.queue_draw(ctx, debug_overlay);
         }
 
         Ok(view_builder)
@@ -718,14 +772,13 @@ impl ViewBuilder {
         &mut self,
         ctx: &RenderContext,
         draw_data: impl Into<QueueableDrawData>,
-    ) -> Result<&mut Self, crate::RendererRegistrationError> {
+    ) -> &mut Self {
         let view_info = DrawableCollectionViewInfo {
-            view_id: self.setup.view_id,
             camera_world_position: self.setup.camera_position,
         };
         self.draw_phase_manager
-            .add_draw_data(ctx, draw_data.into(), &view_info)?;
-        Ok(self)
+            .add_draw_data(ctx, draw_data.into(), &view_info);
+        self
     }
 
     /// Draws the frame as instructed to a temporary HDR target.
@@ -736,12 +789,26 @@ impl ViewBuilder {
     ) -> Result<wgpu::CommandBuffer, PoolError> {
         re_tracing::profile_function!();
 
+        // Renderers and render pipelines are locked for the entirety of this method:
+        // This means it's *not* possible to add renderers or pipelines while drawing is in progress!
+        // Renderers can't be added anyways at this point (RendererData add their Renderer on creation),
+        // so no point in taking the lock repeatedly.
+        //
+        // This used to be due to the lifetime association render passes had all passed in resources,
+        // this restriction has been lifted by now in wgpu.
+        // However, having our locking concentrated for the duration of a view draw
+        // is also beneficial since it enforces the model of prepare->draw which avoids a lot of repeated
+        // locking and unlocking.
+        //
+        // TODO(andreas): No longer having those lifetime issues with wgpu may still save us some locking though?
+
+        let renderers = ctx.read_lock_renderers();
         let pipelines = ctx.gpu_resources.render_pipelines.resources();
 
         let setup = &self.setup;
 
         // Prepare the drawables for drawing!
-        self.draw_phase_manager.sort_drawables(ctx.renderers());
+        self.draw_phase_manager.sort_drawables(&renderers);
 
         let mut encoder = ctx
             .device
@@ -781,7 +848,7 @@ impl ViewBuilder {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &setup.depth_buffer.default_view,
                     depth_ops: Some(wgpu::Operations {
-                        load: Self::DEFAULT_DEPTH_CLEAR,
+                        load: setup.depth_load_op,
                         store: wgpu::StoreOp::Discard,
                     }),
                     stencil_ops: None,
@@ -794,12 +861,13 @@ impl ViewBuilder {
             pass.set_bind_group(0, &setup.bind_group_0, &[]);
 
             for phase in [
+                DrawPhase::DepthPrepass,
                 DrawPhase::Opaque,
                 DrawPhase::Background,
                 DrawPhase::Transparent,
             ] {
                 self.draw_phase_manager
-                    .draw(ctx.renderers(), &pipelines, phase, &mut pass);
+                    .draw(&renderers, &pipelines, phase, &mut pass);
             }
         }
 
@@ -807,7 +875,7 @@ impl ViewBuilder {
             {
                 let mut pass = picking_processor.begin_render_pass(&setup.name, &mut encoder);
                 self.draw_phase_manager.draw(
-                    ctx.renderers(),
+                    &renderers,
                     &pipelines,
                     DrawPhase::PickingLayer,
                     &mut pass,
@@ -831,13 +899,13 @@ impl ViewBuilder {
                 let mut pass = outline_mask_processor.start_mask_render_pass(&mut encoder);
                 pass.set_bind_group(0, &setup.bind_group_0, &[]);
                 self.draw_phase_manager.draw(
-                    ctx.renderers(),
+                    &renderers,
                     &pipelines,
                     DrawPhase::OutlineMask,
                     &mut pass,
                 );
                 self.draw_phase_manager.draw(
-                    ctx.renderers(),
+                    &renderers,
                     &pipelines,
                     DrawPhase::OutlineMaskNoDepth,
                     &mut pass,
@@ -851,7 +919,7 @@ impl ViewBuilder {
                 let mut pass = screenshot_processor.begin_render_pass(&setup.name, &mut encoder);
                 pass.set_bind_group(0, &setup.bind_group_0, &[]);
                 self.draw_phase_manager.draw(
-                    ctx.renderers(),
+                    &renderers,
                     &pipelines,
                     DrawPhase::CompositingScreenshot,
                     &mut pass,
@@ -921,10 +989,111 @@ impl ViewBuilder {
         pass.set_bind_group(0, &self.setup.bind_group_0, &[]);
 
         self.draw_phase_manager.draw(
-            ctx.renderers(),
+            &ctx.read_lock_renderers(),
             &ctx.gpu_resources.render_pipelines.resources(),
             DrawPhase::Compositing,
             pass,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{TargetConfiguration, ViewBuilder};
+    use crate::MsaaMode;
+    use crate::RenderContext;
+
+    #[test]
+    fn external_depth() {
+        re_log::setup_logging();
+        re_log::PanicOnWarnScope::new();
+
+        let mut ctx = RenderContext::new_test();
+        ctx.execute_test_frame(|ctx| {
+            let target_config = TargetConfiguration::default();
+            let num_textures_before_external_depth = ctx.gpu_resources.textures.num_resources();
+            let external_depth = ctx.gpu_resources.textures.alloc(
+                &ctx.device,
+                &ViewBuilder::main_target_depth_texture_desc(
+                    &target_config.name,
+                    target_config.resolution_in_pixel,
+                    ctx.render_config().msaa_mode.sample_count(),
+                )
+                .with_label("external depth".into()),
+            );
+            let num_textures_before_view_builder = ctx.gpu_resources.textures.num_resources();
+            let expected_additional_color_targets = match ctx.render_config().msaa_mode {
+                MsaaMode::Off => 1,
+                MsaaMode::Msaa4x => 2,
+            };
+
+            let view = match ViewBuilder::new_with_external_depth(
+                ctx,
+                target_config,
+                external_depth.clone(),
+            ) {
+                Ok(view) => view,
+                Err(err) => {
+                    panic!("external depth view builder should initialize: {err}");
+                }
+            };
+
+            assert!(Arc::ptr_eq(&view.setup.depth_buffer, &external_depth));
+            assert!(matches!(view.setup.depth_load_op, wgpu::LoadOp::Load));
+            assert_eq!(
+                ctx.gpu_resources.textures.num_resources() - num_textures_before_view_builder,
+                expected_additional_color_targets
+            );
+            assert_eq!(
+                num_textures_before_view_builder - num_textures_before_external_depth,
+                1
+            );
+
+            std::iter::empty()
+        });
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "external depth texture must support wgpu::TextureUsages::RENDER_ATTACHMENT"
+    )]
+    fn external_depth_requires_render_attachment_usage() {
+        re_log::setup_logging();
+        re_log::PanicOnWarnScope::new();
+
+        let mut ctx = RenderContext::new_test();
+        ctx.execute_test_frame(|ctx| {
+            let target_config = TargetConfiguration::default();
+            let external_depth_desc = ViewBuilder::main_target_depth_texture_desc(
+                &target_config.name,
+                target_config.resolution_in_pixel,
+                ctx.render_config().msaa_mode.sample_count(),
+            )
+            .with_label("external depth without render attachment".into());
+            let external_depth = ctx.gpu_resources.textures.alloc(
+                &ctx.device,
+                &crate::wgpu_resources::TextureDesc {
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    ..external_depth_desc
+                },
+            );
+
+            let _ = match ViewBuilder::new_with_external_depth(
+                ctx,
+                target_config,
+                external_depth,
+            ) {
+                Ok(view) => view,
+                Err(err) => {
+                    panic!(
+                        "external depth render attachment validation should happen before returning an error: {err}",
+                    );
+                }
+            };
+
+            std::iter::empty()
+        });
     }
 }

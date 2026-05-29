@@ -5,7 +5,7 @@ use crate::renderer::{
     DrawData, DrawDataDrawable, DrawError, DrawInstruction, DrawableCollectionViewInfo, Renderer,
     screen_triangle_vertex_shader,
 };
-use crate::view_builder::{BlendWithBackground, ViewBuilder};
+use crate::view_builder::ViewBuilder;
 use crate::wgpu_resources::{
     BindGroupDesc, BindGroupEntry, BindGroupLayoutDesc, GpuBindGroup, GpuBindGroupLayoutHandle,
     GpuRenderPipelineHandle, GpuRenderPipelinePoolAccessor, GpuTexture, PipelineLayoutDesc,
@@ -26,7 +26,8 @@ mod gpu_data {
         pub outline_color_layer_b: wgpu_buffer_types::Vec4,
         pub outline_radius_pixel: f32,
         pub blend_with_background: u32,
-        pub padding: [u32; 2],
+        pub source_is_premultiplied: u32,
+        pub padding: u32,
         pub end_padding: [wgpu_buffer_types::PaddingRow; 16 - 3],
     }
 }
@@ -44,8 +45,8 @@ pub struct CompositorDrawData {
     /// a uniform buffer for describing a tonemapper/compositor configuration.
     bind_group: GpuBindGroup,
 
-    /// How the compositor should blend with the existing image.
-    blend_with_background: BlendWithBackground,
+    /// If true, the compositor will blend with the image.
+    enable_blending: bool,
 }
 
 impl DrawData for CompositorDrawData {
@@ -68,14 +69,16 @@ impl DrawData for CompositorDrawData {
 }
 
 impl CompositorDrawData {
+    #[expect(clippy::fn_params_excessive_bools)]
     pub fn new(
         ctx: &RenderContext,
         color_texture: &GpuTexture,
         outline_final_voronoi: Option<&GpuTexture>,
         outline_config: Option<&OutlineConfig>,
-        blend_with_background: BlendWithBackground,
-    ) -> Result<Self, crate::RendererRegistrationError> {
-        let compositor = ctx.renderer::<Compositor>()?;
+        enable_blending: bool,
+        source_is_premultiplied: bool,
+    ) -> Self {
+        let compositor = ctx.renderer::<Compositor>();
 
         let outline_config = outline_config.cloned().unwrap_or(OutlineConfig {
             outline_radius_pixel: 0.0,
@@ -90,7 +93,8 @@ impl CompositorDrawData {
                 outline_color_layer_a: outline_config.color_layer_a.into(),
                 outline_color_layer_b: outline_config.color_layer_b.into(),
                 outline_radius_pixel: outline_config.outline_radius_pixel,
-                blend_with_background: blend_with_background as u32,
+                blend_with_background: enable_blending as u32,
+                source_is_premultiplied: source_is_premultiplied as u32,
                 padding: Default::default(),
                 end_padding: Default::default(),
             },
@@ -101,7 +105,7 @@ impl CompositorDrawData {
             |t| t.handle,
         );
 
-        Ok(Self {
+        Self {
             bind_group: ctx.gpu_resources.bind_groups.alloc(
                 &ctx.device,
                 &ctx.gpu_resources,
@@ -115,8 +119,8 @@ impl CompositorDrawData {
                     layout: compositor.bind_group_layout,
                 },
             ),
-            blend_with_background,
-        })
+            enable_blending,
+        }
     }
 }
 
@@ -235,12 +239,13 @@ impl Renderer for Compositor {
     ) -> Result<(), DrawError> {
         for DrawInstruction { draw_data, .. } in draw_instructions {
             let pipeline_handle = match phase {
-                DrawPhase::Compositing => match draw_data.blend_with_background {
-                    BlendWithBackground::No => self.render_pipeline_opaque,
-                    BlendWithBackground::AlphaToCoverage | BlendWithBackground::Premultiplied => {
+                DrawPhase::Compositing => {
+                    if draw_data.enable_blending {
                         self.render_pipeline_blended
+                    } else {
+                        self.render_pipeline_opaque
                     }
-                },
+                }
                 DrawPhase::CompositingScreenshot => self.render_pipeline_screenshot,
                 _ => unreachable!("We were called on a phase we weren't subscribed to: {phase:?}"),
             };

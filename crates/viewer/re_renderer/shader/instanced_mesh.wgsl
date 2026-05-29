@@ -126,6 +126,7 @@ fn fs_main_shaded(in: VertexOut) -> @location(0) vec4f {
     // Apply additive tint.
     matcap_color += in.additive_tint_rgba.rgb;
     matcap_color *= in.additive_tint_rgba.a;
+    matcap_color *= material.albedo_factor.a;
 
     // Selection tint: blend towards geometry type color.
     if in.element_id != 0u && is_selected(in.element_id) {
@@ -137,7 +138,8 @@ fn fs_main_shaded(in: VertexOut) -> @location(0) vec4f {
         matcap_color = mix(matcap_color, in.selection_tint * 1.3, 0.5);
     }
 
-    return vec4f(matcap_color, matcap_sample.a);
+    let alpha = matcap_sample.a * material.albedo_factor.a * in.additive_tint_rgba.a;
+    return vec4f(matcap_color, alpha);
 }
 
 @fragment

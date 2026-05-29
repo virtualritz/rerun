@@ -28,10 +28,13 @@ pub use screenshot::ScreenshotProcessor;
 ///
 #[derive(Debug, enumset::EnumSetType)]
 pub enum DrawPhase {
+    /// Depth-only geometry that must be available before visible opaque drawables.
+    DepthPrepass = 0,
+
     /// Opaque objects, performing reads/writes to the depth buffer.
     ///
     /// Typically they are order independent, so everything uses this same index.
-    Opaque = 0,
+    Opaque,
 
     /// Background, rendering where depth wasn't written.
     Background,
