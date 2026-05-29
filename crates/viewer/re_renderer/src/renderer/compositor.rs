@@ -26,7 +26,8 @@ mod gpu_data {
         pub outline_color_layer_b: wgpu_buffer_types::Vec4,
         pub outline_radius_pixel: f32,
         pub blend_with_background: u32,
-        pub padding: [u32; 2],
+        pub source_is_premultiplied: u32,
+        pub padding: u32,
         pub end_padding: [wgpu_buffer_types::PaddingRow; 16 - 3],
     }
 }
@@ -68,12 +69,14 @@ impl DrawData for CompositorDrawData {
 }
 
 impl CompositorDrawData {
+    #[expect(clippy::fn_params_excessive_bools)]
     pub fn new(
         ctx: &RenderContext,
         color_texture: &GpuTexture,
         outline_final_voronoi: Option<&GpuTexture>,
         outline_config: Option<&OutlineConfig>,
         enable_blending: bool,
+        source_is_premultiplied: bool,
     ) -> Self {
         let compositor = ctx.renderer::<Compositor>();
 
@@ -91,6 +94,7 @@ impl CompositorDrawData {
                 outline_color_layer_b: outline_config.color_layer_b.into(),
                 outline_radius_pixel: outline_config.outline_radius_pixel,
                 blend_with_background: enable_blending as u32,
+                source_is_premultiplied: source_is_premultiplied as u32,
                 padding: Default::default(),
                 end_padding: Default::default(),
             },

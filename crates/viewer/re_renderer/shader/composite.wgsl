@@ -8,6 +8,7 @@ struct CompositeUniformBuffer {
     outline_color_layer_b: vec4f,
     outline_radius_pixel: f32,
     blend_with_background: u32,
+    source_is_premultiplied: u32,
 };
 @group(1) @binding(0)
 var<uniform> uniforms: CompositeUniformBuffer;
@@ -36,6 +37,8 @@ fn main(in: FragmentInput) -> @location(0) vec4f {
     if uniforms.blend_with_background == 0 {
         // To not apply this hack needlessly and account for alpha from alpha to coverage, we have to ignore alpha values if blending is disabled.
         color = vec4f(color.rgb, 1.0);
+    } else if uniforms.source_is_premultiplied != 0 {
+        color = vec4f(color.rgb, color.a);
     } else {
         color = vec4f(color.rgb * color.a, color.a);
     }

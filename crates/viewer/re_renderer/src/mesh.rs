@@ -115,13 +115,13 @@ impl CpuMesh {
                 num_texcoords,
             });
         }
-        if let Some(element_ids) = vertex_element_ids {
-            if num_pos != element_ids.len() {
-                return Err(MeshError::WrongNumberOfElementIds {
-                    num_pos,
-                    num_element_ids: element_ids.len(),
-                });
-            }
+        if let Some(element_ids) = vertex_element_ids
+            && num_pos != element_ids.len()
+        {
+            return Err(MeshError::WrongNumberOfElementIds {
+                num_pos,
+                num_element_ids: element_ids.len(),
+            });
         }
         if self.vertex_positions.is_empty() {
             return Err(MeshError::ZeroVertices);
@@ -287,7 +287,7 @@ pub(crate) mod gpu_data {
     }
 
     impl MaterialUniformBuffer {
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         pub fn new(albedo_factor: ecolor::Rgba, texture_format: TextureFormat) -> Self {
             Self::with_matcap(albedo_factor, texture_format, false)
         }
