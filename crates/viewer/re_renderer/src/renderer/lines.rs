@@ -695,7 +695,9 @@ impl Renderer for LineRenderer {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 ..Default::default()
             },
-            depth_stencil: Some(ViewBuilder::MAIN_TARGET_DEFAULT_DEPTH_STATE),
+            // Overlay depth state: slope-scaled bias so wireframe/edges win the
+            // depth test against coincident faces at grazing angles.
+            depth_stencil: Some(ViewBuilder::MAIN_TARGET_OVERLAY_DEPTH_STATE),
             multisample: ViewBuilder::main_target_default_msaa_state(ctx.render_config(), true),
         };
         let render_pipeline_color =

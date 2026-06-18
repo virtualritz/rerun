@@ -594,7 +594,9 @@ impl Renderer for PointCloudRenderer {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 ..Default::default()
             },
-            depth_stencil: Some(ViewBuilder::MAIN_TARGET_DEFAULT_DEPTH_STATE),
+            // Overlay depth state: slope-scaled bias so selection vertices win
+            // the depth test against coincident faces at grazing angles.
+            depth_stencil: Some(ViewBuilder::MAIN_TARGET_OVERLAY_DEPTH_STATE),
             // We discard pixels to do the round cutout, therefore we need to calculate our own sampling mask.
             multisample: ViewBuilder::main_target_default_msaa_state(ctx.render_config(), true),
         };
