@@ -367,6 +367,9 @@ impl MeshDrawData {
                         MeshDrawMode::PickingOnly => {
                             *phases = EnumSet::from(DrawPhase::PickingLayer);
                         }
+                        MeshDrawMode::SelectionCue => {
+                            *phases = EnumSet::from(DrawPhase::Transparent);
+                        }
                     }
                 }
                 instances.sort_by_key(|(_instance, phases)| *phases);
@@ -417,7 +420,10 @@ impl MeshDrawData {
                             instance_range: instance_idx..(instance_idx + 1),
                             draw_phase: DrawPhase::Transparent,
                             depth_only: false,
-                            has_transparent_tint: !instance.additive_tint.is_opaque(),
+                            // The selection cue uses opaque meshes/tints, so force
+                            // the transparent flag or the transparent pass skips it.
+                            has_transparent_tint: mode == MeshDrawMode::SelectionCue
+                                || !instance.additive_tint.is_opaque(),
                             cull_mode: batch_key.cull_mode,
                             position: instance.world_from_mesh.transform_point3a(mesh_center),
                         });
@@ -455,7 +461,7 @@ impl MeshDrawData {
                     }
                 }
 
-                if mode != MeshDrawMode::DepthOnly {
+                if mode != MeshDrawMode::DepthOnly && mode != MeshDrawMode::SelectionCue {
                     // Add one additional batch for the picking layer in which all instances are drawn in one go regardless.
                     // (see `instance_draw_phases`)
                     batches.push(MeshBatch {
@@ -498,8 +504,17 @@ impl MeshDrawData {
         ctx: &RenderContext,
         instances: &[GpuMeshInstance],
         selected_ids: &[u32],
+        cue_alpha: f32,
     ) -> Result<Self, CpuWriteGpuReadError> {
-        let mut draw_data = Self::new(ctx, instances)?;
+        // A non-zero cue alpha turns this into the wireframe-mode cue: draw
+        // only in the transparent phase so selected faces tint over the
+        // wireframe without an opaque shaded pass.
+        let mode = if cue_alpha > 0.0 {
+            MeshDrawMode::SelectionCue
+        } else {
+            MeshDrawMode::Normal
+        };
+        let mut draw_data = Self::new_internal(ctx, instances, mode)?;
 
         if !selected_ids.is_empty() {
             let mesh_renderer = ctx.renderer::<MeshRenderer>();
@@ -517,16 +532,40 @@ impl MeshDrawData {
             ctx.queue
                 .write_buffer(&buffer, 0, bytemuck::cast_slice(selected_ids));
 
+            // Selection cue uniform (vec4f, `.x` = cue alpha). Rides alongside
+            // the SSBO so a wireframe-mode draw can tint only selected faces.
+            let cue_buffer = ctx.gpu_resources.buffers.alloc(
+                &ctx.device,
+                &BufferDesc {
+                    label: "MeshDrawData::selection_cue_buffer".into(),
+                    size: 16,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                },
+            );
+            ctx.queue.write_buffer(
+                &cue_buffer,
+                0,
+                bytemuck::cast_slice(&[cue_alpha, 0.0, 0.0, 0.0]),
+            );
+
             draw_data.selection_bind_group = Some(ctx.gpu_resources.bind_groups.alloc(
                 &ctx.device,
                 &ctx.gpu_resources,
                 &BindGroupDesc {
                     label: "MeshDrawData::selection_bind_group".into(),
-                    entries: smallvec![BindGroupEntry::Buffer {
-                        handle: buffer.handle,
-                        offset: 0,
-                        size: None,
-                    }],
+                    entries: smallvec![
+                        BindGroupEntry::Buffer {
+                            handle: buffer.handle,
+                            offset: 0,
+                            size: None,
+                        },
+                        BindGroupEntry::Buffer {
+                            handle: cue_buffer.handle,
+                            offset: 0,
+                            size: None,
+                        },
+                    ],
                     layout: mesh_renderer.selection_bind_group_layout,
                 },
             ));
@@ -541,6 +580,11 @@ enum MeshDrawMode {
     Normal,
     DepthOnly,
     PickingOnly,
+    /// Wireframe-mode selection cue: draw every instance once in the
+    /// transparent phase only (forcing `has_transparent_tint` so the
+    /// transparent pass does not skip it), with no picking batch. Paired with a
+    /// non-zero selection cue alpha so the shader shows only selected faces.
+    SelectionCue,
 }
 
 pub struct MeshRenderer {
@@ -625,16 +669,29 @@ impl Renderer for MeshRenderer {
             &ctx.device,
             &BindGroupLayoutDesc {
                 label: "MeshRenderer::selection_bind_group_layout".into(),
-                entries: vec![wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: std::num::NonZeroU64::new(4),
+                entries: vec![
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: std::num::NonZeroU64::new(4),
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
+                    // Selection cue uniform (vec4f, `.x` = cue alpha).
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: std::num::NonZeroU64::new(16),
+                        },
+                        count: None,
+                    },
+                ],
             },
         );
 
@@ -648,16 +705,36 @@ impl Renderer for MeshRenderer {
                 mapped_at_creation: false,
             },
         );
+        // Default selection cue uniform: zero, so the shaded pass is unchanged
+        // unless a draw opts into the cue via `new_with_selection`.
+        let default_cue_buffer = ctx.gpu_resources.buffers.alloc(
+            &ctx.device,
+            &BufferDesc {
+                label: "MeshRenderer::default_cue_buffer".into(),
+                size: 16,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            },
+        );
+        ctx.queue
+            .write_buffer(&default_cue_buffer, 0, bytemuck::cast_slice(&[0.0_f32; 4]));
         let default_selection_bind_group = ctx.gpu_resources.bind_groups.alloc(
             &ctx.device,
             &ctx.gpu_resources,
             &BindGroupDesc {
                 label: "MeshRenderer::default_selection_bind_group".into(),
-                entries: smallvec![BindGroupEntry::Buffer {
-                    handle: empty_selection_buffer.handle,
-                    offset: 0,
-                    size: None,
-                }],
+                entries: smallvec![
+                    BindGroupEntry::Buffer {
+                        handle: empty_selection_buffer.handle,
+                        offset: 0,
+                        size: None,
+                    },
+                    BindGroupEntry::Buffer {
+                        handle: default_cue_buffer.handle,
+                        offset: 0,
+                        size: None,
+                    },
+                ],
                 layout: selection_bind_group_layout,
             },
         );
