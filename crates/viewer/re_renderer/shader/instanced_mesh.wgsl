@@ -23,6 +23,13 @@ var<uniform> material: MaterialUniformBuffer;
 @group(2) @binding(0)
 var<storage, read> selected_ids: array<u32>;
 
+// Wireframe-mode face-selection cue. `.x` is the cue alpha: when > 0, the
+// shaded pass draws ONLY selected faces, at this alpha, with everything else
+// fully transparent -- giving selected faces a shading cue even when the
+// opaque shaded pass is off. 0 (the default) leaves the shaded pass unchanged.
+@group(2) @binding(1)
+var<uniform> selection_cue: vec4f;
+
 struct VertexOut {
     @builtin(position)
     position: vec4f,
@@ -138,7 +145,15 @@ fn fs_main_shaded(in: VertexOut) -> @location(0) vec4f {
         matcap_color = mix(matcap_color, in.selection_tint * 1.3, 0.5);
     }
 
-    let alpha = matcap_sample.a * material.albedo_factor.a * in.additive_tint_rgba.a;
+    var alpha = matcap_sample.a * material.albedo_factor.a * in.additive_tint_rgba.a;
+
+    // Wireframe-mode selection cue: when active, this draw shows only selected
+    // faces (at cue alpha); every other fragment is fully transparent.
+    if selection_cue.x > 0.0 {
+        let selected = in.element_id != 0u && is_selected(in.element_id);
+        alpha = select(0.0, selection_cue.x, selected);
+    }
+
     return vec4f(matcap_color, alpha);
 }
 
@@ -152,9 +167,13 @@ fn fs_main_picking_layer(in: VertexOut) -> @location(0) vec4u {
     if in.picking_layer_id.x != 0u {
         return vec4u(in.picking_layer_id.x, 0u, 0u, 0u);
     }
-    // Per-vertex element_id (face mode).
+    // Per-vertex element_id (face mode). Carry the instance's picking layer
+    // `instance` half (z/w) through so the element id stays unique across
+    // separate mesh instances -- without it, face id N collides between every
+    // object. `object.x` is unchanged (= element_id), so single-object picking
+    // is byte-identical.
     if in.element_id != 0u {
-        return vec4u(in.element_id, 0u, 0u, 0u);
+        return vec4u(in.element_id, 0u, in.picking_layer_id.z, in.picking_layer_id.w);
     }
     discard;
     // Unreachable after `discard`, but WGSL's browser validator requires
