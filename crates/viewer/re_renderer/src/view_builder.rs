@@ -456,6 +456,27 @@ impl ViewBuilder {
             ..Self::MAIN_TARGET_DEFAULT_DEPTH_STATE
         };
 
+    /// Depth state for overlay lines and points (wireframe, control cage,
+    /// selection edges/vertices). Like the default depth state, but with a
+    /// slope-scaled depth bias that pushes the primitive toward the camera so
+    /// it wins the depth test against coincident faces at grazing angles.
+    ///
+    /// The in-shader `apply_depth_offset` already gives overlays a *constant*
+    /// pull toward the camera, but a constant offset is insufficient where the
+    /// surface's depth gradient is steep (grazing views) -- the wireframe then
+    /// z-fights with the face it sits on. The hardware slope-scaled bias scales
+    /// with that gradient, curing the grazing-angle case. We use reverse-Z
+    /// (`GreaterEqual`, larger depth = closer), so a *positive* `slope_scale`
+    /// biases toward the camera -- the same direction as the in-shader offset.
+    pub const MAIN_TARGET_OVERLAY_DEPTH_STATE: wgpu::DepthStencilState = wgpu::DepthStencilState {
+        bias: wgpu::DepthBiasState {
+            constant: 0,
+            slope_scale: 1.0,
+            clamp: 0.0,
+        },
+        ..Self::MAIN_TARGET_DEFAULT_DEPTH_STATE
+    };
+
     pub fn new(ctx: &RenderContext, config: TargetConfiguration) -> Result<Self, ViewBuilderError> {
         Self::new_internal(ctx, config, None)
     }
