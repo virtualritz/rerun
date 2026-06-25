@@ -1,7 +1,6 @@
 mod compositor;
 mod debug_overlay;
 mod depth_cloud;
-mod gaussian_splat;
 mod generic_skybox;
 mod lines;
 mod mesh_renderer;
@@ -9,14 +8,9 @@ mod plane_clustering;
 mod point_cloud;
 mod rectangles;
 mod test_triangle;
-mod voxel_grid;
 mod world_grid;
 
 pub use debug_overlay::{DebugOverlayDrawData, DebugOverlayError, DebugOverlayRenderer};
-pub use gaussian_splat::{
-    GaussianSplatBatchFlags, GaussianSplatBatchInfo, GaussianSplatDrawData,
-    GaussianSplatDrawDataError, GaussianSplatRenderer, SH_TEXELS_PER_GAUSSIAN,
-};
 pub use generic_skybox::{GenericSkyboxDrawData, GenericSkyboxType};
 pub use lines::{LineBatchInfo, LineDrawData, LineDrawDataError, LineStripFlags};
 pub use mesh_renderer::{GpuMeshInstance, MeshDrawData};
@@ -28,17 +22,11 @@ pub use rectangles::{
     TextureAlpha, TextureFilterMag, TextureFilterMin, TexturedRect,
 };
 pub use test_triangle::TestTriangleDrawData;
-pub use voxel_grid::{
-    VoxelGridDrawData, VoxelGridDrawDataError, VoxelGridInstance, VoxelGridOptions,
-};
 pub use world_grid::{WorldGridConfiguration, WorldGridDrawData, WorldGridRenderer};
 
 pub use self::depth_cloud::{DepthCloud, DepthCloudDrawData, DepthCloudRenderer, DepthClouds};
 
 pub mod gpu_data {
-    pub use super::gaussian_splat::gpu_data::{
-        GaussianPositionScaleX, GaussianRotation, GaussianScaleYZ, GaussianShCoefficient,
-    };
     pub use super::lines::gpu_data::{LineStripInfo, LineVertex};
     pub use super::point_cloud::gpu_data::PositionRadius;
 }
@@ -47,8 +35,6 @@ pub(crate) use compositor::CompositorDrawData;
 pub(crate) use mesh_renderer::MeshRenderer;
 
 // ------------
-use std::any::Any;
-
 use crate::{
     Drawable, DrawableCollector, QueueableDrawData,
     context::RenderContext,
@@ -90,6 +76,15 @@ pub struct DrawDataDrawable {
 
 impl DrawDataDrawable {
     #[inline]
+    pub fn from_affine(
+        view_info: &DrawableCollectionViewInfo,
+        world_from_rdf: &glam::Affine3A,
+        draw_data_payload: DrawDataDrawablePayload,
+    ) -> Self {
+        Self::from_world_position(view_info, world_from_rdf.translation, draw_data_payload)
+    }
+
+    #[inline]
     pub fn from_world_position(
         view_info: &DrawableCollectionViewInfo,
         world_position: glam::Vec3A,
@@ -111,9 +106,6 @@ impl DrawDataDrawable {
 
 /// Information about the view for which can be taken into account when collecting drawables.
 pub struct DrawableCollectionViewInfo {
-    /// Stable identity of the view collecting the drawables.
-    pub view_id: crate::ViewBuilderId,
-
     /// The position of the camera in world space.
     pub camera_world_position: glam::Vec3A,
 }
@@ -125,7 +117,10 @@ pub struct DrawableCollectionViewInfo {
 // TODO(andreas): We're currently not re-using draw across several views & frames.
 // Architecturally there's not much preventing this except for `QueueableDrawData` consuming `DrawData` right now.
 pub trait DrawData {
-    type Renderer: Renderer<RendererDrawData = Self> + Send + Sync;
+    // `WasmNotSendSync` is `Send + Sync` on native and single-threaded wasm, but an empty
+    // bound on multi-threaded (atomics) wasm where wgpu's WebGPU backend types are not
+    // thread-safe. This keeps native unchanged while allowing atomic-wasm builds.
+    type Renderer: Renderer<RendererDrawData = Self> + wgpu::WasmNotSendSync;
 
     /// Collects all drawables for all phases of a specific view.
     ///
@@ -145,9 +140,6 @@ pub trait DrawData {
 pub enum DrawError {
     #[error(transparent)]
     Pool(#[from] PoolError),
-
-    #[error(transparent)]
-    Renderer(#[from] crate::RendererRegistrationError),
 }
 
 /// A draw instruction specifies which drawables of a given [`DrawData`] should be rendered.
@@ -184,7 +176,8 @@ pub trait Renderer {
     ) -> Result<(), DrawError>;
 }
 
-pub trait RendererExt: Any + Send + Sync {
+/// Extension trait for [`Renderer`] that allows running draw instructions with type erased draw data.
+pub(crate) trait RendererExt: wgpu::WasmNotSendSync {
     fn run_draw_instructions(
         &self,
         gpu_resources: &GpuRenderPipelinePoolAccessor<'_>,
@@ -192,9 +185,12 @@ pub trait RendererExt: Any + Send + Sync {
         pass: &mut wgpu::RenderPass<'_>,
         type_erased_draw_instructions: &[DrawInstruction<'_, QueueableDrawData>],
     ) -> Result<(), DrawError>;
+
+    /// Name of the renderer, used for debugging & error reporting.
+    fn name(&self) -> &'static str;
 }
 
-impl<R: Renderer + Send + Sync + 'static> RendererExt for R {
+impl<R: Renderer + wgpu::WasmNotSendSync> RendererExt for R {
     fn run_draw_instructions(
         &self,
         gpu_resources: &GpuRenderPipelinePoolAccessor<'_>,
@@ -213,6 +209,10 @@ impl<R: Renderer + Send + Sync + 'static> RendererExt for R {
 
         self.draw(gpu_resources, phase, pass, &draw_instructions)
     }
+
+    fn name(&self) -> &'static str {
+        std::any::type_name::<R>()
+    }
 }
 
 /// Gets or creates a vertex shader module for drawing a screen filling triangle.
@@ -225,19 +225,4 @@ pub fn screen_triangle_vertex_shader(
         ctx,
         &include_shader_module!("../../shader/screen_triangle.wgsl"),
     )
-}
-
-pub fn register_renderers(renderers: &mut crate::Renderers) {
-    renderers.register::<compositor::Compositor>();
-    renderers.register::<debug_overlay::DebugOverlayRenderer>();
-    renderers.register::<depth_cloud::DepthCloudRenderer>();
-    renderers.register::<gaussian_splat::GaussianSplatRenderer>();
-    renderers.register::<generic_skybox::GenericSkybox>();
-    renderers.register::<lines::LineRenderer>();
-    renderers.register::<mesh_renderer::MeshRenderer>();
-    renderers.register::<point_cloud::PointCloudRenderer>();
-    renderers.register::<rectangles::RectangleRenderer>();
-    renderers.register::<test_triangle::TestTriangle>();
-    renderers.register::<voxel_grid::VoxelGridRenderer>();
-    renderers.register::<world_grid::WorldGridRenderer>();
 }
