@@ -82,7 +82,7 @@ trait DedupableError: Sized + std::error::Error + 'static {
         type_of_var(self).hash(state);
     }
 
-    fn eq(&self, rhs: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    fn eq(&self, rhs: &(dyn std::error::Error + 'static)) -> bool {
         rhs.downcast_ref::<Self>().is_some()
     }
 }
@@ -150,7 +150,7 @@ impl DedupableError for wgpu_core::pipeline::CreateShaderModuleError {
         }
     }
 
-    fn eq(&self, rhs: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    fn eq(&self, rhs: &(dyn std::error::Error + 'static)) -> bool {
         if rhs.downcast_ref::<Self>().is_none() {
             return false;
         }

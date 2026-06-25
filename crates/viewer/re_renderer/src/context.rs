@@ -4,7 +4,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::{MappedRwLockReadGuard, RwLock, RwLockReadGuard};
 use re_mutex::Mutex;
+// On multi-threaded (atomics) wasm the renderers hold wgpu types that are not `Send + Sync`,
+// so the concurrent `TypeMap` (which requires `Send + Sync` values) can't store them. The
+// non-concurrent variant has the same API and is fine since wgpu is main-thread-only there.
+#[cfg(not(target_feature = "atomics"))]
 use type_map::concurrent::TypeMap;
+#[cfg(target_feature = "atomics")]
+use type_map::TypeMap;
 
 use crate::allocator::{CpuWriteGpuReadBelt, GpuReadbackBelt};
 use crate::device_caps::DeviceCaps;
@@ -187,7 +193,7 @@ impl<T: Renderer> RendererWithKey<T> {
 }
 
 impl Renderers {
-    pub fn get_or_create<R: 'static + Renderer + Send + Sync>(
+    pub fn get_or_create<R: 'static + Renderer + wgpu::WasmNotSendSync>(
         &mut self,
         ctx: &RenderContext,
     ) -> &RendererWithKey<R> {
@@ -309,6 +315,11 @@ impl RenderContext {
         // See https://www.w3.org/TR/webgpu/#telemetry
         let top_level_error_tracker = {
             let err_tracker = Arc::new(ErrorTracker::default());
+            // wgpu's `UncapturedErrorHandler` is unconditionally `Send + Sync`, but on
+            // multi-threaded (atomics) wasm the captured `ErrorTracker` holds non-`Send`
+            // wgpu-core error types. wgpu objects stay main-thread-only there, so we simply
+            // skip registering the uncaptured-error callback on that target.
+            #[cfg(not(target_feature = "atomics"))]
             device.on_uncaptured_error({
                 let err_tracker = Arc::clone(&err_tracker);
                 let frame_index_for_uncaptured_errors = frame_index_for_uncaptured_errors.clone();
@@ -539,7 +550,7 @@ This means, either a call to RenderContext::before_submit was omitted, or the pr
     }
 
     /// Gets a renderer with the specified type, initializing it if necessary.
-    pub fn renderer<R: 'static + Renderer + Send + Sync>(
+    pub fn renderer<R: 'static + Renderer + wgpu::WasmNotSendSync>(
         &self,
     ) -> MappedRwLockReadGuard<'_, RendererWithKey<R>> {
         // Most likely we already have the renderer. Take a read lock and return it.

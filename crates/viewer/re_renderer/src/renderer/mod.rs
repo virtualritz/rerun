@@ -117,7 +117,10 @@ pub struct DrawableCollectionViewInfo {
 // TODO(andreas): We're currently not re-using draw across several views & frames.
 // Architecturally there's not much preventing this except for `QueueableDrawData` consuming `DrawData` right now.
 pub trait DrawData {
-    type Renderer: Renderer<RendererDrawData = Self> + Send + Sync;
+    // `WasmNotSendSync` is `Send + Sync` on native and single-threaded wasm, but an empty
+    // bound on multi-threaded (atomics) wasm where wgpu's WebGPU backend types are not
+    // thread-safe. This keeps native unchanged while allowing atomic-wasm builds.
+    type Renderer: Renderer<RendererDrawData = Self> + wgpu::WasmNotSendSync;
 
     /// Collects all drawables for all phases of a specific view.
     ///
@@ -174,7 +177,7 @@ pub trait Renderer {
 }
 
 /// Extension trait for [`Renderer`] that allows running draw instructions with type erased draw data.
-pub(crate) trait RendererExt: Send + Sync {
+pub(crate) trait RendererExt: wgpu::WasmNotSendSync {
     fn run_draw_instructions(
         &self,
         gpu_resources: &GpuRenderPipelinePoolAccessor<'_>,
@@ -187,7 +190,7 @@ pub(crate) trait RendererExt: Send + Sync {
     fn name(&self) -> &'static str;
 }
 
-impl<R: Renderer + Send + Sync> RendererExt for R {
+impl<R: Renderer + wgpu::WasmNotSendSync> RendererExt for R {
     fn run_draw_instructions(
         &self,
         gpu_resources: &GpuRenderPipelinePoolAccessor<'_>,
