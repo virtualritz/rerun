@@ -11,6 +11,7 @@ use enumset::EnumSet;
 use smallvec::smallvec;
 
 use super::{DrawData, DrawError, RenderContext, Renderer};
+use crate::device_caps::DeviceCapabilityTier;
 use crate::draw_phases::{DrawPhase, OutlineMaskProcessor};
 use crate::mesh::gpu_data::MaterialUniformBuffer;
 use crate::mesh::{GpuMesh, mesh_vertices};
@@ -500,6 +501,10 @@ impl MeshDrawData {
     ///
     /// `selected_ids` contains encoded pick IDs of selected faces. The shader
     /// searches this buffer to determine if a fragment should be tinted.
+    ///
+    /// On the [`DeviceCapabilityTier::Limited`] tier (WebGL2) the ids go into
+    /// a fixed-capacity uniform buffer instead of a storage buffer; ids beyond
+    /// [`MAX_SELECTED_IDS_LIMITED_TIER`] are dropped from the tint.
     pub fn new_with_selection(
         ctx: &RenderContext,
         instances: &[GpuMeshInstance],
@@ -520,17 +525,51 @@ impl MeshDrawData {
             let mesh_renderer = ctx.renderer::<MeshRenderer>();
 
             // Create and upload the selection buffer.
-            let buffer = ctx.gpu_resources.buffers.alloc(
-                &ctx.device,
-                &BufferDesc {
-                    label: "MeshDrawData::selection_buffer".into(),
-                    size: std::mem::size_of_val(selected_ids) as u64,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                },
-            );
-            ctx.queue
-                .write_buffer(&buffer, 0, bytemuck::cast_slice(selected_ids));
+            let buffer = if ctx.device_caps().tier == DeviceCapabilityTier::Limited {
+                // No storage buffers on this tier: pack `count` + ids into the
+                // fixed-size uniform layout of `instanced_mesh_limited.wgsl`.
+                let count = selected_ids.len().min(MAX_SELECTED_IDS_LIMITED_TIER);
+                if selected_ids.len() > MAX_SELECTED_IDS_LIMITED_TIER {
+                    re_log::warn_once!(
+                        "Selection has {} ids, more than the {MAX_SELECTED_IDS_LIMITED_TIER} \
+                         supported on this GPU tier; the rest won't be tinted.",
+                        selected_ids.len()
+                    );
+                }
+                let mut contents = Vec::with_capacity(
+                    SELECTION_UNIFORM_BUFFER_SIZE as usize / std::mem::size_of::<u32>(),
+                );
+                contents.push(count as u32);
+                contents.extend([0_u32; 3]); // Header padding (`count` is a vec4u).
+                contents.extend(&selected_ids[..count]);
+                contents.resize(contents.capacity(), 0);
+
+                let buffer = ctx.gpu_resources.buffers.alloc(
+                    &ctx.device,
+                    &BufferDesc {
+                        label: "MeshDrawData::selection_buffer".into(),
+                        size: SELECTION_UNIFORM_BUFFER_SIZE,
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    },
+                );
+                ctx.queue
+                    .write_buffer(&buffer, 0, bytemuck::cast_slice(&contents));
+                buffer
+            } else {
+                let buffer = ctx.gpu_resources.buffers.alloc(
+                    &ctx.device,
+                    &BufferDesc {
+                        label: "MeshDrawData::selection_buffer".into(),
+                        size: std::mem::size_of_val(selected_ids) as u64,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    },
+                );
+                ctx.queue
+                    .write_buffer(&buffer, 0, bytemuck::cast_slice(selected_ids));
+                buffer
+            };
 
             // Selection cue uniform (vec4f, `.x` = cue alpha). Rides alongside
             // the SSBO so a wireframe-mode draw can tint only selected faces.
@@ -586,6 +625,16 @@ enum MeshDrawMode {
     /// non-zero selection cue alpha so the shader shows only selected faces.
     SelectionCue,
 }
+
+/// Maximum number of selected element ids on the [`DeviceCapabilityTier::Limited`]
+/// tier, where the ids are passed in a fixed-size uniform buffer (WebGL2 has no
+/// storage buffers). Keep in sync with `instanced_mesh_limited.wgsl`.
+pub const MAX_SELECTED_IDS_LIMITED_TIER: usize = 4092;
+
+/// Size of the `Limited`-tier selection uniform buffer: 16 header bytes
+/// (`count` as a vec4u) + 1023 * 16 id bytes = 16384 bytes, the guaranteed
+/// minimum uniform buffer size on WebGL2.
+const SELECTION_UNIFORM_BUFFER_SIZE: u64 = 16384;
 
 pub struct MeshRenderer {
     rp_shaded: GpuRenderPipelineHandle,
@@ -664,7 +713,12 @@ impl Renderer for MeshRenderer {
                 ],
             },
         );
-        // Selection SSBO bind group (group 2): storage buffer of selected element IDs.
+        // The `Limited` tier (WebGL2) has no storage buffers, so the selection
+        // ids move into a fixed-capacity uniform buffer there, with a matching
+        // shader variant.
+        let limited_tier = ctx.device_caps().tier == DeviceCapabilityTier::Limited;
+
+        // Selection bind group (group 2): buffer of selected element IDs.
         let selection_bind_group_layout = ctx.gpu_resources.bind_group_layouts.get_or_create(
             &ctx.device,
             &BindGroupLayoutDesc {
@@ -674,9 +728,17 @@ impl Renderer for MeshRenderer {
                         binding: 0,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            ty: if limited_tier {
+                                wgpu::BufferBindingType::Uniform
+                            } else {
+                                wgpu::BufferBindingType::Storage { read_only: true }
+                            },
                             has_dynamic_offset: false,
-                            min_binding_size: std::num::NonZeroU64::new(4),
+                            min_binding_size: std::num::NonZeroU64::new(if limited_tier {
+                                SELECTION_UNIFORM_BUFFER_SIZE
+                            } else {
+                                4
+                            }),
                         },
                         count: None,
                     },
@@ -695,13 +757,22 @@ impl Renderer for MeshRenderer {
             },
         );
 
-        // Default empty selection buffer (single zero).
+        // Default empty selection buffer (zero-initialized by wgpu, so the
+        // stored count/id is zero and nothing matches).
         let empty_selection_buffer = ctx.gpu_resources.buffers.alloc(
             &ctx.device,
             &BufferDesc {
                 label: "MeshRenderer::empty_selection_buffer".into(),
-                size: 4,
-                usage: wgpu::BufferUsages::STORAGE,
+                size: if limited_tier {
+                    SELECTION_UNIFORM_BUFFER_SIZE
+                } else {
+                    4
+                },
+                usage: if limited_tier {
+                    wgpu::BufferUsages::UNIFORM
+                } else {
+                    wgpu::BufferUsages::STORAGE
+                },
                 mapped_at_creation: false,
             },
         );
@@ -753,7 +824,11 @@ impl Renderer for MeshRenderer {
 
         let shader_module = ctx.gpu_resources.shader_modules.get_or_create(
             ctx,
-            &include_shader_module!("../../shader/instanced_mesh.wgsl"),
+            &if limited_tier {
+                include_shader_module!("../../shader/instanced_mesh_limited.wgsl")
+            } else {
+                include_shader_module!("../../shader/instanced_mesh.wgsl")
+            },
         );
 
         // We always assume counter-clockwise faces as front.
