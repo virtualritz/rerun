@@ -4,6 +4,10 @@ use re_mutex::Mutex;
 use super::wgpu_core_error::WgpuCoreWrappedContextError;
 
 #[derive(Debug, Hash, PartialEq, Eq)]
+// Dead on multi-threaded (atomics) wasm: the uncaptured-error callback that
+// constructs these variants (via `handle_error`) is not registered on that
+// target (see `context.rs`). Live on native and single-threaded wasm.
+#[cfg_attr(target_feature = "atomics", allow(dead_code))]
 pub enum ContextError {
     WgpuCoreError(WgpuCoreWrappedContextError),
     #[cfg(web)]
@@ -54,6 +58,9 @@ impl ErrorTracker {
     /// `frame_index` should be the frame index associated with the error.
     /// Since errors may be reported on the `device timeline`, not the `content timeline`,
     /// this may not be the currently active frame index.
+    // Dead on multi-threaded (atomics) wasm: the uncaptured-error callback that
+    // would call this is not registered there (see `context.rs`).
+    #[cfg_attr(target_feature = "atomics", allow(dead_code))]
     pub fn handle_error(&self, error: wgpu::Error, frame_index: u64) {
         let is_internal_error = matches!(error, wgpu::Error::Internal { .. });
 
