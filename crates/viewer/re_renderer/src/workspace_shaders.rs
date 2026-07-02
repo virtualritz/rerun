@@ -68,6 +68,18 @@ pub fn init() {
     }
 
     {
+        let virtpath = Path::new("shader/instanced_mesh_common.wgsl");
+        let content = include_str!("../shader/instanced_mesh_common.wgsl").into();
+        fs.create_file(virtpath, content).unwrap();
+    }
+
+    {
+        let virtpath = Path::new("shader/instanced_mesh_limited.wgsl");
+        let content = include_str!("../shader/instanced_mesh_limited.wgsl").into();
+        fs.create_file(virtpath, content).unwrap();
+    }
+
+    {
         let virtpath = Path::new("shader/lines.wgsl");
         let content = include_str!("../shader/lines.wgsl").into();
         fs.create_file(virtpath, content).unwrap();
