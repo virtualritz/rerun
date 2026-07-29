@@ -126,7 +126,7 @@ impl Projection {
                 // We use infinite reverse-z projection matrix
                 // * great precision both with floating point and integer: https://developer.nvidia.com/content/depth-precision-visualized
                 // * no need to worry about far plane
-                glam::Mat4::perspective_infinite_reverse_rh(
+                glam::camera::rh::proj::directx::perspective_infinite_reverse(
                     vertical_fov,
                     aspect_ratio,
                     near_plane_distance,
@@ -142,7 +142,7 @@ impl Projection {
 
                 // Note that we inverse z (by swapping near and far plane) to be consistent with our perspective projection.
                 match camera_mode {
-                    OrthographicCameraMode::NearPlaneCenter => glam::Mat4::orthographic_rh(
+                    OrthographicCameraMode::NearPlaneCenter => glam::camera::rh::proj::directx::orthographic(
                         -0.5 * horizontal_world_size,
                         0.5 * horizontal_world_size,
                         -0.5 * vertical_world_size,
@@ -150,7 +150,7 @@ impl Projection {
                         far_plane_distance,
                         0.0,
                     ),
-                    OrthographicCameraMode::TopLeftCornerAndExtendZ => glam::Mat4::orthographic_rh(
+                    OrthographicCameraMode::TopLeftCornerAndExtendZ => glam::camera::rh::proj::directx::orthographic(
                         0.0,
                         horizontal_world_size,
                         vertical_world_size,
