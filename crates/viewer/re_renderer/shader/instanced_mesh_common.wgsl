@@ -98,13 +98,16 @@ fn vs_main(in_vertex: VertexIn, in_instance: InstanceIn) -> VertexOut {
     return out;
 }
 
-@fragment
-fn fs_main_shaded(in: VertexOut) -> @location(0) vec4f {
-    // Always use matcap shading. Fallback to +Z if a normal is missing.
-    let has_normal = any(in.normal_world_space != vec3f(0.0, 0.0, 0.0));
+// Matcap albedo, used when `material.use_matcap != 0`. The bound texture is a
+// matcap, sampled by the view-space normal rather than by the mesh's texture
+// coordinates, so a mesh needs no UVs at all on this path. Returns linear
+// unmultiplied rgb in `.rgb` and separate alpha in `.a`.
+fn shade_matcap(normal_world_space: vec3f, additive_tint_rgba: vec4f) -> vec4f {
+    // Fallback to +Z if a normal is missing.
+    let has_normal = any(normal_world_space != vec3f(0.0, 0.0, 0.0));
     let normal_world = normalize(select(
         vec3f(0.0, 0.0, 1.0),
-        in.normal_world_space,
+        normal_world_space,
         vec3<bool>(has_normal, has_normal, has_normal),
     ));
 
@@ -126,21 +129,76 @@ fn fs_main_shaded(in: VertexOut) -> @location(0) vec4f {
     matcap_color *= material.albedo_factor.rgb;
 
     // Apply additive tint.
-    matcap_color += in.additive_tint_rgba.rgb;
-    matcap_color *= in.additive_tint_rgba.a;
+    matcap_color += additive_tint_rgba.rgb;
+    matcap_color *= additive_tint_rgba.a;
     matcap_color *= material.albedo_factor.a;
+
+    let alpha = matcap_sample.a * material.albedo_factor.a * additive_tint_rgba.a;
+
+    return vec4f(matcap_color, alpha);
+}
+
+// Textured albedo, used when `material.use_matcap == 0`. The bound texture is a
+// base-color map sampled at the interpolated corner UV, lit by a fixed two-light
+// diffuse rig so that surface form still reads. This restores the shading path
+// that the matcap work replaced, rather than inventing a second one. Returns
+// linear unmultiplied rgb in `.rgb` and separate alpha in `.a`.
+fn shade_textured(texcoord: vec2f, vertex_color: vec3f, normal_world_space: vec3f, additive_tint_rgba: vec4f) -> vec4f {
+    let sample = textureSample(albedo_texture, trilinear_sampler_repeat, texcoord);
+    var texture_color: vec3f;
+    switch material.texture_format {
+        case FORMAT_RGBA: { texture_color = linear_from_srgb(sample.rgb); }
+        case FORMAT_GRAYSCALE: { texture_color = linear_from_srgb(sample.rrr); }
+        default: { texture_color = vec3f(0.0); }
+    }
+
+    // Texture alpha is deliberately ignored: the CPU side flags a mesh as
+    // transparent from `albedo_factor.a` alone, so honouring texture alpha here
+    // would surprise-enable transparency on a mesh nothing sorted.
+    var albedo = vec4f(texture_color * vertex_color, 1.0) * material.albedo_factor;
+
+    // The additive tint is linear space with unmultiplied/separate (!!) alpha.
+    albedo += vec4f(additive_tint_rgba.rgb, 0.0);
+    albedo *= additive_tint_rgba.a;
+
+    // Two lights, so that every side of the mesh picks up some shading. A mesh
+    // without normals stays unshaded rather than going black.
+    var shading = 1.0;
+    if any(normal_world_space != vec3f(0.0, 0.0, 0.0)) {
+        let normal = normalize(normal_world_space);
+        shading = 0.2;
+        shading += 1.0 * clamp(dot(normalize(vec3f(1.0, 2.0, 3.0)), normal), 0.0, 1.0);
+        shading += 0.5 * clamp(dot(normalize(vec3f(-1.0, -3.0, -5.0)), normal), 0.0, 1.0);
+        shading = clamp(shading, 0.0, 1.0);
+    }
+
+    return vec4f(albedo.rgb * shading, albedo.a);
+}
+
+@fragment
+fn fs_main_shaded(in: VertexOut) -> @location(0) vec4f {
+    // Matcap is the default and stays the untextured path; `use_matcap == 0`
+    // opts into sampling the albedo texture at the interpolated corner UV.
+    var shaded: vec4f;
+    if material.use_matcap != 0u {
+        shaded = shade_matcap(in.normal_world_space, in.additive_tint_rgba);
+    } else {
+        shaded = shade_textured(in.texcoord, in.color, in.normal_world_space, in.additive_tint_rgba);
+    }
+
+    var shaded_color = shaded.rgb;
 
     // Selection tint: blend towards geometry type color.
     if in.element_id != 0u && is_selected(in.element_id) {
-        matcap_color = mix(matcap_color, in.selection_tint, 0.4);
+        shaded_color = mix(shaded_color, in.selection_tint, 0.4);
     }
 
     // Hover tint: stronger blend towards geometry type color.
     if in.hover_element_id != 0u && in.element_id == in.hover_element_id {
-        matcap_color = mix(matcap_color, in.selection_tint * 1.3, 0.5);
+        shaded_color = mix(shaded_color, in.selection_tint * 1.3, 0.5);
     }
 
-    var alpha = matcap_sample.a * material.albedo_factor.a * in.additive_tint_rgba.a;
+    var alpha = shaded.a;
 
     // Wireframe-mode selection cue: when active, this draw shows only selected
     // faces (at cue alpha); every other fragment is fully transparent.
@@ -149,7 +207,7 @@ fn fs_main_shaded(in: VertexOut) -> @location(0) vec4f {
         alpha = select(0.0, selection_cue.x, selected);
     }
 
-    return vec4f(matcap_color, alpha);
+    return vec4f(shaded_color, alpha);
 }
 
 @fragment
