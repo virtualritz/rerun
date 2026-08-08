@@ -1,7 +1,6 @@
 //! MCAP file importer implementation.
 
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -9,13 +8,10 @@ use crossbeam::channel::Sender;
 use re_chunk::RowId;
 use re_lenses::Lenses;
 use re_log_types::{SetStoreInfo, StoreId, StoreInfo};
-use re_mcap::{DecoderIdentifier, DecoderRegistry, SelectedDecoders};
+use re_mcap::{DecoderIdentifier, DecoderRegistry, SelectedDecoders, TopicFilter};
 use re_quota_channel::send_crossbeam;
 
-use crate::{
-    FOXGLOVE_LENSES_IDENTIFIER, ImportedData, Importer, ImporterError, ImporterSettings,
-    URDF_DECODER_IDENTIFIER,
-};
+use crate::{ImportedData, Importer, ImporterError, ImporterSettings, URDF_DECODER_IDENTIFIER};
 
 const MCAP_IMPORTER_NAME: &str = "McapImporter";
 
@@ -36,6 +32,9 @@ pub struct McapImporter {
     selected_decoders: SelectedDecoders,
     // TODO(RR-3491): We don't need the fallback logic anymore; use `OutputMode` instead.
     raw_fallback_enabled: bool,
+    topic_filter: TopicFilter,
+    time_range: Option<(u64, u64)>,
+    recover: bool,
     lenses_by_time_type: HashMap<re_log_types::TimeType, Arc<Lenses>>,
 }
 
@@ -61,6 +60,9 @@ impl McapImporter {
         Self {
             selected_decoders: selected_decoders.clone(),
             raw_fallback_enabled: true,
+            topic_filter: TopicFilter::default(),
+            time_range: None,
+            recover: false,
             lenses_by_time_type,
         }
     }
@@ -68,6 +70,40 @@ impl McapImporter {
     /// Configures whether the raw decoder is used as a fallback for unsupported channels.
     pub fn with_raw_fallback(mut self, raw_fallback_enabled: bool) -> Self {
         self.raw_fallback_enabled = raw_fallback_enabled;
+        self
+    }
+
+    /// Configures a regex-based topic filter.
+    ///
+    /// See [`TopicFilter`] for matching semantics.
+    pub fn with_topic_filter(mut self, topic_filter: TopicFilter) -> Self {
+        self.topic_filter = topic_filter;
+        self
+    }
+
+    /// Restricts decoding to messages whose MCAP `log_time` falls in `[start, end)` (nanoseconds).
+    ///
+    /// This filters on the raw MCAP `log_time`, i.e. *before* any `timestamp_offset_ns` is applied
+    /// and before content-derived timelines. Chunks whose index bounds fall entirely outside the
+    /// range are skipped before decompression, so this bounds peak memory as well as output.
+    /// `None` clears the filter.
+    pub fn with_time_range(mut self, time_range: Option<(u64, u64)>) -> Self {
+        self.time_range = time_range;
+        self
+    }
+
+    /// Enables recovery of truncated / summary-less MCAP files when using
+    /// [`Importer::import_from_path`] or [`Importer::import_from_file_contents`].
+    ///
+    /// When enabled, a missing or invalid summary is reconstructed in memory from the readable
+    /// portion of the file.
+    /// The incomplete tail chunk or record is dropped with a warning, and recovered statistics only
+    /// count the channels and messages that could be recovered.
+    ///
+    /// Note: This has no effect on [`Self::emit_chunks`], which uses the recovery setting of the
+    /// supplied [`re_mcap::McapFile`].
+    pub fn with_recover(mut self, recover: bool) -> Self {
+        self.recover = recover;
         self
     }
 
@@ -84,72 +120,93 @@ impl McapImporter {
         selected_decoders: &SelectedDecoders,
         time_type: re_log_types::TimeType,
     ) -> Option<Arc<Lenses>> {
-        if !selected_decoders.contains(&DecoderIdentifier::from(FOXGLOVE_LENSES_IDENTIFIER)) {
-            return None;
-        }
-
-        match super::lenses::foxglove_lenses(time_type) {
-            Ok(lenses) => Some(Arc::new(lenses)),
+        match super::lenses::mcap_lenses(selected_decoders, time_type) {
+            Ok(Some(lenses)) => Some(Arc::new(lenses)),
+            Ok(None) => None,
             Err(err) => {
                 re_log::error_once!(
-                    "Failed to build Foxglove lenses: {err}. MCAP importer will run without them."
+                    "Failed to build MCAP lenses: {err}. MCAP importer will run without them."
                 );
                 None
             }
         }
     }
 
-    /// Load chunks from MCAP bytes, calling `emit_chunk` for each produced chunk.
+    /// Load chunks from an [`re_mcap::McapFile`], calling `emit_chunk` for each produced chunk.
     ///
     /// Bypasses the [`Importer`] / [`ImportedData`] / `SetStoreInfo` ceremony.
     /// Uses the decoders, raw fallback, and lenses already configured on this importer.
-    pub fn emit_chunks(
+    pub fn emit_chunks<BytesSource>(
         &self,
-        mcap: &[u8],
+        mcap_file: &re_mcap::McapFile<BytesSource>,
         timeline_type: re_log_types::TimeType,
         timestamp_offset_ns: Option<i64>,
-        emit_chunk: &mut dyn FnMut(re_chunk::Chunk),
-    ) -> Result<(), ImporterError> {
-        re_tracing::profile_function!();
+        emit_chunk: &(dyn Fn(re_chunk::Chunk) + Send + Sync),
+    ) -> Result<(), ImporterError>
+    where
+        BytesSource: AsRef<[u8]>,
+    {
+        // Tag the scope with the time range so each window of a windowed read is a distinct span.
+        re_tracing::profile_function!(match self.time_range {
+            Some((start, end)) => format!("log_time [{start}, {end})"),
+            None => "full".to_owned(),
+        });
 
         let lenses = self.lenses_for(timeline_type);
 
-        let mut on_chunk_with_transforms = |chunk: re_chunk::Chunk| {
+        // Apply time offset (if set) and make sure chunks are sorted by RowId before passing to the callback.
+        let emit_final_chunk = |chunk: re_chunk::Chunk| {
+            let mut chunk = apply_timestamp_offset(chunk, timestamp_offset_ns);
+            chunk.sort_by_row_ids_if_needed();
+
+            // If we hit this warning, we may be producing unnecessarily slow .rrd:s
+            // See RR-4658 for details.
+            chunk.warn_if_out_of_order();
+
+            emit_chunk(chunk);
+        };
+
+        let on_chunk_with_transforms = |chunk: re_chunk::Chunk| {
             if let Some(ref lenses) = lenses {
-                for result in lenses.apply(&chunk) {
+                for result in lenses.apply(&chunk, &re_lenses::default_runtime()) {
                     match result {
-                        Ok(c) => emit_chunk(apply_timestamp_offset(c, timestamp_offset_ns)),
+                        Ok(chunk) => emit_final_chunk(chunk),
                         Err(partial) => {
                             for error in partial.errors() {
                                 re_log::error_once!("Lens error: {error}");
                             }
-                            if let Some(c) = partial.take() {
-                                emit_chunk(apply_timestamp_offset(c, timestamp_offset_ns));
+                            if let Some(chunk) = partial.partial_chunk() {
+                                emit_final_chunk(chunk);
                             }
                         }
                     }
                 }
             } else {
-                emit_chunk(apply_timestamp_offset(chunk, timestamp_offset_ns));
+                emit_final_chunk(chunk);
             }
         };
 
-        let reader = Cursor::new(&mcap);
-        let summary = re_mcap::read_summary(reader)?
-            .ok_or_else(|| anyhow::anyhow!("MCAP file does not contain a summary"))?;
-
+        let summary = mcap_file.summary().map_err(anyhow::Error::from)?;
         DecoderRegistry::all_builtin(self.raw_fallback_enabled)
             .select(&self.selected_decoders)
-            .plan(mcap, &summary)?
-            .run(mcap, &summary, timeline_type, &mut on_chunk_with_transforms)?;
+            .plan(mcap_file.bytes(), &summary, &self.topic_filter)?
+            .with_time_range(self.time_range)
+            .run(
+                mcap_file.bytes(),
+                &summary,
+                timeline_type,
+                &on_chunk_with_transforms,
+            )?;
 
         if self
             .selected_decoders
             .contains(&DecoderIdentifier::from(URDF_DECODER_IDENTIFIER))
             && let Err(err) = super::robot_description::extract_urdf_from_robot_descriptions(
-                mcap,
+                mcap_file.bytes(),
                 &summary,
-                &mut on_chunk_with_transforms,
+                &self.topic_filter,
+                mcap_file.recover(),
+                &on_chunk_with_transforms,
             )
         {
             re_log::warn_once!("Failed to extract URDF from robot_description topics: {err}");
@@ -204,8 +261,9 @@ impl Importer for McapImporter {
                         return;
                     }
                 };
+                let mcap_file = re_mcap::McapFile::new(mmap, loader.recover);
 
-                if let Err(err) = loader.load_and_send(&mmap, &settings, &tx) {
+                if let Err(err) = loader.load_and_send(&mcap_file, &settings, &tx) {
                     re_log::error!("Failed to load MCAP file: {err}");
                 }
             })
@@ -235,14 +293,17 @@ impl Importer for McapImporter {
         // `load` will spawn a bunch of importers on the common rayon thread pool and wait for
         // their response via channels: we cannot be waiting for these responses on the
         // common rayon thread pool.
-        cfg_if::cfg_if! {
-            if #[cfg(target_arch = "wasm32")] {
-                loader.load_and_send(&contents, &settings, &tx)?;
-            } else {
+        cfg_select! {
+            target_arch = "wasm32" => {
+                let mcap_file = re_mcap::McapFile::new(contents, loader.recover);
+                loader.load_and_send(&mcap_file, &settings, &tx)?;
+            }
+            _ => {
                 std::thread::Builder::new()
                     .name(format!("load_mcap({filepath:?})"))
                     .spawn(move || {
-                        if let Err(err) = loader.load_and_send(&contents, &settings, &tx) {
+                        let mcap_file = re_mcap::McapFile::new(contents, loader.recover);
+                        if let Err(err) = loader.load_and_send(&mcap_file, &settings, &tx) {
                             re_log::error!("Failed to load MCAP file: {err}");
                         }
                     })
@@ -257,12 +318,15 @@ impl Importer for McapImporter {
 impl McapImporter {
     /// Send `SetStoreInfo` then decode chunks via [`Self::emit_chunks`],
     /// forwarding each chunk to the [`Importer`] channel.
-    pub fn load_and_send(
+    pub fn load_and_send<BytesSource>(
         &self,
-        mcap: &[u8],
+        mcap_file: &re_mcap::McapFile<BytesSource>,
         settings: &ImporterSettings,
         tx: &Sender<ImportedData>,
-    ) -> Result<(), ImporterError> {
+    ) -> Result<(), ImporterError>
+    where
+        BytesSource: AsRef<[u8]>,
+    {
         re_log::debug!(
             "Loading MCAP with timeline type {:?}",
             settings.timeline_type
@@ -285,10 +349,10 @@ impl McapImporter {
         }
 
         self.emit_chunks(
-            mcap,
+            mcap_file,
             settings.timeline_type,
             settings.timestamp_offset_ns,
-            &mut |chunk| {
+            &|chunk| {
                 send_chunk_to_channel(tx, &store_id, chunk);
             },
         )

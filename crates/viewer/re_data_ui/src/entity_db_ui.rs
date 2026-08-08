@@ -1,16 +1,13 @@
-use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use egui::NumExt as _;
 use jiff::SignedDuration;
 use jiff::fmt::friendly::{FractionalUnit, SpanPrinter};
-use re_byte_size::SizeBytes as _;
-use re_chunk_store::Chunk;
 use re_chunk_store::ChunkStoreConfig;
-use re_entity_db::{EntityDb, RrdManifestIndex, entity_db::RedapConnectionState};
+use re_entity_db::{EntityDb, entity_db::RedapConnectionState};
 use re_format::{format_bytes, format_uint};
 use re_log_channel::LogSource;
-use re_log_types::{EntityPath, StoreKind};
+use re_log_types::StoreKind;
 use re_ui::UiExt as _;
 use re_viewer_context::{AppContext, UiLayout};
 
@@ -93,18 +90,10 @@ impl crate::AppUi for EntityDb {
             }
         }
 
-        if ctx.app_options.show_metrics
-            && self.can_fetch_chunks_from_redap()
-            && ui_layout.is_selection_panel()
-        {
-            ui.add_space(4.0);
-            ui.collapsing_header("In-flight chunk requests", false, |ui| {
-                chunk_requests_ui(ui, self.rrd_manifest_index());
-            });
-        }
-
-        if cfg!(debug_assertions) && !ctx.is_test {
-            ui.collapsing_header("Debug info", true, |ui| {
+        #[cfg(debug_assertions)]
+        if !ctx.is_test {
+            let title = re_ui::debug_only::with_debug_only_badge(ui.style(), "Debug info");
+            ui.collapsing_header(title, true, |ui| {
                 debug_ui(ui, self);
             });
         }
@@ -126,7 +115,7 @@ fn grid_content_ui(ctx: &AppContext<'_>, db: &EntityDb, ui: &mut egui::Ui, ui_la
     }) = &db.data_source
     {
         ui.grid_left_hand_label("Segment ID");
-        ui.label(segment_id);
+        ui.label(segment_id.to_string());
         ui.end_row();
     }
 
@@ -223,7 +212,7 @@ fn grid_content_ui(ctx: &AppContext<'_>, db: &EntityDb, ui: &mut egui::Ui, ui_la
         if db.rrd_manifest_index().has_manifest() {
             ui.grid_left_hand_label("Downloaded");
 
-            let memory_limit = ctx.memory_limit;
+            let memory_limit = ctx.app_options.memory_limit;
             let max_downloaded_bytes = if db.rrd_manifest_index().is_fully_loaded() {
                 full_size_bytes
             } else {
@@ -233,16 +222,16 @@ fn grid_content_ui(ctx: &AppContext<'_>, db: &EntityDb, ui: &mut egui::Ui, ui_la
             let current_size = format_bytes(current_size_bytes as _);
             let max_downloaded = format_bytes(max_downloaded_bytes as _);
 
-            ui.horizontal(|ui| {
-                let mut num_root_chunks = 0_usize;
-                let mut num_fully_loaded = 0_usize;
-                for info in db.rrd_manifest_index().root_chunks() {
-                    num_root_chunks += 1;
-                    if info.is_fully_loaded() {
-                        num_fully_loaded += 1;
-                    }
+            let mut num_root_chunks = 0_usize;
+            let mut num_fully_loaded = 0_usize;
+            for info in db.rrd_manifest_index().root_chunks() {
+                num_root_chunks += 1;
+                if info.is_fully_loaded() {
+                    num_fully_loaded += 1;
                 }
+            }
 
+            ui.horizontal(|ui| {
                 if db.redap_connection_state() == RedapConnectionState::PartialManifest {
                     ui.label(format!("{current_size} / ?"));
                     ui.label(format!("({} / ? chunks)", format_uint(num_fully_loaded)));
@@ -272,6 +261,16 @@ fn grid_content_ui(ctx: &AppContext<'_>, db: &EntityDb, ui: &mut egui::Ui, ui_la
             });
 
             ui.end_row();
+
+            // ----
+
+            if 0 < num_root_chunks {
+                ui.grid_left_hand_label("Avg chunk size")
+                    .on_hover_text("On remote");
+                let avg_chunk_size_bytes = full_size_bytes as f64 / num_root_chunks as f64;
+                ui.label(format_bytes(avg_chunk_size_bytes));
+                ui.end_row();
+            }
         }
     }
 
@@ -308,7 +307,7 @@ fn grid_content_ui(ctx: &AppContext<'_>, db: &EntityDb, ui: &mut egui::Ui, ui_la
             chunk_max_rows_if_unsorted,
         } = db.storage_engine().store().config();
 
-        ui.grid_left_hand_label("Compaction");
+        ui.grid_left_hand_label("Compaction config");
         ui.label(format!(
             "{} rows ({} if unsorted) or {}",
             re_format::format_uint(chunk_max_rows),
@@ -339,7 +338,7 @@ fn grid_content_ui(ctx: &AppContext<'_>, db: &EntityDb, ui: &mut egui::Ui, ui_la
 
                     This compaction process is an ephemeral, in-memory optimization of the Rerun viewer.\
                     It will not modify the recording itself: use the `Save` command of the viewer, or the \
-                    `rerun rrd compact` CLI tool if you wish to persist the compacted results, which will \
+                    `rerun rrd optimize` CLI tool if you wish to persist the compacted results, which will \
                     make future runs cheaper.
                     ",
                         chunk_max_rows = re_format::format_uint(chunk_max_rows),
@@ -362,81 +361,8 @@ fn grid_content_ui(ctx: &AppContext<'_>, db: &EntityDb, ui: &mut egui::Ui, ui_la
     }
 }
 
-fn chunk_requests_ui(ui: &mut egui::Ui, rrd_manifest_index: &RrdManifestIndex) {
-    let Some(rrd_manifest) = rrd_manifest_index.manifest() else {
-        return;
-    };
-
-    let chunk_requests = rrd_manifest_index.chunk_requests();
-    let requests = chunk_requests.pending_requests();
-
-    let col_chunk_entity_path_raw = rrd_manifest.col_chunk_entity_path_raw();
-
-    let mut entities = BTreeSet::<EntityPath>::new();
-    let mut total_in_flight_bytes = 0;
-    let mut total_uncompressed_bytes = 0;
-    let mut total_chunks = 0;
-    for request in &requests {
-        total_in_flight_bytes += request.size_bytes_on_wire;
-        total_uncompressed_bytes += request.size_bytes_uncompressed;
-        total_chunks += request.row_indices.len() as u64;
-
-        for &row_idx in &request.row_indices {
-            let path = col_chunk_entity_path_raw.value(row_idx);
-            entities.insert(EntityPath::parse_forgiving(path));
-        }
-    }
-
-    ui.label("Data currently being downloaded from the server");
-
-    egui::Grid::new("chunk-requests").show(ui, |ui| {
-        ui.label("Speed");
-        if let Some(bytes_per_second) = chunk_requests.bandwidth() {
-            ui.label(format!("{}/s", format_bytes(bytes_per_second)));
-            if 0.0 < bytes_per_second {
-                ui.request_repaint(); // Show latest estimate
-            }
-        }
-        ui.end_row();
-
-        ui.label("Requests");
-        ui.label(format_uint(requests.len()));
-        ui.end_row();
-
-        ui.label("Chunks");
-        ui.label(format_uint(total_chunks));
-        ui.end_row();
-
-        ui.label("Recently canceled");
-        ui.label(format_uint(
-            chunk_requests
-                .recently_canceled
-                .iter()
-                .map(|(_time, count)| count)
-                .sum::<usize>(),
-        ));
-        ui.end_row();
-
-        ui.label("Bytes (compressed)");
-        ui.label(format_bytes(total_in_flight_bytes as _));
-        ui.end_row();
-
-        ui.label("Bytes (uncompressed)");
-        ui.label(format_bytes(total_uncompressed_bytes as _));
-        ui.end_row();
-
-        ui.label("Entities");
-        ui.label(format_uint(entities.len()));
-        ui.end_row();
-    });
-
-    for entity in &entities {
-        ui.label(format!("  - {entity}"));
-    }
-}
-
+#[cfg(debug_assertions)]
 fn debug_ui(ui: &mut egui::Ui, db: &EntityDb) {
-    ui.weak("(only visible in debug builds)");
     egui::Grid::new("debug-info").show(ui, |ui| {
         if let Some(manifest) = db.rrd_manifest_index().manifest() {
             ui.label("Entities");
@@ -451,67 +377,11 @@ fn debug_ui(ui: &mut egui::Ui, db: &EntityDb) {
         ui.end_row();
 
         ui.label("Connection");
-        ui.label(format!("{:?}", db.redap_connection_state()));
+        ui.label(format!("{:?}", db.redap_connection_state())); // NOLINT: debug-only UI
         ui.end_row();
 
         ui.label("Physical chunks");
         ui.label(format_bytes(db.byte_size_of_physical_chunks() as _));
-        ui.end_row();
-    });
-
-    protected_chunks_ui(ui, db);
-}
-
-fn protected_chunks_ui(ui: &mut egui::Ui, db: &EntityDb) {
-    #![expect(clippy::iter_over_hash_type)] // just summing sizes, order doesn't matter
-
-    let rrd_manifest_index = db.rrd_manifest_index();
-    let protected = rrd_manifest_index.chunk_prioritizer().protected_chunks();
-
-    if protected.roots.is_empty() && protected.physical.is_empty() {
-        return;
-    }
-
-    let manifest = rrd_manifest_index.manifest();
-    let store = db.storage_engine();
-    let store = store.store();
-
-    // Compute root (virtual) chunk sizes from the manifest
-    let mut roots_total_bytes: u64 = 0;
-    if let Some(manifest) = &manifest {
-        let col_sizes = manifest.col_chunk_byte_size_uncompressed();
-        for root_id in &protected.roots {
-            if let Some(info) = rrd_manifest_index.root_chunk_info(root_id) {
-                roots_total_bytes += col_sizes[info.row_id];
-            }
-        }
-    }
-
-    // Compute physical chunk sizes from the store
-    let mut physical_total_bytes: u64 = 0;
-    for chunk_id in &protected.physical {
-        if let Some(chunk) = store.physical_chunk(chunk_id) {
-            physical_total_bytes += Chunk::total_size_bytes(chunk.as_ref());
-        }
-    }
-
-    ui.add_space(4.0);
-    ui.label("Protected chunks");
-    egui::Grid::new("protected-chunks").show(ui, |ui| {
-        ui.label("Roots");
-        ui.label(format!(
-            "{} chunks, {}",
-            format_uint(protected.roots.len()),
-            format_bytes(roots_total_bytes as _),
-        ));
-        ui.end_row();
-
-        ui.label("Physical");
-        ui.label(format!(
-            "{} chunks, {}",
-            format_uint(protected.physical.len()),
-            format_bytes(physical_total_bytes as _),
-        ));
         ui.end_row();
     });
 }

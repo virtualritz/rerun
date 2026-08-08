@@ -11,7 +11,15 @@ use re_types_core::ViewClassIdentifier;
 use crate::ViewSystemIdentifier;
 
 /// Types of matches when matching [`crate::VisualizabilityConstraints::SingleRequiredComponent`].
-#[derive(Clone, Debug)]
+///
+/// Two components can be related on three different levels:
+/// * the *semantic* component type (e.g. `rerun.components.Position3D`),
+/// * the *encoding*, i.e. the Rerun datatype the component is built from (e.g. `rerun.datatypes.Vec3D`),
+/// * the *physical* Arrow datatype (e.g. `FixedSizeList(3 x non-null Float32)`).
+///
+/// Only the semantic type and the Arrow datatype are known at runtime — the encoding isn't tracked
+/// by the store — but components that share an encoding always share their Arrow datatype.
+#[derive(Clone, Debug, re_byte_size::SizeBytes)]
 pub enum DatatypeMatch {
     /// Only the physical datatype was matched, but semantics aren't the native ones.
     PhysicalDatatypeOnly {
@@ -42,26 +50,6 @@ pub enum DatatypeMatch {
     },
 }
 
-impl re_byte_size::SizeBytes for DatatypeMatch {
-    fn heap_size_bytes(&self) -> u64 {
-        match self {
-            Self::PhysicalDatatypeOnly {
-                arrow_datatype,
-                component_type,
-                selectors,
-            } => {
-                arrow_datatype.heap_size_bytes()
-                    + component_type.heap_size_bytes()
-                    + selectors.heap_size_bytes()
-            }
-            Self::NativeSemantics {
-                arrow_datatype,
-                component_type,
-            } => arrow_datatype.heap_size_bytes() + component_type.heap_size_bytes(),
-        }
-    }
-}
-
 impl DatatypeMatch {
     pub fn component_type(&self) -> Option<&re_chunk::ComponentType> {
         match self {
@@ -79,7 +67,7 @@ impl DatatypeMatch {
 }
 
 /// [`crate::VisualizabilityConstraints::SingleRequiredComponent`] matched for this entity with the given components.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, re_byte_size::SizeBytes)]
 pub struct SingleRequiredComponentMatch {
     /// The component that needs to be mapped to one of the matches.
     pub target_component: ComponentIdentifier,
@@ -94,7 +82,7 @@ pub struct SingleRequiredComponentMatch {
 ///
 /// Both a buffer component (matched by arrow datatype) and a format component
 /// (matched by arrow datatype AND semantic type) were found on the entity.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, re_byte_size::SizeBytes)]
 pub struct BufferAndFormatMatch {
     /// The buffer slot on the visualizer that needs to be mapped.
     pub buffer_target: ComponentIdentifier,
@@ -113,33 +101,8 @@ pub struct BufferAndFormatMatch {
     pub format_matches: IntSet<ComponentIdentifier>,
 }
 
-impl re_byte_size::SizeBytes for SingleRequiredComponentMatch {
-    fn heap_size_bytes(&self) -> u64 {
-        let Self {
-            target_component,
-            matches,
-        } = self;
-        target_component.heap_size_bytes() + matches.heap_size_bytes()
-    }
-}
-
-impl re_byte_size::SizeBytes for BufferAndFormatMatch {
-    fn heap_size_bytes(&self) -> u64 {
-        let Self {
-            buffer_target,
-            format_target,
-            buffer_matches,
-            format_matches,
-        } = self;
-        buffer_target.heap_size_bytes()
-            + format_target.heap_size_bytes()
-            + buffer_matches.heap_size_bytes()
-            + format_matches.heap_size_bytes()
-    }
-}
-
 /// Describes why a given entity was marked as visualizable.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, re_byte_size::SizeBytes)]
 pub enum VisualizableReason {
     /// The entity is visualizable because all entities are visualizable for this type.
     Always,
@@ -152,16 +115,6 @@ pub enum VisualizableReason {
 
     /// See [`BufferAndFormatMatch`].
     BufferAndFormatMatch(BufferAndFormatMatch),
-}
-
-impl re_byte_size::SizeBytes for VisualizableReason {
-    fn heap_size_bytes(&self) -> u64 {
-        match self {
-            Self::Always | Self::ExactMatchAny => 0,
-            Self::SingleRequiredComponentMatch(m) => m.heap_size_bytes(),
-            Self::BufferAndFormatMatch(m) => m.heap_size_bytes(),
-        }
-    }
 }
 
 impl VisualizableReason {
@@ -189,6 +142,33 @@ impl VisualizableReason {
             }
         }
     }
+
+    /// Returns true if this component is known to match only by its physical arrow datatype,
+    /// i.e. its semantics are *not* the ones the visualizer natively works with.
+    ///
+    /// For example, `GaussianSplats3D:scales` (`Scale3D`) matches the `Points3D:positions`
+    /// (`Position3D`) slot only physically, since both share the `rerun.datatypes.Vec3D` encoding.
+    ///
+    /// Unlike the negation of [`Self::full_native_match`], components that aren't part of this
+    /// match at all are *not* reported as physical-only.
+    /// This makes it suitable for ranking mapping candidates that may map components
+    /// beyond the ones this reason is concerned with.
+    pub fn physical_datatype_only_match(&self, component_identifier: ComponentIdentifier) -> bool {
+        match self {
+            Self::Always | Self::ExactMatchAny => false,
+
+            Self::SingleRequiredComponentMatch(m) => matches!(
+                m.matches.get(&component_identifier),
+                Some(DatatypeMatch::PhysicalDatatypeOnly { .. })
+            ),
+
+            // Format matches are always native by construction (semantic match required).
+            Self::BufferAndFormatMatch(m) => matches!(
+                m.buffer_matches.get(&component_identifier),
+                Some(DatatypeMatch::PhysicalDatatypeOnly { .. })
+            ),
+        }
+    }
 }
 
 /// List of entities that are visualizable with a given visualizer.
@@ -199,14 +179,8 @@ impl VisualizableReason {
 /// We evaluate this filtering step entirely by store subscriber and provide a reason
 /// for why this entity was deemed visualizable. This in turn implies that this can
 /// *not* be influenced by individual view setups.
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Clone, Debug, re_byte_size::SizeBytes)]
 pub struct VisualizableEntities(pub IntMap<EntityPath, VisualizableReason>);
-
-impl re_byte_size::SizeBytes for VisualizableEntities {
-    fn heap_size_bytes(&self) -> u64 {
-        self.0.heap_size_bytes()
-    }
-}
 
 impl std::ops::Deref for VisualizableEntities {
     type Target = IntMap<EntityPath, VisualizableReason>;
@@ -221,7 +195,7 @@ impl std::ops::Deref for VisualizableEntities {
 ///
 /// In order to be a match the entity must have at some point in time on any timeline had any
 /// component that had an associated archetype as specified by the respective visualizer system.
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Clone, Debug, re_byte_size::SizeBytes)]
 pub struct IndicatedEntities(pub IntSet<EntityPath>);
 
 impl std::ops::Deref for IndicatedEntities {
@@ -237,7 +211,7 @@ impl std::ops::Deref for IndicatedEntities {
 ///
 /// Careful, if you're in the context of a view, this may contain visualizers that aren't relevant to the current view.
 /// Refer to [`PerVisualizerTypeInViewClass`] for a collection that is limited to visualizers active for a given view.
-#[derive(Debug)]
+#[derive(Debug, re_byte_size::SizeBytes)]
 pub struct PerVisualizerType<T>(pub IntMap<ViewSystemIdentifier, T>);
 
 impl<T> std::ops::Deref for PerVisualizerType<T> {
@@ -267,15 +241,6 @@ impl<T> PerVisualizerType<T> {
     #[inline]
     pub fn as_ref(&self) -> PerVisualizerType<&T> {
         PerVisualizerType(self.0.iter().map(|(&k, v)| (k, v)).collect())
-    }
-}
-
-impl<T> re_byte_size::SizeBytes for PerVisualizerType<T>
-where
-    T: re_byte_size::SizeBytes,
-{
-    fn heap_size_bytes(&self) -> u64 {
-        self.0.heap_size_bytes()
     }
 }
 
@@ -311,7 +276,7 @@ impl<T> std::ops::Deref for PerVisualizerTypeInViewClass<T> {
 }
 
 /// List of elements per visualizer instruction id.
-#[derive(Debug)]
+#[derive(Debug, re_byte_size::SizeBytes)]
 pub struct PerVisualizerInstruction<T>(pub HashMap<VisualizerInstructionId, T>);
 
 impl<T> std::ops::Deref for PerVisualizerInstruction<T> {
@@ -340,14 +305,5 @@ impl<T: Clone> Clone for PerVisualizerInstruction<T> {
 impl<T> Default for PerVisualizerInstruction<T> {
     fn default() -> Self {
         Self(HashMap::default())
-    }
-}
-
-impl<T> re_byte_size::SizeBytes for PerVisualizerInstruction<T>
-where
-    T: re_byte_size::SizeBytes,
-{
-    fn heap_size_bytes(&self) -> u64 {
-        self.0.heap_size_bytes()
     }
 }

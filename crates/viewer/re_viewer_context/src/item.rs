@@ -1,5 +1,5 @@
 use re_entity_db::{EntityDb, InstancePath};
-use re_log_types::{ComponentPath, DataPath, EntityPath, TableId};
+use re_log_types::{ComponentPath, DataPath, EntityPath, EntryId, TableId};
 use re_sdk_types::blueprint::components::VisualizerInstructionId;
 
 use crate::{BlueprintId, ContainerId, Contents, ViewId};
@@ -76,13 +76,38 @@ pub enum Item {
     /// An entity or instance in the context of a view's data results.
     DataResult(DataResultInteractionAddress),
 
-    /// A table or dataset entry stored in a Redap server.
-    // TODO(ab): this should probably be split into separate variant, and made more consistent with
-    // `AppId` and `TableId`.
-    RedapEntry(re_uri::EntryUri),
+    /// An entry within a Redap server's hierarchy: dataset, table, or folder (group).
+    RedapEntry {
+        origin: re_uri::Origin,
+        kind: RedapEntryKind,
+    },
 
     /// A Redap server.
     RedapServer(re_uri::Origin),
+}
+
+/// The kind of node addressed by [`Item::RedapEntry`].
+///
+/// Dataset-vs-table distinction lives at the data layer (authoritative: the server) rather than
+/// here — at this level the entry is identified by [`EntryId`] only.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RedapEntryKind {
+    /// A concrete entry (table or dataset), identified by its [`EntryId`].
+    Entry(EntryId),
+
+    /// A folder (group) in the server's dataset hierarchy, identified by a
+    /// dot-separated path prefix (e.g. `"project.subdir"`).
+    Folder(String),
+}
+
+impl RedapEntryKind {
+    /// Returns the [`EntryId`] if this kind refers to a concrete entry.
+    pub fn entry_id(&self) -> Option<EntryId> {
+        match self {
+            Self::Entry(id) => Some(*id),
+            Self::Folder(_) => None,
+        }
+    }
 }
 
 impl Item {
@@ -93,8 +118,7 @@ impl Item {
 
     pub fn redap_origin(&self) -> Option<&re_uri::Origin> {
         match self {
-            Self::RedapServer(origin) => Some(origin),
-            Self::RedapEntry(entry_uri) => Some(&entry_uri.origin),
+            Self::RedapServer(origin) | Self::RedapEntry { origin, .. } => Some(origin),
             _ => None,
         }
     }
@@ -108,10 +132,30 @@ impl Item {
             | Self::InstancePath(_)
             | Self::ComponentPath(_)
             | Self::Container(_)
-            | Self::RedapEntry(_)
+            | Self::RedapEntry { .. }
             | Self::RedapServer(_) => None,
             Self::View(view_id) => Some(*view_id),
             Self::DataResult(data_result) => Some(data_result.view_id),
+        }
+    }
+
+    /// Does validating this item require a viewport blueprint?
+    ///
+    /// `View`, `Container`, and `DataResult` only exist within a viewport blueprint, so without one
+    /// they can neither be validated nor make sense as a selection. All other items (recordings,
+    /// redap entries/servers, tables, …) are independent of the blueprint.
+    pub fn requires_blueprint(&self) -> bool {
+        match self {
+            Self::View(_) | Self::Container(_) | Self::DataResult(_) => true,
+
+            Self::AppId(_)
+            | Self::DataSource(_)
+            | Self::StoreId(_)
+            | Self::TableId(_)
+            | Self::InstancePath(_)
+            | Self::ComponentPath(_)
+            | Self::RedapEntry { .. }
+            | Self::RedapServer(_) => false,
         }
     }
 
@@ -124,7 +168,7 @@ impl Item {
             | Self::Container(_)
             | Self::StoreId(_)
             | Self::RedapServer(_)
-            | Self::RedapEntry(_) => None,
+            | Self::RedapEntry { .. } => None,
 
             Self::ComponentPath(component_path) => Some(&component_path.entity_path),
 
@@ -165,7 +209,7 @@ impl Item {
             | Self::Container(_)
             | Self::StoreId(_)
             | Self::RedapServer(_)
-            | Self::RedapEntry(_) => None,
+            | Self::RedapEntry { .. } => None,
 
             Self::ComponentPath(component_path) => Some(DataPath {
                 entity_path: component_path.entity_path.clone(),
@@ -212,6 +256,15 @@ impl From<InstancePath> for Item {
     #[inline]
     fn from(instance_path: InstancePath) -> Self {
         Self::InstancePath(instance_path)
+    }
+}
+
+impl From<re_uri::EntryUri> for Item {
+    fn from(uri: re_uri::EntryUri) -> Self {
+        Self::RedapEntry {
+            origin: uri.origin,
+            kind: RedapEntryKind::Entry(uri.entry_id),
+        }
     }
 }
 
@@ -271,9 +324,12 @@ impl std::fmt::Debug for Item {
                 )
             }
             Self::Container(tile_id) => write!(f, "(tile: {tile_id:?})"),
-            Self::RedapEntry(entry) => {
-                write!(f, "{entry}")
-            }
+            Self::RedapEntry { origin, kind } => match kind {
+                RedapEntryKind::Entry(id) => write!(f, "RedapEntry({origin}, {id})"),
+                RedapEntryKind::Folder(path_prefix) => {
+                    write!(f, "RedapFolder({origin}, {path_prefix})")
+                }
+            },
             Self::RedapServer(server) => write!(f, "{server}"),
         }
     }
@@ -300,7 +356,10 @@ impl Item {
                     "Data result entity"
                 }
             }
-            Self::RedapEntry(_) => "Redap entry",
+            Self::RedapEntry { kind, .. } => match kind {
+                RedapEntryKind::Entry(_) => "Redap entry",
+                RedapEntryKind::Folder(_) => "Redap folder",
+            },
             Self::RedapServer(_) => "Redap server",
         }
     }
@@ -328,7 +387,7 @@ pub fn resolve_mono_instance_path_item(
         | Item::ComponentPath(_)
         | Item::View(_)
         | Item::Container(_)
-        | Item::RedapEntry(_)
+        | Item::RedapEntry { .. }
         | Item::RedapServer(_) => item.clone(),
     }
 }
@@ -347,7 +406,7 @@ pub fn resolve_mono_instance_path(
         // NOTE: While we normally frown upon direct queries to the datastore, `all_components` is fine.
         let Some(components) = engine
             .store()
-            .all_components_on_timeline(&query.timeline(), &instance.entity_path)
+            .all_components_on_timeline(query.timeline().as_ref(), &instance.entity_path)
         else {
             // No components at all, return unindexed entity.
             return re_entity_db::InstancePath::entity_all(instance.entity_path.clone());
@@ -357,7 +416,12 @@ pub fn resolve_mono_instance_path(
         for component in components {
             if let Some(array) = engine
                 .cache()
-                .latest_at(query, &instance.entity_path, [component])
+                .latest_at(
+                    re_chunk_store::ChunkTrackingMode::ReportTransient,
+                    query,
+                    &instance.entity_path,
+                    [component],
+                )
                 .component_batch_raw(component)
                 && array.len() > 1
             {

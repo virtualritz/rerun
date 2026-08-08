@@ -1,3 +1,5 @@
+#![allow(clippy::iter_over_hash_type)]
+
 //! This crate covers two equally important but orthogonal matters:
 //! * Converting between transport-level and application-level Rerun types.
 //! * Encoding and decoding Rerun RRD streams.
@@ -66,6 +68,7 @@
 //! top-level `LogMsg` object is never used in RRD streams, but is used in SDK comms), but for all
 //! the types they do share, the encoding will be the exact same.
 
+pub mod chunk_provider;
 pub mod rrd;
 
 mod app_id_injector;
@@ -78,5 +81,8 @@ pub mod external {
 pub use self::app_id_injector::{
     ApplicationIdInjector, CachingApplicationIdInjector, DummyApplicationIdInjector,
 };
+#[cfg(feature = "decoder")]
+pub use self::chunk_provider::RrdChunkProvider;
+pub use self::chunk_provider::{ChunkProvider, ChunkProviderError};
 pub use self::rrd::*;
 pub use self::transport_to_app::{ToApplication, ToTransport};

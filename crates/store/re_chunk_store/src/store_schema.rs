@@ -10,7 +10,6 @@ use arrow::array::ListArray as ArrowListArray;
 use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 use nohash_hasher::IntMap;
 
-use re_byte_size::SizeBytes;
 use re_chunk::ComponentIdentifier;
 use re_log_types::{EntityPath, TimeType, Timeline, TimelineName};
 use re_sdk_types::ComponentDescriptor;
@@ -22,22 +21,11 @@ use re_types_core::{ArchetypeName, ComponentSet, ComponentType};
 use crate::ColumnMetadataState;
 
 /// Per-column metadata for a single component on a single entity.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, re_byte_size::SizeBytes)]
 pub struct ColumnMetadataEntry {
     pub descriptor: ComponentDescriptor,
     pub metadata_state: ColumnMetadataState,
     pub datatype: ArrowDataType,
-}
-
-impl re_byte_size::SizeBytes for ColumnMetadataEntry {
-    fn heap_size_bytes(&self) -> u64 {
-        let Self {
-            descriptor,
-            metadata_state,
-            datatype,
-        } = self;
-        descriptor.heap_size_bytes() + metadata_state.heap_size_bytes() + datatype.heap_size_bytes()
-    }
 }
 
 use crate::{ChunkComponentMeta, ChunkMeta, ChunkStoreEvent};
@@ -70,7 +58,7 @@ fn schema_component_key(descr: &ComponentColumnDescriptor) -> SchemaComponentKey
 /// Contains [`ChunkColumnDescriptors`], per-entity component sets, and the entity tree.
 /// Updated via [`Self::on_events`] when chunks are inserted or RRD manifests are ingested.
 /// The schema itself is purely additive, but the entity tree is pruned on deletions.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, re_byte_size::SizeBytes)]
 pub struct StoreSchema {
     /// The _latest_ [`TimeType`] for each timeline name.
     time_type_registry: IntMap<TimelineName, TimeType>,
@@ -159,26 +147,19 @@ impl StoreSchema {
             .map(|entry| &entry.metadata_state)
     }
 
-    /// Checks whether any column in the store with the given [`re_types_core::ComponentType`] has a datatype
-    /// that differs from `expected_datatype`.
+    /// The metadata of every component column in the store, together with the entity it belongs to.
     ///
     /// This iterates over all entities, so it should not be called in a hot path.
-    pub fn has_mismatched_datatype_for_component_type(
+    pub fn all_column_metadata(
         &self,
-        component_type: &ComponentType,
-        expected_datatype: &ArrowDataType,
-    ) -> Option<&ArrowDataType> {
-        re_tracing::profile_function!();
-        for per_component in self.per_column_metadata.values() {
-            for entry in per_component.values() {
-                if entry.descriptor.component_type.as_ref() == Some(component_type)
-                    && entry.datatype != *expected_datatype
-                {
-                    return Some(&entry.datatype);
-                }
-            }
-        }
-        None
+    ) -> impl Iterator<Item = (&EntityPath, &ColumnMetadataEntry)> + '_ {
+        self.per_column_metadata
+            .iter()
+            .flat_map(|(entity_path, per_component)| {
+                per_component
+                    .values()
+                    .map(move |entry| (entity_path, entry))
+            })
     }
 
     /// Access the per-column metadata for a given entity.
@@ -447,23 +428,5 @@ impl StoreSchema {
     /// Called after store deletions to keep the tree in sync with actual data.
     pub fn prune_entity_tree(&mut self, entity_has_data: &impl Fn(&EntityPath) -> bool) {
         self.entity_tree.prune_empty_entities(entity_has_data);
-    }
-}
-
-impl SizeBytes for StoreSchema {
-    fn heap_size_bytes(&self) -> u64 {
-        let Self {
-            time_type_registry,
-            components,
-            components_per_entity,
-            per_column_metadata,
-            entity_tree,
-        } = self;
-
-        time_type_registry.heap_size_bytes()
-            + components.heap_size_bytes()
-            + components_per_entity.heap_size_bytes()
-            + per_column_metadata.heap_size_bytes()
-            + entity_tree.heap_size_bytes()
     }
 }

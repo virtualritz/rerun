@@ -1,5 +1,6 @@
 <!--[metadata]
 title = "TFRecord loader"
+description = "An external importer plugin that opens TFRecord (Tensorboard) event files in the Rerun viewer, extending the viewer without modifying it."
 source = "https://github.com/rerun-io/rerun-loader-python-example-tfrecord"
 tags = ["2D", "Tensor", "Loader", "Time series"]
 thumbnail = "https://static.rerun.io/tfrecord_loader/26da14f065a3d12322890d2842c988031113bd7b/480w.png"
@@ -17,7 +18,7 @@ thumbnail_dimensions = [480, 480]
 
 ## Overview
 
-This is an example importer plugin that lets you view a TFRecord of Events (i.e., Tensorboard log files). It uses the [external importer mechanism](https://www.rerun.io/docs/concepts/logging-and-ingestion/importers/overview?speculative-link#external-importers) to add this capability to the Rerun Viewer without modifying the Viewer itself.
+This is an example importer plugin that lets you view a TFRecord of Events (i.e., Tensorboard log files). It uses the [external importer mechanism](https://www.rerun.io/docs/concepts/logging-and-ingestion/importers/overview#external-importers) to add this capability to the Rerun Viewer without modifying the Viewer itself.
 
 This example is written in Python, and uses [TensorFlow](https://www.tensorflow.org/) to read the files. The events are then logged to Rerun.
 

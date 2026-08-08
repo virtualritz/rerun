@@ -20,7 +20,8 @@ use crate::{
 ///
 /// This is the immutable "template" stored in the [`crate::ViewClassRegistry`],
 /// extracted from a visualizer's query info at registration time.
-#[derive(Clone)] // Cheap to clone; uses ref-counted data internally.
+// We use Arc:s, so this is more or less amortized.
+#[derive(Clone, re_byte_size::SizeBytes)] // Cheap to clone; uses ref-counted data internally.
 pub struct VisualizerEntityConfig {
     /// Visualizer type this config is associated with.
     pub visualizer: ViewSystemIdentifier,
@@ -31,6 +32,7 @@ pub struct VisualizerEntityConfig {
     /// The mode for checking component requirements.
     ///
     /// See [`crate::VisualizerQueryInfo::constraints`]
+    #[size_bytes(ignore)]
     pub constraints: Arc<VisualizabilityConstraints>,
 
     /// Lists all known builtin enums components.
@@ -38,13 +40,8 @@ pub struct VisualizerEntityConfig {
     /// Used by [`VisualizabilityConstraints::SingleRequiredComponent`] to skip physical-only matches
     /// for enum types (which should only match via native semantics).
     // TODO(andreas): It would be great if we could just always access the latest reflection data, but this is really hard to pipe through to a store subscriber.
+    #[size_bytes(ignore)]
     pub known_builtin_enum_components: Arc<IntSet<ComponentType>>,
-}
-
-impl re_byte_size::SizeBytes for VisualizerEntityConfig {
-    fn heap_size_bytes(&self) -> u64 {
-        0 // We use Arc:s, so this is more or less amortized
-    }
 }
 
 impl VisualizerEntityConfig {
@@ -67,39 +64,23 @@ impl VisualizerEntityConfig {
 /// "visualizable" is determined by the set of required components
 ///
 /// There's only a single entity subscriber per visualizer *type* per store.
+#[derive(re_byte_size::SizeBytes)]
+#[size_bytes(profile)]
 pub struct VisualizerEntitySubscriber {
     config: VisualizerEntityConfig,
     mapping: VisualizerEntityMapping,
 }
 
-impl re_byte_size::SizeBytes for VisualizerEntitySubscriber {
-    fn heap_size_bytes(&self) -> u64 {
-        re_tracing::profile_function!();
-        let Self { config, mapping } = self;
-        config.heap_size_bytes() + mapping.heap_size_bytes()
-    }
-}
-
 /// Per-entity state for a [`VisualizabilityConstraints::BufferAndFormat`] constraint.
 ///
 /// Buffer and format components may arrive in separate chunk store events, so we keep accumulating them here.
-#[derive(Default)]
+#[derive(Default, re_byte_size::SizeBytes)]
 struct BufferAndFormatEntityState {
     all_buffer_matches: IntMap<ComponentIdentifier, DatatypeMatch>,
     all_formats_matches: IntSet<ComponentIdentifier>,
 }
 
-impl re_byte_size::SizeBytes for BufferAndFormatEntityState {
-    fn heap_size_bytes(&self) -> u64 {
-        let Self {
-            all_buffer_matches,
-            all_formats_matches,
-        } = self;
-        all_buffer_matches.heap_size_bytes() + all_formats_matches.heap_size_bytes()
-    }
-}
-
-#[derive(Default)]
+#[derive(Default, re_byte_size::SizeBytes)]
 struct VisualizerEntityMapping {
     /// Which entities the visualizer can be applied to.
     visualizable_entities: VisualizableEntities,
@@ -114,19 +95,6 @@ struct VisualizerEntityMapping {
     ///
     /// Only populated when the requirement is [`VisualizabilityConstraints::BufferAndFormat`].
     buffer_and_format_state: IntMap<EntityPath, BufferAndFormatEntityState>,
-}
-
-impl re_byte_size::SizeBytes for VisualizerEntityMapping {
-    fn heap_size_bytes(&self) -> u64 {
-        let Self {
-            visualizable_entities,
-            indicated_entities,
-            buffer_and_format_state,
-        } = self;
-        visualizable_entities.heap_size_bytes()
-            + indicated_entities.heap_size_bytes()
-            + buffer_and_format_state.heap_size_bytes()
-    }
 }
 
 impl VisualizerEntityMapping {
@@ -269,7 +237,7 @@ fn process_entity_components(
         VisualizabilityConstraints::AnyBuiltinComponent(relevant_components) => {
             let has_any_component = components
                 .iter()
-                .any(|c| relevant_components.contains(&c.descriptor.component) && c.has_data);
+                .any(|c| relevant_components.contains(&c.descriptor.component));
 
             if has_any_component {
                 re_log::trace!(
@@ -300,8 +268,7 @@ fn process_entity_components(
                     arrow_datatype,
                     c.descriptor.component_type,
                     c.descriptor.component,
-                ) && c.has_data
-                {
+                ) {
                     has_any_datatype = true;
 
                     store_mapping.add_visualizability_reason(
@@ -327,10 +294,6 @@ fn process_entity_components(
 
         VisualizabilityConstraints::BufferAndFormat(constraint) => {
             for c in components {
-                if !c.has_data {
-                    continue;
-                }
-
                 let Some(arrow_datatype) = &c.inner_arrow_datatype else {
                     continue;
                 };
@@ -433,11 +396,13 @@ impl VisualizerEntitySubscriber {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::BufferAndFormatConstraint;
+    use crate::{BufferAndFormatConstraint, SingleRequiredComponentConstraint};
     use re_chunk_store::{
         ChunkStoreDiff, ChunkStoreDiffSchemaAddition, ChunkStoreEvent, ChunkStoreGeneration,
     };
+    use re_log_types::{example_components::MyPoint, example_components::MyPoints};
     use re_sdk_types::ComponentDescriptor;
+    use re_types_core::Loggable as _;
 
     const BUFFER_CTYPE: &str = "test.components.Buffer";
     const FORMAT_CTYPE: &str = "test.components.Format";
@@ -471,12 +436,31 @@ mod tests {
         }
     }
 
+    fn test_single_required_component_subscriber() -> VisualizerEntitySubscriber {
+        VisualizerEntitySubscriber {
+            config: VisualizerEntityConfig {
+                visualizer: "TestVisualizer".into(),
+                relevant_archetype: MyPoints::descriptor_points().archetype,
+                constraints: Arc::new(VisualizabilityConstraints::SingleRequiredComponent(
+                    SingleRequiredComponentConstraint::new::<MyPoint>(
+                        &MyPoints::descriptor_points(),
+                    ),
+                )),
+                known_builtin_enum_components: Arc::new(IntSet::default()),
+            },
+            mapping: Default::default(),
+        }
+    }
+
     /// Build a `ComponentDescriptor` with the given component identifier and optional semantic type.
-    fn descriptor(component: &str, component_type: Option<&str>) -> ComponentDescriptor {
+    fn descriptor(
+        component: impl Into<ComponentIdentifier>,
+        component_type: Option<&str>,
+    ) -> ComponentDescriptor {
         ComponentDescriptor {
             archetype: None,
             component: component.into(),
-            component_type: component_type.map(Into::into),
+            component_type: component_type.and_then(|s| ComponentType::try_new(s).ok()),
         }
     }
 
@@ -531,7 +515,40 @@ mod tests {
         );
     }
 
+    fn assert_visualizable(subscriber: &VisualizerEntitySubscriber, entity: &EntityPath) {
+        let is_visualizable = subscriber.visualizable_entities().contains_key(entity);
+        assert!(is_visualizable, "entity {entity} should be visualizable");
+    }
+
     // ---- Tests ----
+
+    // Regression test for https://github.com/rerun-io/rerun/issues/12736
+    #[test]
+    fn empty_required_component_is_still_visualizable() {
+        let store_id = test_store_id();
+        let entity: EntityPath = "/test/entity".into();
+        let mut sub = test_single_required_component_subscriber();
+
+        sub.on_events(&[ChunkStoreEvent {
+            store_id: store_id.clone(),
+            store_generation: ChunkStoreGeneration::default(),
+            event_id: 0,
+            diff: ChunkStoreDiff::SchemaAddition(ChunkStoreDiffSchemaAddition {
+                new_columns: vec![re_chunk_store::ChunkMeta {
+                    entity_path: entity.clone(),
+                    components: vec![re_chunk_store::ChunkComponentMeta {
+                        descriptor: MyPoints::descriptor_points(),
+                        inner_arrow_datatype: Some(MyPoint::arrow_datatype()),
+                        has_data: false, // This would happen if someone logs an entity without any rows!
+                        is_static: false,
+                    }],
+                }],
+            }),
+        }]);
+
+        assert!(sub.indicated_entities().contains(&entity));
+        assert_visualizable(&sub, &entity);
+    }
 
     #[test]
     fn both_buffer_and_format_in_one_event() {

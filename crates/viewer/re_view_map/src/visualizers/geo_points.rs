@@ -5,7 +5,7 @@ use re_sdk_types::Archetype as _;
 use re_sdk_types::archetypes::GeoPoints;
 use re_sdk_types::components::{LatLon, Radius};
 use re_view::{
-    AnnotationSceneContext, DataResultQuery as _, VisualizerInstructionQueryResults,
+    AnnotationMapCache, DataResultQuery as _, VisualizerInstructionQueryResults,
     process_annotation_slices, process_color_slice,
 };
 use re_viewer_context::{
@@ -14,7 +14,7 @@ use re_viewer_context::{
     typed_fallback_for,
 };
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct GeoPointBatch {
     pub positions: Vec<walkers::Position>,
     pub radii: Vec<Radius>,
@@ -23,7 +23,7 @@ pub struct GeoPointBatch {
 }
 
 /// Output data from [`GeoPointsVisualizer`].
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct GeoPointsOutput {
     pub batches: Vec<(EntityPath, GeoPointBatch)>,
 }
@@ -34,7 +34,10 @@ pub struct GeoPointsVisualizer;
 
 impl IdentifiedViewSystem for GeoPointsVisualizer {
     fn identifier() -> re_viewer_context::ViewSystemIdentifier {
-        "GeoPoints".into()
+        re_viewer_context::external::re_string_interner::intern_static!(
+            re_viewer_context::ViewSystemIdentifier,
+            "GeoPoints"
+        )
     }
 }
 
@@ -53,11 +56,11 @@ impl VisualizerSystem for GeoPointsVisualizer {
         &self,
         ctx: &ViewContext<'_>,
         view_query: &ViewQuery<'_>,
-        context_systems: &ViewContextCollection,
+        _context_systems: &ViewContextCollection,
     ) -> Result<VisualizerExecutionOutput, ViewSystemExecutionError> {
         let output = VisualizerExecutionOutput::default();
-        let annotation_scene_context = context_systems.get::<AnnotationSceneContext>(&output)?;
         let latest_at_query = view_query.latest_at_query();
+        let annotations = AnnotationMapCache::for_query(ctx.viewer_ctx, &latest_at_query);
         let mut batches = Vec::new();
 
         for (data_result, instruction) in
@@ -67,7 +70,7 @@ impl VisualizerSystem for GeoPointsVisualizer {
                 data_result.query_archetype_with_history::<GeoPoints>(ctx, view_query, instruction);
             let results = VisualizerInstructionQueryResults::new(instruction, &results, &output);
 
-            let annotation_context = annotation_scene_context.0.find(&data_result.entity_path);
+            let annotation_context = annotations.find(&data_result.entity_path);
 
             let mut batch_data = GeoPointBatch::default();
 
@@ -117,8 +120,8 @@ impl VisualizerSystem for GeoPointsVisualizer {
                 // iterate over all instances
                 for (instance_index, (position, color, radius)) in itertools::izip!(
                     positions,
-                    colors.iter(),
-                    radii.iter().chain(std::iter::repeat(&last_radii)),
+                    &colors,
+                    std::iter::chain(radii, std::iter::repeat(&last_radii)),
                 )
                 .enumerate()
                 {
@@ -163,16 +166,14 @@ impl GeoPointsOutput {
         // so boosting the outline radius would make it erreously large.
 
         for (entity_path, batch) in &self.batches {
-            let (positions, radii): (Vec<_>, Vec<_>) = batch
-                .positions
-                .iter()
-                .zip(&batch.radii)
-                .map(|(pos, radius)| {
-                    let size = super::radius_to_size(*radius, projector, *pos);
-                    let ui_position = projector.project(*pos);
-                    (glam::vec3(ui_position.x, ui_position.y, 0.0), size)
-                })
-                .unzip();
+            let (positions, radii): (Vec<_>, Vec<_>) =
+                std::iter::zip(&batch.positions, &batch.radii)
+                    .map(|(pos, radius)| {
+                        let size = super::radius_to_size(*radius, projector, *pos);
+                        let ui_position = projector.project(*pos);
+                        (glam::vec3(ui_position.x, ui_position.y, 0.0), size)
+                    })
+                    .unzip();
 
             let outline = highlight.entity_outline_mask(entity_path.hash());
 
@@ -187,6 +188,7 @@ impl GeoPointsOutput {
 
             //TODO(ab, andreas): boilerplate copy-pasted from points2d
             let num_instances = positions.len() as u64;
+            #[expect(clippy::iter_over_hash_type)] // Non-overlapping per-instance mask ranges.
             for (highlighted_key, instance_mask_ids) in &outline.instances {
                 let highlighted_point_index =
                     (highlighted_key.get() < num_instances).then_some(highlighted_key.get());

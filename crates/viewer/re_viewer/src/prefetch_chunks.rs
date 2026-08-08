@@ -6,7 +6,7 @@ use re_chunk::Chunk;
 use re_entity_db::{
     ChunkFetcher, ChunkPrefetchOptions, FetchStage, RemainingByteBudget, StoreBundle,
 };
-use re_log_types::{StoreId, TimelinePoint};
+use re_log_types::StoreId;
 use re_redap_client::{ApiResult, ConnectionClient};
 
 pub enum RecordingOpenKind {
@@ -19,7 +19,7 @@ pub enum RecordingOpenKind {
 pub struct RecordingPrefetchInfo {
     pub store_id: StoreId,
     pub open_kind: RecordingOpenKind,
-    pub time_cursor: Option<TimelinePoint>,
+    pub time_cursor: Option<re_entity_db::PrefetchTimeCursor>,
     pub origin: re_uri::Origin,
 }
 
@@ -40,39 +40,6 @@ pub fn prefetch_chunks_for_recordings(
         store_id: StoreId,
         fetcher: ChunkFetcher<'a>,
         origin: re_uri::Origin,
-    }
-
-    /// Fetches all stages in a specific order:
-    /// 1. Required for active recordings.
-    /// 2. Required for preview recordings.
-    /// 3. Similar for active recordings.
-    /// 4. Similar for preview recordings.
-    /// 5. Everything for active recordings.
-    /// 6. Everything for background recordings.
-    ///
-    /// (Preview recordings intentionally skip the `Everything` stage)
-    ///
-    /// If any budget (on wire, or memory) gets filled here we stop and don't
-    /// request/prioritize further.
-    fn fetch_stages<'a>(
-        active_states: &mut [FetchState<'a>],
-        preview_states: &mut [FetchState<'a>],
-        background_states: &mut [FetchState<'a>],
-        mut fetch_stage: impl FnMut(&mut FetchState<'a>, FetchStage) -> bool,
-    ) {
-        for stage in [FetchStage::Required, FetchStage::Similar] {
-            for state in chain!(active_states.iter_mut(), preview_states.iter_mut()) {
-                if fetch_stage(state, stage) {
-                    return;
-                }
-            }
-        }
-
-        for state in chain!(active_states.iter_mut(), background_states.iter_mut()) {
-            if fetch_stage(state, FetchStage::Everything) {
-                return;
-            }
-        }
     }
 
     let mut recordings_stores_with_info = store_bundle
@@ -135,18 +102,77 @@ pub fn prefetch_chunks_for_recordings(
         }
     }
 
-    fetch_stages(
-        &mut active_states,
-        &mut preview_states,
-        &mut background_states,
-        |state: &mut FetchState<'_>, stage| {
-            if let Err(err) = state.fetcher.fetch(&mut budget, stage) {
-                re_log::warn_once!("prefetch_chunks failed: {err}");
-            }
+    let mut fetch_states = |states: &mut [FetchState<'_>], stage| {
+        if states.is_empty() || budget.full() {
+            return;
+        }
+        let mut states: Vec<_> = states.iter_mut().collect();
 
-            budget.full()
-        },
-    );
+        while !states.is_empty() && !budget.full() {
+            // Evenly distribute bytes on wire between the states.
+            let on_wire_bytes_per_state =
+                budget.remaining_bytes_on_wire / states.len().cast_signed() as i64;
+
+            budget.remaining_bytes_on_wire %= states.len().cast_signed() as i64;
+
+            states.retain_mut(|state| {
+                // Don't set to `on_wire_bytes_per_state`, as both
+                // positive and negative number of bytes could remain from
+                // the last iteration.
+                //
+                // We add this `states.len()` times, so in total we add back
+                // as much memory as the `%=` above removed.
+                budget.remaining_bytes_on_wire += on_wire_bytes_per_state;
+
+                if budget.full() {
+                    return true;
+                }
+
+                if let Err(err) = state.fetcher.fetch(&mut budget, stage) {
+                    re_log::warn_once!("prefetch_chunks failed: {err}");
+                }
+
+                // If we've used the on wire budget, there are possibly more
+                // chunks to fetch in this fetch stage, so keep it for the
+                // next iteration.
+                budget.remaining_bytes_on_wire <= 0
+            });
+        }
+    };
+
+    // Fetches all stages in a specific order:
+    // 1. `Required` for active recordings.
+    // 2. `Required` for preview recordings.
+    // 3. `Similar(MAX_PREVIEW_FETCH_STAGE)` for active recordings.
+    // 4. `Similar(MAX_PREVIEW_FETCH_STAGE)` for preview recordings.
+    // 3. `max_fetch_stage` for active recordings.
+    // 6. If `max_fetch_stage == Everything`, `Everything` for background recordings.
+    //
+    // (Preview recordings intentionally skip above `Similar(MAX_PREVIEW_FETCH_STAGE)` stage)
+    //
+    // Stages above `max_fetch_stage` are skipped entirely.
+    //
+    // If any budget (on wire, or memory) gets filled here we stop and don't
+    // request/prioritize further.
+    {
+        const MAX_PREVIEW_FETCH_STAGE: FetchStage =
+            FetchStage::Similar(Some(std::time::Duration::from_secs(10)));
+
+        for stage in [
+            FetchStage::Required,
+            MAX_PREVIEW_FETCH_STAGE.min(options.max_fetch_stage),
+        ] {
+            fetch_states(&mut active_states, stage);
+
+            fetch_states(&mut preview_states, stage);
+        }
+
+        fetch_states(&mut active_states, options.max_fetch_stage);
+
+        if options.max_fetch_stage == FetchStage::Everything {
+            fetch_states(&mut background_states, FetchStage::Everything);
+        }
+    };
 
     // Then finish fetching for all
     let results = chain!(active_states, preview_states, background_states)
@@ -187,19 +213,16 @@ fn make_load_fn<'a>(
 
         let fut = async move {
             let mut client = connection_registry.client(origin).await.map_err(|err| {
-                re_log::warn_once!("Failed to connect to remote: {err}");
+                re_log::warn_once!("Failed to connect to server: {err}");
             })?;
             load_chunks(&mut client, &rb).await.map_err(|err| {
                 re_log::warn_once!("{err}");
             })
         };
 
-        cfg_if::cfg_if! {
-            if #[cfg(target_arch = "wasm32")] {
-                poll_promise::Promise::spawn_local(fut)
-            } else {
-                poll_promise::Promise::spawn_async(fut)
-            }
+        cfg_select! {
+            target_arch = "wasm32" => poll_promise::Promise::spawn_local(fut),
+            _ => poll_promise::Promise::spawn_async(fut),
         }
     }
 }

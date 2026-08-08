@@ -1,5 +1,6 @@
 <!--[metadata]
 title = "Mast3r slam - real-time dense slam with 3D reconstruction priors"
+description = "Mast3r-SLAM is a real-time monocular SLAM system built on the Mast3r 3D reconstruction prior, robust in the wild."
 tags = ["2D", "3D", "Pinhole camera", "Time series", "SLAM"]
 source = "https://github.com/rerun-io/mast3r-slam"
 thumbnail = "https://static.rerun.io/square-thumbnail/56b091d93d23c4353f6a919bf789493da19893e6/480w.png"
@@ -10,7 +11,7 @@ https://vimeo.com/1064055355?autoplay=1&loop=1&autopause=0&background=1&muted=1&
 
 ## Background
 
-Mast3r-slam is a realtime monocular slam system that is based on Mast3r, a two view 3D reconstruction and matching prior. Equipped with this strong prior, the system is robust on in-the-wild video sequences despite making no assumption on a fixed or parametric camera model beyond a unique camera center. It introduces efficient methods for pointmap matching, camera tracking and local fusion, graph construction and loop closure, and second-order global optimisation. With known calibration, a simple modification to the system achieves state-of-the-art performance across various benchmarks.
+Mast3r-slam is a realtime monocular slam system that is based on Mast3r, a two view 3D reconstruction and matching prior. Equipped with this strong prior, the system is robust on in-the-wild video sequences despite making no assumption on a fixed or parametric camera model beyond a unique camera center. It introduces efficient methods for pointmap matching, camera tracking and local fusion, graph construction and loop closure, and second-order global optimization. With known calibration, a simple modification to the system achieves state-of-the-art performance across various benchmarks.
 
 ## Run the code
 

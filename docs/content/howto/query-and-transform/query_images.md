@@ -1,10 +1,11 @@
 ---
 title: Query images
 order: 60
+description: Query and decode image frames from a catalog
 ---
 
 Images are incredibly useful, however there are many ways to store and manipulate them.
-This example focuses on querying image frames from the Rerun Data Platform.
+This example focuses on querying image frames from a catalog server.
 
 The dependencies in this example require `rerun-sdk[all]`.
 

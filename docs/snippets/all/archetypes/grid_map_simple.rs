@@ -1,7 +1,8 @@
 //! Log a simple occupancy grid map.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let rec = rerun::RecordingStreamBuilder::new("rerun_example_grid_map").spawn()?;
+    let rec =
+        rerun::RecordingStreamBuilder::new("rerun_example_grid_map").spawn()?;
 
     let width: usize = 64;
     let height: usize = 64;
@@ -36,7 +37,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             -(width as f32) * cell_size / 2.0,
             -(height as f32) * cell_size / 2.0,
             0.0,
-        ]),
+        ])
+        .with_colormap(rerun::components::Colormap::RvizMap),
     )?;
 
     Ok(())

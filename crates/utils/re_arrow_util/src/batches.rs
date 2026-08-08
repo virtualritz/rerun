@@ -32,6 +32,8 @@ pub fn concat_polymorphic_batches(batches: &[RecordBatch]) -> arrow::error::Resu
         return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
     }
 
+    re_tracing::profile_function!();
+
     let schema_merged = {
         let mut schema_builder = SchemaBuilder::new();
         for batch in batches {
@@ -40,6 +42,7 @@ pub fn concat_polymorphic_batches(batches: &[RecordBatch]) -> arrow::error::Resu
             }
 
             let md_merged = schema_builder.metadata_mut();
+            #[expect(clippy::iter_over_hash_type)] // Metadata order is irrelevant.
             for (k, v) in batch.schema_ref().metadata() {
                 if let Some(previous) = md_merged.insert(k.clone(), v.clone())
                     && previous != *v
@@ -211,14 +214,12 @@ impl RecordBatchExt for RecordBatch {
         let (schema_ref, columns, row_count) = self.into_parts();
         let Schema { fields, metadata } = Arc::unwrap_or_clone(schema_ref);
 
-        let (fields, columns): (Vec<_>, Vec<_>) = fields
-            .iter()
-            .map(Arc::clone)
-            .zip(columns)
-            .sorted_by(|(left_field, _), (right_field, _)| {
-                cmp_fn(left_field.as_ref(), right_field.as_ref())
-            })
-            .unzip();
+        let (fields, columns): (Vec<_>, Vec<_>) =
+            std::iter::zip(fields.iter().map(Arc::clone), columns)
+                .sorted_by(|(left_field, _), (right_field, _)| {
+                    cmp_fn(left_field.as_ref(), right_field.as_ref())
+                })
+                .unzip();
 
         Self::try_new_with_options(
             Arc::new(Schema::new_with_metadata(fields, metadata)),
@@ -234,12 +235,10 @@ impl RecordBatchExt for RecordBatch {
         let (schema_ref, columns, row_count) = self.into_parts();
         let Schema { fields, metadata } = Arc::unwrap_or_clone(schema_ref);
 
-        let (new_fields, new_columns): (Vec<_>, Vec<_>) = fields
-            .iter()
-            .map(Arc::clone)
-            .zip(columns)
-            .filter(|(field, _)| predicate(field))
-            .unzip();
+        let (new_fields, new_columns): (Vec<_>, Vec<_>) =
+            std::iter::zip(fields.iter().map(Arc::clone), columns)
+                .filter(|(field, _)| predicate(field))
+                .unzip();
 
         Self::try_new_with_options(
             Arc::new(Schema::new_with_metadata(new_fields, metadata)),

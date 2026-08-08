@@ -20,9 +20,6 @@ pub struct LoginOptions {
 /// Settings set once at startup (e.g. via command-line options) and not serialized.
 #[derive(Clone)]
 pub struct StartupOptions {
-    /// When the total process RAM reaches this limit, we GC old data.
-    pub memory_limit: re_memory::MemoryLimit,
-
     pub persist_state: bool,
 
     /// Whether or not the app is running in the context of a Jupyter Notebook.
@@ -127,21 +124,20 @@ impl StartupOptions {
     /// Returns `StartupOptions::enable_history` on web, and `false` on native.
     #[allow(clippy::allow_attributes, clippy::unused_self)] // Only used on web.
     pub fn web_history_enabled(&self) -> bool {
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.enable_history
-        }
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            false
+        cfg_select! {
+            target_arch = "wasm32" => {
+                self.enable_history
+            }
+            _ => {
+                false
+            }
         }
     }
 
     /// The url to use for the web viewer when sharing links.
     #[allow(clippy::allow_attributes, clippy::unused_self)] // Only used on web.
     pub fn web_viewer_base_url(&self) -> Option<url::Url> {
-        // TODO(RR-1878): Would be great to grab this from the Data Platform when available.
+        // TODO(RR-1878): Would be great to grab this from the catalog server when available.
 
         if let Some(url) = &self.viewer_base_url
             && let Ok(url) = url.parse::<url::Url>()
@@ -154,14 +150,16 @@ impl StartupOptions {
 
             url::Url::parse(&format!("https://rerun.io/viewer/version/{version}")).ok()
         } else {
-            #[cfg(target_arch = "wasm32")]
-            {
-                crate::web_tools::current_base_url().ok()
-            }
-
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                None
+            cfg_select! {
+                target_arch = "wasm32" => {
+                    re_web::browser::current_page_url()
+                        .ok()
+                        .and_then(|url| url.parse().ok())
+                        .map(|url| re_viewer_context::open_url::base_url(&url))
+                }
+                _ => {
+                    None
+                }
             }
         }
     }
@@ -170,7 +168,6 @@ impl StartupOptions {
 impl Default for StartupOptions {
     fn default() -> Self {
         Self {
-            memory_limit: re_memory::MemoryLimit::from_fraction_of_total(0.75),
             persist_state: true,
             is_in_notebook: false,
 

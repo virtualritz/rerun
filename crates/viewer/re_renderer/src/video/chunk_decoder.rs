@@ -1,4 +1,4 @@
-use re_video::{Frame, FrameContent};
+use re_video::{DecodedFrameContent, Frame, FrameContent};
 
 use super::{VideoPlayerError, VideoTexture};
 use crate::RenderContext;
@@ -15,21 +15,75 @@ pub fn update_video_texture_with_frame(
         info: _,
     } = source_frame;
 
+    let expected_width = source_content.width();
+    let expected_height = source_content.height();
+    let expected_format = gpu_texture_format_for_frame_content(source_content);
+
+    if let Some(target_texture) = target_video_texture.texture.as_ref() {
+        let size_mismatch =
+            target_texture.width() != expected_width || target_texture.height() != expected_height;
+
+        let format_mismatch = target_texture.format() != expected_format;
+
+        // Recreate the texture if size or format aren't what's expected.
+        if size_mismatch || format_mismatch {
+            target_video_texture.texture = None;
+        }
+    }
+
     // Ensure that we have a texture to copy to.
     let gpu_texture = target_video_texture.texture.get_or_insert_with(|| {
         alloc_video_frame_texture(
             &render_ctx.device,
             &render_ctx.gpu_resources.textures,
-            source_content.width(),
-            source_content.height(),
+            expected_width,
+            expected_height,
+            expected_format,
         )
     });
 
-    let format = copy_frame_to_texture(render_ctx, source_content, gpu_texture)?;
+    // If the upload fails, clear the texture so we don't render stale/zeroed contents.
+    let format = match copy_frame_to_texture(render_ctx, source_content, gpu_texture) {
+        Ok(format) => format,
+        Err(err) => {
+            target_video_texture.texture = None;
+            return Err(err);
+        }
+    };
 
     target_video_texture.source_pixel_format = format;
 
     Ok(())
+}
+
+/// Picks the GPU texture format for the allocated video frame texture.
+fn gpu_texture_format_for_frame_content(content: &FrameContent) -> wgpu::TextureFormat {
+    cfg_select! {
+        target_arch = "wasm32" => {
+            match content {
+                FrameContent::WebVideoFrame(_) => wgpu::TextureFormat::Rgba8Unorm,
+                FrameContent::Decoded(content) => gpu_texture_format_for_decoded_frame_content(content),
+            }
+        }
+        _ => {
+            gpu_texture_format_for_decoded_frame_content(content)
+        }
+    }
+}
+
+fn gpu_texture_format_for_decoded_frame_content(
+    content: &DecodedFrameContent,
+) -> wgpu::TextureFormat {
+    match content.format {
+        re_video::PixelFormat::L8 => wgpu::TextureFormat::R8Unorm,
+        // `R16Unorm` would require the `TEXTURE_FORMAT_16BIT_NORM` feature, which isn't
+        // implemented in wgpu's OpenGL backend.
+        re_video::PixelFormat::L16 => wgpu::TextureFormat::R16Uint,
+        re_video::PixelFormat::R32Float => wgpu::TextureFormat::R32Float,
+        re_video::PixelFormat::Rgb8Unorm
+        | re_video::PixelFormat::Rgba8Unorm
+        | re_video::PixelFormat::Yuv { .. } => wgpu::TextureFormat::Rgba8Unorm,
+    }
 }
 
 fn alloc_video_frame_texture(
@@ -37,6 +91,7 @@ fn alloc_video_frame_texture(
     pool: &GpuTexturePool,
     width: u32,
     height: u32,
+    format: wgpu::TextureFormat,
 ) -> GpuTexture2D {
     let Some(texture) = GpuTexture2D::new(
         pool.alloc(
@@ -51,7 +106,7 @@ fn alloc_video_frame_texture(
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
+                format,
                 // Needs [`wgpu::TextureUsages::RENDER_ATTACHMENT`], otherwise copy of external textures will fail.
                 // Adding [`wgpu::TextureUsages::COPY_SRC`] so we can read back pixels on demand.
                 usage: wgpu::TextureUsages::COPY_DST
@@ -75,13 +130,20 @@ pub fn copy_frame_to_texture(
     frame: &FrameContent,
     target_texture: &GpuTexture,
 ) -> Result<SourceImageDataFormat, VideoPlayerError> {
-    #[cfg(target_arch = "wasm32")]
-    {
-        copy_web_video_frame_to_texture(ctx, frame, target_texture)
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        copy_native_video_frame_to_texture(ctx, frame, target_texture)
+    cfg_select! {
+        target_arch = "wasm32" => {
+            match frame {
+                FrameContent::WebVideoFrame(frame) => {
+                    copy_web_video_frame_to_texture(ctx, frame, target_texture)
+                }
+                FrameContent::Decoded(frame) => {
+                    copy_decoded_video_frame_to_texture(ctx, frame, target_texture)
+                }
+            }
+        }
+        _ => {
+            copy_decoded_video_frame_to_texture(ctx, frame, target_texture)
+        }
     }
 }
 
@@ -89,7 +151,7 @@ pub fn copy_frame_to_texture(
 #[expect(clippy::unnecessary_wraps)]
 fn copy_web_video_frame_to_texture(
     ctx: &RenderContext,
-    frame: &FrameContent,
+    frame: &web_sys::VideoFrame,
     target_texture: &GpuTexture,
 ) -> Result<SourceImageDataFormat, VideoPlayerError> {
     let size = wgpu::Extent3d {
@@ -97,7 +159,6 @@ fn copy_web_video_frame_to_texture(
         height: frame.display_height(),
         depth_or_array_layers: 1,
     };
-    let frame: &web_sys::VideoFrame = frame;
     let source = wgpu::CopyExternalImageSourceInfo {
         // Careful: `web_sys::VideoFrame` has a custom `clone` method:
         // https://developer.mozilla.org/en-US/docs/Web/API/VideoFrame/clone
@@ -123,14 +184,13 @@ fn copy_web_video_frame_to_texture(
     ))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn copy_native_video_frame_to_texture(
+fn copy_decoded_video_frame_to_texture(
     ctx: &RenderContext,
-    frame: &FrameContent,
+    frame: &DecodedFrameContent,
     target_texture: &GpuTexture,
 ) -> Result<SourceImageDataFormat, VideoPlayerError> {
     use crate::resource_managers::{
-        ImageDataDesc, SourceImageDataFormat, YuvMatrixCoefficients, YuvPixelLayout, YuvRange,
+        ImageDataDesc, YuvMatrixCoefficients, YuvPixelLayout, YuvRange,
         transfer_image_data_to_texture,
     };
 
@@ -138,12 +198,13 @@ fn copy_native_video_frame_to_texture(
     match frame.format {
         re_video::PixelFormat::Rgb8Unorm => {
             // TODO(andreas): `ImageDataDesc` should have RGB handling!
-            return copy_native_video_frame_to_texture(
+            return copy_decoded_video_frame_to_texture(
                 ctx,
-                &FrameContent {
+                &DecodedFrameContent {
                     data: crate::pad_rgb_to_rgba(&frame.data, 255_u8),
+                    width: frame.width,
+                    height: frame.height,
                     format: re_video::PixelFormat::Rgba8Unorm,
-                    ..*frame
                 },
                 target_texture,
             );
@@ -151,7 +212,8 @@ fn copy_native_video_frame_to_texture(
         re_video::PixelFormat::Rgba8Unorm
         | re_video::PixelFormat::Yuv { .. }
         | re_video::PixelFormat::L8
-        | re_video::PixelFormat::L16 => {}
+        | re_video::PixelFormat::L16
+        | re_video::PixelFormat::R32Float => {}
     }
 
     re_tracing::profile_function!();
@@ -192,7 +254,11 @@ fn copy_native_video_frame_to_texture(
         }
 
         re_video::PixelFormat::L16 => {
-            SourceImageDataFormat::WgpuCompatible(wgpu::TextureFormat::R16Unorm)
+            SourceImageDataFormat::WgpuCompatible(wgpu::TextureFormat::R16Uint)
+        }
+
+        re_video::PixelFormat::R32Float => {
+            SourceImageDataFormat::WgpuCompatible(wgpu::TextureFormat::R32Float)
         }
     };
 

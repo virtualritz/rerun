@@ -1,6 +1,7 @@
 ---
 title: Building blueprints programmatically
 order: 500
+description: Configure the Viewer in code using the Python Blueprint API
 ---
 
 For maximum control and automation, you can define [Blueprints](../../concepts/visualization/blueprints.md) in code using the Python Blueprint API. This is ideal for:
@@ -350,7 +351,7 @@ This is particularly useful when using Rust or C++ SDKs, since the blueprint API
 
 snippet: howto/visualization/load_blueprint
 
-This works using the `log_file_from_path` API, which allows you to log any file that contains data that Rerun understands—in this case, blueprint data.
+This works using the `log_file_from_path` API, which allows you to log any file that contains data that Rerun understands — in this case, blueprint data.
 
 API reference:
 

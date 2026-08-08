@@ -8,15 +8,10 @@ from rerun_bindings import (
     EntryKind as EntryKind,
     IndexColumnDescriptor as IndexColumnDescriptor,
     IndexColumnSelector as IndexColumnSelector,
-    IndexConfig as IndexConfig,
-    IndexingResult as IndexingResult,
     NotFoundError as NotFoundError,
-    VectorDistanceMetric as VectorDistanceMetric,
-    get_trace_context_var as get_trace_context_var,
 )
 from rerun_bindings.types import (
     IndexValuesLike as IndexValuesLike,
-    VectorDistanceMetricLike as VectorDistanceMetricLike,
 )
 
 from ._catalog_client import CatalogClient as CatalogClient, VersionInfo as VersionInfo
@@ -34,3 +29,6 @@ from ._registration_handle import (
     SegmentRegistrationResult as SegmentRegistrationResult,
 )
 from ._schema import Schema as Schema
+from ._unregistration_handle import (
+    UnregistrationHandle as UnregistrationHandle,
+)

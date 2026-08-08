@@ -9,7 +9,6 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 use super::arrow::quote_fqname_as_type_path;
-use super::blueprint_validation::generate_blueprint_validation;
 use super::reflection::generate_reflection;
 use super::util::{append_tokens, doc_as_lines, quote_doc_lines};
 use crate::codegen::rust::arrow::ArrowDataTypeTokenizer;
@@ -22,11 +21,8 @@ use crate::codegen::rust::util::{is_tuple_struct_from_obj, quote_doc_line};
 use crate::codegen::{Target, autogen_warning};
 use crate::objects::ObjectClass;
 use crate::{
-    ATTR_DEFAULT, ATTR_RERUN_COMPONENT_OPTIONAL, ATTR_RERUN_COMPONENT_RECOMMENDED,
-    ATTR_RERUN_COMPONENT_REQUIRED, ATTR_RERUN_VIEW_IDENTIFIER, ATTR_RERUN_VISUALIZER,
-    ATTR_RUST_CUSTOM_CLAUSE, ATTR_RUST_DERIVE, ATTR_RUST_DERIVE_ONLY, ATTR_RUST_NEW_PUB_CRATE,
-    ATTR_RUST_REPR, CodeGenerator, ElementType, Object, ObjectField, ObjectKind, Objects, Reporter,
-    Type, TypeRegistry, format_path,
+    ATTR_DEFAULT, CodeGenerator, ElementType, Object, ObjectField, ObjectKind, Objects, Reporter,
+    RerunAttr, RustAttr, Type, TypeRegistry, format_path,
 };
 
 // ---
@@ -63,7 +59,6 @@ impl CodeGenerator for RustCodeGenerator {
             );
         }
 
-        generate_blueprint_validation(reporter, objects, &mut files_to_write);
         generate_reflection(
             reporter,
             objects,
@@ -159,6 +154,7 @@ fn generate_object_file(
     code.push_str("#![allow(clippy::allow_attributes)]\n");
     code.push_str("#![allow(clippy::clone_on_copy)]\n");
     code.push_str("#![allow(clippy::cloned_instead_of_copied)]\n");
+    code.push_str("#![allow(clippy::eq_op)]\n"); // `IS_POD` consts of different types resolve to the same trait item, so `SizeBytes` derivations look like equal operands.
     code.push_str("#![allow(clippy::map_flatten)]\n");
     code.push_str("#![allow(clippy::needless_question_mark)]\n");
     code.push_str("#![allow(clippy::new_without_default)]\n");
@@ -263,19 +259,18 @@ fn quote_struct(
 
     let quoted_doc = quote_obj_docs(reporter, objects, obj);
 
-    let derive_only = obj.is_attr_set(ATTR_RUST_DERIVE_ONLY);
+    let derive_only = obj.is_attr_set(RustAttr::DeriveOnly);
     let quoted_derive_clone_debug = if derive_only {
         quote!()
     } else {
         quote_derive_clone_debug()
     };
     let quoted_derive_clause = if derive_only {
-        quote_meta_clause_from_obj(obj, ATTR_RUST_DERIVE_ONLY, "derive")
+        quote_meta_clause_from_obj(obj, RustAttr::DeriveOnly, "derive")
     } else {
-        quote_meta_clause_from_obj(obj, ATTR_RUST_DERIVE, "derive")
+        quote_meta_clause_from_obj(obj, RustAttr::Derive, "derive")
     };
-    let quoted_repr_clause = quote_meta_clause_from_obj(obj, ATTR_RUST_REPR, "repr");
-    let quoted_custom_clause = quote_meta_clause_from_obj(obj, ATTR_RUST_CUSTOM_CLAUSE, "");
+    let quoted_repr_clause = quote_meta_clause_from_obj(obj, RustAttr::Repr, "repr");
 
     // Archetypes must always derive Default.
     let quoted_derive_default_clause =
@@ -308,55 +303,15 @@ fn quote_struct(
 
     let quoted_builder = quote_builder_from_obj(reporter, objects, obj);
 
-    let quoted_heap_size_bytes = {
-        let heap_size_bytes_impl = if is_tuple_struct_from_obj(obj) {
-            quote!(self.0.heap_size_bytes())
-        } else if obj.fields.is_empty() {
-            quote!(0)
-        } else {
-            let quoted_heap_size_bytes = obj.fields.iter().map(|obj_field| {
-                let field_name = format_ident!("{}", obj_field.name);
-                quote!(self.#field_name.heap_size_bytes())
-            });
-            quote!(#(#quoted_heap_size_bytes)+*)
-        };
-
-        let is_pod_impl = if obj.fields.is_empty() {
-            quote!(true)
-        } else {
-            let quoted_is_pods = obj.fields.iter().map(|obj_field| {
-                let quoted_field_type = quote_field_type_from_object_field(obj, obj_field);
-                quote!(<#quoted_field_type>::is_pod())
-            });
-            quote!(#(#quoted_is_pods)&&*)
-        };
-
-        let quoted_is_pod = (!obj.is_archetype()).then_some(quote! {
-            #[inline]
-            fn is_pod() -> bool {
-                #is_pod_impl
-            }
-        });
-
-        quote! {
-            impl ::re_byte_size::SizeBytes for #name {
-                #[inline]
-                fn heap_size_bytes(&self) -> u64 {
-                    #heap_size_bytes_impl
-                }
-
-                #quoted_is_pod
-            }
-        }
-    };
+    let quoted_derive_size_bytes = quote!(#[derive(::re_byte_size::SizeBytes)]);
 
     let tokens = quote! {
         #quoted_doc
         #quoted_derive_clone_debug
         #quoted_derive_clause
         #quoted_derive_default_clause
+        #quoted_derive_size_bytes
         #quoted_repr_clause
-        #quoted_custom_clause
         #quoted_deprecation_summary
         #quoted_struct
 
@@ -365,8 +320,6 @@ fn quote_struct(
         #quoted_from_impl
 
         #quoted_builder
-
-        #quoted_heap_size_bytes
     };
 
     tokens
@@ -385,19 +338,18 @@ fn quote_union(
     let name = format_ident!("{name}");
 
     let quoted_doc = quote_obj_docs(reporter, objects, obj);
-    let derive_only = obj.try_get_attr::<String>(ATTR_RUST_DERIVE_ONLY).is_some();
+    let derive_only = obj.try_get_attr::<String>(RustAttr::DeriveOnly).is_some();
     let quoted_derive_clone_debug = if derive_only {
         quote!()
     } else {
         quote_derive_clone_debug()
     };
     let quoted_derive_clause = if derive_only {
-        quote_meta_clause_from_obj(obj, ATTR_RUST_DERIVE_ONLY, "derive")
+        quote_meta_clause_from_obj(obj, RustAttr::DeriveOnly, "derive")
     } else {
-        quote_meta_clause_from_obj(obj, ATTR_RUST_DERIVE, "derive")
+        quote_meta_clause_from_obj(obj, RustAttr::Derive, "derive")
     };
-    let quoted_repr_clause = quote_meta_clause_from_obj(obj, ATTR_RUST_REPR, "repr");
-    let quoted_custom_clause = quote_meta_clause_from_obj(obj, ATTR_RUST_CUSTOM_CLAUSE, "");
+    let quoted_repr_clause = quote_meta_clause_from_obj(obj, RustAttr::Repr, "repr");
 
     let quoted_fields = fields.iter().map(|obj_field| {
         let name = format_ident!("{}", re_case::to_pascal_case(&obj_field.name));
@@ -420,65 +372,19 @@ fn quote_union(
 
     let quoted_trait_impls = quote_trait_impls_from_obj(reporter, type_registry, objects, obj);
 
-    let quoted_heap_size_bytes = {
-        let quoted_matches = fields.iter().map(|obj_field| {
-            let name = format_ident!("{}", re_case::to_pascal_case(&obj_field.name));
-
-            if obj_field.typ == Type::Unit {
-                quote!(Self::#name => 0)
-            } else {
-                quote!(Self::#name(v) => v.heap_size_bytes())
-            }
-        });
-
-        let is_pod_impl = {
-            let quoted_is_pods: Vec<_> = obj
-                .fields
-                .iter()
-                .filter(|obj_field| obj_field.typ != Type::Unit)
-                .map(|obj_field| {
-                    let quoted_field_type = quote_field_type_from_object_field(obj, obj_field);
-                    quote!(<#quoted_field_type>::is_pod())
-                })
-                .collect();
-            if quoted_is_pods.is_empty() {
-                quote!(true)
-            } else {
-                quote!(#(#quoted_is_pods)&&*)
-            }
-        };
-
-        quote! {
-            impl ::re_byte_size::SizeBytes for #name {
-                #[inline]
-                fn heap_size_bytes(&self) -> u64 {
-                    #![allow(clippy::match_same_arms)]
-                    match self {
-                        #(#quoted_matches),*
-                    }
-                }
-
-                #[inline]
-                fn is_pod() -> bool {
-                    #is_pod_impl
-                }
-            }
-        }
-    };
+    let quoted_derive_size_bytes = quote!(#[derive(::re_byte_size::SizeBytes)]);
 
     let tokens = quote! {
         #quoted_doc
         #quoted_derive_clone_debug
         #quoted_derive_clause
+        #quoted_derive_size_bytes
         #quoted_repr_clause
-        #quoted_custom_clause
         pub enum #name {
             #(#quoted_fields,)*
         }
 
         #quoted_trait_impls
-
-        #quoted_heap_size_bytes
     };
 
     tokens
@@ -498,7 +404,6 @@ fn quote_enum(
     let name = format_ident!("{name}");
 
     let quoted_doc = quote_obj_docs(reporter, objects, obj);
-    let quoted_custom_clause = quote_meta_clause_from_obj(obj, ATTR_RUST_CUSTOM_CLAUSE, "");
 
     let mut derives = vec!["Clone", "Copy", "Debug", "Hash", "PartialEq", "Eq"];
 
@@ -524,7 +429,7 @@ fn quote_enum(
         quote!(#derive)
     });
 
-    // NOTE: we keep the casing of the enum variants exactly as specified in the .fbs file,
+    // NOTE: we keep the casing of the enum variants exactly as written in `re_type_definitions`,
     // or else `RGBA` would become `Rgba` and so on.
     // Note that we want consistency across:
     // * all languages (C++, Python, Rust)
@@ -650,7 +555,7 @@ fn quote_enum(
     let tokens = quote! {
         #quoted_doc
         #[derive( #(#derives,)* )]
-        #quoted_custom_clause
+        #[derive(::re_byte_size::SizeBytes)]
         #[repr(#repr_type)]
         pub enum #name {
             #(#quoted_fields,)*
@@ -689,17 +594,6 @@ fn quote_enum(
             }
         }
 
-        impl ::re_byte_size::SizeBytes for #name {
-            #[inline]
-            fn heap_size_bytes(&self) -> u64 {
-                0
-            }
-
-            #[inline]
-            fn is_pod() -> bool {
-                true
-            }
-        }
     };
 
     tokens
@@ -858,6 +752,10 @@ impl quote::ToTokens for &ElementType {
             ElementType::Binary => quote!(::arrow::buffer::Buffer),
             ElementType::String => quote!(::re_types_core::ArrowString),
             ElementType::Object { fqname } => quote_fqname_as_type_path(fqname),
+            ElementType::Array { elem_type, length } => {
+                let elem_type = &**elem_type;
+                quote!([#elem_type; #length])
+            }
         }
         .to_tokens(tokens);
     }
@@ -867,7 +765,7 @@ fn quote_derive_clone_debug() -> TokenStream {
     quote!(#[derive(Clone, Debug)])
 }
 
-fn quote_meta_clause_from_obj(obj: &Object, attr: &str, clause: &str) -> TokenStream {
+fn quote_meta_clause_from_obj(obj: &Object, attr: RustAttr, clause: &str) -> TokenStream {
     let quoted = obj
         .try_get_attr::<String>(attr)
         .map(|contents| {
@@ -917,7 +815,8 @@ fn quote_trait_impls_for_datatype_or_component(
 
     let datatype = type_registry.get(fqname);
 
-    let optimize_for_buffer_slice = should_optimize_buffer_slice_deserialize(obj, type_registry);
+    let optimize_for_buffer_slice =
+        should_optimize_buffer_slice_deserialize(objects, obj, type_registry);
 
     let is_forwarded_type = obj.is_arrow_transparent()
         && !obj.fields[0].is_nullable
@@ -1092,21 +991,18 @@ fn quote_trait_impls_for_archetype(reporter: &Reporter, obj: &Object) -> TokenSt
 
     fn compute_component_descriptors(
         obj: &Object,
-        requirement_attr_value: &'static str,
+        requirement_attr_value: RerunAttr,
     ) -> (usize, TokenStream) {
         let descriptors = obj
             .fields
             .iter()
-            .filter_map(move |field| {
-                field
-                    .try_get_attr::<String>(requirement_attr_value)
-                    .map(|_| {
-                        let archetype_name = format_ident!("{}", obj.name);
-                        let component = field.snake_case_name();
-                        let fn_name = format_ident!("descriptor_{component}");
+            .filter(|field| field.has_attr(requirement_attr_value))
+            .map(move |field| {
+                let archetype_name = format_ident!("{}", obj.name);
+                let component = field.snake_case_name();
+                let fn_name = format_ident!("descriptor_{component}");
 
-                        quote!(#archetype_name::#fn_name())
-                    })
+                quote!(#archetype_name::#fn_name())
             })
             .collect_vec();
 
@@ -1151,17 +1047,20 @@ fn quote_trait_impls_for_archetype(reporter: &Reporter, obj: &Object) -> TokenSt
             #(#doc_attrs)*
             #[inline]
                 pub fn #fn_name() -> ComponentDescriptor {
-                    ComponentDescriptor {
-                        archetype: Some(#archetype_name.into()),
-                        component: #component.into(),
-                        component_type: Some(#component_type.into()),
-                    }
+                    static DESCRIPTOR: std::sync::LazyLock<ComponentDescriptor> = std::sync::LazyLock::new(|| {
+                        ComponentDescriptor {
+                            archetype: Some(#archetype_name.into()),
+                            component: #component.into(),
+                            component_type: Some(#component_type.into()),
+                        }
+                    });
+                    (*DESCRIPTOR).clone()
                 }
             }
         })
         .collect_vec();
 
-    let visualizer_trait_impl = attrs.get_string(ATTR_RERUN_VISUALIZER).map(|visualizer| {
+    let visualizer_trait_impl = attrs.get_string(RerunAttr::Visualizer).map(|visualizer| {
         quote! {
             impl crate::VisualizableArchetype for #name {
                 #[inline]
@@ -1173,11 +1072,11 @@ fn quote_trait_impls_for_archetype(reporter: &Reporter, obj: &Object) -> TokenSt
     });
 
     let (num_required_descriptors, required_descriptors) =
-        compute_component_descriptors(obj, ATTR_RERUN_COMPONENT_REQUIRED);
+        compute_component_descriptors(obj, RerunAttr::Required);
     let (num_recommended_descriptors, recommended_descriptors) =
-        compute_component_descriptors(obj, ATTR_RERUN_COMPONENT_RECOMMENDED);
+        compute_component_descriptors(obj, RerunAttr::Recommended);
     let (num_optional_descriptors, optional_descriptors) =
-        compute_component_descriptors(obj, ATTR_RERUN_COMPONENT_OPTIONAL);
+        compute_component_descriptors(obj, RerunAttr::Optional);
 
     let num_components_docstring = quote_doc_line(&format!(
         "The total number of components in the archetype: {num_required_descriptors} required, {num_recommended_descriptors} recommended, {num_optional_descriptors} optional"
@@ -1255,7 +1154,10 @@ fn quote_trait_impls_for_archetype(reporter: &Reporter, obj: &Object) -> TokenSt
         impl ::re_types_core::Archetype for #name {
             #[inline]
             fn name() -> ::re_types_core::ArchetypeName {
-                #fqname.into()
+                ::re_types_core::external::re_string_interner::intern_static_nonempty!(
+                    ::re_types_core::ArchetypeName,
+                    #fqname
+                )
             }
 
             #[inline]
@@ -1319,11 +1221,11 @@ fn quote_trait_impls_for_view(reporter: &Reporter, obj: &Object) -> TokenStream 
 
     let name = format_ident!("{}", obj.name);
 
-    let Some(identifier): Option<String> = obj.try_get_attr(ATTR_RERUN_VIEW_IDENTIFIER) else {
+    let Some(identifier): Option<String> = obj.try_get_attr(RerunAttr::ViewIdentifier) else {
         reporter.error(
             &obj.virtpath,
             &obj.fqname,
-            format!("Missing {ATTR_RERUN_VIEW_IDENTIFIER} attribute for view"),
+            format!("Missing {} attribute for view", RerunAttr::ViewIdentifier),
         );
         return TokenStream::new();
     };
@@ -1332,7 +1234,10 @@ fn quote_trait_impls_for_view(reporter: &Reporter, obj: &Object) -> TokenStream 
         impl ::re_types_core::View for #name {
             #[inline]
             fn identifier() -> ::re_types_core::ViewClassIdentifier {
-                #identifier .into()
+                ::re_types_core::external::re_string_interner::intern_static_nonempty!(
+                    ::re_types_core::ViewClassIdentifier,
+                    #identifier
+                )
             }
         }
     }
@@ -1520,7 +1425,7 @@ fn quote_builder_from_obj(reporter: &Reporter, objects: &Objects, obj: &Object) 
             quote!(#field_name: None)
         });
 
-        let fn_new_pub = if obj.is_attr_set(ATTR_RUST_NEW_PUB_CRATE) {
+        let fn_new_pub = if obj.is_attr_set(RustAttr::NewPubCrate) {
             quote!(pub(crate))
         } else {
             quote!(pub)
@@ -1540,7 +1445,7 @@ fn quote_builder_from_obj(reporter: &Reporter, objects: &Objects, obj: &Object) 
         }
     };
 
-    let with_methods = required.iter().chain(optional.iter()).map(|field| {
+    let with_methods = std::iter::chain(&required, &optional).map(|field| {
         // fn with_*()
         let field_name = format_ident!("{}", field.name);
         let descr_fn_name = format_ident!("descriptor_{field_name}");
@@ -1596,7 +1501,7 @@ fn quote_builder_from_obj(reporter: &Reporter, objects: &Objects, obj: &Object) 
             quote_doc_line(&format!("Update only some specific fields of a `{name}`."));
         let clear_fields_doc = quote_doc_line(&format!("Clear all the fields of a `{name}`."));
 
-        let fields = required.iter().chain(optional.iter()).map(|field| {
+        let fields = std::iter::chain(&required, &optional).map(|field| {
             let field_name = format_ident!("{}", field.name);
             let descr_fn_name = format_ident!("descriptor_{field_name}");
             let (typ, _) = quote_field_type_from_typ(&field.typ, true);
@@ -1649,15 +1554,15 @@ fn quote_builder_from_obj(reporter: &Reporter, objects: &Objects, obj: &Object) 
         ");
         let columns_unary_doc = quote_doc_lines(&columns_unary_doc.lines().map(|l| l.to_owned()).collect_vec());
 
-        let fields = required.iter().chain(optional.iter()).map(|field| {
+        let fields = std::iter::chain(&required, &optional).map(|field| {
             let field_name = format_ident!("{}", field.name);
             quote!(self.#field_name.map(|#field_name| #field_name.partitioned(_lengths.clone())).transpose()?)
         });
 
-        let field_lengths = required.iter().chain(optional.iter()).map(|field| {
-            format_ident!("len_{}", field.name)
-        }).collect_vec();
-        let unary_fields = required.iter().chain(optional.iter()).map(|field| {
+        let field_lengths = std::iter::chain(&required, &optional)
+            .map(|field| format_ident!("len_{}", field.name))
+            .collect_vec();
+        let unary_fields = std::iter::chain(&required, &optional).map(|field| {
             let field_name = format_ident!("{}", field.name);
             let len_field_name = format_ident!("len_{}", field.name);
             quote!(let #len_field_name = self.#field_name.as_ref().map(|b| b.array.len()))

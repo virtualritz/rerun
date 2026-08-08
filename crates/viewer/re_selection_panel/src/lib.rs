@@ -1,7 +1,5 @@
 //! The UI for the selection panel.
 
-#![warn(clippy::iter_over_hash_type)] //  TODO(#6198): enable everywhere
-
 mod defaults_ui;
 mod item_heading_no_breadcrumbs;
 mod item_heading_with_breadcrumbs;
@@ -13,6 +11,7 @@ mod visible_time_range_ui;
 mod visualizer_ui;
 
 pub use selection_panel::SelectionPanel;
+pub use visualizer_ui::SourceSelectorContext;
 
 #[cfg(test)]
 mod test {
@@ -41,7 +40,7 @@ mod test {
             );
 
             let mut selection_panel = SelectionPanel::default();
-            selection_panel.show_panel(ctx, &blueprint, &mut Default::default(), ui, true);
+            selection_panel.show_panel(ctx, &blueprint, &mut Default::default(), ui, &mut true);
         });
     }
 }

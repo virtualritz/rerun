@@ -140,15 +140,15 @@ impl RecordBatchTestExt for arrow::array::RecordBatch {
     }
 
     fn sort_rows_by(&self, columns: &[&str]) -> Result<Self, DataFusionError> {
-        let sort_exprs = columns
+        let sort_exprs: Vec<_> = columns
             .iter()
-            .map(|column| {
+            .map(|column| -> Result<_, DataFusionError> {
                 Ok(PhysicalSortExpr::new(
                     col(column, self.schema_ref())?,
                     SortOptions::default(),
                 ))
             })
-            .collect::<Result<Vec<_>, DataFusionError>>()?;
+            .try_collect()?;
 
         let Some(ordering) = LexOrdering::new(sort_exprs) else {
             return Ok(self.clone());
@@ -158,17 +158,17 @@ impl RecordBatchTestExt for arrow::array::RecordBatch {
     }
 
     fn auto_sort_rows(&self) -> Result<Self, DataFusionError> {
-        let sort_exprs = self
+        let sort_exprs: Vec<_> = self
             .schema()
             .fields()
             .iter()
-            .map(|column| {
+            .map(|column| -> Result<_, DataFusionError> {
                 Ok(PhysicalSortExpr::new(
                     col(column.name(), self.schema_ref())?,
                     SortOptions::default(),
                 ))
             })
-            .collect::<Result<Vec<_>, DataFusionError>>()?;
+            .try_collect()?;
 
         let Some(ordering) = LexOrdering::new(sort_exprs) else {
             return Ok(self.clone());
@@ -325,6 +325,24 @@ impl RecordBatchTestExt for arrow::array::RecordBatch {
                     arrays.push(redact_array!(array, arrow::array::BinaryArray, |opt| opt
                         .map(|_| [0u8; 8].as_slice())));
                 }
+                arrow::datatypes::DataType::FixedSizeBinary(size) => {
+                    let typed_array = array
+                        .try_downcast_array_ref::<arrow::array::FixedSizeBinaryArray>()
+                        .expect("expected column to be FixedSizeBinaryArray");
+                    let zeroes = vec![0u8; *size as usize];
+                    let redacted_values = typed_array
+                        .iter()
+                        .map(|opt| opt.map(|_| zeroes.as_slice()))
+                        .collect_vec();
+
+                    arrays.push(Arc::new(
+                        arrow::array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                            redacted_values.into_iter(),
+                            *size,
+                        )
+                        .expect("all redacted values share the column's fixed size"),
+                    ) as ArrayRef);
+                }
                 // TODO(zehiko) add support for other types as needed
                 _ => {
                     panic!("Redaction not implemented for type {}", column.data_type());
@@ -409,7 +427,7 @@ impl SchemaTestExt for arrow::datatypes::Schema {
             }
         });
 
-        metadata.into_iter().chain(fields).join("\n")
+        std::iter::chain(metadata, fields).join("\n")
     }
 }
 

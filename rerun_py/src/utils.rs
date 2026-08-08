@@ -15,21 +15,34 @@ pub(crate) fn get_tokio_runtime() -> &'static Runtime {
     // which adds a check in that disallows calls from a forked process
     // https://github.com/delta-io/delta-rs/blob/87010461cfe01563d91a4b9cd6fa468e2ad5f283/python/src/utils.rs#L10-L31
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-    RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"))
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Runtime::new() // NOLINT: the Python extension owns one process-wide runtime
+            .expect("Failed to create Tokio runtime")
+    })
 }
 
 /// `f` should do very little work besides spawning tasks and awaiting them.
 ///
+/// The caller's current [`tracing::Span`] is attached to the future so that
+/// `Span::current()` inside `f` resolves to the caller's span on every poll,
+/// even after the future is resumed on a different tokio worker thread.
+///
 /// See [this] for more information.
 ///
 /// [this]: https://docs.rs/tokio/latest/tokio/runtime/struct.Runtime.html#non-worker-future
-#[tracing::instrument(level = "trace", skip_all)]
 pub fn wait_for_future<F>(py: Python<'_>, f: F) -> F::Output
 where
     F: Future + Send,
     F::Output: Send,
 {
+    use tracing::Instrument as _;
     let runtime: &Runtime = get_tokio_runtime();
+    let f = f.in_current_span();
+    // Read the active `tracing_session()` id once here (GIL still held) and stash
+    // it in a tokio task_local for the duration of `f`. Every gRPC injection
+    // inside `f` then reads the cached value without touching Python.
+    #[cfg(feature = "perf_telemetry")]
+    let f = re_perf_telemetry::with_current_tracing_session(f);
     py.detach(|| runtime.block_on(f))
 }
 
@@ -45,8 +58,19 @@ pub fn py_rerun_warn_cstr(msg: &std::ffi::CStr) -> PyResult<()> {
 }
 
 /// Logs a warning using rerun logging system and issues the warning to python runtime.
-#[expect(dead_code)]
 pub fn py_rerun_warn(msg: &str) -> PyResult<()> {
     let cmsg = CString::new(msg)?;
     py_rerun_warn_cstr(&cmsg)
+}
+
+/// Build the reserved entity path for a recording property: `/__properties/{parts…}`.
+///
+/// Each part is treated as a single literal (escaped) path part, so this is the one
+/// place that defines the escaping rules for property names.
+pub fn property_entity_path(
+    parts: impl IntoIterator<Item = re_log_types::EntityPathPart>,
+) -> re_log_types::EntityPath {
+    re_log_types::EntityPath::properties().join(&re_log_types::EntityPath::from(
+        parts.into_iter().collect::<Vec<_>>(),
+    ))
 }

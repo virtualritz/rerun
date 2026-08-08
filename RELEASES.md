@@ -16,7 +16,8 @@ This document describes the current release and versioning strategy. This strate
 
 ## Release cadence
 
-New Rerun versions are released approximately once every month. Sometimes we do out-of-schedule patch releases.
+New Rerun versions are released every two weeks. Sometimes we do out-of-schedule patch releases.
+We do not block a release on a PR. Incomplete work should be hidden behind a feature flag.
 
 ## Library versioning and release cadence
 
@@ -97,37 +98,55 @@ The fastest way to get an overview of all the patch candidate PRs from both repo
 uv run scripts/fetch_patch_candidates.py
 ```
 
-When done, run [`cargo semver-checks`](https://github.com/obi1kenobi/cargo-semver-checks) to check that we haven't introduced any semver breaking changes.
-
 After cherry-picking a commit into the patch, please make sure to remove the `consider-patch` label.
 
-### 4. Update [`CHANGELOG.md`](./CHANGELOG.md)
+### 4. Finalize the changeset and update [`CHANGELOG.md`](./CHANGELOG.md)
 
 ⚠️ Skip this step when preparing an alpha release.
 
-Update the change log. It should include:
+The curated part of the release notes — highlights, breaking changes & migration guides, and new
+features, including any screenshots/GIFs — is written incrementally **during the cycle, per PR**:
+every `include in changelog` PR drops one file in [`docs/content/changelog/upcoming/`](./docs/content/changelog/upcoming)
+(one file per PR avoids merge conflicts). At release, assemble those into the release's changeset:
 
--   A one-line summary of the release
--   A multi-line summary of the release
-    - You may ask feature leads to write a summary for each highlighted item
--   A gif or screenshot showing one or more major new features
-    - Try to avoid `mp4`s, gifs have a better experience on GitHub
-    - You can upload images to a PR, use the link it generates to use GitHub as an image hosting service.
--   Run `pixi run uvpy scripts/generate_changelog.py > new_changelog.md`
+-   Assemble `upcoming/*.md` into `docs/content/changelog/changeset-0-xx.md`, grouping each entry by
+    its `type:` hint (`highlight` / `breaking` / `feature`). This is an agent-friendly task — run the
+    `/assemble-changelog` skill (Claude Code), which merges and de-duplicates the entries, generates
+    the detail sections, and verifies every `include in changelog` PR has an entry.
+-   Once assembled and reviewed, delete the merged files from `upcoming/` (leave `_template.md`).
+-   Resolve every `TODO(name)` in the changeset (docs links, example links, screenshots/GIFs, migration guides).
+    **The release is blocked until all of these are resolved.**
+-   Sanity-check the `## Highlights` section reads well as a whole. (Feature leads write their own items per PR;
+    here you just make sure the one-line and multi-line summary of the release hang together.)
+
+Then update `CHANGELOG.md` with the auto-generated detail (bug fixes + the full list of changes):
+
+-   Run `pixi run uvpy scripts/generate_changelog.py --version 0.x.y > new_changelog.md`
 -   Edit PR descriptions/labels to improve the generated changelog
 -   Copy-paste the results into `CHANGELOG.md`.
--   Editorialize the changelog if necessary
--   Make sure the changelog includes instructions for handling any breaking changes
+
+The changeset is *not* copied into `CHANGELOG.md`. The script summarizes it instead — the section
+headings plus links to the changeset on the website — so the full prose lives in exactly one place.
+Assemble the changeset before running the script, or the summary will be a `TODO` placeholder. <!-- NOLINT -->
 
 ### 5. Clean up documentation links
 
 ⚠️ Skip this step when preparing an alpha release.
 
-Remove all the `attr.docs.unreleased` attributes in all `.fbs` files, followed by `pixi run codegen`.
+Remove all the `#[docs(unreleased)]` attributes in `re_type_definitions`, followed by `pixi run codegen`.
 
 Remove the speculative link markers (`?speculative-link`).
 
 Update the [python support table](./rerun_py/docs/gen_common_index.py) for the major release.
+
+Point the `redirect:` in [`docs/content/changelog.md`](./docs/content/changelog.md) at this release's changeset.
+
+Do *not* create the next release's changeset yet: `scripts/ci/check_changelog_redirect.py` requires the
+newest `changeset-0-xx.md` to be the one `changelog.md` redirects to, so an empty changeset for an unreleased
+version would fail CI. The next changeset is created from
+[`docs/content/changelog/_template.md`](./docs/content/changelog/_template.md) when that release is assembled
+(step 4). Until then the now-empty [`upcoming/`](./docs/content/changelog/upcoming) folder collects the next
+release's per-PR entries.
 
 Once you're done, commit and push onto the release branch.
 
@@ -141,22 +160,25 @@ In the UI:
         This will create a one-off alpha release.
 
     - `rc` if the branch name is `prepare-release-x.y.z`.
-      This will create a pull request for the release, and publish a release candidate.
+      This will publish a release candidate.
 
-    - `final` for the final public release
+    - `final` for the final public release.
+
+In all three cases, the workflow opens (or updates) a release pull request against `main`.
 
 ![Image showing the Run workflow UI. It can be found at https://github.com/rerun-io/rerun/actions/workflows/release.yml](https://github.com/rerun-io/rerun/assets/1665677/6cdc8e7e-c0fc-4cf1-99cb-0749957b8328)
 
-### 7. Wait for both workflows to finish
+### 7. Wait for the release workflow to finish
 
 Once the release workflow is started, it will create a pull request for the release.
 The pull request description will tell you what to do next.
 
-[The `Release` workflow](https://github.com/rerun-io/rerun/actions/workflows/release.yml) will build artifacts and run PR checks.
-Additionally, if the release type is set to `final` or `rc`, it will spawn a second workflow (when the release artifacts have been published to PyPI, crates.io etc.) called [`GitHub Release`](https://github.com/rerun-io/rerun/actions/workflows/on_gh_release.yml).
-This workflow is responsible for creating [the GitHub release draft](https://github.com/rerun-io/rerun/releases) and to publish the artifacts to it.
-**Make sure this workflow also finishes!**.
-Only after it finishes successfully should you un-draft [the GitHub release](https://github.com/rerun-io/rerun/releases).
+[The `Release` workflow](https://github.com/rerun-io/rerun/actions/workflows/release.yml) will build artifacts, run PR checks, and publish them to PyPI, crates.io, npm, etc.
+For `rc` and `final` releases it also creates a **draft** [GitHub release](https://github.com/rerun-io/rerun/releases) (in the `tag-release` job) and attaches a comment to the release PR pointing at it.
+
+Once the `Release` workflow has finished successfully and you've sanity-checked the artifacts, edit the GitHub release draft (changelog, header media) and click `Publish release`.
+Publishing the release triggers the [`GitHub Release` workflow](https://github.com/rerun-io/rerun/actions/workflows/on_gh_release.yml), which syncs the binary assets from `build.rerun.io` onto the published GitHub release.
+**Make sure that workflow also finishes successfully** so the release ends up with all of its assets attached.
 
 ### 8. Merge changes to `main`
 

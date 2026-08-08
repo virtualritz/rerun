@@ -17,7 +17,7 @@ use super::auto_color_egui;
 
 const MISSING_ROW_ID: RowId = RowId::ZERO;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, re_byte_size::SizeBytes)]
 pub struct Annotations {
     row_id: RowId,
     class_map: HashMap<ClassId, CachedClassDescription>,
@@ -61,7 +61,7 @@ impl Annotations {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, re_byte_size::SizeBytes)]
 struct CachedClassDescription {
     class_description: ClassDescription,
     keypoint_map: HashMap<KeypointId, AnnotationInfo>,
@@ -131,7 +131,7 @@ impl ResolvedClassDescription<'_> {
 
 // ----------------------------------------------------------------------------
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, re_byte_size::SizeBytes)]
 pub struct ResolvedAnnotationInfo {
     pub class_id: Option<ClassId>,
     pub annotation_info: Option<AnnotationInfo>,
@@ -179,37 +179,17 @@ impl ResolvedAnnotationInfo {
     }
 }
 
-impl re_byte_size::SizeBytes for ResolvedAnnotationInfo {
-    #[inline]
-    fn heap_size_bytes(&self) -> u64 {
-        let Self {
-            class_id,
-            annotation_info,
-        } = self;
-        class_id.heap_size_bytes() + annotation_info.heap_size_bytes()
-    }
-}
-
 // ----------------------------------------------------------------------------
 
 /// Many [`ResolvedAnnotationInfo`], with optimization
 /// for a common case where they are all the same.
+#[derive(re_byte_size::SizeBytes)]
 pub enum ResolvedAnnotationInfos {
     /// All the same
     Same(usize, ResolvedAnnotationInfo),
 
     /// All different
     Many(Vec<ResolvedAnnotationInfo>),
-}
-
-impl re_byte_size::SizeBytes for ResolvedAnnotationInfos {
-    #[inline]
-    fn heap_size_bytes(&self) -> u64 {
-        match self {
-            Self::Same(_count, info) => info.heap_size_bytes(),
-            Self::Many(infos) => infos.heap_size_bytes(),
-        }
-    }
 }
 
 impl ResolvedAnnotationInfos {
@@ -241,7 +221,7 @@ impl ResolvedAnnotationInfos {
 
 // ----------------------------------------------------------------------------
 
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Clone, Debug, re_byte_size::SizeBytes)]
 pub struct AnnotationMap(pub BTreeMap<EntityPath, Arc<Annotations>>);
 
 impl AnnotationMap {
@@ -321,6 +301,13 @@ impl AnnotationContextStoreSubscriber {
     pub fn subscription_handle() -> ChunkStoreSubscriberHandle {
         static SUBSCRIPTION: OnceLock<ChunkStoreSubscriberHandle> = OnceLock::new();
         *SUBSCRIPTION.get_or_init(ChunkStore::register_per_store_subscriber::<Self>)
+    }
+}
+
+impl re_byte_size::MemUsageTreeCapture for AnnotationContextStoreSubscriber {
+    fn capture_mem_usage_tree(&self) -> re_byte_size::MemUsageTree {
+        use re_byte_size::SizeBytes as _;
+        re_byte_size::MemUsageTree::Bytes(self.entities_with_annotation_context.total_size_bytes())
     }
 }
 

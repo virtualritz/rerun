@@ -1,8 +1,11 @@
+#![allow(clippy::iter_over_hash_type)]
+
 //! Handles importing of Rerun data from file using importer plugins.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, LazyLock};
 
+use itertools::chain;
 use re_chunk::{Chunk, ChunkResult};
 use re_log_types::{ArrowMsg, EntityPath, LogMsg, RecordingId, StoreId, TimePoint};
 
@@ -13,9 +16,6 @@ mod importer_archetype;
 mod importer_directory;
 mod importer_rrd;
 mod importer_urdf;
-
-#[cfg(not(target_arch = "wasm32"))]
-pub mod lerobot;
 
 // This importer currently only works when loading the entire dataset directory, and we cannot do that on web yet.
 #[cfg(not(target_arch = "wasm32"))]
@@ -121,11 +121,6 @@ pub struct ImporterSettings {
     /// At what time(s) should the data be logged to?
     pub timepoint: Option<TimePoint>,
 
-    /// If `true`, keep reading `.rrd` files past EOF, tailing new data as it arrives.
-    ///
-    /// Defaults to `false`.
-    pub follow: bool,
-
     /// If set, an offset in nanoseconds to add to all `TimestampNs` time columns.
     pub timestamp_offset_ns: Option<i64>,
 
@@ -147,7 +142,6 @@ impl ImporterSettings {
             force_store_info: false,
             entity_path_prefix: None,
             timepoint: None,
-            follow: false,
             timestamp_offset_ns: None,
             timeline_type: re_log_types::TimeType::TimestampNs,
         }
@@ -180,7 +174,6 @@ impl ImporterSettings {
             force_store_info: _,
             entity_path_prefix,
             timepoint,
-            follow: _,
             timestamp_offset_ns: _,
             timeline_type: _,
         } = self;
@@ -289,7 +282,7 @@ pub type ImporterName = String;
 ///
 /// ## Registering custom importers
 ///
-/// Checkout our [guide](https://www.rerun.io/docs/concepts/logging-and-ingestion/importers/overview?speculative-link).
+/// Checkout our [guide](https://www.rerun.io/docs/concepts/logging-and-ingestion/importers/overview).
 ///
 /// ## Execution
 ///
@@ -406,23 +399,54 @@ pub enum ImporterError {
     #[error(transparent)]
     Mcap(#[from] ::mcap::McapError),
 
+    #[error("Failed to import mp4 video: {source}\nFile path: {path:?}")]
+    Mp4 {
+        path: std::path::PathBuf,
+        source: re_mp4_reader::Mp4Error,
+    },
+
     #[error("{}", re_error::format(.0))]
     Other(#[from] anyhow::Error),
+
+    #[error("{source}\nFile path: {path}")]
+    File {
+        path: String,
+        #[source]
+        source: Box<Self>,
+    },
 }
 
 impl ImporterError {
+    /// Attaches the file being imported, so that individual loaders don't each have to
+    /// thread the path through just to produce a useful error message.
+    pub fn with_path(self, path: &std::path::Path) -> Self {
+        match self {
+            // These already name the file.
+            Self::Incompatible { .. } | Self::Mp4 { .. } | Self::File { .. } => self,
+            err => Self::File {
+                path: path.display().to_string(),
+                source: Box::new(err),
+            },
+        }
+    }
+
     #[inline]
     pub fn is_path_not_found(&self) -> bool {
         match self {
             #[cfg(not(target_arch = "wasm32"))]
             Self::IO(err) => err.kind() == std::io::ErrorKind::NotFound,
+            Self::File { source, .. } => source.is_path_not_found(),
             _ => false,
         }
     }
 
     #[inline]
     pub fn is_incompatible(&self) -> bool {
-        matches!(self, Self::Incompatible { .. })
+        match self {
+            Self::Incompatible { .. } => true,
+            Self::File { source, .. } => source.is_incompatible(),
+            _ => false,
+        }
     }
 }
 
@@ -498,10 +522,7 @@ static BUILTIN_IMPORTERS: LazyLock<Vec<Arc<dyn Importer>>> = LazyLock::new(|| {
 /// Iterator over all registered [`Importer`]s.
 #[inline]
 pub fn iter_importers() -> impl Iterator<Item = Arc<dyn Importer>> {
-    BUILTIN_IMPORTERS
-        .clone()
-        .into_iter()
-        .chain(CUSTOM_IMPORTERS.read().clone())
+    std::iter::chain(BUILTIN_IMPORTERS.clone(), CUSTOM_IMPORTERS.read().clone())
 }
 
 /// Keeps track of all custom [`Importer`]s.
@@ -560,17 +581,18 @@ pub const SUPPORTED_TEXT_EXTENSIONS: &[&str] = &["txt", "md"];
 
 /// All file extension supported by our builtin [`Importer`]s.
 pub fn supported_extensions() -> impl Iterator<Item = &'static str> {
-    SUPPORTED_RERUN_EXTENSIONS
-        .iter()
-        .chain(SUPPORTED_THIRD_PARTY_FORMATS)
-        .chain(SUPPORTED_IMAGE_EXTENSIONS)
-        .chain(SUPPORTED_DEPTH_IMAGE_EXTENSIONS)
-        .chain(SUPPORTED_VIDEO_EXTENSIONS)
-        .chain(SUPPORTED_MESH_EXTENSIONS)
-        .chain(SUPPORTED_POINT_CLOUD_EXTENSIONS)
-        .chain(SUPPORTED_PARQUET_EXTENSIONS)
-        .chain(SUPPORTED_TEXT_EXTENSIONS)
-        .copied()
+    chain!(
+        SUPPORTED_RERUN_EXTENSIONS,
+        SUPPORTED_THIRD_PARTY_FORMATS,
+        SUPPORTED_IMAGE_EXTENSIONS,
+        SUPPORTED_DEPTH_IMAGE_EXTENSIONS,
+        SUPPORTED_VIDEO_EXTENSIONS,
+        SUPPORTED_MESH_EXTENSIONS,
+        SUPPORTED_POINT_CLOUD_EXTENSIONS,
+        SUPPORTED_PARQUET_EXTENSIONS,
+        SUPPORTED_TEXT_EXTENSIONS,
+    )
+    .copied()
 }
 
 /// Is this a supported file extension by any of our builtin [`Importer`]s?
@@ -632,6 +654,7 @@ fn test_supported_mcap_decoder_identifiers() {
     // Check that expected identifiers are present.
     assert!(as_strings.contains(&FOXGLOVE_LENSES_IDENTIFIER.to_owned()));
     assert!(as_strings.contains(&URDF_DECODER_IDENTIFIER.to_owned()));
+    assert!(as_strings.contains(&"attachments".to_owned()));
     assert!(as_strings.contains(&"raw".to_owned()));
     assert!(as_strings.contains(&"protobuf".to_owned()));
     assert!(as_strings.contains(&"ros2msg".to_owned()));

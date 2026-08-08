@@ -13,7 +13,7 @@ use re_sdk_types::{ComponentDescriptor, ComponentIdentifier, ViewClassIdentifier
 use crate::{
     BufferAndFormatConstraint, SingleRequiredComponentConstraint, ViewContext,
     ViewContextCollection, ViewQuery, ViewSystemExecutionError, ViewSystemIdentifier,
-    VisualizabilityConstraints,
+    ViewerDiagnostic, ViewerReportSeverity, VisualizabilityConstraints,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -141,27 +141,8 @@ impl VisualizerQueryInfo {
     }
 }
 
-/// Severity level for visualizer diagnostics.
-///
-/// Sorts from least concern to highest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum VisualizerReportSeverity {
-    /// Something went wrong on an optional component.
-    ///
-    /// We can often still show something using the default.
-    Warning,
-
-    /// Something went wrong on a required component (or otherwise fatally).
-    ///
-    /// The entity usually can't be shown.
-    Error,
-
-    /// It's not just a single visualizer instruction that failed, but the visualizer as a whole tanked.
-    OverallVisualizerError,
-}
-
 /// Contextual information about where/why a diagnostic occurred.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, re_byte_size::SizeBytes)]
 pub struct VisualizerReportContext {
     /// The component that caused the issue (if applicable).
     ///
@@ -170,12 +151,6 @@ pub struct VisualizerReportContext {
 
     /// Additional free-form context
     pub extra: Option<String>,
-}
-
-impl re_byte_size::SizeBytes for VisualizerReportContext {
-    fn heap_size_bytes(&self) -> u64 {
-        self.extra.heap_size_bytes()
-    }
 }
 
 /// A diagnostic message (error or warning) from a visualizer for a single instruction.
@@ -197,24 +172,10 @@ impl re_byte_size::SizeBytes for VisualizerReportContext {
 ///     has an unexpected type, or is otherwise unusable.
 ///
 /// For a high-level failure handling overview, see the `re_viewer` crate documentation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, re_byte_size::SizeBytes)]
 pub struct VisualizerInstructionReport {
-    pub severity: VisualizerReportSeverity,
+    pub diagnostic: ViewerDiagnostic,
     pub context: VisualizerReportContext,
-
-    /// Short message suitable for inline display
-    pub summary: String,
-
-    /// Optional detailed explanation
-    pub details: Option<String>,
-}
-
-impl re_byte_size::SizeBytes for VisualizerInstructionReport {
-    fn heap_size_bytes(&self) -> u64 {
-        self.summary.heap_size_bytes()
-            + self.details.heap_size_bytes()
-            + self.context.heap_size_bytes()
-    }
 }
 
 /// Result of running [`VisualizerSystem::execute`].
@@ -283,15 +244,17 @@ impl VisualizerExecutionOutput {
     pub fn report_unspecified_source(
         &self,
         instruction_id: VisualizerInstructionId,
-        severity: VisualizerReportSeverity,
+        severity: ViewerReportSeverity,
         summary: impl Into<String>,
     ) {
         self.report(
             instruction_id,
             VisualizerInstructionReport {
-                severity,
-                summary: summary.into(),
-                details: None,
+                diagnostic: ViewerDiagnostic {
+                    severity,
+                    summary: summary.into(),
+                    details: None,
+                },
                 context: VisualizerReportContext::default(),
             },
         );
@@ -366,6 +329,23 @@ pub trait VisualizerSystem: Send + Sync + std::any::Any {
         query: &ViewQuery<'_>,
         context_systems: &ViewContextCollection,
     ) -> Result<VisualizerExecutionOutput, ViewSystemExecutionError>;
+
+    /// Optional custom UI shown in the selection panel for this visualizer instruction.
+    ///
+    /// Returns `true` if the custom UI replaces the default per-component value UI.
+    /// Visualizers that need source-mapping selectors render them themselves as part of
+    /// this UI. Returns `false` to fall back to the default per-component UI; the default
+    /// impl renders nothing and returns `false`.
+    fn selection_ui(
+        &self,
+        _ctx: &ViewContext<'_>,
+        _ui: &mut egui::Ui,
+        _data_result: &crate::DataResult,
+        _instruction: &crate::VisualizerInstruction,
+        _type_report: Option<&crate::VisualizerTypeReport>,
+    ) -> bool {
+        false
+    }
 }
 
 pub struct VisualizerCollection {

@@ -5,9 +5,9 @@ use std::sync::Arc;
 use arrow::array::{Int32Array, RecordBatch, StringArray, StructArray};
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use datafusion::prelude::SessionContext;
+use re_async::AsyncRuntimeHandle;
 use re_dataframe_ui::DataFusionTableWidget;
 use re_test_context::TestContext;
-use re_viewer_context::AsyncRuntimeHandle;
 
 use common::run_async_harness;
 
@@ -23,7 +23,12 @@ async fn test_text_truncation() {
             test_context.run_recording(&ui.ctx().clone(), |ctx| {
                 DataFusionTableWidget::new(Arc::clone(&session_context), table_ref)
                     .title("Text truncation")
-                    .show(ctx, &runtime_handle, ui);
+                    .show(
+                        ctx.app_ctx,
+                        &runtime_handle,
+                        ui,
+                        &mut test_context.view_states.lock(),
+                    );
             });
         });
 

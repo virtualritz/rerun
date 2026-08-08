@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::pin::Pin;
 
-use re_byte_size::SizeBytes;
+use re_byte_size::{MemUsageNode, MemUsageTree, SizeBytes};
 use re_log_channel::{DataSourceMessage, DataSourceUiCommand};
 use re_log_encoding::{ToApplication as _, ToTransport as _};
 use re_log_types::TableMsg;
@@ -16,8 +16,8 @@ use re_protos::common::v1alpha1::{
 use re_protos::log_msg::v1alpha1::LogMsg as LogMsgProto;
 use re_protos::sdk_comms::v1alpha1::{
     ReadMessagesRequest, ReadMessagesResponse, ReadTablesRequest, ReadTablesResponse,
-    SaveScreenshotRequest, SaveScreenshotResponse, WriteMessagesRequest, WriteMessagesResponse,
-    WriteTableRequest, WriteTableResponse, message_proxy_service_server,
+    WriteMessagesRequest, WriteMessagesResponse, WriteTableRequest, WriteTableResponse,
+    message_proxy_service_server,
 };
 use re_quota_channel::{async_broadcast_channel, async_mpsc_channel};
 use std::task::{Context, Poll};
@@ -31,6 +31,9 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use crate::priority_stream::PriorityMerge;
 
 mod priority_stream;
+mod viewer_control;
+
+pub use viewer_control::ViewerControl;
 
 pub use re_memory::MemoryLimit;
 
@@ -46,6 +49,13 @@ const CHANNEL_SIZE_MESSAGES: usize = 1024; // TODO(emilk): move into `ServerOpti
 /// Make sure we can handle a quick burst of messages without blocking,
 /// even if the server has a [`ServerOptions::memory_limit`] of zero.
 const CHANNEL_SIZE_BYTES: u64 = 128 * 1024 * 1024; // TODO(emilk): move into `ServerOptions` after the patch release.
+
+/// How often the server sends HTTP/2 keepalive pings to idle clients.
+const HTTP2_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long the server waits for a keepalive ping response before
+/// considering the connection dead and closing it.
+const HTTP2_KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Options for the gRPC Proxy Server
 #[derive(Clone, Debug)]
@@ -162,12 +172,12 @@ fn is_origin_allowed(origin: &str, patterns: &[wildmatch::WildMatch]) -> bool {
 /// Patterns are matched against the full `Origin` header value,
 /// using glob-style matching where `*` matches any sequence of characters.
 pub fn cors_layer(extra_allowed_origins: &[String]) -> CorsLayer {
-    let allowed_origin_patterns: Vec<wildmatch::WildMatch> = DEFAULT_CORS_PATTERNS
-        .iter()
-        .copied()
-        .chain(extra_allowed_origins.iter().map(String::as_str))
-        .map(wildmatch::WildMatch::new)
-        .collect();
+    let allowed_origin_patterns: Vec<wildmatch::WildMatch> = std::iter::chain(
+        DEFAULT_CORS_PATTERNS.iter().copied(),
+        extra_allowed_origins.iter().map(String::as_str),
+    )
+    .map(wildmatch::WildMatch::new)
+    .collect();
     CorsLayer::very_permissive().allow_origin(AllowOrigin::predicate(
         move |origin, _request_parts| {
             let Ok(origin) = origin.to_str() else {
@@ -176,6 +186,61 @@ pub fn cors_layer(extra_allowed_origins: &[String]) -> CorsLayer {
             is_origin_allowed(origin, &allowed_origin_patterns)
         },
     ))
+}
+
+/// Interceptor that rejects any request whose peer is not on the local machine.
+#[derive(Clone, Copy, Default)]
+pub struct LoopbackOnly;
+
+impl tonic::service::Interceptor for LoopbackOnly {
+    fn call(&mut self, request: tonic::Request<()>) -> tonic::Result<tonic::Request<()>> {
+        if request
+            .remote_addr()
+            .is_some_and(|addr| addr.ip().is_loopback())
+        {
+            Ok(request)
+        } else {
+            Err(tonic::Status::permission_denied(
+                "Only connections from the local machine are allowed",
+            ))
+        }
+    }
+}
+
+/// gRPC services to serve alongside the proxy, each restricted to connections from the local machine.
+///
+/// Pass to [`spawn_with_recv_and_services`]. Every added service is wrapped with [`LoopbackOnly`].
+#[derive(Default)]
+pub struct LoopbackServices {
+    builder: tonic::service::RoutesBuilder,
+}
+
+impl LoopbackServices {
+    /// Add a gRPC service that may only be reached from the local machine.
+    pub fn add_service<S>(&mut self, svc: S) -> &mut Self
+    where
+        S: tonic::codegen::Service<
+                tonic::codegen::http::Request<tonic::body::Body>,
+                Response = tonic::codegen::http::Response<tonic::body::Body>,
+                Error = std::convert::Infallible,
+            > + tonic::server::NamedService
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        S::Future: Send + 'static,
+    {
+        self.builder
+            .add_service(tonic::service::interceptor::InterceptedService::new(
+                svc,
+                LoopbackOnly,
+            ));
+        self
+    }
+
+    fn into_routes(self) -> tonic::service::Routes {
+        self.builder.routes()
+    }
 }
 
 // TODO(jan): Refactor `serve`/`spawn` variants into a builder?
@@ -202,7 +267,14 @@ pub async fn serve(
     shutdown: shutdown::Shutdown,
 ) -> anyhow::Result<()> {
     let message_proxy = MessageProxy::new(options.clone());
-    serve_impl(addr, options, message_proxy, shutdown).await
+    serve_impl(
+        addr,
+        options,
+        message_proxy,
+        shutdown,
+        tonic::service::Routes::default(),
+    )
+    .await
 }
 
 async fn serve_impl(
@@ -210,6 +282,7 @@ async fn serve_impl(
     options: ServerOptions,
     message_proxy: MessageProxy,
     shutdown: shutdown::Shutdown,
+    extra_services: tonic::service::Routes,
 ) -> anyhow::Result<()> {
     // TODO(rust-lang/rust#130668): When listening on `::` we want to listen to both ipv6 `::` and ipv4 `0.0.0.0`
     // On Mac & Linux this happens automatically since all sockets are dual-stack by default.
@@ -263,20 +336,20 @@ async fn serve_impl(
     let cors = cors_layer(&options.cors_allowed_origins);
     let grpc_web = tonic_web::GrpcWebLayer::new();
 
-    let routes = {
-        let mut routes_builder = tonic::service::Routes::builder();
-        routes_builder.add_service(
-            re_protos::sdk_comms::v1alpha1::message_proxy_service_server::MessageProxyServiceServer::new(
-                message_proxy,
-            )
-            .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE)
-            .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE),
-        );
-        routes_builder.routes()
-    };
+    let routes = extra_services.add_service(
+        re_protos::sdk_comms::v1alpha1::message_proxy_service_server::MessageProxyServiceServer::new(
+            message_proxy,
+        )
+        .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE)
+        .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE),
+    );
 
     Server::builder()
         .accept_http1(true) // Support `grpc-web` clients
+        // Ping clients so silently dropped connections (no TCP RST, e.g. cable pull
+        // or dead NAT entry) are detected and torn down instead of lingering forever:
+        .http2_keepalive_interval(Some(HTTP2_KEEPALIVE_INTERVAL))
+        .http2_keepalive_timeout(Some(HTTP2_KEEPALIVE_TIMEOUT))
         .layer(cors) // Allow CORS requests from web clients
         .layer(grpc_web) // Support `grpc-web` clients
         .add_routes(routes)
@@ -358,7 +431,15 @@ pub async fn serve_from_channel(
         }
     });
 
-    if let Err(err) = serve_impl(addr, options, message_proxy, shutdown).await {
+    if let Err(err) = serve_impl(
+        addr,
+        options,
+        message_proxy,
+        shutdown,
+        tonic::service::Routes::default(),
+    )
+    .await
+    {
         re_log::error!("message proxy server crashed: {err}");
     }
 }
@@ -376,12 +457,21 @@ pub fn spawn_from_rx_set(
     options: ServerOptions,
     shutdown: shutdown::Shutdown,
     rxs: re_log_channel::LogReceiverSet,
-) {
+) -> MessageProxyHandle {
     let message_proxy = MessageProxy::new(options.clone());
-    let event_tx = message_proxy.event_tx.clone();
+    let handle = message_proxy.handle();
+    let event_tx = handle.event_tx.clone();
 
     tokio::spawn(async move {
-        if let Err(err) = serve_impl(addr, options, message_proxy, shutdown).await {
+        if let Err(err) = serve_impl(
+            addr,
+            options,
+            message_proxy,
+            shutdown,
+            tonic::service::Routes::default(),
+        )
+        .await
+        {
             re_log::error!("message proxy server crashed: {err}");
         }
     });
@@ -445,6 +535,8 @@ pub fn spawn_from_rx_set(
             }
         }
     });
+
+    handle
 }
 
 /// Start a Rerun server, listening on `addr`.
@@ -462,7 +554,20 @@ pub fn spawn_with_recv(
     addr: SocketAddr,
     options: ServerOptions,
     shutdown: shutdown::Shutdown,
-) -> re_log_channel::LogReceiver {
+) -> (re_log_channel::LogReceiver, MessageProxyHandle) {
+    spawn_with_recv_and_services(addr, options, shutdown, LoopbackServices::default())
+}
+
+/// Like [`spawn_with_recv`], but additionally serves `extra_services` on the same port.
+///
+/// The extra services are restricted to connections from the local machine (see
+/// [`LoopbackServices`]). The message proxy remains reachable according to the bound address.
+pub fn spawn_with_recv_and_services(
+    addr: SocketAddr,
+    options: ServerOptions,
+    shutdown: shutdown::Shutdown,
+    mut loopback_services: LoopbackServices,
+) -> (re_log_channel::LogReceiver, MessageProxyHandle) {
     let uri = re_uri::ProxyUri::new(re_uri::Origin::from_scheme_and_socket_addr(
         re_uri::Scheme::RerunHttp,
         addr,
@@ -472,9 +577,28 @@ pub fn spawn_with_recv(
         re_log_channel::log_channel(re_log_channel::LogSource::MessageProxy(uri));
 
     let (message_proxy, mut broadcast_log_rx) = MessageProxy::new_with_recv(options.clone());
+    let handle = message_proxy.handle();
+
+    // Serve the viewer-control service alongside the proxy, restricted to loopback connections:
+    // it drives the local viewer (e.g. from the MCP server), which only ever connects over 127.0.0.1.
+    loopback_services.add_service(
+        re_protos::sdk_comms::v1alpha1::viewer_control_service_server::ViewerControlServiceServer::new(
+            message_proxy.viewer_control(),
+        )
+        .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE)
+        .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE),
+    );
 
     tokio::spawn(async move {
-        if let Err(err) = serve_impl(addr, options, message_proxy, shutdown).await {
+        if let Err(err) = serve_impl(
+            addr,
+            options,
+            message_proxy,
+            shutdown,
+            loopback_services.into_routes(),
+        )
+        .await
+        {
             re_log::error!("message proxy server crashed: {err}");
         }
     });
@@ -545,7 +669,7 @@ pub fn spawn_with_recv(
         }
     });
 
-    channel_log_rx
+    (channel_log_rx, handle)
 }
 
 enum Event {
@@ -559,30 +683,26 @@ enum Event {
 
     /// A client sent a message.
     Message(LogOrTableMsgProto),
+
+    /// Request that the event loop refresh the cached `MemUsageTree` snapshot.
+    ///
+    /// The result is written to the shared `MemorySnapshot` held by every
+    /// [`MessageProxyHandle`]; the requester reads it from there.
+    CaptureMemory,
 }
 
-#[derive(Clone)]
+#[derive(Clone, re_byte_size::SizeBytes)]
 struct TableMsgProto {
     id: TableIdProto,
     data: DataframePartProto,
 }
 // -----------------------------------------------------------------------------------
 
-#[derive(Clone)]
+#[derive(Clone, re_byte_size::SizeBytes)]
 enum LogOrTableMsgProto {
     LogMsg(LogMsgProto),
     Table(TableMsgProto),
     UiCommand(DataSourceUiCommand),
-}
-
-impl SizeBytes for LogOrTableMsgProto {
-    fn heap_size_bytes(&self) -> u64 {
-        match self {
-            Self::LogMsg(log_msg) => log_msg.heap_size_bytes(),
-            Self::Table(table) => table.heap_size_bytes(),
-            Self::UiCommand(cmd) => cmd.heap_size_bytes(),
-        }
-    }
 }
 
 impl From<LogMsgProto> for LogOrTableMsgProto {
@@ -695,7 +815,7 @@ impl MessageBuffer {
                     .collect()
             }
             PlaybackBehavior::NewestFirst => itertools::chain!(
-                persistent.iter().rev(),
+                persistent.iter(),
                 static_.iter().rev(),
                 disposable.iter().rev()
             )
@@ -840,6 +960,13 @@ impl<T: Clone + SizeBytes + Send + Sync + 'static> Stream for BackPressureReceiv
 /// Main event loop for the server, which runs in its own task.
 ///
 /// Handles message history, and broadcasts messages to clients.
+/// Shared cell that holds the latest memory snapshot the event loop has produced.
+///
+/// Written by `EventLoop` when it handles [`Event::CaptureMemory`], read by
+/// [`MessageProxyHandle::capture_memory`]. `None` until the loop has produced
+/// at least one snapshot.
+type MemorySnapshot = std::sync::Arc<parking_lot::Mutex<Option<MemUsageTree>>>;
+
 struct EventLoop {
     options: ServerOptions,
 
@@ -852,6 +979,9 @@ struct EventLoop {
 
     /// All messages received so far, minus those that have been garbage collected.
     history: MessageBuffer,
+
+    /// Latest memory snapshot, refreshed on `Event::CaptureMemory`.
+    memory_snapshot: MemorySnapshot,
 }
 
 impl EventLoop {
@@ -859,12 +989,14 @@ impl EventLoop {
         options: ServerOptions,
         event_rx: async_mpsc_channel::Receiver<Event>,
         broadcast_log_tx: async_broadcast_channel::Sender<LogOrTableMsgProto>,
+        memory_snapshot: MemorySnapshot,
     ) -> Self {
         Self {
             options,
             broadcast_log_tx,
             event_rx,
             history: Default::default(),
+            memory_snapshot,
         }
     }
 
@@ -884,8 +1016,25 @@ impl EventLoop {
                         .ok();
                 }
                 Event::Message(msg) => self.handle_msg(msg).await,
+                Event::CaptureMemory => {
+                    *self.memory_snapshot.lock() = Some(self.capture_mem_usage_tree());
+                }
             }
         }
+    }
+
+    /// Snapshot the proxy's history and broadcast queue sizes as a `MemUsageTree`.
+    ///
+    /// Cheap: reads the already-maintained `MsgQueue::size_bytes` counters and the
+    /// broadcast channel's atomic byte counter — no traversal.
+    fn capture_mem_usage_tree(&self) -> MemUsageTree {
+        MemUsageTree::Node(
+            MemUsageNode::new()
+                .with_child("disposable", self.history.disposable.size_bytes)
+                .with_child("static", self.history.static_.size_bytes)
+                .with_child("persistent", self.history.persistent.size_bytes)
+                .with_child("broadcast", self.broadcast_log_tx.bytes_in_flight()),
+        )
     }
 
     async fn handle_msg(&mut self, msg: LogOrTableMsgProto) {
@@ -913,10 +1062,27 @@ impl EventLoop {
     }
 }
 
-impl SizeBytes for TableMsgProto {
-    fn heap_size_bytes(&self) -> u64 {
-        let Self { id, data } = self;
-        id.heap_size_bytes() + data.heap_size_bytes()
+/// A cloneable handle to a running [`MessageProxy`].
+///
+/// Used to read the proxy's most recent memory snapshot from outside the tokio
+/// runtime (e.g. from the viewer's UI thread).
+#[derive(Clone)]
+pub struct MessageProxyHandle {
+    event_tx: async_mpsc_channel::Sender<Event>,
+    memory_snapshot: MemorySnapshot,
+}
+
+impl MessageProxyHandle {
+    /// Return the latest recent memory snapshot the proxy has produced.
+    pub fn capture_memory(&self) -> Option<MemUsageTree> {
+        let res = self.event_tx.try_send(Event::CaptureMemory);
+
+        match res {
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) | Ok(()) => {
+                Some(self.memory_snapshot.lock().clone().unwrap_or_default())
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => None,
+        }
     }
 }
 
@@ -924,6 +1090,7 @@ pub struct MessageProxy {
     options: ServerOptions,
     _queue_task_handle: tokio::task::JoinHandle<()>,
     event_tx: async_mpsc_channel::Sender<Event>,
+    memory_snapshot: MemorySnapshot,
 }
 
 impl MessageProxy {
@@ -946,10 +1113,13 @@ impl MessageProxy {
             async_mpsc_channel::channel("re_grpc_server events", message_queue_capacity)
         };
 
+        let memory_snapshot: MemorySnapshot = Default::default();
+
         let task_handle = tokio::spawn({
             let options = options.clone();
+            let memory_snapshot = memory_snapshot.clone();
             async move {
-                EventLoop::new(options, event_rx, broadcast_log_tx)
+                EventLoop::new(options, event_rx, broadcast_log_tx, memory_snapshot)
                     .run_in_place()
                     .await;
             }
@@ -960,9 +1130,23 @@ impl MessageProxy {
                 options,
                 _queue_task_handle: task_handle,
                 event_tx,
+                memory_snapshot,
             },
             broadcast_log_rx,
         )
+    }
+
+    pub fn handle(&self) -> MessageProxyHandle {
+        MessageProxyHandle {
+            event_tx: self.event_tx.clone(),
+            memory_snapshot: self.memory_snapshot.clone(),
+        }
+    }
+
+    pub fn viewer_control(&self) -> ViewerControl {
+        ViewerControl {
+            event_tx: self.event_tx.clone(),
+        }
     }
 
     async fn push_message(&self, message: impl Into<LogOrTableMsgProto>) {
@@ -1000,7 +1184,7 @@ impl MessageProxy {
         });
 
         match self.options.playback_behavior {
-            PlaybackBehavior::OldestFirst => Box::pin(history.chain(channel)),
+            PlaybackBehavior::OldestFirst => Box::pin(history.chain(channel)), // NOLINT: Stream::chain
             PlaybackBehavior::NewestFirst => Box::pin(PriorityMerge::new(channel, history)),
         }
     }
@@ -1138,20 +1322,6 @@ impl message_proxy_service_server::MessageProxyService for MessageProxy {
     ) -> tonic::Result<tonic::Response<Self::ReadTablesStream>> {
         Ok(tonic::Response::new(self.new_client_table_stream().await))
     }
-
-    async fn save_screenshot(
-        &self,
-        request: tonic::Request<SaveScreenshotRequest>,
-    ) -> tonic::Result<tonic::Response<SaveScreenshotResponse>> {
-        let SaveScreenshotRequest { view_id, file_path } = request.into_inner();
-        self.push_message(DataSourceUiCommand::SaveScreenshot {
-            file_path: file_path.into(),
-            view_id,
-        })
-        .await;
-
-        Ok(tonic::Response::new(SaveScreenshotResponse {}))
-    }
 }
 
 #[cfg(test)]
@@ -1173,6 +1343,48 @@ mod tests {
     use tonic::transport::{Channel, Endpoint};
 
     use super::*;
+
+    #[test]
+    fn loopback_only_rejects_non_loopback_peers() {
+        use tonic::service::Interceptor as _;
+        use tonic::transport::server::TcpConnectInfo;
+
+        fn request_from(remote_addr: Option<SocketAddr>) -> tonic::Request<()> {
+            let mut request = tonic::Request::new(());
+            if let Some(remote_addr) = remote_addr {
+                request.extensions_mut().insert(TcpConnectInfo {
+                    local_addr: None,
+                    remote_addr: Some(remote_addr),
+                });
+            }
+            request
+        }
+
+        let mut interceptor = LoopbackOnly;
+
+        assert!(
+            interceptor
+                .call(request_from(Some("127.0.0.1:5000".parse().unwrap())))
+                .is_ok()
+        );
+        assert!(
+            interceptor
+                .call(request_from(Some("[::1]:5000".parse().unwrap())))
+                .is_ok()
+        );
+
+        assert_eq!(
+            interceptor
+                .call(request_from(Some("10.0.0.1:5000".parse().unwrap())))
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            interceptor.call(request_from(None)).unwrap_err().code(),
+            tonic::Code::PermissionDenied
+        );
+    }
 
     #[derive(Clone)]
     struct Completion(Arc<CancellationToken>);
@@ -1212,11 +1424,9 @@ mod tests {
 
     /// Generates `n` log messages wrapped in a `SetStoreInfo` at the start and `BlueprintActivationCommand` at the end,
     /// to exercise message ordering.
-    fn fake_log_stream_blueprint(n: usize) -> Vec<LogMsg> {
-        let store_id = StoreId::random(StoreKind::Blueprint, "test_app");
-
+    fn fake_log_stream_blueprint(store_id: &StoreId, n: usize) -> Vec<LogMsg> {
         let mut messages = Vec::new();
-        messages.push(set_store_info_msg(&store_id));
+        messages.push(set_store_info_msg(store_id));
         for _ in 0..n {
             messages.push(LogMsg::ArrowMsg(
                 store_id.clone(),
@@ -1240,7 +1450,7 @@ mod tests {
         }
         messages.push(LogMsg::BlueprintActivationCommand(
             re_log_types::BlueprintActivationCommand {
-                blueprint_id: store_id,
+                blueprint_id: store_id.clone(),
                 make_active: true,
                 make_default: true,
             },
@@ -1403,7 +1613,9 @@ mod tests {
     async fn pubsub_basic() {
         let (completion, addr) = setup().await;
         let mut client = make_client(addr).await; // We use the same client for both producing and consuming
-        let messages = fake_log_stream_blueprint(3);
+
+        let blueprint_id = StoreId::random(StoreKind::Blueprint, "test_app");
+        let messages = fake_log_stream_blueprint(&blueprint_id, 3);
 
         // start reading
         let mut log_stream = client.read_messages(ReadMessagesRequest {}).await.unwrap();
@@ -1428,7 +1640,8 @@ mod tests {
     async fn pubsub_history() {
         let (completion, addr) = setup().await;
         let mut client = make_client(addr).await; // We use the same client for both producing and consuming
-        let messages = fake_log_stream_blueprint(3);
+        let blueprint_id = StoreId::random(StoreKind::Blueprint, "test_app");
+        let messages = fake_log_stream_blueprint(&blueprint_id, 3);
 
         // don't read anything yet - these messages should be sent to us as part of history when we call `read_messages` later
 
@@ -1448,7 +1661,8 @@ mod tests {
         let (completion, addr) = setup().await;
         let mut producer = make_client(addr).await; // We use separate clients for producing and consuming
         let mut consumers = vec![make_client(addr).await, make_client(addr).await];
-        let messages = fake_log_stream_blueprint(3);
+        let blueprint_id = StoreId::random(StoreKind::Blueprint, "test_app");
+        let messages = fake_log_stream_blueprint(&blueprint_id, 3);
 
         // Initialize multiple read streams:
         let mut log_streams = vec![];
@@ -1477,7 +1691,8 @@ mod tests {
         let (completion, addr) = setup().await;
         let mut producers = vec![make_client(addr).await, make_client(addr).await];
         let mut consumers = vec![make_client(addr).await, make_client(addr).await];
-        let messages = fake_log_stream_blueprint(3);
+        let blueprint_id = StoreId::random(StoreKind::Blueprint, "test_app");
+        let messages = fake_log_stream_blueprint(&blueprint_id, 3);
 
         // Initialize multiple read streams:
         let mut log_streams = vec![];
@@ -1550,7 +1765,8 @@ mod tests {
         // Use an absurdly low memory limit to force all messages to be dropped immediately from history
         let (completion, addr) = setup_with_memory_limit(MemoryLimit::from_bytes(1)).await;
         let mut client = make_client(addr).await;
-        let messages = fake_log_stream_blueprint(3);
+        let blueprint_id = StoreId::random(StoreKind::Blueprint, "test_app");
+        let messages = fake_log_stream_blueprint(&blueprint_id, 3);
 
         // Write some messages
         write_messages(&mut client, messages.clone()).await;
@@ -1592,7 +1808,8 @@ mod tests {
             let (completion, addr) =
                 setup_with_memory_limit(MemoryLimit::from_bytes(memory_limit)).await;
             let mut client = make_client(addr).await; // We use the same client for both producing and consuming
-            let messages = fake_log_stream_blueprint(3);
+            let blueprint_id = StoreId::random(StoreKind::Blueprint, "test_app");
+            let messages = fake_log_stream_blueprint(&blueprint_id, 3);
 
             // Start reading
             let mut log_stream = client.read_messages(ReadMessagesRequest {}).await.unwrap();
@@ -1647,13 +1864,17 @@ mod tests {
         .await;
         let mut client = make_client(addr).await;
 
-        let store_id = StoreId::random(StoreKind::Recording, "test_app");
+        let application_id = "test_app";
+        let store_id = StoreId::random(StoreKind::Recording, application_id);
+        let blueprint_id = StoreId::random(StoreKind::Blueprint, application_id);
 
+        let blueprints = fake_log_stream_blueprint(&blueprint_id, 3);
         let set_store_info = vec![set_store_info_msg(&store_id)];
         let first_statics = generate_log_messages(&store_id, 3, Temporalness::Static);
         let temporals = generate_log_messages(&store_id, 3, Temporalness::Temporal);
         let second_statics = generate_log_messages(&store_id, 3, Temporalness::Static);
 
+        write_messages(&mut client, blueprints.clone()).await;
         write_messages(&mut client, set_store_info.clone()).await;
         write_messages(&mut client, first_statics.clone()).await;
         write_messages(&mut client, temporals.clone()).await;
@@ -1661,6 +1882,9 @@ mod tests {
 
         // All static data should always come before temporal data:
         let expected = itertools::chain!(
+            // `BlueprintActivationCommand` has to follow the blueprint data,
+            // so it's crucial that these are not reversed, in contrast to the others:
+            blueprints.into_iter(),
             set_store_info.into_iter().rev(),
             second_statics.into_iter().rev(),
             first_statics.into_iter().rev(),
@@ -1680,12 +1904,10 @@ mod tests {
         use super::super::{DEFAULT_CORS_PATTERNS, is_origin_allowed};
 
         fn check(origin: &str, extra: &[&str]) -> bool {
-            let patterns: Vec<wildmatch::WildMatch> = DEFAULT_CORS_PATTERNS
-                .iter()
-                .copied()
-                .chain(extra.iter().copied())
-                .map(wildmatch::WildMatch::new)
-                .collect();
+            let patterns: Vec<wildmatch::WildMatch> =
+                std::iter::chain(DEFAULT_CORS_PATTERNS.iter().copied(), extra.iter().copied())
+                    .map(wildmatch::WildMatch::new)
+                    .collect();
             is_origin_allowed(origin, &patterns)
         }
 

@@ -9,8 +9,8 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import numpy as np
 
-__version__ = "0.32.0-alpha.1+dev"
-__version_info__ = (0, 32, 0, "alpha.1")
+__version__ = "0.36.0-alpha.1+dev"
+__version_info__ = (0, 36, 0, "alpha.1")
 
 if sys.version_info < (3, 10):  # noqa: UP036
     raise RuntimeError("Rerun SDK requires Python 3.10 or later.")
@@ -27,7 +27,6 @@ from . import (
     blueprint as blueprint,
     catalog as catalog,
     experimental as experimental,
-    recording as recording,
     server as server,
     urdf as urdf,
 )
@@ -75,6 +74,8 @@ from ._send_columns import (
     send_columns as send_columns,
 )
 from ._send_dataframe import (
+    AUTO_INDEX as AUTO_INDEX,
+    RECORDING_PROPERTIES_PATH as RECORDING_PROPERTIES_PATH,
     RERUN_KIND as RERUN_KIND,
     RERUN_KIND_CONTROL as RERUN_KIND_CONTROL,
     RERUN_KIND_INDEX as RERUN_KIND_INDEX,
@@ -86,6 +87,9 @@ from ._send_dataframe import (
     SORBET_IS_TABLE_INDEX as SORBET_IS_TABLE_INDEX,
     send_dataframe as send_dataframe,
     send_record_batch as send_record_batch,
+)
+from ._tracing_session import (
+    tracing_session as tracing_session,
 )
 from .any_batch_value import (
     AnyBatchValue as AnyBatchValue,
@@ -108,9 +112,11 @@ from .archetypes import (
     CoordinateFrame as CoordinateFrame,
     Cylinders3D as Cylinders3D,
     DepthImage as DepthImage,
+    Ellipses2D as Ellipses2D,
     Ellipsoids3D as Ellipsoids3D,
     EncodedDepthImage as EncodedDepthImage,
     EncodedImage as EncodedImage,
+    GaussianSplats3D as GaussianSplats3D,
     GeoLineStrings as GeoLineStrings,
     GeoPoints as GeoPoints,
     GraphEdges as GraphEdges,
@@ -132,6 +138,8 @@ from .archetypes import (
     SegmentationImage as SegmentationImage,
     SeriesLines as SeriesLines,
     SeriesPoints as SeriesPoints,
+    StateChange as StateChange,
+    StateConfiguration as StateConfiguration,
     Tensor as Tensor,
     TextDocument as TextDocument,
     TextLog as TextLog,
@@ -140,6 +148,7 @@ from .archetypes import (
     VideoFrameReference as VideoFrameReference,
     VideoStream as VideoStream,
     ViewCoordinates as ViewCoordinates,
+    VoxelGridMap as VoxelGridMap,
 )
 from .archetypes.boxes2d_ext import (
     Box2DFormat as Box2DFormat,
@@ -201,12 +210,12 @@ from .recording_stream import (
 )
 from .sinks import (
     FileSink as FileSink,
+    GrpcServerSink as GrpcServerSink,
     GrpcSink as GrpcSink,
     connect_grpc as connect_grpc,
     disconnect as disconnect,
     save as save,
     send_blueprint as send_blueprint,
-    send_recording as send_recording,
     serve_grpc as serve_grpc,
     set_sinks as set_sinks,
     spawn as spawn,
@@ -215,6 +224,8 @@ from .sinks import (
 from .time import (
     disable_timeline as disable_timeline,
     reset_time as reset_time,
+    set_log_tick_enabled as set_log_tick_enabled,
+    set_log_time_enabled as set_log_time_enabled,
     set_time as set_time,
 )
 from .web import serve_web_viewer as serve_web_viewer
@@ -476,7 +487,9 @@ def start_web_viewer_server(port: int = 0) -> None:
 
     """
 
-    bindings.start_web_viewer_server(port)
+    from .web import _packaged_assets_archive_path
+
+    bindings.start_web_viewer_server(port, assets_archive_path=_packaged_assets_archive_path())
 
 
 def notebook_show(

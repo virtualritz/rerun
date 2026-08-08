@@ -16,6 +16,8 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from types import TracebackType
 
+__all__ = ["Server"]
+
 
 class Server:
     """
@@ -47,11 +49,13 @@ class Server:
     def __init__(
         self,
         *,
-        host: str = "0.0.0.0",
+        # Binding all interfaces is the intended default: the viewer is normally opened
+        # from another machine. Narrow it with `host=` when that is not wanted.
+        host: str = "0.0.0.0",  # noqa: S104
         port: int | None = None,
         datasets: dict[str, str | PathLike[str] | Sequence[str | PathLike[str]]] | None = None,
         tables: dict[str, PathLike[str]] | None = None,
-        addr: str = "0.0.0.0",
+        addr: str = "0.0.0.0",  # noqa: S104
     ) -> None:
         """
         Create a new Rerun server instance and start it.
@@ -78,7 +82,7 @@ class Server:
 
         """
 
-        if host == "0.0.0.0" and addr != "0.0.0.0":
+        if host == "0.0.0.0" and addr != "0.0.0.0":  # noqa: S104
             host = addr
             _send_warning_or_raise(
                 "The `addr` parameter is deprecated in Rerun 0.29, and has been renamed to `host`.",

@@ -4,15 +4,15 @@ use re_sdk_types::components::{ImageBuffer, ImageFormat, MagnificationFilter, Op
 use re_sdk_types::image::ImageKind;
 use re_viewer_context::{
     IdentifiedViewSystem, ImageInfo, QueryContext, ViewClass as _, ViewContext,
-    ViewContextCollection, ViewQuery, ViewSystemExecutionError, VisualizerExecutionOutput,
-    VisualizerQueryInfo, VisualizerReportSeverity, VisualizerSystem, typed_fallback_for,
+    ViewContextCollection, ViewQuery, ViewSystemExecutionError, ViewerReportSeverity,
+    VisualizerExecutionOutput, VisualizerQueryInfo, VisualizerSystem, typed_fallback_for,
 };
 
 use super::SpatialViewVisualizerData;
 use super::entity_iterator::process_archetype;
 use crate::contexts::SpatialSceneVisualizerInstructionContext;
 use crate::visualizers::{first_copied, textured_rect_from_image};
-use crate::{PickableRectSourceData, PickableTexturedRect};
+use crate::{PickableRectSourceData, PickableTexturedRect, SpaceKind};
 
 #[derive(Default)]
 pub struct ImageVisualizer;
@@ -25,7 +25,10 @@ struct ImageComponentData {
 
 impl IdentifiedViewSystem for ImageVisualizer {
     fn identifier() -> re_viewer_context::ViewSystemIdentifier {
-        "Image".into()
+        re_viewer_context::external::re_string_interner::intern_static!(
+            re_viewer_context::ViewSystemIdentifier,
+            "Image"
+        )
     }
 }
 
@@ -159,13 +162,13 @@ impl ImageVisualizer {
                                 depth_meter: None,
                             },
                         },
-                        spatial_ctx.view_class_identifier,
+                        SpaceKind::TwoD,
                     );
                 }
                 Err(err) => {
                     results.report_for_component(
                         Image::descriptor_buffer().component,
-                        VisualizerReportSeverity::Error,
+                        ViewerReportSeverity::Error,
                         re_error::format(err),
                     );
                 }

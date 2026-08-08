@@ -19,12 +19,12 @@ class Selector:
 
     Syntax overview:
 
-    - ``.field`` — access a named field in a struct
-    - ``[]`` — iterate over every element of a list
-    - ``[N]`` — index into a list by position
-    - ``?`` — error suppression / optional operator
-    - ``!`` — assert non-null
-    - ``|`` — pipe the output of one expression to another
+    - `.field` — access a named field in a struct
+    - `[]` — iterate over every element of a list
+    - `[N]` — index into a list by position
+    - `?` — error suppression / optional operator
+    - `!` — assert non-null
+    - `|` — pipe the output of one expression to another
 
     Example usage::
 
@@ -95,12 +95,12 @@ class Selector:
         Parameters
         ----------
         func:
-            A callable that accepts a ``pyarrow.Array`` and returns a ``pyarrow.Array``
-            or ``None``, or another [`Selector`][] to chain.
+            A callable that accepts a `pyarrow.Array` and returns a `pyarrow.Array`
+            or `None`, or another [`Selector`][rerun.experimental.Selector] to chain.
 
         Returns
         -------
-        A new [`Selector`][] with the transformation applied.
+        A new [`Selector`][rerun.experimental.Selector] with the transformation applied.
 
         """
         new = Selector.__new__(Selector)
@@ -115,3 +115,12 @@ class Selector:
 
     def __str__(self) -> str:
         return str(self._internal)
+
+    def __reduce__(self) -> tuple[type[Selector], tuple[str]]:
+        query = self._internal.try_to_string()
+        if query is None:
+            raise TypeError(
+                "Cannot pickle Selector containing a Python callable from .pipe(); "
+                "pass a Selector to .pipe() instead, or use a pure-string selector.",
+            )
+        return (type(self), (query,))

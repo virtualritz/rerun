@@ -28,6 +28,15 @@ pub enum ObjectKind {
     Box3d,
 }
 
+impl std::fmt::Display for ObjectKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Point3d => f.write_str("Point3d"),
+            Self::Box3d => f.write_str("Box3d"),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct ControlsView {
     pub key_sequence: Vec<String>,
@@ -50,13 +59,17 @@ impl eframe::App for Control {
         // First add our panel(s):
         egui::Panel::right("Control Panel")
             .default_size(400.0)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ScrollArea::vertical().show(ui, |ui| {
                     self.ui(ui);
                 });
             });
 
         self.app.ui(ui, frame);
+    }
+
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.app.logic(ctx, frame);
     }
 }
 
@@ -87,22 +100,15 @@ impl Control {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Message kind:");
-                        ui.drop_down_menu(
-                            "kind",
-                            format!("{:?}", self.states.message_kind),
-                            |ui| {
+                        ui.drop_down_menu("kind", self.states.message_kind.to_string(), |ui| {
+                            for kind in [ObjectKind::Point3d, ObjectKind::Box3d] {
                                 ui.selectable_value(
                                     &mut self.states.message_kind,
-                                    ObjectKind::Point3d,
-                                    "Point3d",
+                                    kind,
+                                    kind.to_string(),
                                 );
-                                ui.selectable_value(
-                                    &mut self.states.message_kind,
-                                    ObjectKind::Box3d,
-                                    "Box3d",
-                                );
-                            },
-                        );
+                            }
+                        });
                     });
 
                     ui.horizontal(|ui| {

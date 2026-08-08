@@ -15,34 +15,31 @@
 //! In the viewer these logs, if >= info, become notifications. See
 //! `re_ui::notifications` for more information.
 
+#[cfg(feature = "setup")]
 mod channel_logger;
 mod debug_assert;
-mod result_extensions;
-
 #[cfg(feature = "setup")]
-mod multi_logger;
-
+mod event_visitor;
+mod log_once;
+mod result_extensions;
 #[cfg(feature = "setup")]
 mod setup;
 
-#[cfg(all(feature = "setup", target_arch = "wasm32"))]
-mod web_logger;
-
-pub use channel_logger::*;
-pub use log::{Level, LevelFilter};
-// The `re_log::info_once!(…)` etc are nice helpers, but the `log-once` crate is a bit lacking.
-// In the future we should implement our own macros to de-duplicate based on the callsite,
-// similar to how the log console in a browser will automatically suppress duplicates.
-pub use log_once::{debug_once, error_once, info_once, log_once, trace_once, warn_once};
 #[cfg(feature = "setup")]
-pub use multi_logger::{MultiLoggerNotSetupError, add_boxed_logger, add_logger};
+pub use channel_logger::{LogMsg, Receiver, Sender, add_log_msg_receiver};
+#[cfg(feature = "setup")]
+pub use event_visitor::FieldValue;
+pub use log_once::LogOnceSet;
 pub use result_extensions::ResultExt;
 #[cfg(all(feature = "setup", not(target_arch = "wasm32")))]
 pub use setup::PanicOnWarnScope;
 #[cfg(feature = "setup")]
 pub use setup::{setup_logging, setup_logging_with_filter};
+pub use tracing::Level;
+#[cfg(feature = "setup")]
+pub use tracing_subscriber::filter::LevelFilter;
 // The tracing macros support more syntax features than the log, that's why we use them:
-pub use tracing::{debug, error, info, trace, warn};
+pub use tracing::{debug, error, event, info, trace, warn};
 
 /// Log a warning in debug builds, or a debug message in release builds.
 ///
@@ -51,11 +48,15 @@ pub use tracing::{debug, error, info, trace, warn};
 ///
 /// In debug builds, the message is prefixed with "DEBUG: " and logged at WARN level.
 /// In release builds, the message is logged at DEBUG level without any prefix.
+///
+/// This macro never triggers panic-on-warn (`RERUN_PANIC_ON_WARN` or `PanicOnWarnScope`):
+/// that is meant to catch user-facing warnings, and this macro is never a warning
+/// in release builds.
 #[cfg(debug_assertions)]
 #[macro_export]
 macro_rules! debug_warn {
     ($($arg:tt)+) => {
-        $crate::warn!("DEBUG: {}", format_args!($($arg)+))
+        $crate::_with_panic_on_warn_suppressed(|| $crate::warn!("DEBUG: {}", format_args!($($arg)+)))
     };
 }
 
@@ -81,11 +82,15 @@ macro_rules! debug_warn {
 ///
 /// In debug builds, the message is prefixed with "DEBUG: " and logged at WARN level.
 /// In release builds, the message is logged at DEBUG level without any prefix.
+///
+/// This macro never triggers panic-on-warn (`RERUN_PANIC_ON_WARN` or `PanicOnWarnScope`):
+/// that is meant to catch user-facing warnings, and this macro is never a warning
+/// in release builds.
 #[cfg(debug_assertions)]
 #[macro_export]
 macro_rules! debug_warn_once {
     ($($arg:tt)+) => {
-        $crate::warn_once!("DEBUG: {}", format_args!($($arg)+))
+        $crate::_with_panic_on_warn_suppressed(|| $crate::warn_once!("DEBUG: {}", format_args!($($arg)+)))
     };
 }
 
@@ -110,6 +115,7 @@ pub mod external {
 }
 
 /// Never log anything less serious than a `ERROR` from these crates.
+#[cfg(any(feature = "setup", not(target_arch = "wasm32")))]
 const CRATES_AT_ERROR_LEVEL: &[&str] = &[
     // silence rustls in release mode: https://github.com/rerun-io/rerun/issues/3104
     #[cfg(not(debug_assertions))]
@@ -117,6 +123,7 @@ const CRATES_AT_ERROR_LEVEL: &[&str] = &[
 ];
 
 /// Never log anything less serious than a `WARN` from these crates.
+#[cfg(any(feature = "setup", not(target_arch = "wasm32")))]
 const CRATES_AT_WARN_LEVEL: &[&str] = &[
     // wgpu crates spam a lot on info level, which is really annoying
     // TODO(emilk): remove once https://github.com/gfx-rs/wgpu/issues/3206 is fixed
@@ -130,6 +137,7 @@ const CRATES_AT_WARN_LEVEL: &[&str] = &[
 /// Never log anything less serious than a `INFO` from these crates.
 ///
 /// These creates are quite spammy on debug, drowning out what we care about:
+#[cfg(any(feature = "setup", not(target_arch = "wasm32")))]
 const CRATES_AT_INFO_LEVEL: &[&str] = &[
     "datafusion_optimizer",
     "datafusion",
@@ -236,35 +244,69 @@ fn add_builtin_log_filter(base_log_filter: &str) -> String {
 }
 
 /// Should we log this message given the filter?
-fn is_log_enabled(filter: log::LevelFilter, metadata: &log::Metadata<'_>) -> bool {
+#[cfg(feature = "setup")]
+fn is_log_enabled(
+    filter: tracing_subscriber::filter::LevelFilter,
+    target: &str,
+    level: &tracing::Level,
+) -> bool {
     if CRATES_AT_ERROR_LEVEL
         .iter()
-        .any(|crate_name| metadata.target().starts_with(crate_name))
+        .any(|crate_name| target.starts_with(crate_name))
     {
-        return metadata.level() <= log::LevelFilter::Error;
-    }
-
-    if CRATES_AT_WARN_LEVEL
+        *level <= tracing_subscriber::filter::LevelFilter::ERROR
+    } else if CRATES_AT_WARN_LEVEL
         .iter()
-        .any(|crate_name| metadata.target().starts_with(crate_name))
+        .any(|crate_name| target.starts_with(crate_name))
     {
-        return metadata.level() <= log::LevelFilter::Warn;
-    }
-
-    if CRATES_AT_INFO_LEVEL
+        *level <= tracing_subscriber::filter::LevelFilter::WARN
+    } else if CRATES_AT_INFO_LEVEL
         .iter()
-        .any(|crate_name| metadata.target().starts_with(crate_name))
+        .any(|crate_name| target.starts_with(crate_name))
     {
-        return metadata.level() <= log::LevelFilter::Info;
+        *level <= tracing_subscriber::filter::LevelFilter::INFO
+    } else {
+        *level <= filter
     }
-
-    metadata.level() <= filter
 }
 
 /// Check if an environment variable is set to a truthy value.
 ///
-/// Returns `true` if the environment variable is set to "1", "true", or "yes" (case-insensitive).
-/// Returns `false` otherwise (including when the variable is not set).
+/// Returns `true` if the environment variable is set to "1/true/yes/on" (case-insensitive).
+/// Returns `false` if the environment variable is set to "0/false/no/off" (case-insensitive).
+/// Otherwise returns `None`.
+///
+/// # Example
+///
+/// ```ignore
+/// if env_var_flag("TELEMETRY_ENABLED") == Some(true) {
+///     // enable telemetry
+/// }
+/// ```
+pub fn env_var_flag(var_name: &str) -> Option<bool> {
+    match std::env::var(var_name)
+        .ok()?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" => None,
+        "0" | "false" | "no" | "off" => Some(false),
+        "1" | "true" | "yes" | "on" => Some(true),
+        value => {
+            crate::warn_once!(
+                "Ignoring unrecognized value {value:?} for environment variable {var_name:?} \
+                    (expected one of: 1/true/yes/on, 0/false/no/off); falling back to the default."
+            );
+            None
+        }
+    }
+}
+
+/// Check if an environment variable is set to a truthy value.
+///
+/// Returns `true` if the environment variable is set to "1/true/yes/on" (case-insensitive).
+/// Otherwise returns `false`.
 ///
 /// # Example
 ///
@@ -274,12 +316,64 @@ fn is_log_enabled(filter: log::LevelFilter, metadata: &log::Metadata<'_>) -> boo
 /// }
 /// ```
 pub fn env_var_is_truthy(var_name: &str) -> bool {
-    std::env::var(var_name)
-        .map(|v| {
-            let v = v.to_lowercase();
-            v == "1" || v == "true" || v == "yes"
-        })
-        .unwrap_or(false)
+    env_var_flag(var_name).unwrap_or(false)
+}
+
+/// Is `RERUN_VERY_STRICT` set to a truthy value?
+///
+/// In very strict mode, Rerun may panic anywhere, at any time, for any reason whenever it
+/// detects something it does not like — e.g. out-of-order chunks, unsorted timelines,
+/// or other invariant violations. Very strict mode is meant for development, testing and
+/// CI, never for production: enable it to catch silent corruption early.
+///
+/// The result is cached on the first call, so subsequent calls are very cheap and
+/// changing the environment variable at runtime has no effect.
+pub fn is_rerun_very_strict() -> bool {
+    static VERY_STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERY_STRICT.get_or_init(|| env_var_is_truthy("RERUN_VERY_STRICT"))
+}
+
+/// Is `RERUN_PANIC_ON_WARN` set to a truthy value?
+///
+/// When enabled, any user-facing warning or error log message causes a panic
+/// (see `setup_logging`). This is meant for tests and CI, to catch warnings early.
+///
+/// The result is cached on the first call, so subsequent calls are very cheap and
+/// changing the environment variable at runtime has no effect.
+pub fn is_panic_on_warn() -> bool {
+    static PANIC_ON_WARN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PANIC_ON_WARN.get_or_init(|| env_var_is_truthy("RERUN_PANIC_ON_WARN"))
+}
+
+thread_local! {
+    static SUPPRESS_PANIC_ON_WARN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with panic-on-warn suppressed on the current thread.
+///
+/// Used by [`debug_warn!`] & co, which are warnings only in debug builds
+/// and thus shouldn't trip `RERUN_PANIC_ON_WARN` or `PanicOnWarnScope`.
+///
+/// This relies on `tracing` dispatching events synchronously on the emitting thread.
+#[doc(hidden)] // implementation detail of the `debug_warn!` family
+pub fn _with_panic_on_warn_suppressed<R>(f: impl FnOnce() -> R) -> R {
+    // RAII-restore, so a panic during `f` (e.g. while formatting) doesn't leak the flag.
+    struct Guard(bool);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            SUPPRESS_PANIC_ON_WARN.with(|suppress| suppress.set(self.0));
+        }
+    }
+
+    let _guard = Guard(SUPPRESS_PANIC_ON_WARN.with(|suppress| suppress.replace(true)));
+    f()
+}
+
+/// Is panic-on-warn currently suppressed on this thread (see [`_with_panic_on_warn_suppressed`])?
+#[cfg(all(feature = "setup", not(target_arch = "wasm32")))] // only used by the `PanicOnWarn` layer
+pub(crate) fn is_panic_on_warn_suppressed() -> bool {
+    SUPPRESS_PANIC_ON_WARN.with(|suppress| suppress.get())
 }
 
 /// Shorten a path to a Rust source file.

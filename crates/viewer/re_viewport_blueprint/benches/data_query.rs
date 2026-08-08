@@ -76,17 +76,19 @@ fn query_tree_many_entities(c: &mut Criterion) {
 
     let view_class_registry = ViewClassRegistry::default();
 
+    let time_ctrl = re_viewer_context::TimeControl::default();
     let ctx = ActiveStoreContext {
         blueprint: &blueprint,
         default_blueprint: None,
         recording: &recording,
         caches: &StoreCache::new(&view_class_registry, &recording),
+        time_ctrl: &time_ctrl,
         should_enable_heuristics: false,
     };
     let blueprint_query = LatestAtQuery::latest(blueprint_timeline());
     let active_timeline = Timeline::new_sequence("frame");
     let query_range = QueryRange::LatestAt;
-    let app_options = re_viewer_context::AppOptions::default();
+    let app_options = re_viewer_context::AppOptions::test();
 
     // Benchmark with simple include-all filter
     {

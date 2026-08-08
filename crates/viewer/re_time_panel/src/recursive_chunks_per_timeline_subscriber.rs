@@ -1,6 +1,6 @@
 use std::sync::{Arc, OnceLock, Weak};
 
-use egui::ahash::HashMap;
+use ahash::HashMap;
 use nohash_hasher::IntMap;
 use re_chunk_store::{
     Chunk, ChunkDirectLineageReport, ChunkId, ChunkStore, ChunkStoreDiff, ChunkStoreEvent,
@@ -9,7 +9,7 @@ use re_chunk_store::{
 use re_log_types::{AbsoluteTimeRange, EntityPath, EntityPathHash, StoreId, TimelineName};
 
 /// Cached information about a chunk in the context of a given timeline.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, re_byte_size::SizeBytes)]
 pub struct ChunkTimelineInfo {
     chunk: Weak<Chunk>,
     pub num_events: u64,
@@ -47,7 +47,7 @@ impl PartialEq for ChunkTimelineInfo {
 }
 
 /// Recursive chunk timeline infos for a given timeline & entity.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, re_byte_size::SizeBytes)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct EntityTimelineChunks {
     /// All chunks used by the entity & timeline, recursive for all children of the entity.
@@ -157,6 +157,13 @@ impl PathRecursiveChunksPerTimelineStoreSubscriber {
                 next_path = path.parent();
             }
         }
+    }
+}
+
+impl re_byte_size::MemUsageTreeCapture for PathRecursiveChunksPerTimelineStoreSubscriber {
+    fn capture_mem_usage_tree(&self) -> re_byte_size::MemUsageTree {
+        use re_byte_size::SizeBytes as _;
+        re_byte_size::MemUsageTree::Bytes(self.chunks_per_timeline_per_entity.total_size_bytes())
     }
 }
 

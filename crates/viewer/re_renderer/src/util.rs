@@ -1,5 +1,9 @@
 /// Like [`macaw::BoundingBox::from_points`], but ignores NaN and infinity values.
-pub fn bounding_box_from_points(points: impl Iterator<Item = glam::Vec3>) -> macaw::BoundingBox {
+pub fn bounding_box_from_points(
+    points: impl ExactSizeIterator<Item = glam::Vec3>,
+) -> macaw::BoundingBox {
+    re_tracing::profile_function_if!(10_000 < points.len());
+
     let mut bbox = macaw::BoundingBox::nothing();
     for p in points {
         if p.is_finite() {
@@ -40,6 +44,7 @@ fn mean_and_sigma(values: impl Iterator<Item = glam::DVec3>) -> Option<(glam::DV
 }
 
 /// Both the exact bounding box and a region of interest for a point cloud.
+#[derive(re_byte_size::SizeBytes)]
 pub struct PointCloudBounds {
     /// Exact bounding box containing all finite points.
     pub bbox: macaw::BoundingBox,
@@ -129,10 +134,7 @@ mod tests {
             Vec3::new(1.2, 1.8, 1.5),
         ];
         let outlier = Vec3::new(100.0, 200.0, 300.0);
-        let points = cluster_core
-            .iter()
-            .copied()
-            .chain(std::iter::once(outlier))
+        let points = std::iter::chain(cluster_core.iter().copied(), std::iter::once(outlier))
             .collect::<Vec<_>>();
 
         let bounds = point_cloud_bounds(&points);

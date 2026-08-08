@@ -31,7 +31,7 @@ fn decode_color(sampled_value: vec4f) -> vec4f {
     // Convert to linear space
     if rect_info.decode_srgb != 0u {
         if all(vec3f(0.0) <= rgba.rgb) && all(rgba.rgb <= vec3f(1.0)) {
-            rgba = linear_from_srgba(rgba);
+            rgba = linear_from_srgba_unmultiplied(rgba);
         } else {
             rgba = ERROR_RGBA; // out of range
         }
@@ -162,8 +162,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4f {
     } else if rect_info.color_mapper == COLOR_MAPPER_OFF_RGB {
         texture_color = normalized_value;
     } else if rect_info.color_mapper == COLOR_MAPPER_FUNCTION {
-        let rgb = colormap_linear(rect_info.colormap_function, normalized_value.r);
-        texture_color = vec4f(rgb, 1.0);
+        texture_color = colormap_linear(rect_info.colormap_function, normalized_value.r);
     } else if rect_info.color_mapper == COLOR_MAPPER_TEXTURE {
         let colormap_size = textureDimensions(colormap_texture).xy;
         let num_colors = colormap_size.x * colormap_size.y;

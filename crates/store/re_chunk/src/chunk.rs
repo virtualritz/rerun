@@ -28,7 +28,7 @@ use crate::{ChunkId, RowId};
 /// the use of a [`crate::ChunkBatcher`].
 #[derive(thiserror::Error, Debug)]
 pub enum ChunkError {
-    #[error("Detected malformed Chunk: {reason}")]
+    #[error("Detected malformed chunk: {reason}")]
     Malformed { reason: String },
 
     #[error("Arrow: {0}")]
@@ -48,7 +48,7 @@ pub enum ChunkError {
     Deserialization(#[from] DeserializationError),
 
     #[error(transparent)]
-    UnsupportedTimeType(#[from] re_sorbet::UnsupportedTimeType),
+    IndexColumn(#[from] re_sorbet::IndexColumnError),
 
     #[error(transparent)]
     WrongDatatypeError(#[from] re_arrow_util::WrongDatatypeError),
@@ -58,6 +58,10 @@ pub enum ChunkError {
 
     #[error(transparent)]
     InvalidSorbetSchema(#[from] re_sorbet::SorbetError),
+
+    // Boxed: `DataframeToChunksError` is large (it wraps a `SorbetError`), and this variant is rare.
+    #[error(transparent)]
+    DataframeToChunks(#[from] Box<re_sorbet::DataframeToChunksError>),
 }
 
 const _: () = assert!(
@@ -250,6 +254,22 @@ pub struct Chunk {
     pub(crate) components: ChunkComponents,
 }
 
+/// Generates sequential [`RowId`]s derived from a [`ChunkId`].
+///
+/// A core assumption of the data model is that the value of a cell
+/// defined by (`RowId` x column descriptor) is not allowed to change,
+/// which is why we have to generate new `RowId`s before modifying
+/// components or indexes.
+fn auto_row_ids(id: ChunkId, count: usize) -> FixedSizeBinaryArray {
+    let row_ids: Vec<RowId> =
+        std::iter::successors(Some(RowId::from_tuid((*id).next())), |row_id| {
+            Some(row_id.next())
+        })
+        .take(count)
+        .collect();
+    RowId::arrow_from_slice(&row_ids)
+}
+
 impl std::fmt::Debug for Chunk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self {
@@ -306,9 +326,7 @@ impl PartialEq for Chunk {
 impl Chunk {
     /// Returns a version of us with a new [`ChunkId`].
     ///
-    /// Reminder:
-    /// * The returned [`Chunk`] will re-use the exact same [`RowId`]s as `self`.
-    /// * Duplicated [`RowId`]s in the `ChunkStore` is undefined behavior.
+    /// The returned [`Chunk`] will re-use the exact same [`RowId`]s as `self`.
     #[must_use]
     #[inline]
     pub fn with_id(mut self, id: ChunkId) -> Self {
@@ -326,8 +344,20 @@ impl Chunk {
     ///
     /// Useful for tests.
     pub fn ensure_similar(lhs: &Self, rhs: &Self) -> anyhow::Result<()> {
+        Self::ensure_similar_ignoring_timelines(lhs, rhs, &[])
+    }
+
+    /// Like [`Self::ensure_similar`], but the given timelines are ignored entirely:
+    /// their presence, absence, and values are not compared.
+    ///
+    /// Useful when comparing recordings produced with different default-timeline settings,
+    /// e.g. `log_tick`, which is opt-in.
+    pub fn ensure_similar_ignoring_timelines(
+        lhs: &Self,
+        rhs: &Self,
+        ignored_timelines: &[TimelineName],
+    ) -> anyhow::Result<()> {
         anyhow::ensure!(lhs.num_rows() == rhs.num_rows());
-        anyhow::ensure!(lhs.num_columns() == rhs.num_columns());
 
         let Self {
             id: _,
@@ -339,11 +369,40 @@ impl Chunk {
             components,
         } = lhs;
 
+        let is_ignored = |timeline: &TimelineName| ignored_timelines.contains(timeline);
+
         anyhow::ensure!(*entity_path == rhs.entity_path);
 
-        anyhow::ensure!(timelines.keys().collect_vec() == rhs.timelines.keys().collect_vec());
+        // Compare the set of timelines, disregarding any ignored timelines on either side.
+        // Compared as a sorted set, since the timeline iteration order is not meaningful.
+        let lhs_timelines = timelines
+            .keys()
+            .filter(|t| !is_ignored(t))
+            .sorted()
+            .collect_vec();
+        let rhs_timelines = rhs
+            .timelines
+            .keys()
+            .filter(|t| !is_ignored(t))
+            .sorted()
+            .collect_vec();
+        anyhow::ensure!(
+            lhs_timelines == rhs_timelines,
+            "Timelines differ: {lhs_timelines:?} vs {rhs_timelines:?}"
+        );
+
+        // Number of components must match (timelines are already checked above).
+        anyhow::ensure!(
+            components.len() == rhs.components.len(),
+            "Number of components differs: {} vs {}",
+            components.len(),
+            rhs.components.len()
+        );
 
         for (timeline, left_time_col) in timelines {
+            if is_ignored(timeline) {
+                continue;
+            }
             let right_time_col = rhs
                 .timelines
                 .get(timeline)
@@ -409,12 +468,59 @@ impl Chunk {
             && components.0 == other.components.0
     }
 
-    /// Clones the chunk and renames a component.
+    /// Creates a new chunk with a mapped component column.
     ///
-    /// The returned chunk always gets a new unique [`ChunkId`].
+    /// The returned chunk always gets a new unique [`ChunkId`] and new auto-generated [`RowId`]s,
+    /// since the component data may have been modified by the closure.
     ///
-    /// Note: archetype information and component type information is lost.
+    /// When `target` is `None` the new column will carry over the [`ComponentDescriptor`] from
+    /// the `source` column.
     pub fn with_mapped_component<E>(
+        &self,
+        source: ComponentIdentifier,
+        target: Option<ComponentDescriptor>,
+        f: impl FnOnce(ArrowListArray) -> Result<ArrowListArray, E>,
+    ) -> Result<Self, E> {
+        let mut new_components = self.components.clone();
+        if let Some(old_entry) = new_components.remove(&source) {
+            new_components.insert(SerializedComponentColumn {
+                descriptor: target.unwrap_or(old_entry.descriptor),
+                list_array: f(old_entry.list_array)?,
+            });
+        }
+
+        let id = ChunkId::new();
+        let row_ids = auto_row_ids(id, self.num_rows());
+
+        Ok(Self {
+            id,
+            entity_path: self.entity_path.clone(),
+            heap_size_bytes: AtomicU64::new(0),
+            is_sorted: true,
+            row_ids,
+            timelines: self.timelines.clone(),
+            components: new_components,
+        })
+    }
+
+    /// Creates a new chunk with a mapped component column, keeping the original [`RowId`]s.
+    ///
+    /// The returned chunk gets a new unique [`ChunkId`] but retains the original [`RowId`]s.
+    ///
+    /// In most cases, prefer [`Self::with_mapped_component`] instead, which generates new
+    /// [`RowId`]s to maintain the data model invariants.
+    ///
+    /// # Warning
+    ///
+    /// This is **only safe** when the closure does **not** modify the actual component data
+    /// (e.g. it introduces a new component column). If an existing column is modified, the
+    /// invariant that the value of a cell defined by (`RowId` x column descriptor) is immutable
+    /// will be violated, and the caller has to handle this appropriately.
+    ///
+    /// Note: archetype information and component type information is lost on the mapped component.
+    //
+    // TODO(grtlr): This should be revised when implementing caching of mapped chunks.
+    pub fn with_shadowed_component<E>(
         &self,
         source: ComponentIdentifier,
         target: ComponentIdentifier,
@@ -465,6 +571,13 @@ impl Chunk {
     #[inline]
     pub fn clone_with_new_id(&self) -> Self {
         self.clone_with_id(ChunkId::new())
+    }
+
+    #[inline]
+    pub fn clone_with_new_entity_path(&self, entity_path: EntityPath) -> Self {
+        let mut chunk = self.clone_with_id(ChunkId::new());
+        chunk.entity_path = entity_path;
+        chunk
     }
 }
 
@@ -682,7 +795,7 @@ impl Chunk {
                 .list_arrays()
                 .fold(HashMap::default(), |acc, list_array| {
                     if let Some(validity) = list_array.nulls() {
-                        time_column.times().zip(validity.iter()).fold(
+                        std::iter::zip(time_column.times(), validity.iter()).fold(
                             acc,
                             |mut acc, (time, is_valid)| {
                                 *acc.entry(time).or_default() += is_valid as u64;
@@ -731,7 +844,7 @@ impl Chunk {
 
         let row_ids = self.row_ids().collect_vec();
 
-        if self.is_sorted() {
+        if self.is_row_ids_sorted() {
             self.components
                 .iter()
                 .filter_map(|(component, column)| {
@@ -779,7 +892,7 @@ impl Chunk {
 
 // ---
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, re_byte_size::SizeBytes)]
 pub struct TimeColumn {
     pub(crate) timeline: Timeline,
 
@@ -845,7 +958,7 @@ impl Chunk {
             components,
         };
 
-        chunk.is_sorted = is_sorted.unwrap_or_else(|| chunk.is_sorted_uncached());
+        chunk.is_sorted = is_sorted.unwrap_or_else(|| chunk.is_row_ids_sorted_uncached());
 
         chunk.sanity_check()?;
 
@@ -879,32 +992,93 @@ impl Chunk {
     /// This will fail if the passed in data is malformed in any way -- see [`Self::sanity_check`]
     /// for details.
     ///
-    /// The data is assumed to be sorted in `RowId`-order. Sequential `RowId`s will be generated for each
-    /// row in the chunk.
+    /// The input order will NOT be respected.
+    /// The rows will be stably reordered so that the time columns are non-decreasing
+    /// (lexicographically across timelines, in deterministic timeline-name order).
+    /// Sequential `RowId`s are then assigned to the reordered rows.
+    /// This makes it less likely that we end up with "out-of-order" chunks
+    /// (chunks where some time columns are not sorted with respect to `RowId`).
     pub fn from_auto_row_ids(
         id: ChunkId,
         entity_path: EntityPath,
         timelines: IntMap<TimelineName, TimeColumn>,
         components: ChunkComponents,
     ) -> ChunkResult<Self> {
+        re_tracing::profile_function!();
+
         let count = components
             .list_arrays()
             .next()
             .map_or(0, |list_array| list_array.len());
 
-        let row_ids = std::iter::from_fn({
-            let tuid: re_tuid::Tuid = *id;
-            let mut row_id = RowId::from_tuid(tuid.next());
-            move || {
-                let yielded = row_id;
-                row_id = row_id.next();
-                Some(yielded)
-            }
-        })
-        .take(count)
-        .collect_vec();
+        // Compute a stable permutation that lexicographically sorts the rows by their
+        // time-column values. We pick a deterministic timeline order (sorted by name) so the
+        // result does not depend on `IntMap` iteration order.
+        let timeline_order: Vec<TimelineName> = timelines.keys().copied().sorted().collect();
 
-        Self::from_native_row_ids(id, entity_path, Some(true), &row_ids, timelines, components)
+        let mut swaps: Vec<usize> = (0..count).collect();
+        swaps.sort_by(|&a, &b| {
+            for name in &timeline_order {
+                let times = timelines[name].times_raw();
+                let ord = times[a].cmp(&times[b]);
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+
+        // Build the chunk with placeholder sequential row_ids, then permute everything via
+        // `shuffle_with`, then reassign sequential row_ids so the chunk is RowId-sorted again.
+        let placeholder_row_ids = auto_row_ids(id, count);
+        let mut chunk = Self::new(
+            id,
+            entity_path,
+            Some(true),
+            placeholder_row_ids,
+            timelines,
+            components,
+        )?;
+
+        let already_sorted = swaps
+            .iter()
+            .copied()
+            .enumerate()
+            .all(|(to, from)| to == from);
+        if !already_sorted {
+            chunk.shuffle_with(&swaps);
+            chunk.row_ids = auto_row_ids(chunk.id, count);
+            chunk.is_sorted = true;
+
+            #[cfg(debug_assertions)]
+            #[expect(clippy::unwrap_used)] // dev only
+            chunk.sanity_check().unwrap();
+        }
+
+        Ok(chunk)
+    }
+
+    /// Creates a new [`Chunk`] from columnar data.
+    ///
+    /// Pass an empty iterator for `timelines` to create static data.
+    ///
+    /// The input order will NOT be respected.
+    /// The rows will be stably reordered so that the time columns are non-decreasing
+    /// (lexicographically across timelines, in deterministic timeline-name order).
+    /// Sequential `RowId`s are then assigned to the reordered rows.
+    /// This makes it less likely that we end up with "out-of-order" chunks
+    /// (chunks where some time columns are not sorted with respect to `RowId`).
+    pub fn from_columns(
+        entity_path: impl Into<EntityPath>,
+        timelines: impl IntoIterator<Item = TimeColumn>,
+        components: impl IntoIterator<Item = (ComponentDescriptor, ArrowListArray)>,
+    ) -> ChunkResult<Self> {
+        let timelines: IntMap<TimelineName, TimeColumn> = timelines
+            .into_iter()
+            .map(|tc| (*tc.timeline().name(), tc))
+            .collect();
+        let components: ChunkComponents = components.into_iter().collect();
+        Self::from_auto_row_ids(ChunkId::new(), entity_path.into(), timelines, components)
     }
 
     /// Simple helper for [`Self::new`] for static data.
@@ -1273,6 +1447,19 @@ impl Chunk {
         self.row_ids_slice().iter().copied()
     }
 
+    /// Find the row index of the given [`RowId`] in this chunk, if it is present.
+    ///
+    /// Uses a binary search on sorted chunks (the common case), falling back to
+    /// a linear scan otherwise.
+    #[inline]
+    pub fn row_index_of(&self, row_id: RowId) -> Option<usize> {
+        if self.is_row_ids_sorted() {
+            self.row_ids_slice().binary_search(&row_id).ok()
+        } else {
+            self.row_ids_slice().iter().position(|r| *r == row_id)
+        }
+    }
+
     /// Returns an iterator over the [`RowId`]s of a [`Chunk`], for a given component.
     ///
     /// This is different than [`Self::row_ids`]: it will only yield `RowId`s for rows at which
@@ -1313,7 +1500,7 @@ impl Chunk {
         let row_ids = self.row_ids_slice();
 
         #[expect(clippy::unwrap_used)] // checked above
-        Some(if self.is_sorted() {
+        Some(if self.is_row_ids_sorted() {
             (
                 row_ids.first().copied().unwrap(),
                 row_ids.last().copied().unwrap(),
@@ -1567,26 +1754,46 @@ impl re_byte_size::SizeBytes for Chunk {
     }
 }
 
-impl re_byte_size::SizeBytes for TimeColumn {
-    #[inline]
-    fn heap_size_bytes(&self) -> u64 {
-        let Self {
-            timeline,
-            times,
-            is_sorted,
-            time_range,
-        } = self;
-
-        timeline.heap_size_bytes()
-            + times.heap_size_bytes()
-            + is_sorted.heap_size_bytes()
-            + time_range.heap_size_bytes()
-    }
-}
-
 // --- Sanity checks ---
 
 impl Chunk {
+    /// Warn if we find out-of-order timelines.
+    ///
+    /// If `RERUN_VERY_STRICT` is set, this will instead panic.
+    ///
+    /// This assumes the chunk is already sorted by `RowId`, like most chunks.
+    ///
+    /// Out-of-order timelines are sometimes unavoidable,
+    /// but if we can avoid them we absolutely should,
+    /// because they cause much slower queries
+    #[track_caller]
+    pub fn warn_if_out_of_order(&self) {
+        if !self.is_row_ids_sorted() {
+            // Big problem!
+            if re_log::is_rerun_very_strict() {
+                panic!("Found chunk that wasn't sorted by RowId. This is a bug");
+            } else {
+                re_log::debug_warn_once!("Found chunk that wasn't sorted by RowId. This is a bug");
+            }
+        }
+
+        let unsorted_timelines: Vec<_> = self.unsorted_timelines().collect();
+        if !unsorted_timelines.is_empty() {
+            if re_log::is_rerun_very_strict() {
+                panic!(
+                    "Found out-of-order timelines for entity '{}': {:?}. Out-of-order timelines are sometimes unavoidable, but they may cause performance problems",
+                    self.entity_path, unsorted_timelines
+                );
+            } else {
+                re_log::debug_warn_once!(
+                    "Found out-of-order timelines for entity '{}': {:?}. Out-of-order timelines are sometimes unavoidable, but they may cause performance problems",
+                    self.entity_path,
+                    unsorted_timelines
+                );
+            }
+        }
+    }
+
     /// Returns an error if the Chunk's invariants are not upheld.
     ///
     /// Costly checks are only run in debug builds.
@@ -1603,6 +1810,8 @@ impl Chunk {
             timelines,
             components,
         } = self;
+
+        self.warn_if_out_of_order();
 
         if cfg!(debug_assertions) {
             let measured = self.heap_size_bytes_inner();
@@ -1633,7 +1842,7 @@ impl Chunk {
 
             #[expect(clippy::collapsible_if)] // readability
             if cfg!(debug_assertions) {
-                if *is_sorted != self.is_sorted_uncached() {
+                if *is_sorted != self.is_row_ids_sorted_uncached() {
                     return Err(ChunkError::Malformed {
                         reason: format!(
                             "Chunk is marked as {}sorted but isn't: {row_ids:?}",

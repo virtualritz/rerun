@@ -9,15 +9,15 @@ use datafusion::functions::expr_fn::concat;
 use datafusion::logical_expr::{binary_expr, col as datafusion_col, lit};
 use datafusion::prelude::{SessionContext, cast, encode};
 use futures::{StreamExt as _, TryStreamExt as _};
+use re_async::AsyncRuntimeHandle;
 use re_log::{error, warn};
 use re_log_types::Timestamp;
 use re_mutex::Mutex;
 use re_quota_channel::send_crossbeam;
 use re_sorbet::{BatchType, SorbetBatch, SorbetSchema};
-use re_viewer_context::AsyncRuntimeHandle;
 
 use crate::ColumnFilter;
-use crate::grid_view::FlagChangeEvent;
+use crate::cards_view::FlagChangeEvent;
 use crate::table_blueprint::{EntryLinksSpec, SegmentLinksSpec, SortBy, TableBlueprint};
 use crate::table_selection::TableSelectionState;
 
@@ -55,8 +55,10 @@ impl From<&TableBlueprint> for DataFusionQueryData {
             entry_links,
             prefilter,
             column_filters,
+            segment_preview_column: _,
             grid_view_card_title: _,
             flag_column: _,
+            url_column: _,
         } = value;
 
         Self {
@@ -216,8 +218,9 @@ impl DataFusionQuery {
         //
 
         if let Some(sort_by) = sort_by {
+            let ascending = sort_by.direction.is_ascending();
             dataframe = dataframe.sort(vec![
-                col(&sort_by.column_physical_name).sort(sort_by.direction.is_ascending(), true),
+                col(&sort_by.column_physical_name).sort(ascending, ascending),
             ])?;
         }
 

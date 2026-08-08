@@ -12,7 +12,7 @@ use crate::datatypes::{Blob, ChannelDatatype, TensorBuffer, TensorData};
 // ----------------------------------------------------------------------------
 
 /// The kind of image data, either color, segmentation, or depth image.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, re_byte_size::SizeBytes)]
 pub enum ImageKind {
     /// A normal grayscale or color image ([`archetypes::Image`]).
     Color,
@@ -39,16 +39,6 @@ impl ImageKind {
         } else {
             Self::Color
         }
-    }
-}
-
-impl re_byte_size::SizeBytes for ImageKind {
-    fn heap_size_bytes(&self) -> u64 {
-        0
-    }
-
-    fn is_pod() -> bool {
-        true
     }
 }
 
@@ -423,6 +413,7 @@ pub fn blob_and_format_from_tiff(bytes: &[u8]) -> Result<(Blob, ImageFormat), Im
         DecodingResult::U16(data) => (bytemuck::cast_slice(data), ChannelDatatype::U16),
         DecodingResult::U32(data) => (bytemuck::cast_slice(data), ChannelDatatype::U32),
         DecodingResult::U64(data) => (bytemuck::cast_slice(data), ChannelDatatype::U64),
+        DecodingResult::F16(data) => (bytemuck::cast_slice(data), ChannelDatatype::F16),
         DecodingResult::F32(data) => (bytemuck::cast_slice(data), ChannelDatatype::F32),
         DecodingResult::F64(data) => (bytemuck::cast_slice(data), ChannelDatatype::F64),
         DecodingResult::I8(data) => (bytemuck::cast_slice(data), ChannelDatatype::I8),

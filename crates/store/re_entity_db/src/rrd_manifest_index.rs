@@ -8,7 +8,7 @@ use re_byte_size::{MemUsageTree, MemUsageTreeCapture};
 use re_chunk::{ChunkId, EntityPath, Timeline, TimelineName};
 use re_chunk_store::{ChunkStore, ChunkStoreDiff, ChunkStoreEvent};
 use re_log_encoding::{CodecResult, RrdManifest};
-use re_log_types::{AbsoluteTimeRange, StoreKind, TimelinePoint};
+use re_log_types::{AbsoluteTimeRange, StoreKind};
 
 pub use crate::chunk_requests::{ChunkPromise, ChunkRequests, RequestInfo};
 
@@ -19,7 +19,7 @@ mod time_range_merger;
 
 pub use chunk_prioritizer::{
     ChunkFetcher, ChunkPrefetchOptions, ChunkPrioritizer, FetchStage, PrefetchError,
-    RemainingByteBudget,
+    PrefetchTimeCursor, PrioritizationState, ProtectedChunks, RemainingByteBudget,
 };
 pub use sorted_temporal_chunks::ChunkCountInfo;
 
@@ -28,7 +28,7 @@ use sorted_temporal_chunks::SortedTemporalChunks;
 /// Is the following chunk loaded?
 ///
 /// The order here is used for priority to show the state in the ui (lower is more prioritized)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, re_byte_size::SizeBytes)]
 enum LoadState {
     /// The chunk is not fully loaded, nor being loaded.
     ///
@@ -54,7 +54,7 @@ impl LoadState {
 }
 
 /// Info about a single chunk that we know ahead of loading it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, re_byte_size::SizeBytes)]
 pub struct RootChunkInfo {
     pub entity_path: EntityPath,
 
@@ -82,19 +82,7 @@ impl RootChunkInfo {
     }
 }
 
-impl re_byte_size::SizeBytes for RootChunkInfo {
-    fn heap_size_bytes(&self) -> u64 {
-        let Self {
-            entity_path,
-            state: _,
-            row_id: _,
-            temporals,
-        } = self;
-        entity_path.heap_size_bytes() + temporals.heap_size_bytes()
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, re_byte_size::SizeBytes)]
 pub struct TemporalChunkInfo {
     pub timeline: Timeline,
 
@@ -107,19 +95,8 @@ pub struct TemporalChunkInfo {
     pub num_rows_for_all_entities_all_components: u64,
 }
 
-impl re_byte_size::SizeBytes for TemporalChunkInfo {
-    fn heap_size_bytes(&self) -> u64 {
-        0
-    }
-
-    #[inline]
-    fn is_pod() -> bool {
-        true
-    }
-}
-
 /// A cache used to calculate which ranges are loaded from a latest at perspective.
-#[derive(Clone)]
+#[derive(Clone, re_byte_size::SizeBytes)]
 struct LoadedRanges {
     ranges: time_range_merger::MergedRanges,
 
@@ -127,19 +104,11 @@ struct LoadedRanges {
     timeline: TimelineName,
 }
 
-impl re_byte_size::SizeBytes for LoadedRanges {
-    fn heap_size_bytes(&self) -> u64 {
-        let Self { ranges, timeline } = self;
-
-        ranges.heap_size_bytes() + timeline.heap_size_bytes()
-    }
-}
-
 /// A secondary index that keeps track of which chunks have been loaded into memory.
 ///
 /// This is constructed from an [`RrdManifest`], which is what the server sends to the client/viewer.
 /// The manifest may be received in parts and concatenated together.
-#[derive(Default)]
+#[derive(Default, re_byte_size::SizeBytes)]
 #[cfg_attr(feature = "testing", derive(Clone))]
 pub struct RrdManifestIndex {
     /// The raw manifest (accumulated from possibly multiple parts).
@@ -410,9 +379,9 @@ impl RrdManifestIndex {
         self.manifest_complete = true;
 
         let num_root_chunks = self.root_chunks.len();
-        if 10_000 < num_root_chunks {
-            re_log::warn!(
-                "There are {} root chunks in this recording. Consider running `rerun rrd compact` on the original.",
+        if 25_000 < num_root_chunks {
+            re_log::debug_warn!(
+                "There are {} root chunks in this recording. Consider running `rerun rrd optimize` on the original.",
                 re_format::format_uint(num_root_chunks)
             );
         }
@@ -482,25 +451,21 @@ impl RrdManifestIndex {
                     let old_state = chunk_info.state;
                     chunk_info.state = new_state;
 
-                    // Only update loaded ranges on actual state transitions to avoid
-                    // mismatched increments/decrements.
+                    // Only update loaded ranges when a chunk actually became loaded or unloaded, to
+                    // avoid mismatched increments/decrements. Note that `InTransit` counts as
+                    // unloaded, so going back to it from `FullyLoaded` is a change too.
                     if let Some(loaded_ranges) = &mut self.loaded_ranges
-                        && old_state != new_state
+                        && old_state.is_fully_loaded() != new_state.is_fully_loaded()
                     {
-                        match new_state {
-                            LoadState::Unloaded => {
-                                loaded_ranges.ranges.on_chunk_unloaded(
-                                    &chunk_id,
-                                    &self.chunk_prioritizer.component_paths_from_root_id,
-                                );
-                            }
-                            LoadState::InTransit => {}
-                            LoadState::FullyLoaded => {
-                                loaded_ranges.ranges.on_chunk_loaded(
-                                    &chunk_id,
-                                    &self.chunk_prioritizer.component_paths_from_root_id,
-                                );
-                            }
+                        let component_paths = &self.chunk_prioritizer.component_paths_from_root_id;
+                        if new_state.is_fully_loaded() {
+                            loaded_ranges
+                                .ranges
+                                .on_chunk_loaded(&chunk_id, component_paths);
+                        } else {
+                            loaded_ranges
+                                .ranges
+                                .on_chunk_unloaded(&chunk_id, component_paths);
                         }
                     }
 
@@ -583,7 +548,7 @@ impl RrdManifestIndex {
         &mut self,
         store: &ChunkStore,
         options: &ChunkPrefetchOptions,
-        time_cursor: Option<TimelinePoint>,
+        time_cursor: Option<PrefetchTimeCursor>,
         budget: &mut RemainingByteBudget,
         load_chunks: &dyn Fn(RecordBatch) -> ChunkPromise,
     ) -> Result<(), PrefetchError> {
@@ -594,7 +559,7 @@ impl RrdManifestIndex {
             return Ok(());
         };
 
-        fetcher.fetch(budget, FetchStage::Everything)?;
+        fetcher.fetch(budget, options.max_fetch_stage)?;
 
         let res = fetcher.finish(load_chunks)?;
 
@@ -628,7 +593,7 @@ impl RrdManifestIndex {
         &'a mut self,
         store: &'a ChunkStore,
         options: &ChunkPrefetchOptions,
-        time_cursor: Option<TimelinePoint>,
+        time_cursor: Option<PrefetchTimeCursor>,
         budget: &mut RemainingByteBudget,
     ) -> Option<ChunkFetcher<'a>> {
         let manifest = self.manifest.as_ref()?;
@@ -636,7 +601,15 @@ impl RrdManifestIndex {
             store,
             manifest,
             options,
-            time_cursor,
+            time_cursor.map(|mut time_cursor| {
+                if let Some(loop_range) = time_cursor.loop_range
+                    && let Some(timeline_range) = self.timeline_range(time_cursor.name())
+                {
+                    time_cursor.loop_range = loop_range.intersection(timeline_range);
+                }
+
+                time_cursor
+            }),
             &self.root_chunks,
             budget,
         ))
@@ -735,34 +708,6 @@ fn warn_when_editing_recording(store_kind: StoreKind, warning: &str) {
         StoreKind::Blueprint => {
             // We edit blueprint by generating new chunks in the viewer.
         }
-    }
-}
-
-impl re_byte_size::SizeBytes for RrdManifestIndex {
-    fn heap_size_bytes(&self) -> u64 {
-        re_tracing::profile_function!();
-
-        let Self {
-            entity_has_static_data,
-            manifest,
-            sorted_chunks,
-            loaded_ranges,
-            root_chunks: virtual_chunks,
-            chunk_prioritizer,
-            timelines,
-            data_time_ranges,
-            full_uncompressed_size: _,
-            manifest_complete: _,
-        } = self;
-
-        entity_has_static_data.heap_size_bytes()
-            + manifest.heap_size_bytes()
-            + sorted_chunks.heap_size_bytes()
-            + loaded_ranges.heap_size_bytes()
-            + virtual_chunks.heap_size_bytes()
-            + chunk_prioritizer.heap_size_bytes()
-            + timelines.heap_size_bytes()
-            + data_time_ranges.heap_size_bytes()
     }
 }
 

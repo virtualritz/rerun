@@ -1,5 +1,3 @@
-use saturating_cast::SaturatingCast as _;
-
 /// Represents a limit in how much RAM to use.
 ///
 /// Different systems can chose to heed the memory limit in different ways,
@@ -7,7 +5,8 @@ use saturating_cast::SaturatingCast as _;
 ///
 /// It is recommended that they log using [`re_log::info_once`] when they
 /// drop data because a memory limit is reached.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(transparent)]
 pub struct MemoryLimit {
     /// Limit in bytes.
     ///
@@ -35,10 +34,24 @@ impl MemoryLimit {
     /// No limit.
     pub const UNLIMITED: Self = Self { max_bytes: None };
 
+    /// The default memory limit for native; 75% of reported
+    /// system memory.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn default_for_current_platform() -> Self {
+        Self::from_fraction_of_total(0.75)
+    }
+
+    /// The default memory for web, where we try to be extra careful
+    /// to not oom.
+    #[cfg(target_arch = "wasm32")]
+    pub fn default_for_current_platform() -> Self {
+        Self::from_bytes(2_500_000_000)
+    }
+
     /// Set the limit to some number of bytes.
     pub fn from_bytes(max_bytes: u64) -> Self {
         Self {
-            max_bytes: Some(max_bytes.saturating_cast()),
+            max_bytes: Some(max_bytes),
         }
     }
 
@@ -48,7 +61,7 @@ impl MemoryLimit {
         if let Some(total_memory) = total_memory {
             let max_bytes = (fraction as f64 * total_memory as f64).round();
 
-            re_log::debug!(
+            re_log::debug_once!(
                 "Setting memory limit to {}, which is {}% of total available memory ({}).",
                 re_format::format_bytes(max_bytes),
                 100.0 * fraction,
@@ -59,7 +72,9 @@ impl MemoryLimit {
                 max_bytes: Some(max_bytes as _),
             }
         } else {
-            re_log::info!("Couldn't determine total available memory. Setting no memory limit.");
+            re_log::info_once!(
+                "Couldn't determine total available memory. Setting no memory limit."
+            );
             Self { max_bytes: None }
         }
     }

@@ -11,8 +11,8 @@ use re_view::{clamped_or_nothing, process_annotation_slices, process_color_slice
 #[cfg(doc)]
 use re_viewer_context::VisualizerSystem;
 use re_viewer_context::{
-    QueryContext, ViewQuery, ViewSystemExecutionError, VisualizerExecutionOutput,
-    VisualizerReportSeverity, typed_fallback_for,
+    QueryContext, ViewQuery, ViewSystemExecutionError, ViewerReportSeverity,
+    VisualizerExecutionOutput, typed_fallback_for,
 };
 use vec1::smallvec_v1::SmallVec1;
 
@@ -97,10 +97,11 @@ fn combine_instance_poses_with_archetype_transforms(
     let mut iter_rotation_quat = clamped_or_nothing(quaternions, num_instances);
 
     let last_target_from_instances = target_from_poses.last();
-    let clamped_target_from_instances = target_from_poses
-        .iter()
-        .chain(std::iter::repeat(last_target_from_instances))
-        .copied();
+    let clamped_target_from_instances = std::iter::chain(
+        target_from_poses,
+        std::iter::repeat(last_target_from_instances),
+    )
+    .copied();
 
     let target_from_instances = clamped_target_from_instances
         .take(num_instances)
@@ -159,7 +160,6 @@ impl<'ctx> ProcMeshDrawableBuilder<'ctx> {
     }
 
     /// Add a batch of data to be drawn.
-    #[expect(clippy::too_many_arguments)]
     pub fn add_batch(
         &mut self,
         query_context: &QueryContext<'_>,
@@ -195,7 +195,7 @@ impl<'ctx> ProcMeshDrawableBuilder<'ctx> {
             if let Some(instruction_id) = query_context.instruction_id {
                 self.output.report_unspecified_source(
                     instruction_id,
-                    VisualizerReportSeverity::Warning,
+                    ViewerReportSeverity::Warning,
                     format!(
                         "Too many instances ({}), capping to {}. \
                              This limit can be lifted in Settings.",
@@ -244,12 +244,11 @@ impl<'ctx> ProcMeshDrawableBuilder<'ctx> {
 
         let mut world_space_bounding_box = macaw::BoundingBox::nothing();
 
-        let world_from_instances = target_from_instances
-            .iter()
-            .map(|transform| transform.as_affine3a())
-            .chain(std::iter::repeat(
-                target_from_instances.last().as_affine3a(),
-            ));
+        let world_from_instances = std::iter::chain(
+            &target_from_instances,
+            std::iter::repeat(target_from_instances.last()),
+        )
+        .map(|transform| transform.as_affine3a());
 
         let mut num_instances = 0;
         for (
@@ -259,7 +258,7 @@ impl<'ctx> ProcMeshDrawableBuilder<'ctx> {
             half_sizes,
             world_from_instances,
             line_radii,
-            colors.iter(),
+            &colors,
             batch.meshes,
             batch.fill_modes
         )
@@ -304,7 +303,7 @@ impl<'ctx> ProcMeshDrawableBuilder<'ctx> {
                         .radius(radius)
                         .picking_instance_id(PickingLayerInstanceId(instance_index as _))
                         // Looped lines should be connected with rounded corners.
-                        .flags(LineStripFlags::FLAGS_OUTWARD_EXTENDING_ROUND_CAPS);
+                        .flags(LineStripFlags::STRIP_FLAGS_OUTWARD_EXTENDING_ROUND_CAPS);
 
                     if let Some(outline_mask_ids) = ent_context
                         .highlight
@@ -360,7 +359,7 @@ impl<'ctx> ProcMeshDrawableBuilder<'ctx> {
             }
         }
 
-        self.data.add_bounding_box(
+        self.data.add_bounding_box_3d(
             entity_path.hash(),
             world_space_bounding_box,
             glam::Affine3A::IDENTITY,
@@ -372,10 +371,11 @@ impl<'ctx> ProcMeshDrawableBuilder<'ctx> {
                 visualizer_instruction: ent_context.visualizer_instruction,
                 num_instances,
                 overall_position: world_space_bounding_box.center(),
-                instance_positions: target_from_instances
-                    .iter()
-                    .chain(std::iter::repeat(target_from_instances.last()))
-                    .map(|t| t.translation.as_vec3()),
+                instance_positions: std::iter::chain(
+                    &target_from_instances,
+                    std::iter::repeat(target_from_instances.last()),
+                )
+                .map(|t| t.translation.as_vec3()),
                 labels: batch.labels,
                 colors: &colors,
                 show_labels: batch

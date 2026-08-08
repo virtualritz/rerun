@@ -36,8 +36,22 @@ pub struct ViewBuilder {
     picking_processor: Option<PickingLayerProcessor>,
 }
 
+/// Stable identity of a rendered view.
+///
+/// Reuse the same id when draw data is shared across frames so per-view renderer caches remain
+/// associated with the correct camera.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, re_byte_size::SizeBytes)]
+pub struct ViewBuilderId(u64);
+
+impl ViewBuilderId {
+    pub const fn new(id: u64) -> Self {
+        Self(id)
+    }
+}
+
 struct ViewTargetSetup {
     name: Label,
+    view_id: ViewBuilderId,
 
     camera_position: glam::Vec3A,
 
@@ -196,6 +210,30 @@ pub enum RenderMode {
     Deterministic,
 }
 
+/// How the `composite` step combines a view's render result with the background.
+///
+/// Discriminants are passed directly to `composite.wgsl` as a `u32` uniform — keep in sync.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlendWithBackground {
+    /// Don't blend; the view's result fully overwrites whatever was there before.
+    #[default]
+    No = 0,
+
+    /// Blend with the background, applying a workaround for alpha-to-coverage MSAA.
+    ///
+    /// Use this for views whose content relies on alpha-to-coverage for anti-aliasing
+    /// (e.g. 3D views with line/point primitives that use ATC).
+    /// See [`ViewBuilder::MAIN_TARGET_ALPHA_TO_COVERAGE_COLOR_STATE`] for context.
+    AlphaToCoverage = 1,
+
+    /// Blend with the background, treating the view's result as already premultiplied alpha.
+    ///
+    /// Use this for views whose content uses regular alpha blending and does not depend on
+    /// alpha-to-coverage (e.g. 2D plots rendered in screen space).
+    Premultiplied = 2,
+}
+
 /// Basic configuration for a target view.
 #[derive(Debug)]
 pub struct TargetConfiguration {
@@ -231,14 +269,8 @@ pub struct TargetConfiguration {
 
     pub outline_config: Option<OutlineConfig>,
 
-    /// If true, the `composite` step will blend the image with the background.
-    ///
-    /// Otherwise, this step will overwrite whatever was there before, drawing the view builder's result
-    /// as an opaque rectangle.
-    pub blend_with_background: bool,
-
-    /// If true, blended main target colors are already premultiplied.
-    pub blend_source_is_premultiplied: bool,
+    /// How the `composite` step combines the view's result with the background.
+    pub blend_with_background: BlendWithBackground,
 
     /// Configuration for the picking layer if any.
     ///
@@ -262,8 +294,7 @@ impl Default for TargetConfiguration {
             viewport_transformation: RectTransform::IDENTITY,
             pixels_per_point: 1.0,
             outline_config: None,
-            blend_with_background: false,
-            blend_source_is_premultiplied: false,
+            blend_with_background: BlendWithBackground::No,
             picking_config: None,
         }
     }
@@ -477,8 +508,13 @@ impl ViewBuilder {
         ..Self::MAIN_TARGET_DEFAULT_DEPTH_STATE
     };
 
-    pub fn new(ctx: &RenderContext, config: TargetConfiguration) -> Result<Self, ViewBuilderError> {
-        Self::new_internal(ctx, config, None)
+    /// Creates a view with an identity that can remain stable across builder instances.
+    pub fn new(
+        ctx: &RenderContext,
+        config: TargetConfiguration,
+        view_id: ViewBuilderId,
+    ) -> Result<Self, ViewBuilderError> {
+        Self::new_internal(ctx, config, view_id, None)
     }
 
     /// Creates a view builder that reuses a caller-supplied depth target for the main pass.
@@ -490,14 +526,16 @@ impl ViewBuilder {
     pub fn new_with_external_depth(
         ctx: &RenderContext,
         config: TargetConfiguration,
+        view_id: ViewBuilderId,
         external_depth_texture: GpuTexture,
     ) -> Result<Self, ViewBuilderError> {
-        Self::new_internal(ctx, config, Some(external_depth_texture))
+        Self::new_internal(ctx, config, view_id, Some(external_depth_texture))
     }
 
     fn new_internal(
         ctx: &RenderContext,
         config: TargetConfiguration,
+        view_id: ViewBuilderId,
         external_depth_texture: Option<GpuTexture>,
     ) -> Result<Self, ViewBuilderError> {
         re_tracing::profile_function!();
@@ -644,6 +682,10 @@ impl ViewBuilder {
         let camera_position = config.view_from_world.inverse().translation();
         let camera_forward = -view_from_world.row(2).truncate();
         let projection_from_world = projection_from_view * view_from_world;
+        let framebuffer_resolution = glam::vec2(
+            config.resolution_in_pixel[0] as _,
+            config.resolution_in_pixel[1] as _,
+        );
 
         // Setup frame uniform buffer
         let frame_uniform_buffer_content = FrameUniformBuffer {
@@ -660,11 +702,8 @@ impl ViewBuilder {
                 RenderMode::Beautiful => 0,
                 RenderMode::Deterministic => 1,
             },
-            framebuffer_resolution: glam::vec2(
-                config.resolution_in_pixel[0] as _,
-                config.resolution_in_pixel[1] as _,
-            )
-            .into(),
+            framebuffer_resolution,
+            focal_length_in_pixels: framebuffer_resolution / (2.0 * tan_half_fov),
         };
         let frame_uniform_buffer = create_and_fill_uniform_buffer(
             ctx,
@@ -741,6 +780,7 @@ impl ViewBuilder {
 
         let setup = ViewTargetSetup {
             name: config.name,
+            view_id,
             camera_position: camera_position.into(),
             bind_group_0,
             main_target_msaa,
@@ -773,7 +813,6 @@ impl ViewBuilder {
                     .map(|p| p.final_voronoi_texture()),
                 config.outline_config.as_ref(),
                 config.blend_with_background,
-                config.blend_source_is_premultiplied,
             ),
         );
 
@@ -795,6 +834,7 @@ impl ViewBuilder {
         draw_data: impl Into<QueueableDrawData>,
     ) -> &mut Self {
         let view_info = DrawableCollectionViewInfo {
+            view_id: self.setup.view_id,
             camera_world_position: self.setup.camera_position,
         };
         self.draw_phase_manager
@@ -1053,6 +1093,7 @@ mod tests {
             let view = match ViewBuilder::new_with_external_depth(
                 ctx,
                 target_config,
+                super::ViewBuilderId::new(0),
                 external_depth.clone(),
             ) {
                 Ok(view) => view,
@@ -1104,6 +1145,7 @@ mod tests {
             let _ = match ViewBuilder::new_with_external_depth(
                 ctx,
                 target_config,
+                super::ViewBuilderId::new(0),
                 external_depth,
             ) {
                 Ok(view) => view,

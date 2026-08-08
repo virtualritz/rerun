@@ -1,5 +1,7 @@
 //! Shared functionality for querying time series data.
 
+use std::iter::zip;
+
 use itertools::Itertools as _;
 
 use re_chunk_store::RangeQuery;
@@ -10,13 +12,25 @@ use re_log_types::external::arrow::datatypes::UInt32Type;
 use re_sdk_types::external::arrow::datatypes::DataType as ArrowDatatype;
 use re_sdk_types::{ComponentDescriptor, Loggable as _, RowId, archetypes, components};
 use re_view::clamped_or_nothing;
-use re_viewer_context::VisualizerReportSeverity;
+use re_viewer_context::{ViewQuery, ViewerReportSeverity};
 
 use crate::{MAX_NUM_SERIES_FOR_REMAPPED_SCALARS, PlotPoint, PlotSeriesKind};
 
 type PlotPointsPerSeries = smallvec::SmallVec<[Vec<PlotPoint>; 1]>;
 
+/// All scalar rows in chunk iteration order.
+fn iter_scalar_slices<'a>(
+    all_scalar_chunks: &'a re_view::ChunksWithComponent<'_>,
+) -> impl Iterator<Item = &'a [f64]> + 'a {
+    all_scalar_chunks
+        .iter()
+        .flat_map(|chunk| chunk.iter_slices::<f64>())
+}
+
 /// Determines how many series there are in the scalar chunks.
+///
+/// Uses the first non-empty scalar slice in chunk iteration order for rendering.
+/// Width consistency is checked in [`collect_scalars`].
 ///
 /// If the scalar component has a non-identity mapping (i.e. it's sourced from a different
 /// component or uses a selector), the number of series is capped at
@@ -27,16 +41,8 @@ pub fn determine_num_series(
     all_scalar_chunks: &re_view::ChunksWithComponent<'_>,
     results: &re_view::VisualizerInstructionQueryResults<'_>,
 ) -> usize {
-    // TODO(andreas): We should determine this only once and cache the result.
-    // As data comes in we can validate that the number of series is consistent.
-    // Keep in mind clears here.
-    let count = all_scalar_chunks
-        .iter()
-        .find_map(|chunk| {
-            chunk
-                .iter_slices::<f64>()
-                .find_map(|slice| (!slice.is_empty()).then_some(slice.len()))
-        })
+    let count = iter_scalar_slices(all_scalar_chunks)
+        .find_map(|slice| (!slice.is_empty()).then_some(slice.len()))
         .unwrap_or(1);
 
     let scalar_component = archetypes::Scalars::descriptor_scalars().component;
@@ -49,10 +55,10 @@ pub fn determine_num_series(
         .visualizer_limits_enabled;
     if !is_identity && limits_enabled && count > MAX_NUM_SERIES_FOR_REMAPPED_SCALARS {
         results.report_unspecified_source(
-            VisualizerReportSeverity::Error,
+            ViewerReportSeverity::Error,
             format!(
                 "Too many series ({}), capping to {}. \
-             This limit can be lifted in Settings.",
+                This limit can be lifted in Settings.",
                 re_format::format_uint(count),
                 re_format::format_uint(MAX_NUM_SERIES_FOR_REMAPPED_SCALARS),
             ),
@@ -133,38 +139,54 @@ pub fn allocate_plot_points(
 }
 
 /// Allocates scalars per series into pre-allocated plot points.
+///
+/// Warns once if non-empty rows have different widths.
 pub fn collect_scalars(
     all_scalar_chunks: &re_view::ChunksWithComponent<'_>,
+    results: &re_view::VisualizerInstructionQueryResults<'_>,
     points_per_series: &mut PlotPointsPerSeries,
 ) {
     re_tracing::profile_function!(format!("points_per_series={}", points_per_series.len()));
 
-    if points_per_series.len() == 1 {
-        let points = &mut *points_per_series[0];
-        for (i, values) in all_scalar_chunks
-            .iter()
-            .flat_map(|chunk| chunk.iter_slices::<f64>())
-            .enumerate()
-        {
+    let num_series = points_per_series.len();
+    let mut expected_width = None;
+    let mut width_mismatch = false;
+
+    // `i` is the time index.
+    for (i, values) in iter_scalar_slices(all_scalar_chunks).enumerate() {
+        if !values.is_empty() {
+            let expected_width = *expected_width.get_or_insert(values.len());
+            width_mismatch |= values.len() != expected_width;
+        }
+
+        if num_series == 1 {
+            let points = &mut points_per_series[0];
             if let Some(value) = values.first() {
                 points[i].value = *value;
             } else {
                 points[i].attrs.kind = PlotSeriesKind::Clear;
             }
-        }
-    } else {
-        for (i, values) in all_scalar_chunks
-            .iter()
-            .flat_map(|chunk| chunk.iter_slices::<f64>())
-            .enumerate()
-        {
-            for (points, value) in points_per_series.iter_mut().zip(values) {
+        } else {
+            for (points, value) in zip(&mut *points_per_series, values) {
                 points[i].value = *value;
             }
+            // `zip` stops at the shorter iterator — extra scalars in `values` are ignored.
             for points in points_per_series.iter_mut().skip(values.len()) {
                 points[i].attrs.kind = PlotSeriesKind::Clear;
             }
         }
+    }
+
+    if width_mismatch {
+        results.report_unspecified_source(
+            ViewerReportSeverity::Warning,
+            format!(
+                "Number of scalars for entity `{}` varies between timestamps in the query, \
+                currently rendering {} series",
+                results.entity_path(),
+                re_format::format_uint(num_series),
+            ),
+        );
     }
 }
 
@@ -192,14 +214,14 @@ pub fn collect_colors(
     let color_iter = query_results.iter_optional(color_descriptor.component);
     let all_color_chunks = color_iter.chunks().iter().collect_vec();
 
-    if all_color_chunks.len() == 1 && all_color_chunks[0].chunk.is_static() {
+    if all_color_chunks.len() == 1 && all_color_chunks[0].chunk.num_rows() == 1 {
         re_tracing::profile_scope!("override/default fast path");
 
         if let Some(colors) = all_color_chunks[0].iter_slices::<u32>().next() {
-            for (points, color) in points_per_series
-                .iter_mut()
-                .zip(clamped_or_nothing(colors, num_series))
-            {
+            for (points, color) in std::iter::zip(
+                points_per_series.iter_mut(),
+                clamped_or_nothing(colors, num_series),
+            ) {
                 let color = map_raw_color(color);
                 for point in points {
                     point.attrs.color = color;
@@ -217,10 +239,10 @@ pub fn collect_colors(
         if let Some(color_array) = fallback_array.as_primitive_opt::<UInt32Type>() {
             let fallback_colors = color_array.values();
 
-            for (points, color) in points_per_series
-                .iter_mut()
-                .zip(clamped_or_nothing(fallback_colors.as_ref(), num_series))
-            {
+            for (points, color) in std::iter::zip(
+                points_per_series.iter_mut(),
+                clamped_or_nothing(fallback_colors.as_ref(), num_series),
+            ) {
                 let color = map_raw_color(color);
                 for point in points {
                     point.attrs.color = color;
@@ -254,10 +276,10 @@ pub fn collect_colors(
         } else {
             all_frames.for_each(|(i, (_index, _scalars, colors))| {
                 if let Some(colors) = colors {
-                    for (points, color) in points_per_series
-                        .iter_mut()
-                        .zip(clamped_or_nothing(colors, num_series))
-                    {
+                    for (points, color) in std::iter::zip(
+                        points_per_series.iter_mut(),
+                        clamped_or_nothing(colors, num_series),
+                    ) {
                         points[i].attrs.color = map_raw_color(color);
                     }
                 }
@@ -270,8 +292,7 @@ pub fn collect_colors(
 /// For selectors like `data[]`, strips the `[]` suffix before adding indices.
 fn expand_series_names(names: &[String], num_series: usize) -> Vec<String> {
     let name_count = names.len();
-    (0..num_series)
-        .zip(clamped_or_nothing(names, num_series))
+    std::iter::zip(0..num_series, clamped_or_nothing(names, num_series))
         .map(|(i, name)| {
             if i < name_count {
                 name.clone()
@@ -350,21 +371,21 @@ pub fn collect_radius_ui(
         let radius_iter = query_results.iter_optional(radius_descriptor.component);
         let all_radius_chunks = radius_iter.chunks().iter().collect_vec();
 
-        if all_radius_chunks.len() == 1 && all_radius_chunks[0].chunk.is_static() {
+        if all_radius_chunks.len() == 1 && all_radius_chunks[0].chunk.num_rows() == 1 {
             re_tracing::profile_scope!("override/default fast path");
 
             if let Some(radius) = all_radius_chunks[0].iter_slices::<f32>().next() {
-                for (points, radius) in points_per_series
-                    .iter_mut()
-                    .zip(clamped_or_nothing(radius, num_series))
-                {
+                for (points, radius) in std::iter::zip(
+                    points_per_series.iter_mut(),
+                    clamped_or_nothing(radius, num_series),
+                ) {
                     let radius = radius * radius_multiplier;
                     for point in points {
                         point.attrs.radius_ui = radius;
                     }
                 }
             }
-        } else {
+        } else if !all_radius_chunks.is_empty() {
             re_tracing::profile_scope!("standard path");
 
             let all_radii = all_radius_chunks.iter().flat_map(|chunk| {
@@ -389,10 +410,10 @@ pub fn collect_radius_ui(
             } else {
                 all_frames.for_each(|(i, (_index, _scalars, radius))| {
                     if let Some(radii) = radius {
-                        for (points, stroke_width) in points_per_series
-                            .iter_mut()
-                            .zip(clamped_or_nothing(radii, num_series))
-                        {
+                        for (points, stroke_width) in std::iter::zip(
+                            points_per_series.iter_mut(),
+                            clamped_or_nothing(radii, num_series),
+                        ) {
                             points[i].attrs.radius_ui = stroke_width * radius_multiplier;
                         }
                     }
@@ -411,4 +432,19 @@ pub fn all_scalars_indices<'a>(
         .flat_map(|chunk| chunk.iter_component_indices(*query.timeline()))
         // That is just so we can satisfy the `range_zip` contract later on.
         .map(|index| (index, ()))
+}
+
+/// Returns true if `series` should be drawn with the highlighted (hovered/selected) style.
+///
+/// Used by both the line visualizer (to thicken the stroke) and the marker painter (to grow
+/// the markers), so the visual highlight stays consistent across line and scatter series.
+pub(crate) fn is_series_highlighted(query: &ViewQuery<'_>, series: &crate::PlotSeries) -> bool {
+    query
+        .highlights
+        .entity_highlight(series.instance_path.entity_path.hash())
+        .index_highlight(
+            series.instance_path.instance,
+            series.visualizer_instruction_id,
+        )
+        .any()
 }

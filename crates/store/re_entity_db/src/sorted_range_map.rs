@@ -3,7 +3,7 @@ use std::ops::RangeInclusive;
 /// A sorted, immutable collection of inclusive ranges mapped to values.
 ///
 /// Supports O(log N) queries for overlapping ranges.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, re_byte_size::SizeBytes)]
 pub struct SortedRangeMap<K, V> {
     /// Entries sorted by `range.start()`.
     entries: Vec<(RangeInclusive<K>, V)>,
@@ -19,17 +19,6 @@ impl<K, V> Default for SortedRangeMap<K, V> {
             entries: Vec::new(),
             max_end: Vec::new(),
         }
-    }
-}
-
-impl<K, V> re_byte_size::SizeBytes for SortedRangeMap<K, V>
-where
-    K: re_byte_size::SizeBytes + Ord + Copy,
-    V: re_byte_size::SizeBytes,
-{
-    fn heap_size_bytes(&self) -> u64 {
-        let Self { entries, max_end } = self;
-        entries.heap_size_bytes() + max_end.heap_size_bytes()
     }
 }
 
@@ -54,7 +43,7 @@ impl<K: Ord + Copy, V> SortedRangeMap<K, V> {
     pub fn resume_query(
         &self,
         query: RangeInclusive<K>,
-        cursor: OverlapCursor,
+        cursor: OverlapIterState,
     ) -> OverlapIter<'_, K, V> {
         OverlapIter {
             map: self,
@@ -109,7 +98,7 @@ impl<K: Ord + Copy, V> SortedRangeMap<K, V> {
 /// Obtain one via [`OverlapIter::cursor`] and pass it to
 /// [`SortedRangeMap::resume_query`] to continue iteration later.
 #[derive(Debug, Clone, Copy)]
-pub struct OverlapCursor(usize);
+pub struct OverlapIterState(usize);
 
 /// Non-allocating iterator over overlapping ranges.
 #[derive(Debug, Clone)]
@@ -123,8 +112,8 @@ impl<K, V> OverlapIter<'_, K, V> {
     /// Snapshot the current position so the query can be resumed later
     /// via [`SortedRangeMap::resume_query`].
     #[inline]
-    pub fn cursor(&self) -> OverlapCursor {
-        OverlapCursor(self.idx)
+    pub fn cursor(&self) -> OverlapIterState {
+        OverlapIterState(self.idx)
     }
 }
 

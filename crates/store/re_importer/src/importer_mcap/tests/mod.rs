@@ -1,5 +1,5 @@
 //! Test utilities for MCAP importer.
 
 mod foxglove;
-
-pub mod util;
+mod ros2msg;
+mod util;

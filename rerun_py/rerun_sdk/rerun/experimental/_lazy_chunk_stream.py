@@ -15,19 +15,21 @@ if TYPE_CHECKING:
     from rerun_bindings import ChunkInternal, ComponentDescriptor
 
     from ._chunk_store import ChunkStore
+    from ._optimization_profile import OptimizationProfile
 
 
 class LazyChunkStream:
     """
     A lazy, composable pipeline over chunks.
 
-    Builder methods (``filter``, ``drop``, ``split``, ``merge``) **consume** the input stream(s)
-    and return new stream(s). A consumed stream cannot be used as a builder input again; attempting
-    to do so raises a ``ValueError``. This prevents accidental reuse that would result in duplicate
-    use of the same stream in a pipeline.
+    Builder methods (`filter`, `drop`, `split`, `map`, `flat_map`, `lenses`, `merge`)
+    **consume** the input stream(s) and return new stream(s). A consumed stream cannot be
+    used again; attempting to do so raises a `ValueError`. This prevents accidental reuse
+    that would result in duplicate use of the same stream in a pipeline.
 
-    Terminal methods (``collect``, ``write_rrd``, ``__iter__``) do **not** consume the stream and
-    may be called repeatedly. Each call creates a fresh execution of the pipeline.
+    Terminal methods (`to_chunks`, `__iter__`, `collect`, `write_rrd`) do **not** consume
+    the stream — they run the pipeline and leave the stream usable. Each call creates a
+    fresh execution.
     """
 
     _internal: LazyChunkStreamInternal
@@ -48,9 +50,9 @@ class LazyChunkStream:
         """
         Keep the matching portion of each chunk; drop the rest. Consumes this stream.
 
-        All criteria are combined with AND. For chunk-level predicates (``content``,
-        ``has_timeline``, ``is_static``) the chunk either passes or is dropped
-        entirely. For ``components``, the chunk is split by component columns:
+        All criteria are combined with AND. For chunk-level predicates (`content`,
+        `has_timeline`, `is_static`) the chunk either passes or is dropped
+        entirely. For `components`, the chunk is split by component columns:
         only matching component columns are kept (timelines and entity
         path are preserved). When a list is given, any column matching
         any of the listed components is kept (OR semantics). Chunks that
@@ -63,14 +65,14 @@ class LazyChunkStream:
         ----------
         content:
             Entity path filter. Accepts a single expression, a list of expressions,
-            or a ``ContentFilter`` object.
+            or a `ContentFilter` object.
         has_timeline:
             Only keep chunks that have a column for this timeline.
         is_static:
-            If ``True``, keep only static chunks. If ``False``, keep only temporal chunks.
+            If `True`, keep only static chunks. If `False`, keep only temporal chunks.
         components:
-            Keep only the listed component columns. Accepts ``ComponentDescriptor`` objects
-            or ``str`` component identifiers (e.g. ``"Points3D:positions"``).
+            Keep only the listed component columns. Accepts `ComponentDescriptor` objects
+            or `str` component identifiers (e.g. `"Points3D:positions"`).
             A single value or a list are both accepted.
 
         """
@@ -94,21 +96,21 @@ class LazyChunkStream:
         """
         Drop the matching portion of each chunk; keep the rest. Consumes this stream.
 
-        Complement of ``filter()``: what ``filter()`` would keep is
+        Complement of `filter()`: what `filter()` would keep is
         discarded, what it would discard is kept.
 
         Parameters
         ----------
         content:
             Entity path filter. Accepts a single expression, a list of expressions,
-            or a ``ContentFilter`` object.
+            or a `ContentFilter` object.
         has_timeline:
             Only drop chunks that have a column for this timeline.
         is_static:
-            If ``True``, drop only static chunks. If ``False``, drop only temporal chunks.
+            If `True`, drop only static chunks. If `False`, drop only temporal chunks.
         components:
-            Drop the listed component columns. Accepts ``ComponentDescriptor`` objects
-            or ``str`` component identifiers (e.g. ``"Points3D:positions"``).
+            Drop the listed component columns. Accepts `ComponentDescriptor` objects
+            or `str` component identifiers (e.g. `"Points3D:positions"`).
             A single value or a list are both accepted.
 
         """
@@ -125,10 +127,10 @@ class LazyChunkStream:
 
     def map(self, fn: Callable[[Chunk], Chunk]) -> LazyChunkStream:
         """
-        Apply a Python function to each chunk, producing exactly one output chunk.
+        Apply a Python function to each chunk, producing exactly one output chunk. Consumes this stream.
 
         Runs in Python (GIL-bound, sequential). For transforms that may produce
-        zero or many chunks, use ``flat_map`` instead.
+        zero or many chunks, use `flat_map` instead.
         """
 
         def _wrapper(internal: ChunkInternal) -> ChunkInternal:
@@ -138,7 +140,7 @@ class LazyChunkStream:
 
     def flat_map(self, fn: Callable[[Chunk], Iterable[Chunk]]) -> LazyChunkStream:
         """
-        Apply a Python function to each chunk, producing zero or more output chunks.
+        Apply a Python function to each chunk, producing zero or more output chunks. Consumes this stream.
 
         Runs in Python (GIL-bound, sequential).
         """
@@ -155,6 +157,7 @@ class LazyChunkStream:
         lenses: Sequence[Lens] | Lens,
         *,
         output_mode: Literal["drop_unmatched", "forward_unmatched", "forward_all"] = "drop_unmatched",
+        content: ContentFilter | str | Sequence[str] | None = None,
     ) -> LazyChunkStream:
         """
         Apply lenses to transform chunk data. Consumes this stream.
@@ -165,13 +168,17 @@ class LazyChunkStream:
         Parameters
         ----------
         lenses:
-            One or more [`Lens`][] objects describing the transformations.
+            One or more [`Lens`][rerun.experimental.Lens] objects.
         output_mode:
             How to handle unmatched chunks:
 
-            - ``"forward_all"``: forward both transformed and original data
-            - ``"forward_unmatched"``: forward transformed if matched, otherwise original
-            - ``"drop_unmatched"``: only forward transformed data (default)
+            - `"forward_all"`: forward both transformed and original data
+            - `"forward_unmatched"`: forward transformed if matched, otherwise original
+            - `"drop_unmatched"`: only forward transformed data (default)
+        content:
+            Optional entity path filter. When set, lenses are applied only to chunks
+            whose entity path matches; non-matching chunks pass through unchanged
+            regardless of `output_mode`.
 
         """
         if isinstance(lenses, Lens):
@@ -180,6 +187,7 @@ class LazyChunkStream:
             self._internal.lenses(
                 [lens._internal for lens in lenses],
                 output_mode,
+                content=_normalize_content(content),
             )
         )
 
@@ -196,8 +204,8 @@ class LazyChunkStream:
         """
         Split into (matching, non_matching). Consumes this stream.
 
-        Equivalent to ``(stream.filter(\u2026), stream.drop(\u2026))``, but the
-        upstream executes only once. ``merge(matching, non_matching)``
+        Equivalent to `(stream.filter(\u2026), stream.drop(\u2026))`, but the
+        upstream executes only once. `merge(matching, non_matching)`
         reconstructs the original stream in a semantically lossless way
         (component-wise chunk splitting is not undone).
 
@@ -209,14 +217,14 @@ class LazyChunkStream:
         ----------
         content:
             Entity path filter. Accepts a single expression, a list of expressions,
-            or a ``ContentFilter`` object.
+            or a `ContentFilter` object.
         has_timeline:
             Only match chunks that have a column for this timeline.
         is_static:
-            If ``True``, match only static chunks. If ``False``, match only temporal chunks.
+            If `True`, match only static chunks. If `False`, match only temporal chunks.
         components:
-            Match the listed component columns. Accepts ``ComponentDescriptor`` objects
-            or ``str`` component identifiers (e.g. ``"Points3D:positions"``).
+            Match the listed component columns. Accepts `ComponentDescriptor` objects
+            or `str` component identifiers (e.g. `"Points3D:positions"`).
             A single value or a list are both accepted.
 
         """
@@ -250,7 +258,7 @@ class LazyChunkStream:
         recording_id: str,
     ) -> None:
         """
-        Consume the stream and write all chunks to an RRD file.
+        Run the pipeline and write all chunks to an RRD file.
 
         The caller must provide application_id and recording_id explicitly.
         """
@@ -260,14 +268,55 @@ class LazyChunkStream:
             recording_id,
         )
 
-    def collect(self) -> ChunkStore:
-        """Consume the stream and materialize all chunks into a ChunkStore."""
+    def collect(
+        self,
+        *,
+        optimize: OptimizationProfile | None = None,
+    ) -> ChunkStore:
+        """
+        Run the pipeline and materialize all chunks into a ChunkStore.
+
+        By default, only the single-pass compaction that happens naturally
+        during chunk insertion is applied. Pass `optimize=OptimizationProfile.LIVE`
+        or `optimize=OptimizationProfile.OBJECT_STORE` to run additional
+        optimization (extra convergence passes, video GoP rebatching) tuned for
+        the chosen target.
+
+        Parameters
+        ----------
+        optimize:
+            If `None` (default), no extra optimization is performed beyond
+            the single pass that happens on insert.
+
+            Otherwise, apply the given profile after insertion.
+
+        Examples
+        --------
+        Run with the object-store-tuned profile:
+
+        ```python
+        store = reader.stream().collect(optimize=OptimizationProfile.OBJECT_STORE)
+        ```
+
+        """
         from ._chunk_store import ChunkStore
 
-        return ChunkStore(self._internal.collect())
+        if optimize is None:
+            return ChunkStore(self._internal.collect())
+        return ChunkStore(
+            self._internal.collect(
+                max_bytes=optimize.max_bytes,
+                max_rows=optimize.max_rows,
+                max_rows_if_unsorted=optimize.max_rows_if_unsorted,
+                extra_passes=optimize.extra_passes,
+                gop_batching=optimize.gop_batching,
+                split_size_ratio=optimize.split_size_ratio,
+                fix_keyframe=optimize.fix_keyframe,
+            ),
+        )
 
     def to_chunks(self) -> list[Chunk]:
-        """Consume the stream and return all chunks as a list."""
+        """Run the pipeline and return all chunks as a list."""
         return [Chunk(internal) for internal in self._internal.to_chunks()]
 
     def __iter__(self) -> Iterator[Chunk]:

@@ -1,12 +1,14 @@
 ---
 title: Migrating from 0.25 to 0.26
 order: 984
+hidden: true
 ---
 <!--   ^^^ this number must be _decremented_ when you copy/paste this file -->
 
 ## `cargo install rerun-cli` requires `protoc` (0.26.0 only)
 
-**NOTE**: this has been fixed in 0.26.1 and no longer applies.
+> [!NOTE]
+> This has been fixed in 0.26.1 and no longer applies.
 
 In order to install the Rerun CLI via cargo, you have to have a `protoc` installation on the `PATH` or `PROTOC` environment variable.
 

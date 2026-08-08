@@ -33,29 +33,6 @@ def temp_empty_directory() -> Iterator[str]:
     os.rmdir(tmp_dir)
 
 
-@pytest.fixture(scope="function")
-def recording_factory(tmp_path: Path) -> Callable[[Sequence[str]], list[str]]:
-    """
-    Factory fixture for creating test recordings with known recording IDs.
-
-    Returns a callable that takes a sequence of recording IDs and returns the
-    corresponding file URIs.
-    """
-
-    def create_recordings(recording_ids: Sequence[str]) -> list[str]:
-        uris = []
-        for i, recording_id in enumerate(recording_ids):
-            rrd_path = tmp_path / f"recording_{i}.rrd"
-            with rr.RecordingStream(f"test_recording_{i}", recording_id=recording_id) as rec:
-                rec.save(rrd_path)
-                rec.log("points", rr.Points2D([[i, i]]))
-                rec.flush()
-            uris.append(rrd_path.absolute().as_uri())
-        return uris
-
-    return create_recordings
-
-
 @pytest.mark.local_only
 def test_registration_invalidargs(
     catalog_client: CatalogClient, temp_empty_file: str, temp_empty_directory: str
@@ -88,7 +65,7 @@ def test_register_single_with_wait(
 
     ds = entry_factory.create_dataset("test_register_single")
 
-    handle = ds.register(uris[0])
+    handle = ds.register([uris[0]])
     result = handle.wait()
 
     assert len(result.segment_ids) == 1
@@ -106,7 +83,7 @@ def test_register_single_with_iter_results(
 
     ds = entry_factory.create_dataset("test_register_iter")
 
-    handle = ds.register(uris[0])
+    handle = ds.register([uris[0]])
     results = list(handle.iter_results())
 
     assert len(results) == 1
@@ -193,7 +170,7 @@ def test_register_unregister_batch(
 └───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘\
 """)
 
-    ds.unregister(segments_to_drop=[recording_ids[0], recording_ids[2]], layers_to_drop=[])
+    ds.unregister(segments_to_drop=[recording_ids[0], recording_ids[2]], layers_to_drop=[]).wait()
 
     df = ds.segment_table()
     assert df.count() == 1
@@ -267,7 +244,7 @@ def test_register_with_layer_name(
 
     ds = entry_factory.create_dataset("test_layer_name")
 
-    handle = ds.register(uris[0], layer_name="custom_layer")
+    handle = ds.register([uris[0]], layer_name="custom_layer")
     result = handle.wait()
 
     assert len(result.segment_ids) == 1
@@ -408,10 +385,10 @@ def test_failed_registration_not_in_segment_table(entry_factory: EntryFactory, t
 
     dataset = entry_factory.create_dataset("test_conflicting_property_schema")
 
-    dataset.register(seg_1_path.as_uri()).wait()
+    dataset.register([seg_1_path.as_uri()]).wait()
 
     with pytest.raises(ValueError, match="schema"):
-        dataset.register(seg_2_path.as_uri()).wait()
+        dataset.register([seg_2_path.as_uri()]).wait()
 
     # Verify it's segment1 (the successful one), not segment2 (the failed one)
     segment_ids = dataset.segment_ids()
@@ -439,11 +416,11 @@ def test_failed_layer_registration_not_in_segment_table(entry_factory: EntryFact
     dataset = entry_factory.create_dataset("test_failed_layer_not_in_segment_table")
 
     # Register base layer - should succeed
-    dataset.register(base_path.as_uri(), layer_name="base").wait()
+    dataset.register([base_path.as_uri()], layer_name="base").wait()
 
     # Register extra layer with conflicting schema - should fail
     with pytest.raises(ValueError, match="schema"):
-        dataset.register(extra_path.as_uri(), layer_name="extra").wait()
+        dataset.register([extra_path.as_uri()], layer_name="extra").wait()
 
     # The segment table should still show the segment (because the base layer succeeded)
     df = dataset.segment_table()
@@ -471,14 +448,14 @@ def test_register_duplicate_error_behavior(
     ds = entry_factory.create_dataset("test_dup_error")
 
     # First registration should succeed
-    handle = ds.register(uris[0], on_duplicate=OnDuplicateSegmentLayer.ERROR)
+    handle = ds.register([uris[0]], on_duplicate=OnDuplicateSegmentLayer.ERROR)
     result = handle.wait()
     assert len(result.segment_ids) == 1
     assert result.segment_ids[0] == recording_id
 
     # Second registration of the same segment should fail
     with pytest.raises(AlreadyExistsError, match="already exists"):
-        ds.register(uris[0], on_duplicate=OnDuplicateSegmentLayer.ERROR).wait()
+        ds.register([uris[0]], on_duplicate=OnDuplicateSegmentLayer.ERROR).wait()
 
 
 @pytest.mark.local_only
@@ -495,7 +472,7 @@ def test_register_duplicate_ignore_behavior(
     ds = entry_factory.create_dataset("test_dup_ignore")
 
     # First registration
-    handle = ds.register(uris[0], on_duplicate=OnDuplicateSegmentLayer.SKIP)
+    handle = ds.register([uris[0]], on_duplicate=OnDuplicateSegmentLayer.SKIP)
     result = handle.wait()
     assert len(result.segment_ids) == 1
     assert result.segment_ids[0] == recording_id
@@ -505,7 +482,7 @@ def test_register_duplicate_ignore_behavior(
     assert points == [[0.0, 0.0]], f"Expected [[0.0, 0.0]] but got {points}"
 
     # Second registration should succeed but not replace the data
-    handle = ds.register(uris[1], on_duplicate=OnDuplicateSegmentLayer.SKIP)
+    handle = ds.register([uris[1]], on_duplicate=OnDuplicateSegmentLayer.SKIP)
     result = handle.wait()
     # The result still contains the segment_id even though it was skipped
     assert len(result.segment_ids) == 1
@@ -534,7 +511,7 @@ def test_register_duplicate_replace_behavior(
     ds = entry_factory.create_dataset("test_dup_replace")
 
     # First registration
-    handle = ds.register(uris[0], on_duplicate=OnDuplicateSegmentLayer.REPLACE)
+    handle = ds.register([uris[0]], on_duplicate=OnDuplicateSegmentLayer.REPLACE)
     result = handle.wait()
     assert len(result.segment_ids) == 1
     assert result.segment_ids[0] == recording_id
@@ -544,7 +521,7 @@ def test_register_duplicate_replace_behavior(
     assert points == [[0.0, 0.0]], f"Expected [[0.0, 0.0]] but got {points}"
 
     # Second registration should succeed and replace the data
-    handle = ds.register(uris[1], on_duplicate=OnDuplicateSegmentLayer.REPLACE)
+    handle = ds.register([uris[1]], on_duplicate=OnDuplicateSegmentLayer.REPLACE)
     result = handle.wait()
     assert len(result.segment_ids) == 1
 
@@ -611,7 +588,7 @@ def test_registration_crossregion(catalog_client: CatalogClient) -> None:
 
 @pytest.mark.aws_only
 def test_registration_footerless(catalog_client: CatalogClient) -> None:
-    """Tests whether registration of footerless datasets fails as expected on Rerun Cloud."""
+    """Tests whether registration of footerless datasets fails as expected on Rerun Hub."""
 
     dataset_url = "s3://rerun-redap-datasets-pdx/test-resources/dataset-footerless/"
     expected_msg = "try running `rerun rrd migrate`"
@@ -644,3 +621,164 @@ def _get_points_data(ds: DatasetEntry) -> list[list[float]]:
             if row is not None:
                 points.extend(row.as_py())
     return points
+
+
+# ---------------------------------------------------------------------------
+# schema-compatibility contract (see also RR-4429)
+# ---------------------------------------------------------------------------
+# This parametric test cements which nested-schema drifts between partitions the
+# server accepts (and the read-time widener in `align_record_batch_to_schema`
+# adapts) vs. which ones registration rejects outright.
+#
+# Note on Union rejection: it's currently a conservative over-reject — any Union
+# anywhere in a *changed* field fails registration. See
+# `union_over_rejected_when_only_a_sibling_widens` in
+# `crates/utils/re_arrow_util/src/lib.rs` for the pinned edge case.
+#
+
+
+def _write_rrd(path: Path, recording_id: str, column_type: object) -> None:
+    """Write a single-row RRD at `path` whose `/data.value` column has the given arrow type."""
+    import pyarrow as pa
+
+    # Planted a 3-element array of the target type; exact values don't matter for
+    # the schema contract, only the type does.
+    data = pa.array([None, None, None], type=column_type)
+    with rr.RecordingStream("rerun_example_schema_contract", recording_id=recording_id) as rec:
+        rec.save(path)
+        rec.log("/data", rr.AnyValues(value=data))
+
+
+def _register_rrds_with_types(
+    entry_factory: EntryFactory,
+    tmp_path: Path,
+    dataset_name: str,
+    column_types: Sequence[object],
+) -> DatasetEntry:
+    """Register one RRD per column-type into a fresh dataset. Raises on registration failure."""
+    uris: list[str] = []
+    for i, ty in enumerate(column_types):
+        p = tmp_path / f"segment{i}.rrd"
+        _write_rrd(p, f"segment{i}", ty)
+        uris.append(p.as_uri())
+    dataset = entry_factory.create_dataset(dataset_name)
+    dataset.register(uris).wait()
+    return dataset
+
+
+def _schema_contract_cases() -> list[tuple[str, list[object], str]]:
+    """Build the parametric case table lazily so pyarrow is only imported when tests actually run."""
+    import pyarrow as pa
+
+    # widening struct is accepted, the narrow struct's missing field
+    # is null-filled client-side
+    struct_wide = pa.struct([
+        pa.field("a", pa.int32()),
+        pa.field("b", pa.int32()),
+        pa.field("c", pa.int32()),
+    ])
+    struct_narrow = pa.struct([
+        pa.field("a", pa.int32()),
+        pa.field("b", pa.int32()),
+    ])
+
+    # non-nullable lists can be widened to nullable
+    list_nullable_inner = pa.list_(pa.field("item", pa.int32(), nullable=True))
+    list_non_null_inner = pa.list_(pa.field("item", pa.int32(), nullable=False))
+
+    # null can be promoted to any type, the reader fills in nulls
+    typed_int = pa.int32()
+    null_typed = pa.null()
+
+    # List of things that can be widened, can also be widened
+    list_wide = pa.list_(struct_wide)
+    list_narrow = pa.list_(struct_narrow)
+
+    # list of a widening struct
+    list_of_struct_wide = pa.list_(struct_wide)
+    list_of_struct_narrow = pa.list_(struct_narrow)
+
+    # identical FSLs pass through via the aligner's fast-path (leaf-equality)
+    fsl_identical = pa.list_(pa.int32(), 3)
+
+    # rejected: different widths of the same primitive
+    int32_t = pa.int32()
+    int64_t = pa.int64()
+
+    # rejected at registration: different lengths of fixed-size list
+    fsl_3 = pa.list_(pa.int32(), 3)
+    fsl_4 = pa.list_(pa.int32(), 4)
+
+    # rejected at registration: FSL with differing inner nullability
+    fsl_inner_non_null = pa.list_(pa.field("item", pa.int32(), nullable=False), 3)
+    fsl_inner_nullable = pa.list_(pa.field("item", pa.int32(), nullable=True), 3)
+
+    # rejected at registration: dictionary vs. non-dictionary of the same value type
+    dict_utf8 = pa.dictionary(pa.int32(), pa.string())
+    utf8_t = pa.string()
+
+    # identical Map/Dictionary pass through
+    map_t = pa.map_(pa.string(), pa.int32())
+    dict_utf8_identical = pa.dictionary(pa.int32(), pa.string())
+
+    # rejected at registration: Map with different value types
+    map_t_int32 = pa.map_(pa.string(), pa.int32())
+    map_t_int64 = pa.map_(pa.string(), pa.int64())
+
+    # Union is covered by Rust unit tests in re_arrow_util — pyarrow has no
+    # sequence-to-array path for unions, and Rerun's SDK doesn't emit them.
+
+    return [
+        # -- adapts ---------------------------------------------------------
+        ("struct_widening", [struct_wide, struct_narrow], "adapts"),
+        ("nullability_widening", [list_nullable_inner, list_non_null_inner], "adapts"),
+        ("null_promotion", [typed_int, null_typed], "adapts"),
+        ("list_inner_widened", [list_wide, list_narrow], "adapts"),
+        ("struct_widening_inside_list", [list_of_struct_wide, list_of_struct_narrow], "adapts"),
+        ("fixed_size_list_identical", [fsl_identical, fsl_identical], "adapts"),
+        ("map_identical", [map_t, map_t], "adapts"),
+        ("dictionary_identical", [dict_utf8_identical, dict_utf8_identical], "adapts"),
+        ("primitive_change", [int32_t, int64_t], "rejected"),
+        ("fixed_size_list_length", [fsl_3, fsl_4], "rejected"),
+        ("fsl_inner_nullability_drift", [fsl_inner_non_null, fsl_inner_nullable], "rejected"),
+        ("dictionary_value_type", [dict_utf8, utf8_t], "rejected"),
+        ("map_value_type_drift", [map_t_int32, map_t_int64], "rejected"),
+    ]
+
+
+@pytest.mark.local_only
+@pytest.mark.parametrize(
+    "case,column_types,outcome",
+    _schema_contract_cases(),
+    ids=lambda v: v if isinstance(v, str) else None,
+)
+def test_schema_compatibility_contract(
+    entry_factory: EntryFactory,
+    tmp_path: Path,
+    case: str,
+    column_types: Sequence[object],
+    outcome: str,
+) -> None:
+    """
+    Cement the contract between what the server accepts and what the read-time widener adapts.
+
+    Each case registers two RRDs with the given column types into a single dataset. The two
+    RRDs are paired such that one is a valid "narrowing" of the other — in the "adapts" cases
+    the server's merge logic produces a union schema and the reader null-pads the narrower
+    partition up to it; in the "rejected" cases the server refuses the second partition.
+    """
+    dataset_name = f"test_schema_contract_{case}"
+
+    if outcome == "rejected":
+        with pytest.raises(ValueError, match="schema"):
+            _register_rrds_with_types(entry_factory, tmp_path, dataset_name, column_types)
+        return
+
+    assert outcome == "adapts"
+    dataset = _register_rrds_with_types(entry_factory, tmp_path, dataset_name, column_types)
+
+    # Reading must not raise. The merged schema is the union, narrower-partition rows
+    # are null-filled by `align_record_batch_to_schema`.
+    df = dataset.filter_contents("/data").reader(index="log_time").collect()
+    n_rows = sum(batch.num_rows for batch in df)
+    assert n_rows > 0, f"expected at least one row after adaptation, got zero for case {case}"

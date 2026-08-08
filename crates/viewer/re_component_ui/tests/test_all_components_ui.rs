@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
-use egui_kittest::{OsThreshold, SnapshotError, SnapshotOptions};
+use egui_kittest::{SnapshotError, SnapshotOptions};
 use itertools::Itertools as _;
 use nohash_hasher::IntSet;
 use re_component_ui::create_component_ui_registry;
@@ -148,34 +148,33 @@ fn test_cases(reflection: &Reflection) -> Vec<TestCase> {
     // EXCLUDE COMPONENTS FROM THE PLACEHOLDER LIST HERE!
     //
 
-    let excluded_components = [
-        // TODO(#6661): these components still have special treatment via `DataUi` and
-        // `EntityDatatUi`. The hooks are registered by `re_data_ui::register_component_uis`, which
-        // is not available here. So basically no point testing them here.
-        re_sdk_types::components::AnnotationContext::name(),
-        re_sdk_types::components::Blob::name(),
-        re_sdk_types::components::ClassId::name(),
-        re_sdk_types::components::ImageBuffer::name(), // this one is not technically handled by `DataUi`, but should get a custom ui first (it's using default ui right now).
-        re_sdk_types::components::KeypointId::name(),
-        re_sdk_types::components::TensorData::name(),
-        //
-        // no need to clutter the tests with these internal blueprint types
-        re_sdk_types::blueprint::components::ActiveTab::name(),
-        re_sdk_types::blueprint::components::AutoLayout::name(),
-        re_sdk_types::blueprint::components::AutoViews::name(),
-        re_sdk_types::blueprint::components::ColumnShare::name(),
-        re_sdk_types::blueprint::components::IncludedContent::name(),
-        re_sdk_types::blueprint::components::PanelState::name(),
-        re_sdk_types::blueprint::components::RootContainer::name(),
-        re_sdk_types::blueprint::components::RowShare::name(),
-        re_sdk_types::blueprint::components::ViewMaximized::name(),
-        re_sdk_types::blueprint::components::ViewOrigin::name(),
-        re_sdk_types::blueprint::components::ViewerRecommendationHash::name(),
-        re_sdk_types::blueprint::components::VisualizerInstructionId::name(),
-    ]
-    .into_iter()
-    // Exclude components that have custom test cases.
-    .chain(
+    let excluded_components = std::iter::chain(
+        [
+            // TODO(#6661): these components still have special treatment via `DataUi` and
+            // `EntityDatatUi`. The hooks are registered by `re_data_ui::register_component_uis`, which
+            // is not available here. So basically no point testing them here.
+            re_sdk_types::components::AnnotationContext::name(),
+            re_sdk_types::components::Blob::name(),
+            re_sdk_types::components::ClassId::name(),
+            re_sdk_types::components::ImageBuffer::name(), // this one is not technically handled by `DataUi`, but should get a custom ui first (it's using default ui right now).
+            re_sdk_types::components::KeypointId::name(),
+            re_sdk_types::components::TensorData::name(),
+            //
+            // no need to clutter the tests with these internal blueprint types
+            re_sdk_types::blueprint::components::ActiveTab::name(),
+            re_sdk_types::blueprint::components::AutoLayout::name(),
+            re_sdk_types::blueprint::components::AutoViews::name(),
+            re_sdk_types::blueprint::components::ColumnShare::name(),
+            re_sdk_types::blueprint::components::IncludedContent::name(),
+            re_sdk_types::blueprint::components::PanelState::name(),
+            re_sdk_types::blueprint::components::RootContainer::name(),
+            re_sdk_types::blueprint::components::RowShare::name(),
+            re_sdk_types::blueprint::components::ViewMaximized::name(),
+            re_sdk_types::blueprint::components::ViewOrigin::name(),
+            re_sdk_types::blueprint::components::ViewerRecommendationHash::name(),
+            re_sdk_types::blueprint::components::VisualizerInstructionId::name(),
+        ],
+        // Exclude components that have custom test cases.
         custom_test_cases
             .iter()
             .map(|test_case| test_case.component_type),
@@ -199,8 +198,7 @@ fn test_cases(reflection: &Reflection) -> Vec<TestCase> {
             }
         });
 
-    placeholder_test_cases
-        .chain(custom_test_cases)
+    std::iter::chain(placeholder_test_cases, custom_test_cases)
         .sorted_by(|left, right| {
             left.component_type
                 .short_name()
@@ -231,9 +229,8 @@ pub fn test_all_components_ui_as_list_items() {
 fn run_all_component_tests(width: f32, theme: egui::Theme, output_dir: &str) {
     let test_context = get_test_context();
     let test_cases = test_cases(&test_context.reflection);
-    let snapshot_options = SnapshotOptions::new()
-        .output_path(output_dir)
-        .threshold(OsThreshold::default().macos(2.5));
+    let snapshot_options =
+        re_ui::testing::default_snapshot_options_for_ui().output_path(output_dir);
 
     let results = test_cases
         .iter()
@@ -261,23 +258,25 @@ fn test_single_component_ui_as_list_item(
 ) -> Result<(), SnapshotError> {
     let actual_ui = |ctx: &ViewerContext<'_>, ui: &mut egui::Ui| {
         ui.list_item_flat_noninteractive(
-            list_item::PropertyContent::new("ComponentName").value_fn(|ui, _| {
-                ctx.component_ui_registry().component_ui_raw(
-                    &ctx.active_recording_store_view_context(),
-                    ui,
-                    UiLayout::List,
-                    &EntityPath::root(),
-                    // As of writing, `ComponentDescriptor` the descriptor part is only used for
-                    // caching and actual lookup of uis is only done via `ComponentType`.
-                    &ComponentDescriptor {
-                        component: test_case.label.into(),
-                        archetype: None,
-                        component_type: Some(test_case.component_type),
-                    },
-                    None,
-                    &*test_case.component_data,
-                );
-            }),
+            list_item::PropertyContent::new(test_case.component_type.short_name()).value_fn(
+                |ui, _| {
+                    ctx.component_ui_registry().component_ui_raw(
+                        &ctx.active_recording_store_view_context(),
+                        ui,
+                        UiLayout::List,
+                        &EntityPath::root(),
+                        // As of writing, `ComponentDescriptor` the descriptor part is only used for
+                        // caching and actual lookup of uis is only done via `ComponentType`.
+                        &ComponentDescriptor {
+                            component: test_case.label.into(),
+                            archetype: None,
+                            component_type: Some(test_case.component_type),
+                        },
+                        None,
+                        &*test_case.component_data,
+                    );
+                },
+            ),
         );
     };
 
@@ -391,7 +390,7 @@ fn check_and_print_results(test_cases: &[TestCase], results: &[Result<(), Snapsh
         .max()
         .unwrap();
 
-    for (test_case, result) in test_cases.iter().zip(results.iter()) {
+    for (test_case, result) in std::iter::zip(test_cases, results) {
         match result {
             Ok(()) => println!(
                 "{:>component_type_width$}[{:label_width$}] OK",
@@ -414,7 +413,7 @@ fn check_and_print_results(test_cases: &[TestCase], results: &[Result<(), Snapsh
 }
 
 /// Create a [`TestContext`] with a fully populated component ui registry.
-// TODO(ab): It would be nice to generalise this utility. However, TestContext current lives in
+// TODO(ab): It would be nice to generalize this utility. However, TestContext current lives in
 // re_viewer_context, which cannot depend on re_component_ui.
 fn get_test_context() -> TestContext {
     let mut test_context = TestContext::new();

@@ -34,12 +34,6 @@ pub enum Error {
     #[error(transparent)]
     FunctionRegistry(#[from] FunctionRegistryError),
 
-    #[error("Struct is missing required field '{field_name}'. Available fields: [{}]", struct_fields.join(", "))]
-    MissingStructField {
-        field_name: String,
-        struct_fields: Vec<String>,
-    },
-
     #[error("Unexpected value: expected one of {expected:?}, got {actual}")]
     UnexpectedValue {
         expected: &'static [&'static str],
@@ -54,9 +48,6 @@ pub enum Error {
 
     #[error("Fixed-size list contains unexpected value type: expected {expected}, got {actual}")]
     UnexpectedFixedSizeListValueType { expected: String, actual: DataType },
-
-    #[error("Expected list to contain struct values, but got {actual}")]
-    ExpectedStructInList { actual: DataType },
 
     #[error(
         "Field '{field_name}' has type {actual_type}, but expected {expected_type} (inferred from field '{reference_field}')"
@@ -74,14 +65,25 @@ pub enum Error {
     #[error("At least one field name is required")]
     NoFieldNames,
 
+    #[error(
+        "`pack` path `{path}` is nullable and must be acknowledged with `!` (e.g. `{path}!`), since a null shadows the whole entry"
+    )]
+    PackPathNullable { path: String },
+
+    #[error(
+        "`pack` path `{path}` has type {actual_type}, but expected {expected_type} (inferred from the first path); all paths must share the same datatype"
+    )]
+    PackPathTypeMismatch {
+        path: String,
+        actual_type: DataType,
+        expected_type: DataType,
+    },
+
     #[error("Offset overflow: cannot fit {actual} into {expected_type}")]
     OffsetOverflow {
         actual: usize,
         expected_type: &'static str,
     },
-
-    #[error("Index {index} out of bounds for array of length {length}")]
-    IndexOutOfBounds { index: usize, length: usize },
 
     #[error(transparent)]
     Arrow(Arc<ArrowError>),
@@ -102,9 +104,9 @@ impl From<crate::selector::Error> for Error {
         match err {
             // If the selector error is already a runtime error, unwrap it
             crate::selector::Error::Runtime(e) => e,
-            // For lex/parse errors, wrap them in a generic error message
-            // These shouldn't typically happen at runtime since selectors are pre-parsed
-            other => ArrowError::InvalidArgumentError(format!("Selector error: {other}")).into(),
+            // For lex/parse errors, wrap them in a generic error message.
+            // These shouldn't typically happen at runtime since selectors are pre-parsed.
+            other => Self::Other(format!("{other}")),
         }
     }
 }

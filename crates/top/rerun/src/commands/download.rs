@@ -25,6 +25,7 @@ pub struct DownloadCommand {
 
 impl DownloadCommand {
     pub fn run(self, tokio_runtime: &tokio::runtime::Handle) -> anyhow::Result<()> {
+        let async_runtime = re_async::AsyncRuntimeHandle::new_native(tokio_runtime.clone());
         let output_dir = self
             .output_dir
             .unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -41,7 +42,6 @@ impl DownloadCommand {
                 re_log_types::FileSource::Cli,
                 url,
                 &FromUriOptions {
-                    follow: false,
                     accept_extensionless_http: true,
                 },
             );
@@ -70,6 +70,7 @@ impl DownloadCommand {
 
             let streaming_options = re_redap_client::StreamingOptions {
                 force_full_download: true,
+                download: re_redap_client::SegmentDownload::default(),
                 on_progress: Some(Arc::new(move |bytes_downloaded, total_bytes| {
                     downloaded_for_progress.store(bytes_downloaded, Ordering::Relaxed);
                     match total_bytes {
@@ -87,7 +88,7 @@ impl DownloadCommand {
                             );
                         }
                         None => {
-                            eprint!("\r  {}", re_format::format_bytes(bytes_downloaded as _),);
+                            eprint!("\r  {}", re_format::format_bytes(bytes_downloaded as _));
                         }
                     }
                 })),
@@ -96,6 +97,7 @@ impl DownloadCommand {
             let readable_url = data_source.as_uri().unwrap_or_else(|| url.clone());
 
             let rx = data_source.stream_with_options(
+                &async_runtime,
                 on_auth_err,
                 &connection_registry,
                 streaming_options,
@@ -214,7 +216,7 @@ fn output_filename(data_source: &LogDataSource, original_url: &str) -> std::path
         LogDataSource::RedapDatasetSegment { uri, .. } => format!("{}.rrd", uri.segment_id).into(),
 
         #[cfg(not(target_arch = "wasm32"))]
-        LogDataSource::FilePath { path, .. } => path
+        LogDataSource::File { path, .. } => path
             .file_name()
             .map(Into::into)
             .unwrap_or_else(|| "output.rrd".into()),

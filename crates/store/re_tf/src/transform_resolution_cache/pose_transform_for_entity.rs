@@ -18,7 +18,7 @@ use super::cached_transforms_for_timeline::CachedTransformsForTimeline;
 /// All instance poses for a given entity over time.
 ///
 /// Similar to [`super::tree_transforms_for_child_frame::TreeTransformsForChildFrame`], but for poses associated with an entity path.
-#[derive(Debug)]
+#[derive(Debug, SizeBytes)]
 pub struct PoseTransformForEntity {
     pub entity_path: EntityPath,
     pub poses_per_time: Mutex<BookkeepingBTreeMap<TimeInt, CachedTransformValue<Vec<DAffine3>>>>,
@@ -30,17 +30,6 @@ impl Clone for PoseTransformForEntity {
             entity_path: self.entity_path.clone(),
             poses_per_time: Mutex::new(self.poses_per_time.lock().clone()),
         }
-    }
-}
-
-impl SizeBytes for PoseTransformForEntity {
-    fn heap_size_bytes(&self) -> u64 {
-        let Self {
-            entity_path,
-            poses_per_time,
-        } = self;
-
-        entity_path.heap_size_bytes() + poses_per_time.lock().heap_size_bytes()
     }
 }
 
@@ -92,20 +81,23 @@ impl PoseTransformForEntity {
         poses_per_time
             .mutate_latest_at(&query.at(), |_t, pose_transform| {
                 // Separate check to work around borrow checker issues.
-                if pose_transform == &CachedTransformValue::Invalidated {
-                    *pose_transform =
-                        CachedTransformValue::Resident(query_and_resolve_instance_poses_at_entity(
+                if let CachedTransformValue::Invalidated { row_id, chunk_id } = pose_transform {
+                    *pose_transform = CachedTransformValue::Resident {
+                        value: query_and_resolve_instance_poses_at_entity(
                             entity_db,
                             missing_chunk_reporter,
                             &self.entity_path,
-                            query,
-                        ));
+                            *chunk_id,
+                            *row_id,
+                        ),
+                        row_id: *row_id,
+                    };
                 }
 
                 match pose_transform {
-                    CachedTransformValue::Resident(transform) => transform.clone(),
+                    CachedTransformValue::Resident { value, .. } => value.clone(),
                     CachedTransformValue::Cleared => Vec::new(),
-                    CachedTransformValue::Invalidated => {
+                    CachedTransformValue::Invalidated { .. } => {
                         unreachable!("Just made transform cache-resident")
                     }
                 }
@@ -128,7 +120,17 @@ impl PoseTransformForEntity {
     }
 
     /// Inserts an invalidation point for poses.
-    pub fn invalidate_at(&mut self, time: TimeInt) {
-        add_invalidated_entry_if_not_already_cleared(self.poses_per_time.get_mut(), time);
+    pub fn invalidate_at(
+        &mut self,
+        time: TimeInt,
+        chunk_id: re_sdk_types::ChunkId,
+        row_id: re_sdk_types::RowId,
+    ) {
+        add_invalidated_entry_if_not_already_cleared(
+            self.poses_per_time.get_mut(),
+            time,
+            chunk_id,
+            row_id,
+        );
     }
 }

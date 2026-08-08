@@ -1,25 +1,26 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
+#[cfg(feature = "perf_telemetry")]
+use crate::trace_context::extract_trace_context_from_contextvar;
 use arrow::datatypes::Schema as ArrowSchema;
 use arrow::pyarrow::PyArrowType;
 use datafusion::catalog::TableProvider;
+use itertools::Itertools as _;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::PyAnyMethods as _;
 use pyo3::{Bound, Py, PyAny, PyRef, PyResult, Python, pyclass, pymethods};
 use re_chunk_store::{QueryExpression, SparseFillStrategy, TimeInt, ViewContentsSelector};
 use re_datafusion::DataframeQueryTableProvider;
 use re_log_types::{EntityPathFilter, ResolvedEntityPathFilter};
-#[cfg(feature = "perf_telemetry")]
-use re_perf_telemetry::extract_trace_context_from_contextvar;
 use re_sorbet::{ColumnDescriptor, SorbetColumnDescriptors};
-use tracing::instrument;
+use re_types_core::SegmentId;
 
-use crate::catalog::trace_context::read_trace_context_from_python;
 use crate::catalog::{
     IndexValuesLike, PyDatasetEntryInternal, PySchemaInternal, PyTableProviderAdapterInternal,
     to_py_err,
 };
+use crate::trace_context::read_trace_context_from_python;
 use crate::utils::wait_for_future;
 
 /// A view over a dataset with optional segment and content filters applied lazily.
@@ -104,9 +105,9 @@ impl PyDatasetViewInternal {
     }
 
     /// Return the schema of the data contained in this view.
-    #[instrument(skip_all)]
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PySchemaInternal> {
         let py = self_.py();
+        let _span = read_trace_context_from_python(py, "DatasetView.schema").entered();
         let dataset = self_.dataset.borrow(py);
         let PySchemaInternal {
             columns: base_columns,
@@ -122,14 +123,16 @@ impl PyDatasetViewInternal {
     }
 
     /// Return the Arrow schema of the data contained in this view.
-    #[instrument(skip_all)]
     fn arrow_schema(self_: PyRef<'_, Self>) -> PyResult<PyArrowType<ArrowSchema>> {
+        let _span =
+            read_trace_context_from_python(self_.py(), "DatasetView.arrow_schema").entered();
         Ok(Self::schema(self_)?.into_arrow_schema().into())
     }
 
     /// Returns a list of segment IDs for this view (filtered if segment filter is set).
     fn segment_ids(self_: PyRef<'_, Self>) -> PyResult<Vec<String>> {
         let py = self_.py();
+        let _span = read_trace_context_from_python(py, "DatasetView.segment_ids").entered();
         let dataset = self_.dataset.borrow(py);
 
         let all_segment_ids = PyDatasetEntryInternal::segment_ids(dataset)?;
@@ -151,6 +154,7 @@ impl PyDatasetViewInternal {
     ///     A list of segment ID strings.
     fn filter_segments(self_: PyRef<'_, Self>, segment_ids: Vec<String>) -> PyResult<Py<Self>> {
         let py = self_.py();
+        let _span = read_trace_context_from_python(py, "DatasetView.filter_segments").entered();
 
         // Extract segment IDs from input
         let new_segments: HashSet<String> = segment_ids.into_iter().collect();
@@ -178,6 +182,7 @@ impl PyDatasetViewInternal {
     ///     Entity path expressions like "/points/**", "-/text/**".
     fn filter_contents(self_: PyRef<'_, Self>, exprs: Vec<String>) -> PyResult<Py<Self>> {
         let py = self_.py();
+        let _span = read_trace_context_from_python(py, "DatasetView.filter_contents").entered();
 
         // Combine with existing content filters
         let combined_filters = match &self_.content_filters {
@@ -224,7 +229,6 @@ impl PyDatasetViewInternal {
         fill_latest_at = false,
         using_index_values = None,
     ))]
-    #[instrument(skip_all)]
     fn reader<'py>(
         self_: PyRef<'py, Self>,
         index: Option<String>,
@@ -234,14 +238,15 @@ impl PyDatasetViewInternal {
         using_index_values: Option<BTreeMap<String, IndexValuesLike<'_>>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let py = self_.py();
+        let _span = read_trace_context_from_python(py, "DatasetView.reader").entered();
 
         // Convert IndexValuesLike to BTreeSet<TimeInt>
         let using_index_values = using_index_values
             .map(|values_map| {
                 values_map
                     .into_iter()
-                    .map(|(k, v)| v.to_index_values().map(|v| (k, v)))
-                    .collect::<Result<BTreeMap<_, _>, _>>()
+                    .map(|(k, v)| v.to_index_values().map(|v| (SegmentId::from(k), v)))
+                    .try_collect()
             })
             .transpose()?;
 
@@ -258,9 +263,7 @@ impl PyDatasetViewInternal {
             using_index_values,
         )?;
 
-        let table = PyTableProviderAdapterInternal::new(provider, true);
-
-        let _span = read_trace_context_from_python(py, "reader").entered();
+        let table = PyTableProviderAdapterInternal::new(provider);
 
         let dataset = self_.dataset.borrow(py);
         let client = dataset.client().borrow(py);
@@ -326,7 +329,7 @@ fn build_view_contents(
 }
 
 /// Build a table provider for dataframe queries with the given parameters.
-#[expect(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+#[expect(clippy::fn_params_excessive_bools)]
 fn build_dataframe_query_table_provider(
     py: Python<'_>,
     dataset: &Py<PyDatasetEntryInternal>,
@@ -336,7 +339,7 @@ fn build_dataframe_query_table_provider(
     include_semantically_empty_columns: bool,
     include_tombstone_columns: bool,
     fill_latest_at: bool,
-    using_index_values: Option<BTreeMap<String, BTreeSet<TimeInt>>>,
+    using_index_values: Option<BTreeMap<SegmentId, BTreeSet<TimeInt>>>,
 ) -> PyResult<Arc<dyn TableProvider + Send>> {
     let dataset_ref = dataset.borrow(py);
     let dataset_id = dataset_ref.entry_id();
@@ -377,7 +380,12 @@ fn build_dataframe_query_table_provider(
         } else {
             re_chunk_store::StaticColumnSelection::Both
         },
-        filtered_index: index.map(Into::into),
+        filtered_index: index
+            .map(|index| {
+                re_chunk::TimelineName::try_new(index)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))
+            })
+            .transpose()?,
         filtered_index_range: None,
         filtered_index_values: None,
         using_index_values: None,
@@ -391,19 +399,31 @@ fn build_dataframe_query_table_provider(
     };
 
     // Capture trace context to propagate into async query execution
-    #[cfg(all(feature = "perf_telemetry", not(target_arch = "wasm32")))]
-    let trace_headers_opt = {
-        let trace_headers = extract_trace_context_from_contextvar(py);
-        if trace_headers.traceparent.is_empty() {
-            None
-        } else {
-            Some(trace_headers)
+    cfg_select! {
+        all(feature = "perf_telemetry", not(target_arch = "wasm32")) => {
+            let trace_headers = extract_trace_context_from_contextvar(py);
+            let trace_headers_opt = if trace_headers.traceparent.is_empty() {
+                None
+            } else {
+                Some(trace_headers)
+            };
         }
-    };
-    #[cfg(not(all(feature = "perf_telemetry", not(target_arch = "wasm32"))))]
-    let trace_headers_opt = None;
+        _ => {
+            let trace_headers_opt = None;
+        }
+    }
 
     let index_values = using_index_values.map(Arc::new);
+    // Reuse the already-fetched schema so the provider skips its own `GetDatasetSchema` RPC.
+    let arrow_schema = Some(schema);
+
+    // Bind any active `query_metrics()` collectors to this query at plan
+    // construction time. Empty when no scope is open; the read traverses the
+    // Python `ContextVar` so only collectors from this thread/task are
+    // captured. Concurrent or unrelated queries elsewhere in the process are
+    // not affected.
+    let metrics_collectors = crate::query_metrics::active_metrics_collectors(py);
+
     wait_for_future(py, async move {
         DataframeQueryTableProvider::new(
             connection.origin().clone(),
@@ -412,8 +432,10 @@ fn build_dataframe_query_table_provider(
             &query_expression,
             &segment_ids,
             index_values,
+            arrow_schema,
             #[cfg(not(target_arch = "wasm32"))]
             trace_headers_opt,
+            metrics_collectors,
         )
         .await
     })

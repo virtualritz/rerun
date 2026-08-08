@@ -78,6 +78,7 @@ pub fn ingest(ctx: &Context) -> anyhow::Result<()> {
         version = ctx.release_version()
     );
     // let base_url = "https://ref.rerun.io/docs/python/main";
+    #[expect(clippy::iter_over_hash_type)] // Search index insertion order is irrelevant.
     for (path, obj) in inv {
         ctx.push(DocumentData {
             kind: DocumentKind::Python,
@@ -249,6 +250,7 @@ enum Item {
 struct Module {
     name: String,
     // labels: Vec<String>,
+    #[serde(default)]
     members: BTreeMap<String, Item>,
     docstring: Option<Docstring>,
 }
@@ -281,6 +283,7 @@ struct Docstring {
 struct Class {
     name: String,
     docstring: Option<Docstring>,
+    #[serde(default)]
     members: BTreeMap<String, Item>,
 }
 

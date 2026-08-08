@@ -1,39 +1,36 @@
-use re_byte_size::SizeBytes;
+use std::ops::Deref;
+
 use re_sdk_types::components;
 
 use crate::TransformFrameIdHash;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, re_byte_size::SizeBytes)]
 pub struct ResolvedPinholeProjection {
+    /// All components that are updated atomically are cached.
+    pub(crate) cached: ResolvedPinholeProjectionCached,
+
+    /// View coordinates at this pinhole camera.
+    ///
+    /// This orients embedded 2D data in 3D and projected 3D data in 2D.
+    /// If no view coordinates were logged, this is set to [`re_sdk_types::archetypes::Pinhole::DEFAULT_CAMERA_XYZ`].
+    pub view_coordinates: components::ViewCoordinates,
+}
+
+impl Deref for ResolvedPinholeProjection {
+    type Target = ResolvedPinholeProjectionCached;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.cached
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, re_byte_size::SizeBytes)]
+pub struct ResolvedPinholeProjectionCached {
     /// The parent frame of the pinhole projection.
     pub parent: TransformFrameIdHash,
 
     pub image_from_camera: components::PinholeProjection,
 
     pub resolution: Option<components::Resolution>,
-
-    /// View coordinates at this pinhole camera.
-    ///
-    /// This is needed to orient 2D in 3D and 3D in 2D the right way around
-    /// (answering questions like which axis is distance to viewer increasing).
-    /// If no view coordinates were logged, this is set to [`re_sdk_types::archetypes::Pinhole::DEFAULT_CAMERA_XYZ`].
-    pub view_coordinates: components::ViewCoordinates,
-}
-
-impl SizeBytes for ResolvedPinholeProjection {
-    fn heap_size_bytes(&self) -> u64 {
-        re_tracing::profile_function!();
-
-        let Self {
-            parent,
-            image_from_camera,
-            resolution,
-            view_coordinates,
-        } = self;
-
-        parent.heap_size_bytes()
-            + image_from_camera.heap_size_bytes()
-            + resolution.heap_size_bytes()
-            + view_coordinates.heap_size_bytes()
-    }
 }

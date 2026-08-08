@@ -1,12 +1,26 @@
 #!/usr/bin/env python3
 
 """
-Summarizes PRs since `latest` branch, grouping them based on their GitHub labels.
+Summarizes PRs since the last release, grouping them based on their GitHub labels.
+
+Every PR carries one of four changelog categories:
+  - `exclude from changelog`: skipped here entirely.
+  - `🪳 bug`: auto-added to the detailed sections below from the PR title.
+  - `📉 performance`: auto-added to the detailed sections below from the PR title.
+  - `include in changelog`: a user-facing change. It is auto-listed in the detailed
+    sections too, but its headline treatment (highlights / breaking change & migration /
+    new feature with docs & example links) is hand-written, one file per PR, in
+    `docs/content/changelog/upcoming/`. At release those files are merged into the
+    release's changeset at `docs/content/changelog/changeset-0-xx.md`.
 
 If the result is not satisfactory, you can edit the original PR titles and labels.
-You can add the `exclude from changelog` label to minor PRs that are not of interest to our users.
 
-Finally, copy-paste the output into `CHANGELOG.md` and add a high-level summary to the top.
+Finally, copy-paste the output into `CHANGELOG.md`.
+
+The curated changeset is *not* inlined here: it is published on the website, and this script
+only lists its headings and links to it. That keeps `CHANGELOG.md` skimmable and keeps the full
+prose in exactly one place — the same reason it has always linked to the migration guide rather
+than inlining it.
 """
 
 from __future__ import annotations
@@ -18,6 +32,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from git import Repo  # pip install GitPython
@@ -27,8 +42,31 @@ OWNER = "rerun-io"
 REPO = "rerun"
 INCLUDE_LABELS = False  # It adds quite a bit of visual noise
 
-# Cache for organization members to avoid repeated API calls
-_org_members_cache: set[str] | None = None
+# Cache for contributor classification to avoid repeated API calls
+_external_contributor_cache: dict[str, bool] = {}
+
+
+# Coding-agent accounts that GitHub registers as ordinary users, not as a `Bot` and with no
+# `[bot]` suffix or `app/` prefix, so neither the account `type` nor the login itself flags them.
+# `claude` is Anthropic's account, committing via `noreply@anthropic.com`. `cursoragent` is Cursor's.
+_AGENT_USER_NAMES = {"claude", "cursoragent"}
+
+
+def is_bot_account(user_name: str, account_type: str | None = None) -> bool:
+    """Return whether a GitHub account is a bot rather than a human contributor.
+
+    The account `type` from the GitHub API is the reliable signal, and the only one that catches
+    bots with a plain login like the `Copilot` agent, so callers pass it whenever they have it.
+    Without a `type` we judge by the login alone, which still covers GitHub App bots in both
+    formats we see. The REST API uses a `[bot]` suffix, as in `dependabot[bot]` or `claude[bot]`.
+    The `gh` CLI uses an `app/` prefix, as in `app/copilot-swe-agent`.
+    A few coding agents run as ordinary user accounts with no such marker, so we also match
+    `claude` and `cursoragent` by name.
+    """
+    if account_type == "Bot":
+        return True
+    name = user_name.lower()
+    return name.endswith("[bot]") or name.startswith("app/") or name in _AGENT_USER_NAMES
 
 
 def eprint(*args: Any, **kwargs: Any) -> None:
@@ -37,7 +75,7 @@ def eprint(*args: Any, **kwargs: Any) -> None:
 
 @dataclass
 class PrInfo:
-    gh_user_name: str | None
+    gh_user_names: list[str]
     pr_title: str
     labels: list[str]
 
@@ -50,41 +88,96 @@ class CommitInfo:
     source_ref_hash: str | None
 
 
-def get_rerun_org_members() -> set[str]:
-    """Fetch all members of the rerun-io GitHub organization."""
-    global _org_members_cache
+def unique_user_names(user_names: list[str]) -> list[str]:
+    """Deduplicate GitHub usernames while preserving order."""
+    seen = set()
+    unique = []
+    for user_name in user_names:
+        if user_name not in seen and not is_bot_account(user_name):
+            seen.add(user_name)
+            unique.append(user_name)
+    return unique
 
-    if _org_members_cache is not None:
-        return _org_members_cache
+
+def is_external_contributor(user_name: str) -> bool:
+    """Return whether a GitHub user looks external to Rerun.
+
+    We intentionally use the repository permissions endpoint instead of the org members endpoint,
+    since the latter only returns public org memberships.
+
+    Bots are never external contributors. The permissions endpoint reports the account `type`,
+    so a resolvable bot like `dependabot[bot]` is caught from its type without a name list.
+    Bots whose login never resolves through the API are caught earlier by `is_bot_account`,
+    including the Copilot agent's `app/…` login.
+    """
+    if is_bot_account(user_name):
+        return False
+
+    if user_name in _external_contributor_cache:
+        return _external_contributor_cache[user_name]
 
     try:
-        # Use gh CLI to fetch organization members
-        # Note: only PUBLIC members will be fetched!
-        # You can see which members are public and private at https://github.com/orgs/rerun-io/people
-        # That's also where members can change themselves from Private to Public.
         result = subprocess.run(
-            ["gh", "api", f"/orgs/{OWNER}/members", "--paginate", "--jq", ".[].login"],
+            [
+                "gh",
+                "api",
+                f"/repos/{OWNER}/{REPO}/collaborators/{user_name}/permission",
+                "--jq",
+                "[.user.type, .permission] | @tsv",
+            ],
             capture_output=True,
             text=True,
             check=True,
         )
-
-        members = set()
-        for line in result.stdout.strip().split("\n"):
-            if line.strip():  # Skip empty lines
-                members.add(line.strip())
-
-        _org_members_cache = members
-        eprint(f"Fetched {len(members)} members from rerun-io organization")
-        return members
-
+        account_type, _, permission = result.stdout.strip().partition("\t")
+        is_external = not is_bot_account(user_name, account_type) and permission not in {
+            "admin",
+            "maintain",
+            "write",
+            "triage",
+        }
     except subprocess.CalledProcessError as e:
         eprint(
-            f"ERROR fetching org members: {e.stderr.strip()}. You need to install the GitHub CLI tools: https://cli.github.com/ and authenticate with github."
+            f"ERROR fetching repository permission for @{user_name}: {e.stderr.strip()}. Assuming external contributor."
         )
-        # Return empty set as fallback to avoid breaking the script
-        _org_members_cache = set()
-        return _org_members_cache
+        is_external = True
+
+    _external_contributor_cache[user_name] = is_external
+    return is_external
+
+
+# Slow
+def fetch_pr_commit_authors(repo: str, pr_number: int) -> list[str]:
+    """Return the GitHub logins of every human who authored a commit in a PR.
+
+    GitHub resolves each commit's author email to a login server-side, so this recovers the real
+    contributors even when their `Co-authored-by` trailers use a private email we cannot map.
+    We pass each author's account `type` to `is_bot_account` so bot commit authors get dropped too,
+    such as the `Copilot` agent whose plain login alone would not look like a bot.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "api",
+                f"/repos/{OWNER}/{repo}/pulls/{pr_number}/commits?per_page=100",
+                "--jq",
+                ".[] | select(.author != null) | [.author.login, .author.type] | @tsv",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        eprint(f"ERROR fetching commits for {repo} PR #{pr_number}: {e.stderr.strip()}")
+        return []
+
+    user_names = []
+    for line in result.stdout.splitlines():
+        login, _, account_type = line.partition("\t")
+        if not is_bot_account(login, account_type):
+            user_names.append(login)
+    return unique_user_names(user_names)
 
 
 # Slow
@@ -100,7 +193,7 @@ def fetch_reality_pr_info(commit_hash: str) -> PrInfo | None:
                 "api",
                 f"/repos/{OWNER}/reality/commits/{commit_hash}/pulls",
                 "--jq",
-                ".[0] | {title: .title, labels: [.labels[].name], author: (.author.login // .user.login)}",
+                ".[0] | {number: .number, title: .title, labels: [.labels[].name]}",
             ],
             capture_output=True,
             text=True,
@@ -113,8 +206,16 @@ def fetch_reality_pr_info(commit_hash: str) -> PrInfo | None:
         if not pr_data or "title" not in pr_data:
             return None
 
-        labels = pr_data["labels"]
-        return PrInfo(gh_user_name=None, pr_title=pr_data["title"], labels=labels)
+        pr_number = pr_data.get("number")
+        # The PR's commit authors are the human contributors. We take them rather than the PR author
+        # because synced PRs are opened by the sync bot, with the real people only on the commits.
+        gh_user_names = fetch_pr_commit_authors("reality", pr_number) if pr_number is not None else []
+
+        return PrInfo(
+            gh_user_names=gh_user_names,
+            pr_title=pr_data["title"],
+            labels=pr_data["labels"],
+        )
 
     except subprocess.CalledProcessError as e:
         # Commit doesn't exist in Reality repo, or API error
@@ -131,36 +232,25 @@ def fetch_pr_info_from_commit_info(commit_info: CommitInfo) -> PrInfo | None:
     Fetch PR info with Reality-first, Rerun-fallback strategy.
 
     Priority order:
-    1. Try Reality repo using Source-Ref commit hash (if present) - use for title and labels
-    2. Always try to get author from the original Rerun PR (if PR number exists)
-    3. Fallback to Rerun repo entirely if no Source-Ref
+    1. Try the Reality repo using the Source-Ref commit hash, if present.
+    2. Fall back to the Rerun repo using the PR number.
+
+    Either way the contributors come from the PR's commit authors, which the API resolves to real
+    logins and tags with an account `type`, so private emails are recovered and bots are dropped.
     """
     # Priority 1: Try Reality repo if Source-Ref is present
     if commit_info.source_ref_hash is not None:
         reality_pr_info = fetch_reality_pr_info(commit_info.source_ref_hash)
         if reality_pr_info is not None:
-            # Got Reality PR info, but we want the author from the original Rerun PR
-            if commit_info.pr_number is not None:
-                rerun_pr_info = fetch_pr_info(commit_info.pr_number)
-                if rerun_pr_info is not None:
-                    # Use title and labels from Reality, author from Rerun
-                    return PrInfo(
-                        gh_user_name=rerun_pr_info.gh_user_name,
-                        pr_title=reality_pr_info.pr_title,
-                        labels=reality_pr_info.labels,
-                    )
-            # No Rerun PR number, so just use Reality info without author attribution
-            # Set author to None so it won't be attributed
-            return PrInfo(
-                gh_user_name=None,
-                pr_title=reality_pr_info.pr_title,
-                labels=reality_pr_info.labels,
-            )
+            return reality_pr_info
         # If Reality lookup fails, fall through to Rerun repo fallback
 
     # Priority 2: Fallback to Rerun repo using PR number
     if commit_info.pr_number is not None:
-        return fetch_pr_info(commit_info.pr_number)
+        pr_info = fetch_pr_info(commit_info.pr_number)
+        if pr_info is not None:
+            pr_info.gh_user_names = fetch_pr_commit_authors(REPO, commit_info.pr_number)
+        return pr_info
 
     # No PR info available
     return None
@@ -189,7 +279,7 @@ def fetch_pr_info(pr_number: int) -> PrInfo | None:
         pr_data = json.loads(result.stdout)
         labels = [label["name"] for label in pr_data["labels"]]
         gh_user_name = pr_data["author"]["login"]
-        return PrInfo(gh_user_name=gh_user_name, pr_title=pr_data["title"], labels=labels)
+        return PrInfo(gh_user_names=unique_user_names([gh_user_name]), pr_title=pr_data["title"], labels=labels)
 
     except subprocess.CalledProcessError as e:
         eprint(
@@ -224,6 +314,64 @@ def get_commit_info(commit: Any) -> CommitInfo:
         pr_number=pr_number,
         source_ref_hash=source_ref_hash,
     )
+
+
+def changeset_path(new_version: str) -> Path:
+    major, minor, _ = new_version.split(".")
+    return Path("docs") / "content" / "changelog" / f"changeset-{major}-{minor}.md"
+
+
+def changeset_url(new_version: str) -> str:
+    major, minor, _ = new_version.split(".")
+    return f"https://rerun.io/docs/changelog/changeset-{major}-{minor}"
+
+
+def changeset_headings(path: Path, section: str) -> list[str]:
+    """The `### ` headings under a `## <section>` heading of a release changeset."""
+    text = path.read_text(encoding="utf8")
+    match = re.search(rf"^## {re.escape(section)}$(.*?)(?=^## |\Z)", text, re.MULTILINE | re.DOTALL)
+    if match is None:
+        return []
+    return re.findall(r"^### (.+)$", match.group(1), re.MULTILINE)
+
+
+def print_changeset_summary(new_version: str) -> None:
+    """
+    Summarize the release changeset, linking to it rather than duplicating it.
+
+    The changeset at `docs/content/changelog/changeset-0-xx.md` is published on the website and
+    is the single source for the full prose. `CHANGELOG.md` only lists the headings and links out,
+    the same way it has always linked to the migration guide instead of inlining it.
+    """
+    path = changeset_path(new_version)
+    if not path.is_file():
+        print(f"TODO: assemble {path} and re-run this script")  # NOLINT
+        print()
+        return
+
+    url = changeset_url(new_version)
+
+    # `CHANGELOG.md` has no separate "New features" section — features live under the
+    # overview, so both changeset sections are listed together here.
+    overview = changeset_headings(path, "Highlights") + changeset_headings(path, "New features")
+    if overview:
+        print("### ✨ Overview & highlights")
+        print()
+        for heading in overview:
+            print(f"- {heading}")
+        print()
+        print(f"📖 Release notes: {url}#highlights")
+        print()
+
+    breaking = changeset_headings(path, "Breaking changes")
+    if breaking:
+        print("### ⚠️ Breaking changes")
+        print()
+        for heading in breaking:
+            print(f"- {heading}")
+        print()
+        print(f"🧳 Migration guide: {url}#breaking-changes")
+        print()
 
 
 def print_section(title: str, items: list[str]) -> None:
@@ -330,19 +478,23 @@ def main() -> None:
 
             labels = pr_info.labels if pr_info else []
 
-            if "include in changelog" not in labels and "include in OSS changelog" not in labels:
+            # The label CI guarantees every PR has exactly one changelog category, so
+            # "not excluded" means it is an auto category (`🪳 bug` / `📉 performance`)
+            # or `include in changelog`.
+            if "exclude from changelog" in labels:
                 continue
 
             # Generate summary - prefer PR number, fallback to commit hash
             if pr_number is not None:
                 summary = f"{title} [#{pr_number}](https://github.com/{OWNER}/{REPO}/pull/{pr_number})"
-                dup_check = f"[#{pr_number}]"
+                dup_checks = [f"[#{pr_number}]"]
             else:
                 # No PR number in title, but we have Reality PR info - use hash of synced commit in Rerun repo
                 summary = f"{title} [{hexsha_short}](https://github.com/{OWNER}/{REPO}/commit/{hexsha_full})"
-                dup_check = f"[{hexsha_full}]"
+                # The changelog records the short hash in brackets and the full hash in the URL, so check both.
+                dup_checks = [f"[{hexsha_short}]", f"[{hexsha_full}]"]
 
-            if dup_check in previous_changelog:
+            if any(dup_check in previous_changelog for dup_check in dup_checks):
                 eprint(f"Ignoring dup: {summary}")
                 continue
 
@@ -352,9 +504,18 @@ def main() -> None:
                 summary += f" ({', '.join(labels)})"
 
             if pr_info is not None:
-                gh_user_name = pr_info.gh_user_name
-                if gh_user_name is not None and gh_user_name not in get_rerun_org_members():
+                external_contributors = [
+                    gh_user_name for gh_user_name in pr_info.gh_user_names if is_external_contributor(gh_user_name)
+                ]
+                if len(external_contributors) == 1:
+                    gh_user_name = external_contributors[0]
                     summary += f" (thanks [@{gh_user_name}](https://github.com/{gh_user_name})!)"
+                elif 1 < len(external_contributors):
+                    thanks = ", ".join(
+                        f"[@{gh_user_name}](https://github.com/{gh_user_name})"
+                        for gh_user_name in external_contributors
+                    )
+                    summary += f" (thanks {thanks}!)"
 
             if labels == ["⛴ release"]:
                 continue  # Ignore release PRs
@@ -421,15 +582,7 @@ def main() -> None:
     print()
     print("📖 Release blogpost: TODO: add link")  # NOLINT
     print()
-    print("🧳 Migration guide: TODO: add link")  # NOLINT
-    print()
-    print("### ✨ Overview & highlights")
-    print("TODO: fill in")  # NOLINT
-    print()
-    print("### ⚠️ Breaking changes")
-    print("TODO: fill in")  # NOLINT
-    print("🧳 Migration guide: TODO: add link (yes, again)")  # NOLINT
-    print()
+    print_changeset_summary(args.version)
     print("### 🔎 Details")
     print()
 

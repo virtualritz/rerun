@@ -9,8 +9,11 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
 
+    import pyarrow as pa
+
     from . import Transform3D
     from ._baseclasses import ComponentColumnList
+    from .experimental import LazyChunkStream
     from .recording_stream import RecordingStream
 
 __all__ = ["UrdfJoint", "UrdfLink", "UrdfMimic", "UrdfTree"]
@@ -18,10 +21,10 @@ __all__ = ["UrdfJoint", "UrdfLink", "UrdfMimic", "UrdfTree"]
 
 class UrdfMimic:
     """
-    A URDF ``<mimic>`` tag specification.
+    A URDF `<mimic>` tag specification.
 
     A mimic joint's value is derived from a driver joint as
-    ``value = multiplier * driver_value + offset``.
+    `value = multiplier * driver_value + offset`.
     """
 
     def __init__(self, inner: _UrdfMimicInternal) -> None:
@@ -34,12 +37,12 @@ class UrdfMimic:
 
     @property
     def multiplier(self) -> float:
-        """Multiplier applied to the driver joint's value (defaults to ``1.0``)."""
+        """Multiplier applied to the driver joint's value (defaults to `1.0`)."""
         return self._inner.multiplier
 
     @property
     def offset(self) -> float:
-        """Offset added after multiplying the driver joint's value (defaults to ``0.0``)."""
+        """Offset added after multiplying the driver joint's value (defaults to `0.0`)."""
         return self._inner.offset
 
     def __repr__(self) -> str:
@@ -109,7 +112,7 @@ class UrdfJoint:
 
     @property
     def mimic(self) -> UrdfMimic | None:
-        """Mimic-tag specification, or ``None`` if this joint is not a mimic joint."""
+        """Mimic-tag specification, or `None` if this joint is not a mimic joint."""
         inner = self._inner.mimic
         return UrdfMimic(inner) if inner is not None else None
 
@@ -231,8 +234,8 @@ class UrdfTree:
             Use to load the same URDF multiple times with unique frames.
         static_transform_entity_path:
             Optional entity path to use when logging static transforms.
-            If omitted, defaults to ``/tf_static``.
-            This path is not affected by ``entity_path_prefix``.
+            If omitted, defaults to `/tf_static`.
+            This path is not affected by `entity_path_prefix`.
 
         """
         return UrdfTree(
@@ -343,16 +346,70 @@ class UrdfTree:
         Log the full robot model (geometry + static transforms) to a recording stream.
 
         This can be used as alternative to [`rerun.log_file_from_path`][] for URDF files,
-        especially in cases where you need the extra configuration options of ``UrdfTree``
-        (e.g. ``frame_prefix`` for multi-robot setups).
+        especially in cases where you need the extra configuration options of `UrdfTree`
+        (e.g. `frame_prefix` for multi-robot setups).
 
         Parameters
         ----------
         recording:
-            The recording stream to log to. If ``None``, the current active recording is used.
+            The recording stream to log to. If `None`, the current active recording is used.
 
         """
         self._inner.log(recording.to_native() if recording is not None else None)
+
+    def stream(self, *, include_joint_transforms: bool = True) -> LazyChunkStream:
+        """
+        Return a lazy stream over chunks emitted from this URDF tree.
+
+        !!! warning
+            This method is experimental and returns the experimental
+            `rerun.experimental.LazyChunkStream` API.
+
+        Parameters
+        ----------
+        include_joint_transforms:
+            Whether to include the static joint transforms from the URDF.
+
+        """
+        from .experimental import LazyChunkStream
+
+        return LazyChunkStream(self._inner.stream(include_joint_transforms=include_joint_transforms))
+
+    def compute_joint_transform_batches(
+        self,
+        names: pa.Array,
+        values: pa.Array,
+        *,
+        clamp: bool = False,
+    ) -> pa.Array:
+        """
+        Compute batches of 3D transform components from Arrow list arrays containing joint names and values.
+
+        `names` must be a `ListArray` with `Utf8` values.
+        `values` must be a `ListArray` with values castable to `Float64`.
+
+        The output is a `ListArray` with `translation`, `quaternion`, `parent_frame`, and
+        `child_frame` fields and the same outer row count as the inputs.
+
+        Note: this is intended as a helper for lens pipelines, where you would usually pipe this output
+        through an additional lens that scatters each batch into final `Transform3D` component rows.
+
+        Parameters
+        ----------
+        names:
+            Joint names for each row.
+        values:
+            Joint values for each row.
+        clamp:
+            Whether to clamp & warn about values outside joint limits.
+
+        Returns
+        -------
+        pa.Array
+            Transform batches with one outer row for each input row.
+
+        """
+        return self._inner.compute_joint_transform_batches(names, values, clamp=clamp)
 
     def __repr__(self) -> str:
         return self._inner.__repr__()

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use ahash::HashMap;
+use re_async::AsyncRuntimeHandle;
 use re_mutex::Mutex;
 use re_redap_client::ConnectionRegistryHandle;
 
@@ -19,28 +20,20 @@ pub enum LatencyResult {
     MostRecent(web_time::Duration),
 }
 
-#[derive(Default)]
+#[derive(Default, re_byte_size::SizeBytes)]
 struct InnerState {
     accessed: bool,
     update_in_progress: bool,
     has_error: bool,
     last_latency: Option<web_time::Duration>,
+
+    #[size_bytes(ignore)] // No size bytes impl.
     last_update_time: Option<web_time::Instant>,
 }
 
-#[derive(Default)]
+#[derive(Default, re_byte_size::SizeBytes)]
 struct LatencyTracker {
     pub inner: Mutex<InnerState>,
-}
-
-impl re_byte_size::SizeBytes for LatencyTracker {
-    fn heap_size_bytes(&self) -> u64 {
-        0
-    }
-
-    fn is_pod() -> bool {
-        true
-    }
 }
 
 impl LatencyTracker {
@@ -93,26 +86,14 @@ pub struct ServerLatencyTrackers {
     servers: HashMap<re_uri::Origin, Arc<LatencyTracker>>,
 }
 
-#[cfg(target_arch = "wasm32")]
-fn spawn_future<F>(future: F)
-where
-    F: std::future::Future<Output = ()> + 'static,
-{
-    wasm_bindgen_futures::spawn_local(future);
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn spawn_future<F>(future: F)
-where
-    F: std::future::Future<Output = ()> + 'static + Send,
-{
-    crate::external::tokio::spawn(future);
-}
-
 impl ServerLatencyTrackers {
     /// Ping all origins if they're in use and enough time has passed since the
     /// last ping.
-    pub fn update(&self, connection_registry_handle: &ConnectionRegistryHandle) {
+    pub fn update(
+        &self,
+        async_runtime: &AsyncRuntimeHandle,
+        connection_registry_handle: &ConnectionRegistryHandle,
+    ) {
         #[expect(clippy::iter_over_hash_type)] // Order doesn't matter here.
         for (origin, tracker) in &self.servers {
             if !tracker.should_update() {
@@ -125,7 +106,7 @@ impl ServerLatencyTrackers {
 
             let origin = origin.clone();
             let handle = connection_registry_handle.clone();
-            spawn_future(async move {
+            async_runtime.spawn_future(async move {
                 tracker.inner.lock().last_update_time = Some(web_time::Instant::now());
 
                 let Ok(mut client) = handle.client(origin).await else {

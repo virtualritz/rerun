@@ -29,6 +29,8 @@ We are continually adding support for more standard message types.
 | Misc. scalar sensor data | `sensor_msgs/Imu`, `sensor_msgs/JointState`, `sensor_msgs/Temperature`, `sensor_msgs/FluidPressure`, `sensor_msgs/RelativeHumidity`, `sensor_msgs/Illuminance`, `sensor_msgs/Range`, `sensor_msgs/BatteryState`, `sensor_msgs/Joy` | - *(usually covered via custom schemas, see [Schema reflection](#schema-reflection) below on this page)* | [Scalars](../../../reference/types/archetypes/scalars.md) |
 | Text | `std_msgs/String` | - | [TextDocument](../../../reference/types/archetypes/text_document.md) |
 | Log messages | `rcl_interfaces/Log` | `Log` | [TextLog](../../../reference/types/archetypes/text_log.md) |
+| 2D grid map | `nav_msgs/OccupancyGrid` | - | [GridMap](../../../reference/types/archetypes/grid_map.md) |
+| 3D voxel grid map | `nav2_msgs/VoxelGrid` | `VoxelGrid` | [VoxelGridMap](../../../reference/types/archetypes/voxel_grid_map.md) |
 
 ### Timelines
 
@@ -76,6 +78,7 @@ MCAP files allow for arbitrary custom message payloads, so you might have other 
 Rerun's MCAP importer automatically decodes unknown Protobuf or ROS 2 messages using schema reflection.
 This means that you won't get Rerun archetypes out of the box, but the message fields become queryable components (e.g. for training data curation via the Rerun SDK, see [here](decoders-explained.md#accessing-decoder-data)).
 Depending on the contents of your data, you can still manually add visualizers for certain fields to your blueprint, e.g. a time-series view for scalars or a dataframe view.
+You can also use [Lenses](../../query-and-transform/lenses.md) to attach Rerun semantics to the reflected data.
 
 ### Example: time-series plot for custom message scalars
 
@@ -113,8 +116,18 @@ You can see this also in the selection panel:
 
 ## ROS1 message types
 
-ROS1 messages are currently not supported for semantic interpretation through any layer.
-The `raw` and `schema` layers are able to preserve the original bytes and structure of the messages.
+ROS 1 data is not supported for semantic interpretation through any decoder.
+The `raw` and `schema` decoders are able to preserve the original bytes and structure of ROS 1 messages in MCAP files, but Rerun will not convert them to visualization archetypes.
+
+We don't plan to add support for ROS 1 in Rerun, as it has reached [end-of-life](https://www.ros.org/blog/noetic-eol/) in May 2025.
+But if you have legacy ROS 1 data and want to migrate it to modern formats, we recommend to try external tools like [`rosbags`](https://ternaris.gitlab.io/rosbags/).
+For example, this command converts a ROS 1 `.bag` to a ROS 2 CDR-encoded `.mcap` that Rerun can import like any other supported ROS 2 recording:
+```bash
+rosbags-convert --src my_data_ros1.bag --dst my_data_ros2 --dst-storage mcap
+
+rerun my_data_ros2/my_data_ros2.mcap
+```
+Please refer to the `rosbags` documentation for further information.
 
 ## Adding support for new types
 

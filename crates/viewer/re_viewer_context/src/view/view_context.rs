@@ -5,8 +5,8 @@ use re_sdk_types::blueprint::components::VisualizerInstructionId;
 use re_sdk_types::{AsComponents, ComponentBatch, ComponentDescriptor, ViewClassIdentifier};
 
 use super::VisualizerCollection;
-use crate::{DataQueryResult, DataResult, QueryContext, ViewId};
-use crate::{ViewerContext, blueprint_helpers::BlueprintContext as _};
+use crate::ViewerContext;
+use crate::{BlueprintContext, CommandSender, DataQueryResult, DataResult, QueryContext, ViewId};
 
 /// The context associated with a view.
 ///
@@ -28,33 +28,36 @@ pub struct ViewContext<'a> {
     pub query_result: &'a DataQueryResult,
 }
 
+impl BlueprintContext for ViewContext<'_> {
+    fn command_sender(&self) -> &CommandSender {
+        self.viewer_ctx.command_sender()
+    }
+
+    fn current_blueprint(&self) -> &re_entity_db::EntityDb {
+        self.viewer_ctx.current_blueprint()
+    }
+
+    fn default_blueprint(&self) -> Option<&re_entity_db::EntityDb> {
+        self.viewer_ctx.default_blueprint()
+    }
+
+    fn blueprint_query(&self) -> &LatestAtQuery {
+        self.viewer_ctx.blueprint_query()
+    }
+}
+
 impl<'a> ViewContext<'a> {
     #[inline]
     pub fn query_context(
         &'a self,
         data_result: &'a DataResult,
         query: LatestAtQuery,
-        instruction_id: VisualizerInstructionId,
+        instruction_id: impl Into<Option<VisualizerInstructionId>>,
     ) -> QueryContext<'a> {
         QueryContext {
             view_ctx: self,
             target_entity_path: &data_result.entity_path,
             instruction_id: instruction_id.into(),
-            archetype_name: None,
-            query,
-        }
-    }
-
-    #[inline]
-    pub fn query_context_without_visualizer(
-        &'a self,
-        data_result: &'a DataResult,
-        query: LatestAtQuery,
-    ) -> QueryContext<'a> {
-        QueryContext {
-            view_ctx: self,
-            target_entity_path: &data_result.entity_path,
-            instruction_id: None,
             archetype_name: None,
             query,
         }

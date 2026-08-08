@@ -16,7 +16,7 @@ use re_viewer_context::{
     VisualizerExecutionOutput, VisualizerQueryInfo, VisualizerSystem, typed_fallback_for,
 };
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct BarChartData {
     pub abscissa: datatypes::TensorData,
     pub widths: Vec<f32>,
@@ -30,7 +30,10 @@ pub struct BarChartVisualizerSystem;
 
 impl IdentifiedViewSystem for BarChartVisualizerSystem {
     fn identifier() -> re_viewer_context::ViewSystemIdentifier {
-        "BarChart".into()
+        re_viewer_context::external::re_string_interner::intern_static!(
+            re_viewer_context::ViewSystemIdentifier,
+            "BarChart"
+        )
     }
 }
 
@@ -93,11 +96,7 @@ impl VisualizerSystem for BarChartVisualizerSystem {
 
                 let widths = clamped_vec_or_else(widths, length as usize, || {
                     typed_fallback_for::<Length>(
-                        &ctx.query_context(
-                            data_result,
-                            view_query.latest_at_query(),
-                            instruction.id,
-                        ),
+                        results.query_context(),
                         BarChart::descriptor_widths().component,
                     )
                     .0

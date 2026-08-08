@@ -95,8 +95,11 @@ pub fn update_simulation(
     simulation
 }
 
+#[derive(re_byte_size::SizeBytes)]
 pub struct ForceLayoutProvider {
     // If all nodes are fixed, we can skip the simulation.
+    // `fjadra::Simulation` keeps its internals private; count layout inputs we own.
+    #[size_bytes(ignore)]
     simulation: Option<fj::Simulation>,
     pub request: LayoutRequest,
 }
@@ -217,6 +220,7 @@ impl ForceLayoutProvider {
             layout.entities.push((entity.clone(), current_rect));
 
             // Multiple edges can occupy the same space in the layout.
+            #[expect(clippy::iter_over_hash_type)] // Each slot writes to a distinct edge key.
             for Slot { kind, edges } in
                 slotted_edges(graph.edges.values().flat_map(|ts| ts.iter())).values()
             {

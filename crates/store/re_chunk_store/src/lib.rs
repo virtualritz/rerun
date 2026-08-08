@@ -1,3 +1,5 @@
+#![allow(clippy::iter_over_hash_type)]
+
 //! The Rerun chunk store, implemented on top of [Apache Arrow](https://arrow.apache.org/)
 //! using the [`arrow`] crate.
 //!
@@ -21,13 +23,14 @@ mod drop_time_range;
 pub mod entity_tree;
 mod events;
 mod gc;
-#[cfg(not(target_arch = "wasm32"))]
-mod lazy_rrd_store;
+mod lazy_store;
 mod lineage;
 mod missing_chunk_reporter;
+mod profile;
 mod properties;
 mod query;
 mod rebatch_videos;
+mod split_thick_thin;
 mod stats;
 mod store;
 mod store_schema;
@@ -59,7 +62,8 @@ pub use self::events::{
 pub use self::gc::{GarbageCollectionOptions, GarbageCollectionTarget};
 pub use self::lineage::{ChunkDirectLineage, ChunkDirectLineageReport};
 pub use self::missing_chunk_reporter::MissingChunkReporter;
-pub use self::properties::ExtractPropertiesError;
+pub use self::profile::OptimizationProfile;
+pub use self::properties::{ExtractPropertiesError, extract_properties_from_chunks};
 pub use self::query::QueryResults;
 pub use self::stats::{ChunkStoreChunkStats, ChunkStoreStats};
 pub use self::store::{
@@ -71,8 +75,7 @@ pub use self::subscribers::{
     ChunkStoreSubscriber, ChunkStoreSubscriberHandle, PerStoreChunkSubscriber,
 };
 
-#[cfg(not(target_arch = "wasm32"))]
-pub use self::lazy_rrd_store::LazyRrdStore;
+pub use self::lazy_store::LazyStore;
 
 pub(crate) use self::store::ColumnMetadataState;
 
@@ -93,6 +96,9 @@ pub enum ChunkStoreError {
     #[error("Failed to load data, parsing error: {0:#}")]
     Codec(#[from] re_log_encoding::CodecError),
 
+    #[error(transparent)]
+    Provider(#[from] re_log_encoding::ChunkProviderError),
+
     #[error("Failed to load data, semantic error: {0:#}")]
     Sorbet(#[from] re_sorbet::SorbetError),
 
@@ -103,18 +109,35 @@ pub enum ChunkStoreError {
         value: String,
         err: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[error("{0:#}")]
+    VideoRebatch(anyhow::Error),
 }
 
 pub type ChunkStoreResult<T> = ::std::result::Result<T, ChunkStoreError>;
 
 /// What to do when a virtual chunk is missing from the store.
+///
+/// The default for queries should be [`ChunkTrackingMode::Report`], which signals
+/// that the chunk should be downloaded/protected from GC. And similar chunks (same
+/// entity & components) should be prefetched.
+///
+/// When a query is driven by something short-lived, [`ChunkTrackingMode::ReportTransient`]
+/// should be used. That does download/protect the given chunk, but ignores similar chunks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChunkTrackingMode {
     /// Ignore missing & used chunks, and return partial results.
     Ignore,
 
     /// Remember the missing & used chunk ID in [`ChunkStore::take_tracked_chunk_ids`].
+    ///
+    /// This signals to the prefetcher that this, and similar chunks should be fetched.
     Report,
+
+    /// Like [`ChunkTrackingMode::Report`], but doesn't speculate by prefetching similar chunks.
+    ///
+    /// This should be used for short-lived things like queries on-hover ui.
+    ReportTransient,
 
     /// Panic when a chunk is missing.
     ///

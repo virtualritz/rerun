@@ -1,7 +1,5 @@
 //! Support crate for context menu and actions.
 
-#![warn(clippy::iter_over_hash_type)] //  TODO(#6198): enable everywhere
-
 use std::sync::OnceLock;
 
 use egui::Popup;
@@ -17,6 +15,12 @@ use re_viewport_blueprint::{ContainerBlueprint, ViewportBlueprint};
 mod actions;
 pub mod collapse_expand;
 mod sub_menu;
+mod visibility_actions;
+
+pub use visibility_actions::{
+    any_view_has_entity_visibility, entity_visibility_in_view, set_entity_visibility_in_all_views,
+    set_entity_visibility_in_view,
+};
 
 use actions::add_container::AddContainerAction;
 use actions::add_entities_to_new_view::AddEntitiesToNewViewAction;
@@ -26,6 +30,7 @@ use actions::collapse_expand_all::CollapseExpandAllAction;
 use actions::move_contents_to_new_container::MoveContentsToNewContainerAction;
 use actions::remove::RemoveAction;
 use actions::show_hide::{HideAction, ShowAction};
+use actions::show_hide_in_all_views::ShowHideInAllViewsAction;
 use actions::{CopyEntityPathToClipboard, TrackEntity};
 use re_ui::menu::menu_style;
 use sub_menu::SubMenu;
@@ -164,6 +169,8 @@ fn action_list(
             vec![
                 Box::new(ShowAction),
                 Box::new(HideAction),
+                Box::new(ShowHideInAllViewsAction::Show),
+                Box::new(ShowHideInAllViewsAction::Hide),
                 Box::new(RemoveAction),
                 Box::new(CopyEntityPathToClipboard),
                 Box::new(TrackEntity),
@@ -386,8 +393,10 @@ trait ContextMenuAction {
                 }
                 Item::Container(container_id) => self.process_container(ctx, container_id),
                 Item::RedapServer(origin) => self.process_redap_server(ctx, origin),
-                Item::RedapEntry(entry) => {
-                    self.process_redap_entry(ctx, &entry.entry_id);
+                Item::RedapEntry { kind, .. } => {
+                    if let Some(entry_id) = kind.entry_id() {
+                        self.process_redap_entry(ctx, &entry_id);
+                    }
                 }
             }
         }

@@ -25,8 +25,9 @@ Configuration for the 3D line grid.
 Configuration of debug drawing in the 3D view.
 
 * `target_frame`: The target reference frame for all transformations.
-* `show_axes`: Whether axes should be shown at the origin.
 * `show_bounding_box`: Whether the bounding box should be shown.
+* `show_axes`: Whether axes should be shown at the origin.
+* `axes`: Controls the orientation of the axes in a 3D view; it has no effect in a 2D view.
 ### `eye_controls`
 Configuration for the 3D eye
 
@@ -72,6 +73,7 @@ snippet: views/spatial3d
 * [`CoordinateFrame`](../archetypes/coordinate_frame.md)
 * [`Cylinders3D`](../archetypes/cylinders3d.md)
 * [`Ellipsoids3D`](../archetypes/ellipsoids3d.md)
+* [`GaussianSplats3D`](../archetypes/gaussian_splats3d.md)
 * [`GridMap`](../archetypes/grid_map.md)
 * [`InstancePoses3D`](../archetypes/instance_poses3d.md)
 * [`LineStrips3D`](../archetypes/line_strips3d.md)
@@ -81,10 +83,12 @@ snippet: views/spatial3d
 * [`Transform3D`](../archetypes/transform3d.md)
 * [`TransformAxes3D`](../archetypes/transform_axes3d.md)
 * [`ViewCoordinates`](../archetypes/view_coordinates.md)
+* [`VoxelGridMap`](../archetypes/voxel_grid_map.md)
 * [`Arrows2D`](../archetypes/arrows2d.md) (if logged under a projection)
 * [`AssetVideo`](../archetypes/asset_video.md) (if logged under a projection)
 * [`Boxes2D`](../archetypes/boxes2d.md) (if logged under a projection)
 * [`DepthImage`](../archetypes/depth_image.md) (if logged under a projection)
+* [`Ellipses2D`](../archetypes/ellipses2d.md) (if logged under a projection)
 * [`EncodedDepthImage`](../archetypes/encoded_depth_image.md) (if logged under a projection)
 * [`EncodedImage`](../archetypes/encoded_image.md) (if logged under a projection)
 * [`Image`](../archetypes/image.md) (if logged under a projection)

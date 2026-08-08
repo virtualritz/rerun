@@ -33,7 +33,7 @@ fn build_mesh_instances(
         .chunks_exact(model_mesh_instances.len())
         .enumerate()
         .flat_map(|(i, positions_and_colors)| {
-            model_mesh_instances.iter().zip(positions_and_colors).map(
+            std::iter::zip(model_mesh_instances, positions_and_colors).map(
                 move |(model_mesh_instances, (p, c))| GpuMeshInstance {
                     gpu_mesh: model_mesh_instances.gpu_mesh.clone(),
                     world_from_mesh: glam::Affine3A::from_scale_rotation_translation(
@@ -101,7 +101,7 @@ fn build_lines(re_ctx: &RenderContext, secs_since_startup: f32) -> anyhow::Resul
         batch
             .add_strip(lorenz_points.into_iter())
             .color(Color32::from_rgb(255, 191, 0))
-            .flags(LineStripFlags::FLAG_COLOR_GRADIENT)
+            .flags(LineStripFlags::STRIP_FLAG_COLOR_GRADIENT)
             .radius(Size::new_ui_points(1.0));
 
         // Green Zig-Zag arrow
@@ -118,9 +118,9 @@ fn build_lines(re_ctx: &RenderContext, secs_since_startup: f32) -> anyhow::Resul
             .color(Color32::GREEN)
             .radius(Size::new_scene_units(0.05))
             .flags(
-                LineStripFlags::FLAG_COLOR_GRADIENT
-                    | LineStripFlags::FLAG_CAP_END_TRIANGLE
-                    | LineStripFlags::FLAG_CAP_START_ROUND,
+                LineStripFlags::STRIP_FLAG_COLOR_GRADIENT
+                    | LineStripFlags::STRIP_FLAG_CAP_END_TRIANGLE
+                    | LineStripFlags::STRIP_FLAG_CAP_START_ROUND,
             );
     }
 
@@ -137,7 +137,7 @@ fn build_lines(re_ctx: &RenderContext, secs_since_startup: f32) -> anyhow::Resul
         }))
         .color(Color32::BLUE)
         .radius(Size::new_scene_units(0.1))
-        .flags(LineStripFlags::FLAG_CAP_END_TRIANGLE);
+        .flags(LineStripFlags::STRIP_FLAG_CAP_END_TRIANGLE);
 
     Ok(builder.into_draw_data()?)
 }
@@ -224,7 +224,11 @@ impl Multiview {
         draw_data: D,
         index: u32,
     ) -> anyhow::Result<(ViewBuilder, wgpu::CommandBuffer)> {
-        let mut view_builder = ViewBuilder::new(re_ctx, target_cfg)?;
+        let mut view_builder = ViewBuilder::new(
+            re_ctx,
+            target_cfg,
+            re_renderer::ViewBuilderId::new(index.into()),
+        )?;
 
         if self
             .take_screenshot_next_frame_for_view

@@ -21,7 +21,7 @@ pub fn run_native_app(
 
     let native_options = eframe_options(force_wgpu_backend);
 
-    let window_title = "Rerun Viewer";
+    let window_title = "Rerun";
     eframe::run_native(
         window_title,
         native_options,
@@ -34,19 +34,18 @@ pub fn run_native_app(
 
 pub fn eframe_options(force_wgpu_backend: Option<&str>) -> eframe::NativeOptions {
     re_tracing::profile_function!();
-    let os = egui::os::OperatingSystem::default();
     eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_app_id(APP_ID) // Controls where on disk the app state is persisted
-            .with_decorations(!re_ui::CUSTOM_WINDOW_DECORATIONS) // Maybe hide the OS-specific "chrome" around the window
-            .with_fullsize_content_view(re_ui::fullsize_content(os))
-            .with_icon(icon_data())
-            .with_inner_size([1600.0, 1200.0])
-            .with_min_inner_size([320.0, 450.0]) // Should be high enough to fit the rerun menu
-            .with_title_shown(!re_ui::fullsize_content(os))
-            .with_titlebar_buttons_shown(!re_ui::CUSTOM_WINDOW_DECORATIONS)
-            .with_titlebar_shown(!re_ui::fullsize_content(os))
-            .with_transparent(re_ui::CUSTOM_WINDOW_DECORATIONS), // To have rounded corners without decorations we need transparency
+        // The persisted `AppOptions::custom_window_decorations` isn't loaded yet, so we
+        // start from the session default. `App::sync_native_window_decorations` fixes up
+        // the difference on the first frame.
+        viewport: re_ui::viewport_with_window_chrome(
+            egui::ViewportBuilder::default()
+                .with_app_id(APP_ID) // Controls where on disk the app state is persisted
+                .with_icon(icon_data())
+                .with_inner_size([1600.0, 1200.0])
+                .with_min_inner_size([320.0, 450.0]), // Should be high enough to fit the rerun menu
+            re_ui::custom_window_decorations_default(),
+        ),
 
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: crate::wgpu_options(force_wgpu_backend),
@@ -60,28 +59,31 @@ pub fn eframe_options(force_wgpu_backend: Option<&str>) -> eframe::NativeOptions
 fn icon_data() -> egui::IconData {
     re_tracing::profile_function!();
 
-    cfg_if::cfg_if! {
-        if #[cfg(target_os = "macos")] {
+    cfg_select! {
+        target_os = "macos" => {
             let app_icon_png_bytes = include_bytes!("../data/app_icon_mac.png");
-        } else if #[cfg(target_os = "windows")] {
-            let app_icon_png_bytes = include_bytes!("../data/app_icon_windows.png");
-        } else {
-            // Use the same icon for X11 as for Windows, at least for now.
-            let app_icon_png_bytes = include_bytes!("../data/app_icon_windows.png");
         }
-    };
+        target_os = "windows" => {
+            let app_icon_png_bytes = include_bytes!("../data/app_icon.png");
+        }
+        _ => {
+            // Use the same icon for X11 as for Windows, at least for now.
+            let app_icon_png_bytes = include_bytes!("../data/app_icon.png");
+        }
+    }
 
     // We include the .png with `include_bytes`. If that fails, things are extremely broken.
     match eframe::icon_data::from_png_bytes(app_icon_png_bytes) {
         Ok(icon_data) => icon_data,
         Err(err) => {
-            #[cfg(debug_assertions)]
-            panic!("Failed to load app icon: {err}");
-
-            #[cfg(not(debug_assertions))]
-            {
-                re_log::warn!("Failed to load app icon: {err}");
-                Default::default()
+            cfg_select! {
+                debug_assertions => {
+                    panic!("Failed to load app icon: {err}");
+                }
+                _ => {
+                    re_log::warn!("Failed to load app icon: {err}");
+                    Default::default()
+                }
             }
         }
     }

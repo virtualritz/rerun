@@ -3,8 +3,6 @@
 //! The only entry point is [`create_component_ui_registry`], which registers all editors in the component UI registry.
 //! This should be called by `re_viewer` on startup.
 
-#![warn(clippy::iter_over_hash_type)] //  TODO(#6198): enable everywhere
-
 mod color;
 pub mod color_swatch;
 mod datatype_uis;
@@ -35,10 +33,11 @@ mod zoom_level;
 use datatype_uis::{
     edit_bool, edit_f32_min_to_max_float, edit_f32_zero_to_max, edit_f32_zero_to_one,
     edit_f64_min_to_max_float, edit_f64_zero_to_max, edit_multiline_string, edit_or_view_vec2d,
-    edit_or_view_vec3d, edit_or_view_vec3d_positive, edit_singleline_string, edit_u64_range,
-    edit_ui_points, edit_view_enum, edit_view_enum_with_variant_available, edit_view_range1d,
-    view_timestamp, view_uuid, view_view_id,
+    edit_or_view_vec3d, edit_or_view_vec3d_positive, edit_singleline_string, edit_u32_range,
+    edit_u64_range, edit_ui_points, edit_view_enum, edit_view_enum_with_variant_available,
+    edit_view_range1d, view_timestamp, view_uuid, view_view_id,
 };
+use re_sdk_types::ColormapSelection;
 use re_sdk_types::blueprint::components::{
     AngularSpeed, BackgroundKind, Corner2D, Enabled, Eye3DKind, ForceDistance, ForceIterations,
     ForceStrength, GridSpacing, LinkAxis, LockRangeDuringZoom, MapProvider, NearClipPlane,
@@ -46,12 +45,14 @@ use re_sdk_types::blueprint::components::{
 };
 use re_sdk_types::components::{
     AggregationPolicy, AlbedoFactor, AxisLength, Color, DepthMeter, DrawOrder, FillMode, FillRatio,
-    GammaCorrection, GraphType, HalfSize3D, ImagePlaneDistance, InterpolationMode, Length,
-    LinearSpeed, MagnificationFilter, MarkerSize, MeshFaceRendering, Name, Opacity, Position2D,
-    Position3D, Range1D, Scale3D, ShowLabels, StrokeWidth, Text, Timestamp, TransformRelation,
-    Translation3D, ValueRange, Vector3D, VideoCodec, Visible,
+    GammaCorrection, GraphType, HalfSize3D, ImagePlaneDistance, InterpolationMode, IsKeyframe,
+    Length, LinearSpeed, MagnificationFilter, MarkerSize, MeshFaceRendering, Name, Opacity,
+    PointShading, Position2D, Position3D, Range1D, Scale3D, ShowLabels, SphericalHarmonicsDegree,
+    StrokeWidth, Text, Timestamp, TransformRelation, Translation3D, ValueRange, Vector3D,
+    VideoCodec, Visible,
 };
-use re_viewer_context::gpu_bridge::colormap_edit_or_view_ui;
+use re_sdk_types::{archetypes, components};
+use re_viewer_context::gpu_bridge::colormap_edit_or_view_ui_with_selection;
 
 /// Default number of ui points to show a number.
 const DEFAULT_NUMBER_WIDTH: f32 = 52.0;
@@ -106,12 +107,25 @@ pub fn create_component_ui_registry() -> re_viewer_context::ComponentUiRegistry 
     registry.add_singleline_edit_or_view::<ForceIterations>(|ctx, ui, value| {
         edit_u64_range(ctx, ui, value, 1..=5)
     });
+    registry.add_singleline_edit_or_view::<SphericalHarmonicsDegree>(|ctx, ui, value| {
+        edit_u32_range(ctx, ui, value, 0..=SphericalHarmonicsDegree::MAX)
+    });
 
     // Bool components:
     registry.add_singleline_edit_or_view::<Enabled>(edit_bool);
     registry.add_singleline_edit_or_view::<LockRangeDuringZoom>(edit_bool);
     registry.add_singleline_edit_or_view::<ShowLabels>(edit_bool);
     registry.add_singleline_edit_or_view::<Visible>(edit_bool);
+
+    // `IsKeyframe` is logged data with no blueprint override path, so force
+    // read-only: any edit here would have nowhere to flow.
+    registry.add_singleline_edit_or_view::<IsKeyframe>(|ctx, ui, value| {
+        edit_bool(
+            ctx,
+            ui,
+            &mut re_viewer_context::MaybeMutRef::Ref(value.as_ref()),
+        )
+    });
 
     // Date components:
     registry.add_singleline_edit_or_view::<Timestamp>(view_timestamp);
@@ -134,6 +148,7 @@ pub fn create_component_ui_registry() -> re_viewer_context::ComponentUiRegistry 
     registry.add_singleline_edit_or_view::<GraphType>(edit_view_enum);
     registry.add_singleline_edit_or_view::<InterpolationMode>(edit_view_enum);
     registry.add_singleline_edit_or_view::<LinkAxis>(edit_view_enum);
+    registry.add_singleline_edit_or_view::<PointShading>(edit_view_enum);
     registry.add_singleline_edit_or_view::<MapProvider>(
         edit_view_enum_with_variant_available::<
             MapProvider,
@@ -182,7 +197,16 @@ pub fn create_component_ui_registry() -> re_viewer_context::ComponentUiRegistry 
     registry.add_singleline_edit_or_view(time_range::time_range_singleline_view_ui);
 
     // `Colormap` _is_ an enum, but its custom editor is far better.
-    registry.add_singleline_edit_or_view(colormap_edit_or_view_ui);
+    registry.add_singleline_edit_or_view::<components::Colormap>(|ctx, ui, map| {
+        colormap_edit_or_view_ui_with_selection(ctx, ui, map, ColormapSelection::Standard)
+    });
+    // Include the grid map colormap category iff we have a `GridMap:colormap` component identifier.
+    registry.add_singleline_edit_or_view_for_component::<components::Colormap>(
+        archetypes::GridMap::descriptor_colormap().component,
+        |ctx, ui, _component_descriptor, map| {
+            colormap_edit_or_view_ui_with_selection(ctx, ui, map, ColormapSelection::IncludeGridMap)
+        },
+    );
 
     registry.add_multiline_edit_or_view(visual_bounds2d::multiline_edit_visual_bounds2d);
     registry.add_singleline_edit_or_view(visual_bounds2d::singleline_edit_visual_bounds2d);
@@ -192,7 +216,10 @@ pub fn create_component_ui_registry() -> re_viewer_context::ComponentUiRegistry 
 
     registry.add_singleline_edit_or_view(image_format::edit_or_view_image_format);
     registry.add_singleline_edit_or_view(resolution::edit_or_view_resolution);
-    registry.add_singleline_edit_or_view(view_coordinates::edit_or_view_view_coordinates);
+
+    registry
+        .add_singleline_edit_or_view(view_coordinates::singleline_edit_or_view_view_coordinates);
+    registry.add_multiline_edit_or_view(view_coordinates::multiline_edit_or_view_view_coordinates);
 
     registry.add_singleline_edit_or_view(radius::edit_radius_ui);
     registry.add_singleline_edit_or_view(marker_shape::edit_marker_shape_ui);

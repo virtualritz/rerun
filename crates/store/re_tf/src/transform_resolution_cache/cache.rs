@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use ahash::HashMap;
 use parking_lot::{ArcRwLockReadGuard, RawRwLock, RwLock};
-use re_byte_size::SizeBytes;
+use re_byte_size::SizeBytes as _;
 use re_chunk_store::ChunkStore;
 use re_entity_db::EntityDb;
 use re_log::{debug_assert, debug_assert_eq};
@@ -12,9 +12,14 @@ use re_sdk_types::archetypes;
 
 use crate::frame_id_registry::FrameIdRegistry;
 use crate::transform_aspect::TransformAspect;
+use crate::transform_queries::{
+    atomic_component_set_for_instance_poses, atomic_component_set_for_pinhole_projection,
+    atomic_component_set_for_tree_transforms,
+};
+use crate::transform_resolution_cache::iter_relevant_rows_in_chunk;
 
 use super::cached_transforms_for_timeline::CachedTransformsForTimeline;
-use super::iter_child_frames_in_chunk;
+use super::iter_relevant_rows_in_chunk_with_child_frames;
 
 type ArcRwLock<T> = Arc<RwLock<T>>;
 
@@ -31,6 +36,7 @@ type ArcRwLock<T> = Arc<RwLock<T>>;
 /// * [`archetypes::InstancePoses3D`]
 ///   Instance poses that should be applied to the tree transforms (via [`crate::TransformForest`]) but not propagate.
 ///   Also unlike tree transforms, these are not associated with transform frames but rather with entity paths.
+#[derive(re_byte_size::SizeBytes)]
 pub struct TransformResolutionCache {
     /// The frame id registry is co-located in the resolution cache for convenience:
     /// the resolution cache is often the lowest level of transform access and
@@ -92,22 +98,6 @@ impl TransformResolutionCache {
     }
 }
 
-impl SizeBytes for TransformResolutionCache {
-    fn heap_size_bytes(&self) -> u64 {
-        re_tracing::profile_function!();
-
-        let Self {
-            frame_id_registry,
-            per_timeline,
-            static_timeline,
-        } = self;
-
-        frame_id_registry.heap_size_bytes()
-            + per_timeline.heap_size_bytes()
-            + static_timeline.heap_size_bytes()
-    }
-}
-
 impl re_byte_size::MemUsageTreeCapture for TransformResolutionCache {
     fn capture_mem_usage_tree(&self) -> re_byte_size::MemUsageTree {
         re_tracing::profile_function!();
@@ -142,12 +132,17 @@ impl TransformResolutionCache {
     }
 
     /// Accesses the transform component tracking data for a given timeline.
+    ///
+    /// A `None` timeline (a static-only query) yields the static transforms.
     #[inline]
     pub fn transforms_for_timeline(
         &self,
-        timeline: TimelineName,
+        timeline: impl Into<Option<TimelineName>>,
     ) -> ArcRwLockReadGuard<RawRwLock, CachedTransformsForTimeline> {
-        if let Some(per_timeline) = self.per_timeline.get(&timeline) {
+        if let Some(per_timeline) = timeline
+            .into()
+            .and_then(|timeline| self.per_timeline.get(&timeline))
+        {
             per_timeline.read_arc()
         } else {
             self.static_timeline.read_arc()
@@ -194,7 +189,7 @@ impl TransformResolutionCache {
     ///
     /// This will internally…
     /// * keep track of which child frames are influenced by which entity
-    /// * create empty entries for where transforms may change over time (may happen conservatively - creating more entries than needed)
+    /// * create empty entries for where transforms may change over time
     ///     * this may invalidate previous entries at the same position
     /// * remove cached entries if chunks were GC'ed
     pub fn process_store_events<'a>(
@@ -206,20 +201,23 @@ impl TransformResolutionCache {
         for event in events {
             match &**event {
                 re_chunk_store::ChunkStoreDiff::Addition(addition) => {
-                    let delta_chunk = addition.delta_chunk();
-
                     // Since entity paths lead to implicit frames, we have to prime our lookup table
                     // with them even if this chunk doesn't have transform data.
+                    // Note that here we can use the delta chunk, since we're only interested in newly added entity paths & transform ids.
                     self.frame_id_registry
                         .write()
-                        .register_all_frames_in_chunk(delta_chunk);
+                        .register_all_frames_in_chunk(addition.delta_chunk());
 
-                    let aspects = TransformAspect::transform_aspects_of(delta_chunk);
+                    // We always keep track of the latest physical chunks.
+                    // By overriding with the latest chunk after processing we never leave references to virtual chunks.
+                    let chunk = &addition.chunk_after_processing;
+
+                    let aspects = TransformAspect::transform_aspects_of(chunk);
                     if !aspects.is_empty() {
-                        if delta_chunk.is_static() {
-                            self.add_static_chunk(delta_chunk, aspects);
+                        if chunk.is_static() {
+                            self.add_static_chunk(chunk, aspects);
                         } else {
-                            self.add_temporal_chunk(delta_chunk, aspects);
+                            self.add_temporal_chunk(chunk, aspects);
                         }
                     }
                 }
@@ -271,6 +269,7 @@ impl TransformResolutionCache {
 
             per_timeline.add_temporal_chunk(
                 chunk,
+                chunk.id(),
                 aspects,
                 *timeline,
                 &static_timeline,
@@ -285,7 +284,7 @@ impl TransformResolutionCache {
         debug_assert!(chunk.is_static());
 
         let entity_path = chunk.entity_path();
-        let place_holder_timeline = TimelineName::new("ignored for static chunk");
+        let place_holder_timeline = TimelineName::from("ignored for static chunk");
 
         let transform_child_frame_component =
             archetypes::Transform3D::descriptor_child_frame().component;
@@ -297,10 +296,11 @@ impl TransformResolutionCache {
         // Add a static transform invalidation to affected child frames on ALL timelines.
 
         if aspects.contains(TransformAspect::Frame) {
-            for (time, frame) in iter_child_frames_in_chunk(
+            for ((time, row_id), frame) in iter_relevant_rows_in_chunk_with_child_frames(
                 chunk,
                 place_holder_timeline,
                 transform_child_frame_component,
+                atomic_component_set_for_tree_transforms(),
             ) {
                 debug_assert_eq!(time, TimeInt::STATIC);
 
@@ -309,7 +309,7 @@ impl TransformResolutionCache {
                     frame,
                     &frame_id_registry,
                 );
-                frame_transforms.invalidate_transform_at(TimeInt::STATIC);
+                frame_transforms.invalidate_transform_at(TimeInt::STATIC, chunk.id(), row_id);
 
                 #[cfg_attr(not(debug_assertions), expect(clippy::for_kv_map))]
                 for (_timeline, per_timeline) in &mut self.per_timeline {
@@ -321,7 +321,7 @@ impl TransformResolutionCache {
                         frame,
                         &frame_id_registry,
                     );
-                    transforms.invalidate_transform_at(TimeInt::STATIC);
+                    transforms.invalidate_transform_at(TimeInt::STATIC, chunk.id(), row_id);
 
                     // Entry might have been newly created. Have to ensure that its associated with the right timeline.
                     #[cfg(debug_assertions)]
@@ -334,20 +334,36 @@ impl TransformResolutionCache {
         if aspects.contains(TransformAspect::Pose) {
             let frame_transforms =
                 static_timeline.get_or_create_pose_transforms_static(entity_path);
-            frame_transforms.invalidate_at(TimeInt::STATIC);
+
+            for (time, row_id) in iter_relevant_rows_in_chunk(
+                chunk,
+                place_holder_timeline,
+                atomic_component_set_for_instance_poses(),
+            ) {
+                debug_assert_eq!(time, TimeInt::STATIC);
+                frame_transforms.invalidate_at(time, chunk.id(), row_id);
+            }
 
             for per_timeline in self.per_timeline.values_mut() {
-                per_timeline
-                    .write()
-                    .get_or_create_pose_transforms_temporal(entity_path, &static_timeline)
-                    .invalidate_at(TimeInt::STATIC);
+                for (time, row_id) in iter_relevant_rows_in_chunk(
+                    chunk,
+                    place_holder_timeline,
+                    atomic_component_set_for_instance_poses(),
+                ) {
+                    debug_assert_eq!(time, TimeInt::STATIC);
+                    per_timeline
+                        .write()
+                        .get_or_create_pose_transforms_temporal(entity_path, &static_timeline)
+                        .invalidate_at(time, chunk.id(), row_id);
+                }
             }
         }
-        if aspects.contains(TransformAspect::PinholeOrViewCoordinates) {
-            for (time, frame) in iter_child_frames_in_chunk(
+        if aspects.contains(TransformAspect::Pinhole) {
+            for ((time, row_id), frame) in iter_relevant_rows_in_chunk_with_child_frames(
                 chunk,
                 place_holder_timeline,
                 pinhole_child_frame_component,
+                atomic_component_set_for_pinhole_projection(),
             ) {
                 debug_assert_eq!(time, TimeInt::STATIC);
 
@@ -356,7 +372,11 @@ impl TransformResolutionCache {
                     frame,
                     &frame_id_registry,
                 );
-                frame_transforms.invalidate_pinhole_projection_at(TimeInt::STATIC);
+                frame_transforms.invalidate_pinhole_projection_at(
+                    TimeInt::STATIC,
+                    chunk.id(),
+                    row_id,
+                );
 
                 #[cfg_attr(not(debug_assertions), expect(clippy::for_kv_map))]
                 for (_timeline, per_timeline) in &mut self.per_timeline {
@@ -368,7 +388,11 @@ impl TransformResolutionCache {
                         frame,
                         &frame_id_registry,
                     );
-                    transforms.invalidate_pinhole_projection_at(TimeInt::STATIC);
+                    transforms.invalidate_pinhole_projection_at(
+                        TimeInt::STATIC,
+                        chunk.id(),
+                        row_id,
+                    );
 
                     // Entry might have been newly created. Have to ensure that its associated with the right timeline.
                     #[cfg(debug_assertions)]

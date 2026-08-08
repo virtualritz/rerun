@@ -5,13 +5,19 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
 use datafusion::error::Result as DataFusionResult;
+use datafusion::logical_expr::TableProviderFilterPushDown;
+use datafusion::prelude::Expr;
 use re_log_types::EntryId;
+use re_protos::cloud::v1alpha1::ext::ScanSegmentTableDataframe;
 use re_protos::cloud::v1alpha1::{ScanSegmentTableRequest, ScanSegmentTableResponse};
 use re_protos::headers::RerunHeadersInjectorExt as _;
 use re_redap_client::{ApiError, ApiResult, ConnectionClient};
 use tracing::instrument;
 
-use crate::grpc_streaming_provider::{GrpcStreamProvider, GrpcStreamToTable};
+use crate::grpc_streaming_provider::{GrpcStreamProvider, GrpcStreamToTable, ScanParams};
+use crate::pushdown_expressions::{
+    classify_segment_id_filters_for_pushdown, segment_id_filter_from_filters,
+};
 use crate::wasm_compat::make_future_send;
 
 //TODO(ab): deduplicate from DatasetManifestProvider
@@ -19,6 +25,10 @@ use crate::wasm_compat::make_future_send;
 pub struct SegmentTableProvider {
     client: ConnectionClient,
     dataset_id: EntryId,
+
+    /// Captured at construction so DataFusion-spawned execution tasks can re-attach
+    /// the caller's tracing span — otherwise gRPC spans below surface as root traces.
+    parent_span: tracing::Span,
 }
 
 impl std::fmt::Debug for SegmentTableProvider {
@@ -31,7 +41,11 @@ impl std::fmt::Debug for SegmentTableProvider {
 
 impl SegmentTableProvider {
     pub fn new(client: ConnectionClient, dataset_id: EntryId) -> Self {
-        Self { client, dataset_id }
+        Self {
+            client,
+            dataset_id,
+            parent_span: tracing::Span::current(),
+        }
     }
 
     /// This is a convenience function
@@ -44,7 +58,7 @@ impl SegmentTableProvider {
 impl GrpcStreamToTable for SegmentTableProvider {
     type GrpcStreamData = ScanSegmentTableResponse;
 
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self), err, parent = &self.parent_span)]
     async fn fetch_schema(&mut self) -> ApiResult<SchemaRef> {
         let mut client = self.client.clone();
         let dataset_id = self.dataset_id;
@@ -57,15 +71,25 @@ impl GrpcStreamToTable for SegmentTableProvider {
 
     // TODO(ab): what `GrpcStreamToTable` attempts to simplify should probably be handled by
     // `ConnectionClient`
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self, params), err, parent = &self.parent_span)]
     async fn send_streaming_request(
         &mut self,
+        params: &ScanParams,
     ) -> ApiResult<re_redap_client::ApiResponseStream<Self::GrpcStreamData>> {
+        let segment_id_filter = segment_id_filter_from_filters(
+            &params.filters,
+            ScanSegmentTableDataframe::COLUMN_RERUN_SEGMENT_ID_NAME,
+        );
+
         let request = tonic::Request::new(ScanSegmentTableRequest {
-            columns: vec![], // all of them
+            columns: params
+                .projected_columns
+                .as_deref()
+                .unwrap_or_default()
+                .to_vec(),
+            segment_id_filter,
         })
-        .with_entry_id(self.dataset_id)
-        .map_err(|err| ApiError::tonic(err, "failed building /ScanSegmentTable request"))?;
+        .with_entry_id(self.dataset_id);
 
         let mut client = self.client.clone();
 
@@ -84,7 +108,21 @@ impl GrpcStreamToTable for SegmentTableProvider {
         ))
     }
 
-    fn process_response(&mut self, response: Self::GrpcStreamData) -> ApiResult<RecordBatch> {
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        Ok(classify_segment_id_filters_for_pushdown(
+            filters,
+            ScanSegmentTableDataframe::COLUMN_RERUN_SEGMENT_ID_NAME,
+        ))
+    }
+
+    fn process_response(
+        &mut self,
+        response: Self::GrpcStreamData,
+        _params: &ScanParams,
+    ) -> ApiResult<RecordBatch> {
         response
             .data
             .ok_or_else(|| {

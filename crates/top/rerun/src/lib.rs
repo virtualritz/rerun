@@ -1,3 +1,5 @@
+#![allow(clippy::iter_over_hash_type)]
+
 //! # Rerun - Visualize streams of multimodal data.
 //!
 //! Add the `rerun` library to your crate with `cargo add rerun`.
@@ -192,6 +194,9 @@ pub mod external {
     #[cfg(feature = "native_viewer")]
     pub use re_viewer;
     #[cfg(feature = "native_viewer")]
+    // Work around for a nightly rust ICE
+    // TODO(isse): Remove once https://github.com/rust-lang/rust/issues/158686 is fixed.
+    #[doc(no_inline)]
     pub use re_viewer::external::*;
     pub use {
         ::re_arrow_util, ::re_build_info, ::re_entity_db, ::re_error, ::re_format, anyhow, arrow,

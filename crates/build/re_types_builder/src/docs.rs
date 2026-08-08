@@ -1,7 +1,7 @@
 use crate::codegen::Target;
 use crate::{Objects, Reporter};
 
-/// A high-level representation of the contents of a flatbuffer docstring.
+/// A high-level representation of the contents of a docstring.
 #[derive(Debug, Clone, Default)]
 pub struct Docs {
     /// All documentation lines, including the leading tag, if any.
@@ -15,20 +15,6 @@ pub struct Docs {
 }
 
 impl Docs {
-    pub fn from_raw_docs(
-        reporter: &Reporter,
-        virtpath: &str,
-        fqname: &str,
-        docs: Option<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<&'_ str>>>,
-    ) -> Self {
-        Self::from_lines(
-            reporter,
-            virtpath,
-            fqname,
-            docs.into_iter().flat_map(|doc| doc.into_iter()),
-        )
-    }
-
     pub fn from_lines<'a>(
         reporter: &Reporter,
         virtpath: &str,
@@ -46,6 +32,21 @@ impl Docs {
         }
 
         Self { lines }
+    }
+
+    /// The docstring as it was written: the text following each `///`, leading space included.
+    ///
+    /// The inverse of [`Self::from_lines`].
+    pub fn to_lines(&self) -> Vec<String> {
+        self.lines
+            .iter()
+            .map(|(tag, comment)| match (tag.as_str(), comment.as_str()) {
+                ("", "") => String::new(),
+                ("", comment) => format!(" {comment}"),
+                (tag, "") => format!(" \\{tag}"),
+                (tag, comment) => format!(" \\{tag} {comment}"),
+            })
+            .collect()
     }
 
     /// Get the first line of the documentation untagged.
@@ -371,7 +372,7 @@ mod doclink_translation {
             }
 
             scope = object.scope().unwrap_or_default();
-            is_unreleased = object.is_attr_set(crate::ATTR_DOCS_UNRELEASED);
+            is_unreleased = object.is_attr_set(crate::DocsAttr::Unreleased);
 
             if let Some(deprecation_summary) = object.deprecation_summary() {
                 return Err(format!(

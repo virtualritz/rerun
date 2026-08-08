@@ -15,7 +15,7 @@ const MAX_UNDOS: usize = 100;
 ///
 /// When undoing, we move back time, and redoing move it forward.
 /// When editing, we first drop all data after the current time.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, re_byte_size::SizeBytes)]
 pub struct BlueprintUndoState {
     /// The current blueprint time, used for latest-at.
     ///
@@ -38,16 +38,6 @@ pub struct BlueprintUndoState {
     /// and is used in debug builds to detect bugs
     /// where we create undo-points every frame.
     inflection_points: BTreeMap<TimeInt, u64>,
-}
-
-impl re_byte_size::SizeBytes for BlueprintUndoState {
-    fn heap_size_bytes(&self) -> u64 {
-        let Self {
-            current_time: _,
-            inflection_points,
-        } = self;
-        inflection_points.heap_size_bytes()
-    }
 }
 
 // We don't restore undo-state when closing the viewer.
@@ -285,7 +275,8 @@ mod tests {
                 time: Some(10.0 + i as f64),
                 ..Default::default()
             };
-            let _out = ctx.run_ui(input, |_| {});
+            let mut output = ctx.run_ui(input, |_| {});
+            output.textures_delta.clear();
         }
     }
 
@@ -297,7 +288,8 @@ mod tests {
             time: Some(100.0 + frame_nr as f64),
             ..Default::default()
         };
-        let _out = ctx.run_ui(input, |_| {});
+        let mut output = ctx.run_ui(input, |_| {});
+        output.textures_delta.clear();
         undo.update(ctx, db);
     }
 

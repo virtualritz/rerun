@@ -14,13 +14,17 @@ use re_log_types::{LogMsg, StoreId, StoreKind, TimeInt, TimeType, Timeline, enti
 const PROTOBUF_COMPRESSED: EncodingOptions = EncodingOptions::PROTOBUF_COMPRESSED;
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use itertools::Itertools as _;
 
-#[cfg(not(debug_assertions))]
-const NUM_POINTS: usize = 10_000;
-
-// `cargo test` also runs the benchmark setup code, so make sure they run quickly:
-#[cfg(debug_assertions)]
-const NUM_POINTS: usize = 1;
+cfg_select! {
+    debug_assertions => {
+        // `cargo test` also runs the benchmark setup code, so make sure they run quickly:
+        const NUM_POINTS: usize = 1;
+    }
+    _ => {
+        const NUM_POINTS: usize = 10_000;
+    }
+}
 
 criterion_group!(
     benches,
@@ -48,7 +52,7 @@ fn encode_log_msgs(
 
 fn decode_log_msgs(mut bytes: &[u8]) -> Vec<LogMsg> {
     let messages = re_log_encoding::DecoderApp::decode_lazy(&mut bytes)
-        .collect::<Result<Vec<LogMsg>, _>>()
+        .try_collect()
         .unwrap();
     assert!(bytes.is_empty());
     messages

@@ -1,9 +1,14 @@
-use crate::{PixelFormat, decode::async_decoder_wrapper::SyncDecoder};
+use crate::{DecodedFrameContent, PixelFormat};
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::decode::sync_decoder_wrapper::SyncDecoder;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub struct SyncImageDecoder {
     image_format: image::ImageFormat,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl SyncImageDecoder {
     pub fn try_new(descr: &crate::VideoDataDescription) -> Option<Self> {
         Some(Self {
@@ -16,6 +21,7 @@ impl SyncImageDecoder {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl SyncDecoder for SyncImageDecoder {
     // TODO(isse): We could potentially cache decoded blobs, but that's missing some things:
     // - A way to purge the cache, i.e have a purge function on video decoders that gets called from `VideoStreamCache`?
@@ -37,7 +43,7 @@ impl SyncDecoder for SyncImageDecoder {
 
         reader.set_format(self.image_format);
 
-        let content = match decode_to_frame_content(reader) {
+        let content = match decode_to_decoded_frame_content(reader) {
             Ok(content) => content,
             Err(err) => {
                 let _send_error = output_sender.send(crate::FrameResult::Err(err));
@@ -65,13 +71,14 @@ impl SyncDecoder for SyncImageDecoder {
     }
 }
 
-fn decode_to_frame_content(
+pub(crate) fn decode_to_decoded_frame_content(
     reader: image::ImageReader<std::io::Cursor<Vec<u8>>>,
-) -> Result<crate::FrameContent, crate::DecodeError> {
+) -> Result<DecodedFrameContent, crate::DecodeError> {
     let dynamic_image = reader
         .decode()
         .map_err(|err| crate::DecodeError::ImageDecoder(err.to_string()))?;
 
+    // RGB -> RGBA padding happens at a later stage.
     let converted_rgb;
     let converted_rgba;
     let (data, (width, height), format): (&[u8], (u32, u32), PixelFormat) = match &dynamic_image {
@@ -122,7 +129,7 @@ fn decode_to_frame_content(
         }
     };
 
-    Ok(crate::FrameContent {
+    Ok(DecodedFrameContent {
         data: data.to_owned(),
         width,
         height,

@@ -1,10 +1,9 @@
 //! This crates implements the Redap browser feature, including the communication and UI aspects of
 //! it.
 
-#![warn(clippy::iter_over_hash_type)] //  TODO(#6198): enable everywhere
-
 mod context;
 mod entries;
+mod folder_card_ui;
 mod server_modal;
 mod servers;
 

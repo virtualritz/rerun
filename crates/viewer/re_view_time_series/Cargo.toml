@@ -19,6 +19,7 @@ workspace = true
 all-features = true
 
 [dependencies]
+re_byte_size = { workspace = true, features = ["egui"] }
 re_chunk_store.workspace = true
 re_component_ui.workspace = true
 re_format.workspace = true
@@ -34,9 +35,12 @@ re_view.workspace = true
 re_viewer_context.workspace = true
 re_viewport_blueprint.workspace = true
 
+ahash.workspace = true
 arrayvec.workspace = true
 egui_plot.workspace = true
 egui.workspace = true
+glam.workspace = true
+macaw.workspace = true
 itertools.workspace = true
 nohash-hasher.workspace = true
 rayon.workspace = true
@@ -44,6 +48,7 @@ smallvec.workspace = true
 vec1.workspace = true
 
 [dev-dependencies]
+re_chunk.workspace = true
 re_chunk_store.workspace = true
 re_test_context.workspace = true
 re_test_viewport.workspace = true

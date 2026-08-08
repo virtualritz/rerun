@@ -53,7 +53,6 @@ exclude_path = [
   ".pixi",
   "build",
   "docs/python/",
-  "landing",
   "rerun_cpp/_deps",
   "rerun_cpp/docs/html",
   "rerun_cpp/docs/xml",
@@ -76,7 +75,9 @@ exclude_path = [
   "crates/store/re_uri/src/redap_uri.rs", # Same as above.
   "crates/store/re_grpc_server/src/lib.rs", # Contains CORS tests with fake origin URLs
   "crates/utils/re_analytics/src/event.rs", # Contains test with malformed urls
+  "crates/utils/re_perf_telemetry/src/telemetry.rs", # Contains `parse_rerun_endpoint` docs/tests with fake `rerun://host…` URLs
   "crates/viewer/re_viewer/src/reflection/mod.rs", # Checker struggles how links from examples are escaped here. They are all checked elsewhere, so not an issue.
+  "docs/content/changelog/upcoming", # Transient per-PR changeset entries; their relative links resolve from changelog/ once merged at release, and the merged changeset is link-checked then.
   "docs/snippets/INDEX.md", # The snippet index is guaranteed should be correct by design.
   "scripts/lint.py", # Contains url-matching regexes that aren't actual urls
   "scripts/screenshot_compare/assets/templates/",
@@ -90,6 +91,7 @@ exclude = [
   # Strings with replacements.
   '/__VIEWER_VERSION__/', # Replacement variable __VIEWER_VERSION__.
   '/\$', # Replacement variable $.
+  '\$$', # URL ending in `$`: stripped template variable (e.g. `${{ inputs.X }}`).
   '/GIT_HASH/', # Replacement variable GIT_HASH.
   '\{\}', # Ignore links with string interpolation.
   '\$relpath\^', # Relative paths as used by rerun_cpp's doc header.
@@ -101,8 +103,9 @@ exclude = [
 
   # Local links that require further setup.
   '/examples', # Relative link to our examples gallery.
-  'http://0.0.0.0:51234',
+  'http://0.0.0.0',
   'http://127.0.0.1',
+  'http://127.0.0.2',
   'http://localhost',
   're_viewer.js', # Build artifact that html is linking to.
   'recording:/', # rrd recording link.
@@ -122,20 +125,23 @@ exclude = [
   'https://github.com/rerun-io/rerun/issues/\.*', # Ignore links to our own issues.
 
   # Intentionally faked links.
+  'file:///does/not/exist.rrd',
+  'file:///path/to/file',
+  'file:///tmp/droidnano/Fri_Aug_18_09:46:43_2023.rrd',
+  'file://cors.json', # AWS CLI `--cors-configuration file://…` syntax in BUCKET_CORS.md, not a real link.
   'file://foo',
+  'file://path/to/file.rrd',
+  'file://somehost/file/path.rrd',
   'http://foo.*',
+  'http://x/',
+  'https://x/',
   'https://foo.*',
   'https://link.to',
   'https://rerun.rs',
   'https://static.rerun.io/my_screenshot/',
-  'https://your-hosted-asset-url.com/widget.js',
   'https://your-hosted-asset-url.com/re_viewer_bg.wasm',
-  'file:///path/to/file',
+  'https://your-hosted-asset-url.com/widget.js',
   'rerun://localhost:51234/recording/some-recording-id',
-  'file:///does/not/exist.rrd',
-  'file://path/to/file.rrd',
-  'file://somehost/file/path.rrd',
-  'file:///tmp/droidnano/Fri_Aug_18_09:46:43_2023.rrd',
 
   'https://customer.cloud.rerun.io/.*',
   'https://redap.rerun.io',
@@ -145,11 +151,14 @@ exclude = [
   'http(s)?://example.com/.*',
   'file:///uri1.rrd',
   'file:///uri2.rrd',
+  'file:///recordings/data.rrd', # Example URL in the url-pill tests.
 
   # Link fragments and data links in examples.
   'https://raw.githubusercontent.com/googlefonts/noto-emoji/', # URL fragment.
   'https://static.rerun.io/rgbd_dataset', # Base data link for rgbd dataset.
   'https://storage.googleapis.com/', # Storage API entrypoint, not a link.
+  'https://ref\.rerun\.io/prose/?$', # GCS bucket prefix, no directory index.
+  'https://build\.rerun\.io/mirror/mozilla/sccache/?$', # GCS bucket prefix, no directory index.
 
   # Not accessible from CI.
   '.github/workflows/.*.yml', # GitHub action workflows cause issues on CI.
@@ -157,6 +166,7 @@ exclude = [
   'https://claude.site/artifacts/*', # Giving a 500, but only from CI
   'https://fifteen-thirtyeight.rerun.io/script.js', # Gives 403 forbidden on CI.
   'https://github.com/user-attachments/assets/.*', # Gives Not Found on CI, but works locally.
+  'https://git.sr.ht/*', # Bot protection returns 418 I'm a teapot on CI.
   'https://lib.rs/*', # Gives 403 forbidden on CI.
   'https://math.stackexchange.com/*', # Gives 403 forbidden on CI.
   'https://pixabay.com/photos/brother-sister-girl-family-boy-977170/', # Gives 403 forbidden on CI.
@@ -170,6 +180,10 @@ exclude = [
   'https://www.shadertoy.com/*', # 403 on CI
   'https://www.tensorflow.org/*', # tensorflow.org apparently blocks CI.
   'https://www.unicode.org/license.txt', # Gives network error on CI.
+
+  # `CHANGELOG.md` links to a release's changeset page, which only goes live with the docs deploy
+  # that follows the release — so the newest links 404 until then.
+  'https://rerun.io/docs/changelog/changeset-.*',
 
   # Need GitHub login.
   'https://github.com/rerun-io/landing',

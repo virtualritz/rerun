@@ -33,6 +33,7 @@ pub enum ApiErrorKind {
     Timeout,
     Internal,
     InvalidArguments,
+    FailedPrecondition,
     ResourcesExhausted,
 
     /// Failed to decode data received from the server (e.g. protobuf → Arrow conversion).
@@ -55,6 +56,7 @@ impl From<tonic::Code> for ApiErrorKind {
             tonic::Code::Unimplemented => Self::Unimplemented,
             tonic::Code::Unavailable => Self::Connection,
             tonic::Code::InvalidArgument => Self::InvalidArguments,
+            tonic::Code::FailedPrecondition => Self::FailedPrecondition,
             tonic::Code::DeadlineExceeded => Self::Timeout,
             _ => Self::Internal,
         }
@@ -73,6 +75,7 @@ impl ApiErrorKind {
             | Self::Unauthenticated
             | Self::Unimplemented
             | Self::InvalidArguments
+            | Self::FailedPrecondition
             | Self::Deserialization
             | Self::Serialization
             | Self::InvalidServer => false,
@@ -91,6 +94,7 @@ impl std::fmt::Display for ApiErrorKind {
             Self::Connection => write!(f, "Connection"),
             Self::Internal => write!(f, "Internal"),
             Self::InvalidArguments => write!(f, "InvalidArguments"),
+            Self::FailedPrecondition => write!(f, "FailedPrecondition"),
             Self::ResourcesExhausted => write!(f, "ResourcesExhausted"),
             Self::Deserialization => write!(f, "Deserialization"),
             Self::Serialization => write!(f, "Serialization"),
@@ -142,10 +146,97 @@ impl ApiError {
         }
     }
 
+    /// Construct an [`ApiError`] with an explicit `kind` and an optional `trace_id`.
+    ///
+    /// Do NOT include `err` in the `message` - it will be added for you.
+    pub fn with_kind_and_source(
+        kind: ApiErrorKind,
+        trace_id: Option<opentelemetry::TraceId>,
+        err: impl std::error::Error + Send + Sync + 'static,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            kind,
+            source: Some(Arc::new(err)),
+            trace_id,
+        }
+    }
+
+    /// Convert an unsuccessful HTTP status into an [`ApiError`].
+    ///
+    /// Authentication, authorization, missing-resource, precondition, and throttling responses map
+    /// to their corresponding API error kinds.
+    /// Server errors are treated as connection failures so callers may retry them.
+    /// Other statuses indicate that the server did not honor the expected HTTP protocol.
+    pub fn http_status(
+        trace_id: Option<opentelemetry::TraceId>,
+        status: u16,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::http_status_with_source(
+            trace_id,
+            status,
+            std::io::Error::other(format!("HTTP {status}")),
+            message,
+        )
+    }
+
+    /// Convert an unsuccessful HTTP status into an [`ApiError`] with a specific source error.
+    ///
+    /// Do NOT include `err` in the `message` - it will be added for you.
+    pub fn http_status_with_source(
+        trace_id: Option<opentelemetry::TraceId>,
+        status: u16,
+        err: impl std::error::Error + Send + Sync + 'static,
+        message: impl Into<String>,
+    ) -> Self {
+        let kind = match status {
+            401 => ApiErrorKind::Unauthenticated,
+            403 => ApiErrorKind::PermissionDenied,
+            404 => ApiErrorKind::NotFound,
+            412 => ApiErrorKind::FailedPrecondition,
+            429 => ApiErrorKind::ResourcesExhausted,
+            500..=599 => ApiErrorKind::Connection,
+            _ => ApiErrorKind::InvalidServer,
+        };
+        Self::with_kind_and_source(kind, trace_id, err, message)
+    }
+
     /// Do NOT include `err` in the `message` - it will be added for you.
     pub fn tonic(err: tonic::Status, message: impl Into<String>) -> Self {
         let message = message.into();
         let kind = ApiErrorKind::from(err.code());
+
+        // On the web, the browser blocks failed `fetch` calls (CORS, mixed content, server
+        // unreachable, DNS, …) and — for security reasons — hides the actual cause from
+        // JavaScript, surfacing only an opaque message (e.g. `TypeError: Failed to fetch` in
+        // Chrome, `NetworkError when attempting to fetch resource` in Firefox, `Load failed` in
+        // Safari). `tonic-web-wasm-client` wraps all of these as `Error::JsError`, which tonic
+        // turns into a `Code::Unknown` status whose message is prefixed `js api error:`.
+        //
+        // Note: other `Code::Unknown` variants (malformed response, missing content-type, …)
+        // mean the server *did* respond but with non-gRPC data (wrong port, a proxy serving
+        // HTML, …) — those are not network failures, so we deliberately don't add the hint there.
+        //
+        // Point the user at the developer console, where the browser *does* print the real
+        // reason (e.g. the missing CORS header).
+        #[cfg(target_arch = "wasm32")]
+        let (kind, message) = if err.code() == tonic::Code::Unknown
+            && err.message().to_ascii_lowercase().contains("js api error")
+        {
+            (
+                ApiErrorKind::Connection,
+                format!(
+                    "{message}: failed to reach the server. \
+                     This is often a CORS issue, but can also mean the server is unreachable. \
+                     Open your browser's developer console for the underlying error."
+                ),
+            )
+        } else {
+            (kind, message)
+        };
+
         let trace_id = extract_trace_id(err.metadata());
         let err = crate::TonicStatusError::from(err); // Wrap in TonicStatusError so we get our nice Display formatting
         if let Some(trace_id) = trace_id {
@@ -193,9 +284,49 @@ impl ApiError {
         }
     }
 
+    /// Failed to decode a quiver record batch received from the server.
+    ///
+    /// Decoding server data is a [`ApiErrorKind::Deserialization`]; the quiver error names the
+    /// offending column and the exact mismatch, so no extra message is needed.
+    pub fn deserialization_quiver(
+        trace_id: Option<opentelemetry::TraceId>,
+        err: quiver::Error,
+    ) -> Self {
+        Self {
+            message: "failed to decode record batch".to_owned(),
+            kind: ApiErrorKind::Deserialization,
+            source: Some(Arc::new(err)),
+            trace_id,
+        }
+    }
+
+    /// Like [`Self::deserialization_quiver`], but names where the batch came from (the endpoint or
+    /// response stream); the quiver error itself only describes the schema mismatch.
+    pub fn deserialization_quiver_from(
+        trace_id: Option<opentelemetry::TraceId>,
+        err: quiver::Error,
+        context: impl std::fmt::Display,
+    ) -> Self {
+        Self {
+            message: format!("failed to decode record batch from {context}"),
+            kind: ApiErrorKind::Deserialization,
+            source: Some(Arc::new(err)),
+            trace_id,
+        }
+    }
+
     /// Failed to encode data for sending to the server.
     pub fn serialization(message: impl Into<String>) -> Self {
         Self::new(ApiErrorKind::Serialization, message)
+    }
+
+    /// Failed to encode a quiver record batch for sending to the server.
+    pub fn serialization_quiver(err: quiver::Error) -> Self {
+        Self::new_with_source(
+            err,
+            ApiErrorKind::Serialization,
+            "failed to encode record batch",
+        )
     }
 
     /// Failed to encode data for sending to the server.
@@ -222,8 +353,18 @@ impl ApiError {
         }
     }
 
+    pub fn invalid_arguments(message: impl Into<String>) -> Self {
+        Self::new(ApiErrorKind::InvalidArguments, message)
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(ApiErrorKind::Internal, message)
+    }
+
+    /// Failed to decode a quiver record batch. The quiver error names the offending column and the
+    /// record-batch schema, so no extra message is needed.
+    pub fn internal_quiver(err: quiver::Error) -> Self {
+        Self::new_with_source(err, ApiErrorKind::Internal, "failed to decode record batch")
     }
 
     /// Do NOT include `err` in the `message` - it will be added for you.
@@ -284,9 +425,27 @@ impl ApiError {
         }
     }
 
+    /// Raised when `GET /version` against the requested origin returns a non-2xx response.
+    ///
+    /// The included status line and body snippet usually tell the user whether the path is
+    /// wrong (404 from a non-Rerun HTTP server), the server is down (5xx), or they hit a
+    /// reverse proxy that redirected somewhere unexpected. Connection-refused (wrong port
+    /// or server not running) hits a different error path above.
     #[expect(clippy::needless_pass_by_value)]
-    pub fn invalid_server(origin: re_uri::Origin, hint: Option<&str>) -> Self {
-        let mut msg = format!("{origin} is not a valid Rerun server");
+    pub fn invalid_server_with_response(
+        origin: re_uri::Origin,
+        status: u16,
+        status_text: &str,
+        body_snippet: Option<&str>,
+        hint: Option<&str>,
+    ) -> Self {
+        let mut msg = format!(
+            "{origin} is not a valid Rerun server (GET /version returned HTTP {status} {status_text})"
+        );
+        if let Some(body) = body_snippet.filter(|s| !s.is_empty()) {
+            msg.push_str(": ");
+            msg.push_str(body);
+        }
         if let Some(hint) = hint {
             msg.push_str(". ");
             msg.push_str(hint);

@@ -6,7 +6,9 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
 
-    from rerun.catalog import Schema
+    import datafusion
+
+    from rerun.catalog import ContentFilter, IndexValuesLike, Schema
     from rerun_bindings import ChunkStoreInternal
 
     from ._chunk import Chunk
@@ -15,16 +17,16 @@ if TYPE_CHECKING:
 
 class ChunkStore:
     """
-    A chunk store.
+    A fully-materialized, in-memory chunk store.
 
-    TODO(RR-4321): currently, this is fully materialized, in-memory.
+    Build one from chunks via
+    [`ChunkStore.from_chunks`][rerun.experimental.ChunkStore.from_chunks], or
+    fully materialize an [`IndexedReader`][rerun.experimental.IndexedReader]
+    via `reader.stream().collect()`.
+    For lazy, on-demand chunk loading, see [`LazyStore`][rerun.experimental.LazyStore].
 
-    Obtain a ChunkStore from an IndexedReader, e.g.:
-
-        store = RrdReader("recording.rrd").store()
-
-    Use ``stream()`` to process chunks through the lazy pipeline, or
-    ``write_rrd()`` to persist to disk.
+    Use `stream()` to process chunks through the lazy pipeline, or
+    `write_rrd()` to persist to disk.
     """
 
     _internal: ChunkStoreInternal
@@ -52,11 +54,9 @@ class ChunkStore:
 
         Each line describes one chunk:
 
-            {entity_path}  rows={n}  bytes={…}  static={True|False}  timelines=[…]  cols=[…]
+            {entity_path}  rows={n}  static={True|False}  timelines=[…]  cols=[…]
 
         Useful for snapshot testing.
-
-        **Important**: For lazily-loaded stores, this forces loading all chunk data from disk.
         """
         return self._internal.summary()
 
@@ -66,25 +66,93 @@ class ChunkStore:
 
         return LazyChunkStream(self._internal.stream())
 
-    def compact(self, *, max_bytes: int | None = None, gop_batching: bool = True) -> ChunkStore:
+    def reader(
+        self,
+        index: str | None,
+        *,
+        contents: ContentFilter | str | list[str] | None = None,
+        include_semantically_empty_columns: bool = False,
+        include_tombstone_columns: bool = False,
+        fill_latest_at: bool = False,
+        using_index_values: IndexValuesLike | None = None,
+        ctx: datafusion.SessionContext | None = None,
+    ) -> datafusion.DataFrame:
         """
-        Return a new ChunkStore with chunks compacted for optimal storage.
+        Build a DataFusion DataFrame over this store.
+
+        The returned DataFrame is data-equivalent to the result of round-tripping
+        the same chunks through `write_rrd → rr.server.Server → dataset.reader()`,
+        modulo the `rerun_segment_id` column (absent here because a single
+        `ChunkStore` has no segment concept).
 
         Parameters
         ----------
-        max_bytes:
-            Override the per-chunk byte ceiling used when merging chunks.
-            If `None`, uses the store's default (~384 KiB).
-        gop_batching:
-            If `True` (default), video stream chunks are additionally rebatched
-            to align with GoP (keyframe) boundaries after normal compaction.
+        index
+            The index (timeline) column to use, or `None` for the static-only view.
+        contents
+            Entity-path filter. A `ContentFilter` built with the fluent API, a single
+            entity-path expression, a list of expressions, or `None` for everything.
+            An empty list returns no rows.
+        include_semantically_empty_columns
+            Whether to include columns that are semantically empty.
+        include_tombstone_columns
+            Whether to include tombstone columns.
+        fill_latest_at
+            Whether to fill null values with the latest valid data.
+        using_index_values
+            Index values at which to **resample** data.
 
-            GoP rebatching never splits a GoP across chunks, so streams with long
-            keyframe intervals (e.g. 10+ seconds between I-frames) can produce
-            chunks much larger than `max_bytes`.
+            When specified, this argument changes the way rows are returned. Instead
+            of returning the rows that exist in the data, one row is returned per
+            `index_value` you provide. If the segment has no row at that index value,
+            nulls are returned — or the latest prior value if fill_latest_at=True`
+            (which is typically what you want for resampling).
+
+            Don't use this argument for plain index slicing — use a DataFusion filter
+            on the index column instead. For example:
+
+            ```python
+            from datafusion import col, lit
+
+            # All rows in a time window.
+            store.reader(index="real_time").filter(
+                (col("real_time") >= lit(t0)) & (col("real_time") <= lit(t1))
+            )
+            ```
+        ctx
+            DataFusion `SessionContext` to register the table into. When `None`,
+            uses `datafusion.SessionContext.global_ctx()` — the process-wide
+            default.
+            Pass an explicit `ctx` for isolation or a custom `SessionConfig`.
 
         """
-        return ChunkStore(self._internal.compact(max_bytes=max_bytes, gop_batching=gop_batching))
+        import datafusion
+
+        from rerun.catalog._content_filter import ContentFilter
+
+        contents_list: list[str] | None
+        match contents:
+            case ContentFilter():
+                contents_list = contents.to_exprs()
+            case str():
+                contents_list = [contents]
+            case None:
+                contents_list = None
+            case _:
+                contents_list = list(contents)
+
+        table = self._internal.reader(
+            index=index,
+            contents=contents_list,
+            include_semantically_empty_columns=include_semantically_empty_columns,
+            include_tombstone_columns=include_tombstone_columns,
+            fill_latest_at=fill_latest_at,
+            using_index_values=using_index_values,
+        )
+        if ctx is None:
+            # TODO(RR-4795): we should use a SDK-provided context (with pre-populated UDF, etc.) instead of global_ctx
+            ctx = datafusion.SessionContext.global_ctx()
+        return ctx.read_table(table)
 
     def write_rrd(
         self,

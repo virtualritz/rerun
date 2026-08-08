@@ -13,7 +13,7 @@ use crate::{SerializationResult, SerializedComponentBatch};
 ///
 /// Have a look at our [Custom Data Importer] example to learn more about handwritten bundles.
 ///
-/// [IDL definitions]: https://github.com/rerun-io/rerun/tree/latest/crates/store/re_sdk_types/definitions/rerun
+/// [IDL definitions]: https://github.com/rerun-io/rerun/tree/latest/crates/build/re_type_definitions/rerun?speculative-link
 /// [Custom Data Importer]: https://github.com/rerun-io/rerun/blob/latest/examples/rust/custom_importer
 /// [`Component`]: [crate::Component]
 pub trait AsComponents {
@@ -208,7 +208,16 @@ mod tests {
 
     use crate::{Component as _, ComponentDescriptor};
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+    #[derive(
+        Clone,
+        Copy,
+        Debug,
+        PartialEq,
+        Eq,
+        bytemuck::Pod,
+        bytemuck::Zeroable,
+        re_byte_size::SizeBytes,
+    )]
     #[repr(transparent)]
     pub struct MyColor(pub u32);
 
@@ -223,14 +232,6 @@ mod tests {
     }
 
     crate::macros::impl_into_cow!(MyColor);
-
-    impl re_byte_size::SizeBytes for MyColor {
-        #[inline]
-        fn heap_size_bytes(&self) -> u64 {
-            let Self(_) = self;
-            0
-        }
-    }
 
     impl crate::Loggable for MyColor {
         fn arrow_datatype() -> arrow::datatypes::DataType {

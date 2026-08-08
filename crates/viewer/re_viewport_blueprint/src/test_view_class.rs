@@ -15,7 +15,10 @@ pub struct TestVisualizer;
 
 impl IdentifiedViewSystem for TestVisualizer {
     fn identifier() -> ViewSystemIdentifier {
-        "TestVisualizer".into()
+        re_viewer_context::external::re_string_interner::intern_static!(
+            re_viewer_context::ViewSystemIdentifier,
+            "TestVisualizer"
+        )
     }
 }
 
@@ -89,7 +92,7 @@ impl ViewClass for TestViewClass {
         _state: &mut dyn ViewState,
         _query: &ViewQuery<'_>,
         _system_output: SystemExecutionOutput,
-    ) -> Result<(), ViewSystemExecutionError> {
-        Ok(())
+    ) -> Result<re_viewer_context::ViewClassUiOutput, ViewSystemExecutionError> {
+        Ok(Default::default())
     }
 }

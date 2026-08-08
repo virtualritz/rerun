@@ -28,6 +28,7 @@ from .entity_path import EntityPath, EntityPathArrayLike, EntityPathBatch, Entit
 from .float32 import Float32, Float32ArrayLike, Float32Batch, Float32Like
 from .float64 import Float64, Float64ArrayLike, Float64Batch, Float64Like
 from .image_format import ImageFormat, ImageFormatArrayLike, ImageFormatBatch, ImageFormatLike
+from .ivec3d import IVec3D, IVec3DArrayLike, IVec3DBatch, IVec3DLike
 from .keypoint_id import KeypointId, KeypointIdArrayLike, KeypointIdBatch, KeypointIdLike
 from .keypoint_pair import KeypointPair, KeypointPairArrayLike, KeypointPairBatch, KeypointPairLike
 from .mat3x3 import Mat3x3, Mat3x3ArrayLike, Mat3x3Batch, Mat3x3Like
@@ -43,6 +44,12 @@ from .rotation_axis_angle import (
     RotationAxisAngleArrayLike,
     RotationAxisAngleBatch,
     RotationAxisAngleLike,
+)
+from .spherical_harmonics3rgb import (
+    SphericalHarmonics3Rgb,
+    SphericalHarmonics3RgbArrayLike,
+    SphericalHarmonics3RgbBatch,
+    SphericalHarmonics3RgbLike,
 )
 from .tensor_buffer import TensorBuffer, TensorBufferArrayLike, TensorBufferBatch, TensorBufferLike
 from .tensor_data import TensorData, TensorDataArrayLike, TensorDataBatch, TensorDataLike
@@ -80,6 +87,7 @@ from .vec3d import Vec3D, Vec3DArrayLike, Vec3DBatch, Vec3DLike
 from .vec4d import Vec4D, Vec4DArrayLike, Vec4DBatch, Vec4DLike
 from .video_timestamp import VideoTimestamp, VideoTimestampArrayLike, VideoTimestampBatch, VideoTimestampLike
 from .view_coordinates import ViewCoordinates, ViewCoordinatesArrayLike, ViewCoordinatesBatch, ViewCoordinatesLike
+from .view_dir import ViewDir, ViewDirArrayLike, ViewDirBatch, ViewDirLike
 from .visible_time_range import VisibleTimeRange, VisibleTimeRangeArrayLike, VisibleTimeRangeBatch, VisibleTimeRangeLike
 
 __all__ = [
@@ -143,6 +151,10 @@ __all__ = [
     "Float64ArrayLike",
     "Float64Batch",
     "Float64Like",
+    "IVec3D",
+    "IVec3DArrayLike",
+    "IVec3DBatch",
+    "IVec3DLike",
     "ImageFormat",
     "ImageFormatArrayLike",
     "ImageFormatBatch",
@@ -191,6 +203,10 @@ __all__ = [
     "RotationAxisAngleArrayLike",
     "RotationAxisAngleBatch",
     "RotationAxisAngleLike",
+    "SphericalHarmonics3Rgb",
+    "SphericalHarmonics3RgbArrayLike",
+    "SphericalHarmonics3RgbBatch",
+    "SphericalHarmonics3RgbLike",
     "TensorBuffer",
     "TensorBufferArrayLike",
     "TensorBufferBatch",
@@ -275,6 +291,10 @@ __all__ = [
     "ViewCoordinatesArrayLike",
     "ViewCoordinatesBatch",
     "ViewCoordinatesLike",
+    "ViewDir",
+    "ViewDirArrayLike",
+    "ViewDirBatch",
+    "ViewDirLike",
     "VisibleTimeRange",
     "VisibleTimeRangeArrayLike",
     "VisibleTimeRangeBatch",

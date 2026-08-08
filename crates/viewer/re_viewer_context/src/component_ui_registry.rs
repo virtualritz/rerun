@@ -8,7 +8,7 @@ use re_log_types::{Instance, StoreId};
 use re_sdk_types::{ComponentDescriptor, ComponentType};
 use re_ui::{UiExt as _, UiLayout};
 
-use crate::{MaybeMutRef, QueryContext, StoreViewContext};
+use crate::{AppContext, MaybeMutRef, QueryContext, StoreViewContext};
 
 /// Describes where an edit should be written to if any
 pub struct EditTarget {
@@ -50,7 +50,7 @@ impl ComponentUiTypes {
 
 type LegacyDisplayComponentUiCallback = Box<
     dyn Fn(
-            &StoreViewContext<'_>,
+            &AppContext<'_>,
             &mut egui::Ui,
             UiLayout,
             &EntityPath,
@@ -69,7 +69,7 @@ pub enum EditOrView {
     View,
 }
 
-re_string_interner::declare_new_type!(
+re_string_interner::declare_new_type_nonempty!(
     /// The name of a UI variant (see [`ComponentUiIdentifier::Variant`]).
     pub struct VariantName;
 );
@@ -77,6 +77,9 @@ re_string_interner::declare_new_type!(
 /// The identifier under which component UIs are registered.
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 enum ComponentUiIdentifier {
+    /// Component UI for one exact component identifier.
+    ExactComponent(ComponentIdentifier),
+
     /// Component UI for a specific component type.
     Component(ComponentType),
 
@@ -100,7 +103,7 @@ impl From<VariantName> for ComponentUiIdentifier {
 /// If no edit was made, should return `None`.
 pub type UntypedComponentEditOrViewCallback = Box<
     dyn Fn(
-            &StoreViewContext<'_>,
+            &AppContext<'_>,
             &mut egui::Ui,
             &ComponentDescriptor,
             Option<RowId>,
@@ -194,17 +197,69 @@ impl ComponentUiRegistry {
     ///     * Make sure that changes are propagated via [`egui::Response::mark_changed`] if necessary.
     pub fn add_singleline_edit_or_view<C: re_sdk_types::Component>(
         &mut self,
-        callback: impl Fn(
-            &StoreViewContext<'_>,
-            &mut egui::Ui,
-            &mut MaybeMutRef<'_, C>,
-        ) -> egui::Response
+        callback: impl Fn(&AppContext<'_>, &mut egui::Ui, &mut MaybeMutRef<'_, C>) -> egui::Response
         + Send
         + Sync
         + 'static,
     ) {
         let multiline = false;
         self.add_editor_ui(multiline, callback);
+    }
+
+    /// Registers how to view, and maybe edit, a given component in the UI in a single list item line
+    /// for one exact component identifier.
+    pub fn add_singleline_edit_or_view_for_component<C: re_sdk_types::Component>(
+        &mut self,
+        component_identifier: ComponentIdentifier,
+        callback: impl Fn(
+            &AppContext<'_>,
+            &mut egui::Ui,
+            &ComponentDescriptor,
+            &mut MaybeMutRef<'_, C>,
+        ) -> egui::Response
+        + Send
+        + Sync
+        + 'static,
+    ) {
+        let untyped_callback: UntypedComponentEditOrViewCallback = Box::new(
+            move |ctx, ui, component_descriptor, _row_id, value, edit_or_view| {
+                debug_assert_eq!(component_descriptor.component_type, Some(C::name()));
+
+                let mut deserialized_value = try_deserialize(value)?;
+                match edit_or_view {
+                    EditOrView::View => {
+                        callback(
+                            ctx,
+                            ui,
+                            component_descriptor,
+                            &mut MaybeMutRef::Ref(&deserialized_value),
+                        );
+                        None
+                    }
+                    EditOrView::Edit => {
+                        let response = callback(
+                            ctx,
+                            ui,
+                            component_descriptor,
+                            &mut MaybeMutRef::MutRef(&mut deserialized_value),
+                        );
+
+                        if response.changed() {
+                            use re_sdk_types::ComponentBatch as _;
+                            deserialized_value.to_arrow().ok_or_log_error_once()
+                        } else {
+                            None
+                        }
+                    }
+                }
+            },
+        );
+
+        self.insert_untyped_callback(
+            ComponentUiIdentifier::ExactComponent(component_identifier),
+            false,
+            untyped_callback,
+        );
     }
 
     /// Registers how to view, and maybe edit, a given component in the UI with multiple list items.
@@ -226,11 +281,7 @@ impl ComponentUiRegistry {
     ///     * Make sure that changes are propagated via [`egui::Response::mark_changed`] if necessary.
     pub fn add_multiline_edit_or_view<C: re_sdk_types::Component>(
         &mut self,
-        callback: impl Fn(
-            &StoreViewContext<'_>,
-            &mut egui::Ui,
-            &mut MaybeMutRef<'_, C>,
-        ) -> egui::Response
+        callback: impl Fn(&AppContext<'_>, &mut egui::Ui, &mut MaybeMutRef<'_, C>) -> egui::Response
         + Send
         + Sync
         + 'static,
@@ -258,7 +309,7 @@ impl ComponentUiRegistry {
     pub fn add_singleline_array_edit_or_view<C: re_sdk_types::Component>(
         &mut self,
         callback: impl Fn(
-            &StoreViewContext<'_>,
+            &AppContext<'_>,
             &mut egui::Ui,
             &mut MaybeMutRef<'_, Vec<C>>,
         ) -> egui::Response
@@ -287,7 +338,7 @@ impl ComponentUiRegistry {
     pub fn add_multiline_array_edit_or_view<C: re_sdk_types::Component>(
         &mut self,
         callback: impl Fn(
-            &StoreViewContext<'_>,
+            &AppContext<'_>,
             &mut egui::Ui,
             &mut MaybeMutRef<'_, Vec<C>>,
         ) -> egui::Response
@@ -302,11 +353,7 @@ impl ComponentUiRegistry {
     fn add_editor_ui<C: re_sdk_types::Component>(
         &mut self,
         multiline: bool,
-        callback: impl Fn(
-            &StoreViewContext<'_>,
-            &mut egui::Ui,
-            &mut MaybeMutRef<'_, C>,
-        ) -> egui::Response
+        callback: impl Fn(&AppContext<'_>, &mut egui::Ui, &mut MaybeMutRef<'_, C>) -> egui::Response
         + Send
         + Sync
         + 'static,
@@ -348,7 +395,7 @@ impl ComponentUiRegistry {
         &mut self,
         multiline: bool,
         callback: impl Fn(
-            &StoreViewContext<'_>,
+            &AppContext<'_>,
             &mut egui::Ui,
             &mut MaybeMutRef<'_, Vec<C>>,
         ) -> egui::Response
@@ -404,11 +451,14 @@ impl ComponentUiRegistry {
     }
 
     /// Registers singleline UI to view Arrow data using a specific [`VariantName`].
+    ///
+    /// `variant_name` must be a valid [`VariantName`] (i.e. non-empty); passing an empty
+    /// string literal/const will panic.
     pub fn add_variant_ui(
         &mut self,
         variant_name: impl Into<VariantName>,
         callback: impl Fn(
-            &StoreViewContext<'_>,
+            &AppContext<'_>,
             &mut egui::Ui,
             ComponentIdentifier,
             Option<RowId>,
@@ -436,12 +486,7 @@ impl ComponentUiRegistry {
                         "UI for variant {variant_name} failed to display the provided data {err}"
                     );
 
-                    fallback_ui(
-                        ui,
-                        UiLayout::List,
-                        ctx.app_options().timestamp_format,
-                        value,
-                    );
+                    fallback_ui(ui, UiLayout::List, ctx.app_options.timestamp_format, value);
                 }
 
                 None
@@ -498,7 +543,6 @@ impl ComponentUiRegistry {
     ///
     /// Has a fallback to show an info text if the instance is not specific,
     /// but in these cases `LatestAtComponentResults::data_ui` should be used instead!
-    #[expect(clippy::too_many_arguments)]
     pub fn component_ui(
         &self,
         ctx: &StoreViewContext<'_>,
@@ -560,16 +604,26 @@ impl ComponentUiRegistry {
     #[expect(clippy::fn_params_excessive_bools)] // private function 🤷‍♂️
     fn untyped_component_ui_callback(
         &self,
-        component_type: ComponentType,
+        component_descr: &ComponentDescriptor,
         allow_multiline: bool,
         is_single_value: bool,
     ) -> Option<&UntypedComponentEditOrViewCallback> {
+        let exact_ui_identifier = ComponentUiIdentifier::ExactComponent(component_descr.component);
+        let component_type = component_descr.component_type?;
         let ui_identifier = ComponentUiIdentifier::Component(component_type);
         let array_ui_identifier = ComponentUiIdentifier::ComponentArray(component_type);
 
         if allow_multiline {
             self.component_multiline_edit_or_view
-                .get(&array_ui_identifier)
+                .get(&exact_ui_identifier)
+                .or_else(|| {
+                    self.component_singleline_edit_or_view
+                        .get(&exact_ui_identifier)
+                })
+                .or_else(|| {
+                    self.component_multiline_edit_or_view
+                        .get(&array_ui_identifier)
+                })
                 .or_else(|| {
                     self.component_singleline_edit_or_view
                         .get(&array_ui_identifier)
@@ -585,7 +639,11 @@ impl ComponentUiRegistry {
                 })
         } else {
             self.component_singleline_edit_or_view
-                .get(&array_ui_identifier)
+                .get(&exact_ui_identifier)
+                .or_else(|| {
+                    self.component_singleline_edit_or_view
+                        .get(&array_ui_identifier)
+                })
                 .or_else(|| {
                     if is_single_value {
                         self.component_singleline_edit_or_view.get(&ui_identifier)
@@ -597,10 +655,9 @@ impl ComponentUiRegistry {
     }
 
     /// Show a UI for a single raw component.
-    #[expect(clippy::too_many_arguments)]
     pub fn component_ui_raw(
         &self,
-        ctx: &StoreViewContext<'_>,
+        ctx: &AppContext<'_>,
         ui: &mut egui::Ui,
         ui_layout: UiLayout,
         entity_path: &EntityPath,
@@ -628,11 +685,11 @@ impl ComponentUiRegistry {
         }
 
         // Fallback to the more specialized UI callbacks (which are only available for known components).
-        if let Some(component_type) = component_descr.component_type {
+        if component_descr.component_type.is_some() {
             let allow_multiline = ui_layout == UiLayout::SelectionPanel;
             let is_single_value = component_raw.len() == 1;
             let edit_or_view_ui = self.untyped_component_ui_callback(
-                component_type,
+                component_descr,
                 allow_multiline,
                 is_single_value,
             );
@@ -654,16 +711,15 @@ impl ComponentUiRegistry {
         fallback_ui(
             ui,
             ui_layout,
-            ctx.app_options().timestamp_format,
+            ctx.app_options.timestamp_format,
             component_raw,
         );
     }
 
     /// Show a UI corresponding to the provided variant name.
-    #[expect(clippy::too_many_arguments)]
     pub fn variant_ui_raw(
         &self,
-        ctx: &StoreViewContext<'_>,
+        ctx: &AppContext<'_>,
         ui: &mut egui::Ui,
         ui_layout: UiLayout,
         variant_name: VariantName,
@@ -708,7 +764,7 @@ impl ComponentUiRegistry {
         fallback_ui(
             ui,
             ui_layout,
-            ctx.app_options().timestamp_format,
+            ctx.app_options.timestamp_format,
             component_raw,
         );
     }
@@ -718,7 +774,6 @@ impl ComponentUiRegistry {
     /// Changes will be written to the blueprint store at the given override path.
     /// Any change is expected to be effective next frame and passed in via the `component_query_result` parameter.
     /// (Otherwise, this method is agnostic to where the component data is stored.)
-    #[expect(clippy::too_many_arguments)]
     pub fn multiline_edit_ui(
         &self,
         query_ctx: &QueryContext<'_>,
@@ -747,7 +802,6 @@ impl ComponentUiRegistry {
     /// Changes will be written to the blueprint store at the given override path.
     /// Any change is expected to be effective next frame and passed in via the `component_query_result` parameter.
     /// (Otherwise, this method is agnostic to where the component data is stored.)
-    #[expect(clippy::too_many_arguments)]
     pub fn singleline_edit_ui(
         &self,
         query_ctx: &QueryContext<'_>,
@@ -771,7 +825,6 @@ impl ComponentUiRegistry {
         );
     }
 
-    #[expect(clippy::too_many_arguments)]
     fn edit_ui(
         &self,
         query_ctx: &QueryContext<'_>,
@@ -811,7 +864,6 @@ impl ComponentUiRegistry {
     }
 
     /// For blueprint editing
-    #[expect(clippy::too_many_arguments)]
     pub fn edit_ui_raw(
         &self,
         query_ctx: &QueryContext<'_>,
@@ -866,14 +918,14 @@ impl ComponentUiRegistry {
 
         // We use the component type to identify which UI to show.
         // (but for saving back edit results, we need the full descriptor)
-        let Some(component_type) = component_descr.component_type else {
+        if component_descr.component_type.is_none() {
             return TryShowEditUiResult::NotShown;
-        };
+        }
 
         let is_single_value = raw_current_value.len() == 1;
 
         let edit_or_view =
-            self.untyped_component_ui_callback(component_type, allow_multiline, is_single_value);
+            self.untyped_component_ui_callback(&component_descr, allow_multiline, is_single_value);
 
         if let Some(edit_or_view) = edit_or_view {
             let mut edited_value = false;

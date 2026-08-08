@@ -81,20 +81,28 @@ pub enum SelectionChange<'a> {
 
 impl ApplicationSelectionState {
     /// Called at the start of each frame.
+    ///
+    /// `resolve_item` decides the fate of each currently selected item: returning `None` drops it,
+    /// while returning `Some(item)` keeps it — possibly replacing it with a different item (e.g.
+    /// downgrading a no-longer-valid data result to a plain entity selection).
     pub fn on_frame_start(
         &mut self,
-        item_retain_condition: impl Fn(&Item) -> bool,
+        resolve_item: impl Fn(&Item) -> Option<Item>,
         fallback_selection: Option<Item>,
     ) -> SelectionChange<'_> {
         // Use a different name so we don't get a collision in puffin.
         re_tracing::profile_scope!("SelectionState::on_frame_start");
 
-        let start_len = self.selection.len();
-        // Purge selection of invalid items.
-        self.selection.retain(|item, _| item_retain_condition(item));
+        // Purge or repair invalid items.
+        let resolved = ItemCollection::from_items_and_context(
+            self.selection
+                .iter()
+                .filter_map(|(item, ctx)| resolve_item(item).map(|item| (item, ctx.clone()))),
+        );
 
-        if start_len != self.selection.len() {
+        if resolved != self.selection {
             self.selection_changed = Some(SelectionSource::Other);
+            self.selection = resolved;
         }
 
         // Set to fallback if empty.
@@ -169,7 +177,7 @@ impl ApplicationSelectionState {
                 | Item::StoreId(_)
                 | Item::View(_)
                 | Item::Container(_)
-                | Item::RedapEntry(_)
+                | Item::RedapEntry { .. }
                 | Item::RedapServer(_) => current == test,
 
                 Item::ComponentPath(component_path) => match test {
@@ -179,7 +187,7 @@ impl ApplicationSelectionState {
                     | Item::StoreId(_)
                     | Item::View(_)
                     | Item::Container(_)
-                    | Item::RedapEntry(_)
+                    | Item::RedapEntry { .. }
                     | Item::RedapServer(_) => false,
 
                     Item::ComponentPath(test_component_path) => {
@@ -203,7 +211,7 @@ impl ApplicationSelectionState {
                     | Item::ComponentPath(_)
                     | Item::View(_)
                     | Item::Container(_)
-                    | Item::RedapEntry(_)
+                    | Item::RedapEntry { .. }
                     | Item::RedapServer(_) => false,
 
                     Item::InstancePath(instance_path)
@@ -224,7 +232,7 @@ impl ApplicationSelectionState {
                     | Item::ComponentPath(_)
                     | Item::View(_)
                     | Item::Container(_)
-                    | Item::RedapEntry(_)
+                    | Item::RedapEntry { .. }
                     | Item::RedapServer(_) => false,
 
                     Item::InstancePath(instance_path)
