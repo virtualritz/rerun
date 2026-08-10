@@ -12,6 +12,18 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+default = ["fs"]
+
+## The wasm `File`/`AsyncReadAt` helpers.
+##
+## Optional because they are not `Send`/`Sync`: `fs::File` holds a `*mut u8`,
+## so on a MULTI-THREADED wasm build (`-C target-feature=+atomics`) the
+## `re_async::AsyncReadAt` impl fails to compile. Consumers that only want
+## `re_web::browser` -- `re_renderer` is one -- can take the crate with
+## `default-features = false` and build for atomics wasm.
+fs = []
+
 [lints]
 workspace = true
 
