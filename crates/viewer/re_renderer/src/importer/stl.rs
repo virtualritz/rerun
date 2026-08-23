@@ -74,6 +74,8 @@ pub fn load_stl_from_buffer(
         vertex_colors: vec![crate::Rgba32Unmul::WHITE; num_vertices],
         vertex_texcoords: vec![glam::Vec2::ZERO; num_vertices],
         vertex_element_ids: None,
+        vertex_topology_ids: None,
+        vertex_edge_ids: None,
 
         materials: smallvec![material],
 

@@ -1272,6 +1272,8 @@ mod tests {
             vertex_normals: vec![glam::Vec3::new(0.0, 0.0, 1.0); 3],
             vertex_texcoords: vec![glam::Vec2::ZERO; 3],
             vertex_element_ids: None,
+            vertex_topology_ids: None,
+            vertex_edge_ids: None,
             materials,
             bbox,
         };
