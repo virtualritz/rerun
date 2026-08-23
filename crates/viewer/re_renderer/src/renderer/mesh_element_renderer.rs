@@ -57,14 +57,16 @@ impl DrawData for MeshElementDrawData {
         }
         // Transparent: edges sit on top of the shaded surface, and stroking
         // discards everywhere else, so depth-writing them would punch holes.
-        collector.add_drawable(
-            DrawPhase::Transparent,
-            DrawDataDrawable {
-                distance_sort_key: 0.0,
-                secondary_sort_key: 0.0,
-                draw_data_payload: 0,
-            },
-        );
+        for phase in [DrawPhase::Transparent, DrawPhase::PickingLayer] {
+            collector.add_drawable(
+                phase,
+                DrawDataDrawable {
+                    distance_sort_key: 0.0,
+                    secondary_sort_key: 0.0,
+                    draw_data_payload: 0,
+                },
+            );
+        }
     }
 }
 
@@ -180,6 +182,7 @@ impl MeshElementDrawData {
 
 pub struct MeshElementRenderer {
     render_pipeline: GpuRenderPipelineHandle,
+    picking_pipeline: GpuRenderPipelineHandle,
     bind_group_layout: GpuBindGroupLayoutHandle,
 }
 
@@ -228,9 +231,7 @@ impl Renderer for MeshElementRenderer {
             &include_shader_module!("../../shader/mesh_elements.wgsl"),
         );
 
-        let render_pipeline = ctx.gpu_resources.render_pipelines.get_or_create(
-            ctx,
-            &RenderPipelineDesc {
+        let render_pipeline_desc = RenderPipelineDesc {
                 label: "MeshElementRenderer::render_pipeline".into(),
                 pipeline_layout: ctx.gpu_resources.pipeline_layouts.get_or_create(
                     ctx,
@@ -267,11 +268,32 @@ impl Renderer for MeshElementRenderer {
                     bias: Default::default(),
                 }),
                 multisample: ViewBuilder::main_target_default_msaa_state(ctx.render_config(), false),
+        };
+        let render_pipeline = ctx
+            .gpu_resources
+            .render_pipelines
+            .get_or_create(ctx, &render_pipeline_desc);
+
+        // Same geometry, same test, different target: ids instead of colour.
+        // Picking writes depth normally -- an edge behind a surface must not
+        // win the pick -- where the colour pass deliberately does not.
+        let picking_pipeline = ctx.gpu_resources.render_pipelines.get_or_create(
+            ctx,
+            &RenderPipelineDesc {
+                label: "MeshElementRenderer::picking_pipeline".into(),
+                fragment_entrypoint: "fs_main_picking_layer".into(),
+                render_targets: smallvec![Some(
+                    crate::PickingLayerProcessor::PICKING_LAYER_FORMAT.into()
+                )],
+                depth_stencil: crate::PickingLayerProcessor::PICKING_LAYER_DEPTH_STATE,
+                multisample: crate::PickingLayerProcessor::PICKING_LAYER_MSAA_STATE,
+                ..render_pipeline_desc
             },
         );
 
         Self {
             render_pipeline,
+            picking_pipeline,
             bind_group_layout,
         }
     }
@@ -279,11 +301,15 @@ impl Renderer for MeshElementRenderer {
     fn draw(
         &self,
         render_pipelines: &GpuRenderPipelinePoolAccessor<'_>,
-        _phase: DrawPhase,
+        phase: DrawPhase,
         pass: &mut wgpu::RenderPass<'_>,
         draw_instructions: &[DrawInstruction<'_, Self::RendererDrawData>],
     ) -> Result<(), DrawError> {
-        let pipeline = render_pipelines.get(self.render_pipeline)?;
+        let handle = match phase {
+            DrawPhase::PickingLayer => self.picking_pipeline,
+            _ => self.render_pipeline,
+        };
+        let pipeline = render_pipelines.get(handle)?;
         pass.set_pipeline(pipeline);
 
         for instruction in draw_instructions {

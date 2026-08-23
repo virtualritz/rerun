@@ -167,3 +167,60 @@ fn fs_main(in: VertexOut) -> @location(0) vec4f {
 
     return select(style.edge_color, style.hover_color, hovered);
 }
+
+// Picking arm: the same geometric test, writing ids instead of colour.
+//
+// The point of drawing edges into the ID buffer at all is that an edge then
+// picks with the same rasterization that drew it -- no fat-line proxy geometry
+// on the CPU, and no separate notion of "close enough" to fall out of step
+// with what the user can see (SPEC-100 T030).
+@fragment
+fn fs_main_picking_layer(in: VertexOut) -> @location(0) vec4u {
+    // A vertex wins over an edge, matching the colour pass: the marker sits on
+    // the join of two edges and the user is aiming at the point.
+    if style.vertex_radius_px > 0.0 {
+        let to_a = pixel_distance_to_side(in.barycentric, 1)
+            + pixel_distance_to_side(in.barycentric, 2);
+        let to_b = pixel_distance_to_side(in.barycentric, 0)
+            + pixel_distance_to_side(in.barycentric, 2);
+        let to_c = pixel_distance_to_side(in.barycentric, 0)
+            + pixel_distance_to_side(in.barycentric, 1);
+
+        let corner_ids = array<u32, 3>(
+            in.vertex_id_a, in.vertex_id_b, in.vertex_id_c);
+        let corner_distances = array<f32, 3>(to_a, to_b, to_c);
+
+        for (var corner = 0; corner < 3; corner += 1) {
+            let id = corner_ids[corner];
+            if id != 0u && corner_distances[corner] <= style.vertex_radius_px {
+                return vec4u(id, 0u, 0u, 0u);
+            }
+        }
+    }
+
+    let side_ids = array<u32, 3>(in.edge_id_ab, in.edge_id_bc, in.edge_id_ca);
+    let opposite = array<i32, 3>(2, 0, 1);
+
+    var nearest = 1e30;
+    var nearest_id = 0u;
+    for (var side = 0; side < 3; side += 1) {
+        let id = side_ids[side];
+        if id == 0u {
+            continue;
+        }
+        let distance = pixel_distance_to_side(in.barycentric, opposite[side]);
+        if distance < nearest {
+            nearest = distance;
+            nearest_id = id;
+        }
+    }
+
+    // Picking uses the HOVER width for every edge, not the drawn width: a
+    // one-pixel line is drawn thin on purpose and would be miserable to hit if
+    // the pick target were equally thin.
+    if nearest_id == 0u || nearest > style.hover_half_width_px {
+        discard;
+    }
+
+    return vec4u(nearest_id, 0u, 0u, 0u);
+}
