@@ -3,6 +3,7 @@ mod debug_overlay;
 mod depth_cloud;
 mod generic_skybox;
 mod lines;
+mod mesh_element_renderer;
 mod mesh_renderer;
 mod plane_clustering;
 mod point_cloud;
@@ -13,6 +14,7 @@ mod world_grid;
 pub use debug_overlay::{DebugOverlayDrawData, DebugOverlayError, DebugOverlayRenderer};
 pub use generic_skybox::{GenericSkyboxDrawData, GenericSkyboxType};
 pub use lines::{LineBatchInfo, LineDrawData, LineDrawDataError, LineStripFlags};
+pub use mesh_element_renderer::{MeshElementDrawData, MeshElementStyle};
 pub use mesh_renderer::{GpuMeshInstance, MeshDrawData};
 pub use point_cloud::{
     PointCloudBatchFlags, PointCloudBatchInfo, PointCloudDrawData, PointCloudDrawDataError,
