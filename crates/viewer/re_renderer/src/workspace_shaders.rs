@@ -92,6 +92,12 @@ pub fn init() {
     }
 
     {
+        let virtpath = Path::new("shader/mesh_elements.wgsl");
+        let content = include_str!("../shader/mesh_elements.wgsl").into();
+        fs.create_file(virtpath, content).unwrap();
+    }
+
+    {
         let virtpath = Path::new("shader/mesh_vertex.wgsl");
         let content = include_str!("../shader/mesh_vertex.wgsl").into();
         fs.create_file(virtpath, content).unwrap();
