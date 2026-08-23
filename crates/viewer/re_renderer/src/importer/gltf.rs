@@ -312,6 +312,8 @@ fn import_mesh(
         vertex_normals,
         vertex_texcoords,
         vertex_element_ids: None,
+        vertex_topology_ids: None,
+        vertex_edge_ids: None,
         materials,
         bbox,
     };

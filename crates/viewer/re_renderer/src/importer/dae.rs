@@ -258,6 +258,8 @@ fn import_geometry(
         vertex_colors: vec![Rgba32Unmul::WHITE; num_vertices],
         vertex_texcoords: bytemuck::cast_vec(texcoords),
         vertex_element_ids: None,
+        vertex_topology_ids: None,
+        vertex_edge_ids: None,
         materials,
         bbox,
     };

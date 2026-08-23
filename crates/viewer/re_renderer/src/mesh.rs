@@ -72,6 +72,20 @@ pub struct CpuMesh {
     /// A value of 0 means "no element ID" and falls back to instance picking.
     pub vertex_element_ids: Option<Vec<u32>>,
 
+    /// Optional per-vertex topology-vertex ID, for vertex-level picking and
+    /// for drawing vertex markers without materialising marker geometry.
+    /// When `Some`, must be equal in length to [`Self::vertex_positions`].
+    /// A value of 0 means "no vertex ID".
+    pub vertex_topology_ids: Option<Vec<u32>>,
+
+    /// Optional per-vertex edge ID: the edge leaving this vertex toward the
+    /// next corner of the same face, for edge-level picking and for drawing
+    /// wireframes without materialising line geometry.
+    /// When `Some`, must be equal in length to [`Self::vertex_positions`].
+    /// A value of 0 means "no edge ID" -- which is also how a triangulation
+    /// diagonal is marked, so a consumer can skip it.
+    pub vertex_edge_ids: Option<Vec<u32>>,
+
     pub materials: SmallVec<[Material; 1]>,
 
     /// Object space bounding box.
@@ -91,6 +105,8 @@ impl CpuMesh {
             vertex_normals,
             vertex_texcoords,
             vertex_element_ids,
+            vertex_topology_ids,
+            vertex_edge_ids,
             materials: _,
             bbox,
         } = self;
@@ -122,6 +138,17 @@ impl CpuMesh {
                 num_pos,
                 num_element_ids: element_ids.len(),
             });
+        }
+        for ids in [vertex_topology_ids, vertex_edge_ids]
+            .into_iter()
+            .flatten()
+        {
+            if num_pos != ids.len() {
+                return Err(MeshError::WrongNumberOfElementIds {
+                    num_pos,
+                    num_element_ids: ids.len(),
+                });
+            }
         }
         if self.vertex_positions.is_empty() {
             return Err(MeshError::ZeroVertices);
@@ -232,6 +259,10 @@ pub struct GpuMesh {
     pub vertex_buffer_normals_range: Range<u64>,
     pub vertex_buffer_texcoord_range: Range<u64>,
     pub vertex_buffer_element_ids_range: Range<u64>,
+    /// Range of the per-vertex topology-vertex ID channel.
+    pub vertex_buffer_topology_ids_range: Range<u64>,
+    /// Range of the per-vertex edge ID channel.
+    pub vertex_buffer_edge_ids_range: Range<u64>,
 
     pub index_buffer_range: Range<u64>,
 
@@ -328,12 +359,19 @@ impl GpuMesh {
         let vb_texcoords_size = (data.vertex_texcoords.len() * size_of::<glam::Vec2>()) as u64;
         // Always allocate space for element IDs (zeros when not present) to keep buffer layout consistent.
         let vb_element_ids_size = (data.vertex_positions.len() * size_of::<u32>()) as u64;
+        // Same policy for the topology-vertex and edge channels: a constant
+        // layout is worth more than the bytes saved by making them optional,
+        // because every consumer would otherwise need two code paths.
+        let vb_topology_ids_size = vb_element_ids_size;
+        let vb_edge_ids_size = vb_element_ids_size;
 
         let vb_combined_size = vb_positions_size
             + vb_color_size
             + vb_normals_size
             + vb_texcoords_size
-            + vb_element_ids_size;
+            + vb_element_ids_size
+            + vb_topology_ids_size
+            + vb_edge_ids_size;
 
         let pools = &ctx.gpu_resources;
         let device = &ctx.device;
@@ -344,7 +382,12 @@ impl GpuMesh {
                 &BufferDesc {
                     label: format!("{} - vertices", data.label).into(),
                     size: vb_combined_size,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    // STORAGE so a vertex-pulling pass can read the channels
+                    // directly instead of binding them as vertex attributes
+                    // (SPEC-100 T020).
+                    usage: wgpu::BufferUsages::VERTEX
+                        | wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 },
             );
@@ -358,11 +401,18 @@ impl GpuMesh {
             staging_buffer.extend_from_slice(bytemuck::cast_slice(&data.vertex_colors))?;
             staging_buffer.extend_from_slice(bytemuck::cast_slice(&data.vertex_normals))?;
             staging_buffer.extend_from_slice(bytemuck::cast_slice(&data.vertex_texcoords))?;
-            if let Some(element_ids) = &data.vertex_element_ids {
-                staging_buffer.extend_from_slice(bytemuck::cast_slice(element_ids))?;
-            } else {
-                let zeros = vec![0u32; data.vertex_positions.len()];
-                staging_buffer.extend_from_slice(bytemuck::cast_slice(&zeros))?;
+            let zeros = vec![0u32; data.vertex_positions.len()];
+            for channel in [
+                &data.vertex_element_ids,
+                &data.vertex_topology_ids,
+                &data.vertex_edge_ids,
+            ] {
+                match channel {
+                    Some(ids) => staging_buffer
+                        .extend_from_slice(bytemuck::cast_slice(ids))?,
+                    None => staging_buffer
+                        .extend_from_slice(bytemuck::cast_slice(&zeros))?,
+                }
             }
             staging_buffer.copy_to_buffer(
                 ctx.active_frame.before_view_builder_encoder.lock().get(),
@@ -379,7 +429,11 @@ impl GpuMesh {
                 &BufferDesc {
                     label: format!("{} - indices", data.label).into(),
                     size: index_buffer_size,
-                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                    // STORAGE for the same reason: the pass fetches indices
+                    // itself rather than relying on the index-buffer stage.
+                    usage: wgpu::BufferUsages::INDEX
+                        | wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 },
             );
@@ -452,6 +506,8 @@ impl GpuMesh {
         let vb_normals_start = vb_colors_start + vb_color_size;
         let vb_texcoord_start = vb_normals_start + vb_normals_size;
         let vb_element_ids_start = vb_texcoord_start + vb_texcoords_size;
+        let vb_topology_ids_start = vb_element_ids_start + vb_element_ids_size;
+        let vb_edge_ids_start = vb_topology_ids_start + vb_topology_ids_size;
 
         Ok(Self {
             index_buffer,
@@ -460,7 +516,11 @@ impl GpuMesh {
             vertex_buffer_colors_range: vb_colors_start..vb_normals_start,
             vertex_buffer_normals_range: vb_normals_start..vb_texcoord_start,
             vertex_buffer_texcoord_range: vb_texcoord_start..vb_element_ids_start,
-            vertex_buffer_element_ids_range: vb_element_ids_start..vb_combined_size,
+            vertex_buffer_element_ids_range: vb_element_ids_start
+                ..vb_topology_ids_start,
+            vertex_buffer_topology_ids_range: vb_topology_ids_start
+                ..vb_edge_ids_start,
+            vertex_buffer_edge_ids_range: vb_edge_ids_start..vb_combined_size,
             index_buffer_range: 0..index_buffer_size,
             materials,
             bbox: data.bbox,

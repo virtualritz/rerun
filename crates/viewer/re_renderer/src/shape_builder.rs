@@ -88,6 +88,8 @@ impl ShapeBuilder {
             vertex_texcoords: vec![Vec2::ZERO; num_vertices],
             // Shape markers are not pickable per element.
             vertex_element_ids: None,
+            vertex_topology_ids: None,
+            vertex_edge_ids: None,
             // albedo_factor = BLACK = (0,0,0,1) so the per-instance `additive_tint` becomes
             // the full marker color (see `instanced_mesh.wgsl` for the exact formula).
             materials: smallvec![Material {
