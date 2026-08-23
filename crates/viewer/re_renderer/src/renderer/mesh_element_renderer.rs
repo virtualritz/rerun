@@ -29,6 +29,18 @@ struct ElementStyleUniform {
     hover_half_width_px: f32,
     vertex_radius_px: f32,
     hover_element_id: u32,
+
+    /// Where each channel starts within the combined vertex buffer, counted in
+    /// 4-byte elements rather than bytes.
+    ///
+    /// The channels cannot be bound as separate storage ranges: a storage
+    /// binding offset must satisfy `min_storage_buffer_offset_alignment`, and
+    /// these start wherever the previous channel happened to end. So the whole
+    /// buffer is bound once and the shader does the arithmetic.
+    positions_offset: u32,
+    edge_ids_offset: u32,
+    topology_ids_offset: u32,
+    _padding: u32,
 }
 
 /// What one mesh contributes to the pass.
@@ -95,6 +107,8 @@ impl MeshElementDrawData {
         let batches = meshes
             .into_iter()
             .map(|(mesh, style)| {
+                let element_offset =
+                    |byte_offset: u64| (byte_offset / 4) as u32;
                 let uniform = ElementStyleUniform {
                     edge_color: style.edge_color,
                     hover_color: style.hover_color,
@@ -102,6 +116,16 @@ impl MeshElementDrawData {
                     hover_half_width_px: style.hover_half_width_px,
                     vertex_radius_px: style.vertex_radius_px,
                     hover_element_id: style.hover_element_id,
+                    positions_offset: element_offset(
+                        mesh.vertex_buffer_positions_range.start,
+                    ),
+                    edge_ids_offset: element_offset(
+                        mesh.vertex_buffer_edge_ids_range.start,
+                    ),
+                    topology_ids_offset: element_offset(
+                        mesh.vertex_buffer_topology_ids_range.start,
+                    ),
+                    _padding: 0,
                 };
                 let style_buffer = ctx.gpu_resources.buffers.alloc(
                     &ctx.device,
@@ -121,36 +145,20 @@ impl MeshElementDrawData {
                     &BindGroupDesc {
                         label: "MeshElementDrawData::bind_group".into(),
                         entries: smallvec![
+                            // Whole buffers, offset 0: a storage binding's
+                            // offset must satisfy
+                            // min_storage_buffer_offset_alignment, and the
+                            // channel starts do not. The shader indexes into
+                            // them using the offsets in the uniform.
                             BindGroupEntry::Buffer {
                                 handle: mesh.index_buffer.handle,
-                                offset: mesh.index_buffer_range.start,
-                                size: std::num::NonZeroU64::new(
-                                    mesh.index_buffer_range.end - mesh.index_buffer_range.start
-                                ),
+                                offset: 0,
+                                size: None,
                             },
                             BindGroupEntry::Buffer {
                                 handle: mesh.vertex_buffer_combined.handle,
-                                offset: mesh.vertex_buffer_positions_range.start,
-                                size: std::num::NonZeroU64::new(
-                                    mesh.vertex_buffer_positions_range.end
-                                        - mesh.vertex_buffer_positions_range.start
-                                ),
-                            },
-                            BindGroupEntry::Buffer {
-                                handle: mesh.vertex_buffer_combined.handle,
-                                offset: mesh.vertex_buffer_edge_ids_range.start,
-                                size: std::num::NonZeroU64::new(
-                                    mesh.vertex_buffer_edge_ids_range.end
-                                        - mesh.vertex_buffer_edge_ids_range.start
-                                ),
-                            },
-                            BindGroupEntry::Buffer {
-                                handle: mesh.vertex_buffer_combined.handle,
-                                offset: mesh.vertex_buffer_topology_ids_range.start,
-                                size: std::num::NonZeroU64::new(
-                                    mesh.vertex_buffer_topology_ids_range.end
-                                        - mesh.vertex_buffer_topology_ids_range.start
-                                ),
+                                offset: 0,
+                                size: None,
                             },
                             BindGroupEntry::Buffer {
                                 handle: style_buffer.handle,
@@ -208,10 +216,8 @@ impl Renderer for MeshElementRenderer {
                 entries: vec![
                     storage(0),
                     storage(1),
-                    storage(2),
-                    storage(3),
                     wgpu::BindGroupLayoutEntry {
-                        binding: 4,
+                        binding: 2,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,

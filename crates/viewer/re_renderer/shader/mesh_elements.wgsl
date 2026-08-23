@@ -28,13 +28,24 @@ struct ElementStyle {
     // exactly as the face path already does, so hover costs O(1) rather than a
     // rebuild.
     hover_element_id: u32,
+
+    // Where each channel starts in `vertex_data`, in 4-byte elements. The
+    // channels cannot be bound as separate storage ranges -- a storage binding
+    // offset must satisfy min_storage_buffer_offset_alignment and these do not
+    // -- so the whole buffer is bound once and indexed here.
+    positions_offset: u32,
+    edge_ids_offset: u32,
+    topology_ids_offset: u32,
+    _padding: u32,
 };
 
 @group(1) @binding(0) var<storage, read> indices: array<u32>;
-@group(1) @binding(1) var<storage, read> positions: array<f32>;
-@group(1) @binding(2) var<storage, read> edge_ids: array<u32>;
-@group(1) @binding(3) var<storage, read> vertex_ids: array<u32>;
-@group(1) @binding(4) var<uniform> style: ElementStyle;
+
+// The mesh's combined vertex buffer, read as raw 4-byte words. Positions are
+// three consecutive floats; the id channels are one word each.
+@group(1) @binding(1) var<storage, read> vertex_data: array<u32>;
+
+@group(1) @binding(2) var<uniform> style: ElementStyle;
 
 struct VertexOut {
     @builtin(position) clip_position: vec4f,
@@ -53,11 +64,23 @@ struct VertexOut {
     @location(6) @interpolate(flat) vertex_id_c: u32,
 };
 
-// Positions are packed three floats to a vertex; reading them as a flat f32
-// array sidesteps the std430 padding a vec3 array would carry.
+// Positions are packed three floats to a vertex. The buffer is bound as words,
+// so each one is bitcast back to f32.
 fn position_at(vertex: u32) -> vec3f {
-    let base = vertex * 3u;
-    return vec3f(positions[base], positions[base + 1u], positions[base + 2u]);
+    let base = style.positions_offset + vertex * 3u;
+    return vec3f(
+        bitcast<f32>(vertex_data[base]),
+        bitcast<f32>(vertex_data[base + 1u]),
+        bitcast<f32>(vertex_data[base + 2u]),
+    );
+}
+
+fn edge_id_at(vertex: u32) -> u32 {
+    return vertex_data[style.edge_ids_offset + vertex];
+}
+
+fn vertex_id_at(vertex: u32) -> u32 {
+    return vertex_data[style.topology_ids_offset + vertex];
 }
 
 @vertex
@@ -83,13 +106,13 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
 
     // The edge leaving each corner toward the next one of the same face. The
     // channel is authored that way, so side a-b carries corner a's id.
-    out.edge_id_ab = edge_ids[index_a];
-    out.edge_id_bc = edge_ids[index_b];
-    out.edge_id_ca = edge_ids[index_c];
+    out.edge_id_ab = edge_id_at(index_a);
+    out.edge_id_bc = edge_id_at(index_b);
+    out.edge_id_ca = edge_id_at(index_c);
 
-    out.vertex_id_a = vertex_ids[index_a];
-    out.vertex_id_b = vertex_ids[index_b];
-    out.vertex_id_c = vertex_ids[index_c];
+    out.vertex_id_a = vertex_id_at(index_a);
+    out.vertex_id_b = vertex_id_at(index_b);
+    out.vertex_id_c = vertex_id_at(index_c);
 
     return out;
 }
