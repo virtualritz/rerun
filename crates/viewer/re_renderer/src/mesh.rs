@@ -382,7 +382,12 @@ impl GpuMesh {
                 &BufferDesc {
                     label: format!("{} - vertices", data.label).into(),
                     size: vb_combined_size,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    // STORAGE so a vertex-pulling pass can read the channels
+                    // directly instead of binding them as vertex attributes
+                    // (SPEC-100 T020).
+                    usage: wgpu::BufferUsages::VERTEX
+                        | wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 },
             );
@@ -424,7 +429,11 @@ impl GpuMesh {
                 &BufferDesc {
                     label: format!("{} - indices", data.label).into(),
                     size: index_buffer_size,
-                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                    // STORAGE for the same reason: the pass fetches indices
+                    // itself rather than relying on the index-buffer stage.
+                    usage: wgpu::BufferUsages::INDEX
+                        | wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 },
             );
