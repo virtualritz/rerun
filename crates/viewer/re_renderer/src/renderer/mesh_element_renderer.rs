@@ -107,8 +107,7 @@ impl MeshElementDrawData {
         let batches = meshes
             .into_iter()
             .map(|(mesh, style)| {
-                let element_offset =
-                    |byte_offset: u64| (byte_offset / 4) as u32;
+                let element_offset = |byte_offset: u64| (byte_offset / 4) as u32;
                 let uniform = ElementStyleUniform {
                     edge_color: style.edge_color,
                     hover_color: style.hover_color,
@@ -116,12 +115,8 @@ impl MeshElementDrawData {
                     hover_half_width_px: style.hover_half_width_px,
                     vertex_radius_px: style.vertex_radius_px,
                     hover_element_id: style.hover_element_id,
-                    positions_offset: element_offset(
-                        mesh.vertex_buffer_positions_range.start,
-                    ),
-                    edge_ids_offset: element_offset(
-                        mesh.vertex_buffer_edge_ids_range.start,
-                    ),
+                    positions_offset: element_offset(mesh.vertex_buffer_positions_range.start),
+                    edge_ids_offset: element_offset(mesh.vertex_buffer_edge_ids_range.start),
                     topology_ids_offset: element_offset(
                         mesh.vertex_buffer_topology_ids_range.start,
                     ),
@@ -163,9 +158,10 @@ impl MeshElementDrawData {
                             BindGroupEntry::Buffer {
                                 handle: style_buffer.handle,
                                 offset: 0,
-                                size: std::num::NonZeroU64::new(
-                                    std::mem::size_of::<ElementStyleUniform>() as u64
-                                ),
+                                size: std::num::NonZeroU64::new(std::mem::size_of::<
+                                    ElementStyleUniform,
+                                >()
+                                    as u64),
                             },
                         ],
                         layout: renderer.bind_group_layout,
@@ -218,7 +214,11 @@ impl Renderer for MeshElementRenderer {
                     storage(1),
                     wgpu::BindGroupLayoutEntry {
                         binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        // Read from both stages: `vs_main` uses
+                        // `style.positions_offset`/`edge_ids_offset`/
+                        // `topology_ids_offset` to pull vertex data before
+                        // `fs_main` ever sees the style at all.
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
@@ -238,42 +238,42 @@ impl Renderer for MeshElementRenderer {
         );
 
         let render_pipeline_desc = RenderPipelineDesc {
-                label: "MeshElementRenderer::render_pipeline".into(),
-                pipeline_layout: ctx.gpu_resources.pipeline_layouts.get_or_create(
-                    ctx,
-                    &PipelineLayoutDesc {
-                        label: "MeshElementRenderer".into(),
-                        entries: vec![ctx.global_bindings.layout, bind_group_layout],
-                    },
-                ),
-                vertex_entrypoint: "vs_main".into(),
-                vertex_handle: shader,
-                fragment_entrypoint: "fs_main".into(),
-                fragment_handle: shader,
-                // Nothing is bound as a vertex attribute: the shader pulls.
-                vertex_buffers: smallvec![],
-                render_targets: smallvec![Some(wgpu::ColorTargetState {
-                    format: ViewBuilder::MAIN_TARGET_COLOR_FORMAT,
-                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    // Edges are drawn from both sides: a back face's cage edge
-                    // is still an edge of the model.
-                    cull_mode: None,
-                    ..Default::default()
+            label: "MeshElementRenderer::render_pipeline".into(),
+            pipeline_layout: ctx.gpu_resources.pipeline_layouts.get_or_create(
+                ctx,
+                &PipelineLayoutDesc {
+                    label: "MeshElementRenderer".into(),
+                    entries: vec![ctx.global_bindings.layout, bind_group_layout],
                 },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: ViewBuilder::MAIN_TARGET_DEPTH_FORMAT,
-                    // Equal-or-nearer, so an edge lying exactly on the surface
-                    // it belongs to is not z-fought out of existence.
-                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                    depth_write_enabled: Some(false),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: ViewBuilder::main_target_default_msaa_state(ctx.render_config(), false),
+            ),
+            vertex_entrypoint: "vs_main".into(),
+            vertex_handle: shader,
+            fragment_entrypoint: "fs_main".into(),
+            fragment_handle: shader,
+            // Nothing is bound as a vertex attribute: the shader pulls.
+            vertex_buffers: smallvec![],
+            render_targets: smallvec![Some(wgpu::ColorTargetState {
+                format: ViewBuilder::MAIN_TARGET_COLOR_FORMAT,
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                // Edges are drawn from both sides: a back face's cage edge
+                // is still an edge of the model.
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: ViewBuilder::MAIN_TARGET_DEPTH_FORMAT,
+                // Equal-or-nearer, so an edge lying exactly on the surface
+                // it belongs to is not z-fought out of existence.
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                depth_write_enabled: Some(false),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: ViewBuilder::main_target_default_msaa_state(ctx.render_config(), false),
         };
         let render_pipeline = ctx
             .gpu_resources
