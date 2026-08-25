@@ -139,10 +139,7 @@ impl CpuMesh {
                 num_element_ids: element_ids.len(),
             });
         }
-        for ids in [vertex_topology_ids, vertex_edge_ids]
-            .into_iter()
-            .flatten()
-        {
+        for ids in [vertex_topology_ids, vertex_edge_ids].into_iter().flatten() {
             if num_pos != ids.len() {
                 return Err(MeshError::WrongNumberOfElementIds {
                     num_pos,
@@ -338,9 +335,73 @@ pub(crate) mod gpu_data {
     }
 }
 
+/// CPU-side vertex/index byte packing for [`GpuMesh::new`], split out so the
+/// copy can happen off the calling thread.
+///
+/// This step touches no GPU handle -- it is safe to run on a background
+/// thread (e.g. a `DisplayBuildWorker`) so the `bytemuck::cast_slice` +
+/// concatenation work, which is many MB for a large mesh (SPEC-101 T062:
+/// ~48MB+ for Nefertiti's ~1M vertices), does not block the UI thread.
+/// [`GpuMesh::new_with_packed`] still needs a `RenderContext` for the
+/// remaining GPU-side work (buffer alloc, `copy_to_buffer`,
+/// materials/bind-groups) and must run on the calling thread.
+pub struct PackedMeshBytes {
+    vertices: Vec<u8>,
+    indices: Vec<u8>,
+}
+
+impl PackedMeshBytes {
+    pub fn pack(data: &CpuMesh) -> Self {
+        re_tracing::profile_function!();
+
+        let vb_positions_size = data.vertex_positions.len() * size_of::<glam::Vec3>();
+        let vb_color_size = data.vertex_colors.len() * size_of::<Rgba32Unmul>();
+        let vb_normals_size = data.vertex_normals.len() * size_of::<glam::Vec3>();
+        let vb_texcoords_size = data.vertex_texcoords.len() * size_of::<glam::Vec2>();
+        let vb_element_ids_size = data.vertex_positions.len() * size_of::<u32>();
+        let vb_combined_size = vb_positions_size
+            + vb_color_size
+            + vb_normals_size
+            + vb_texcoords_size
+            // topology-ids and edge-ids channels are the same size as element-ids.
+            + vb_element_ids_size * 2;
+
+        let mut vertices = Vec::with_capacity(vb_combined_size);
+        vertices.extend_from_slice(bytemuck::cast_slice(&data.vertex_positions));
+        vertices.extend_from_slice(bytemuck::cast_slice(&data.vertex_colors));
+        vertices.extend_from_slice(bytemuck::cast_slice(&data.vertex_normals));
+        vertices.extend_from_slice(bytemuck::cast_slice(&data.vertex_texcoords));
+        let zeros = vec![0u32; data.vertex_positions.len()];
+        for channel in [
+            &data.vertex_element_ids,
+            &data.vertex_topology_ids,
+            &data.vertex_edge_ids,
+        ] {
+            match channel {
+                Some(ids) => vertices.extend_from_slice(bytemuck::cast_slice(ids)),
+                None => vertices.extend_from_slice(bytemuck::cast_slice(&zeros)),
+            }
+        }
+
+        let indices = bytemuck::cast_slice(&data.triangle_indices).to_vec();
+
+        Self { vertices, indices }
+    }
+}
+
 impl GpuMesh {
     // TODO(andreas): Take read-only context here and make uploads happen on staging belt.
     pub fn new(ctx: &RenderContext, data: &CpuMesh) -> Result<Self, MeshError> {
+        Self::new_with_packed(ctx, data, &PackedMeshBytes::pack(data))
+    }
+
+    /// Like [`Self::new`], but skips the CPU-side channel packing when the
+    /// caller already did it off-thread via [`PackedMeshBytes::pack`].
+    pub fn new_with_packed(
+        ctx: &RenderContext,
+        data: &CpuMesh,
+        packed: &PackedMeshBytes,
+    ) -> Result<Self, MeshError> {
         re_tracing::profile_function!();
 
         data.sanity_check()?;
@@ -365,13 +426,17 @@ impl GpuMesh {
         let vb_topology_ids_size = vb_element_ids_size;
         let vb_edge_ids_size = vb_element_ids_size;
 
-        let vb_combined_size = vb_positions_size
-            + vb_color_size
-            + vb_normals_size
-            + vb_texcoords_size
-            + vb_element_ids_size
-            + vb_topology_ids_size
-            + vb_edge_ids_size;
+        let vb_combined_size = packed.vertices.len() as u64;
+        debug_assert_eq!(
+            vb_combined_size,
+            vb_positions_size
+                + vb_color_size
+                + vb_normals_size
+                + vb_texcoords_size
+                + vb_element_ids_size
+                + vb_topology_ids_size
+                + vb_edge_ids_size
+        );
 
         let pools = &ctx.gpu_resources;
         let device = &ctx.device;
@@ -397,23 +462,7 @@ impl GpuMesh {
                 &ctx.gpu_resources.buffers,
                 vb_combined_size as _,
             )?;
-            staging_buffer.extend_from_slice(bytemuck::cast_slice(&data.vertex_positions))?;
-            staging_buffer.extend_from_slice(bytemuck::cast_slice(&data.vertex_colors))?;
-            staging_buffer.extend_from_slice(bytemuck::cast_slice(&data.vertex_normals))?;
-            staging_buffer.extend_from_slice(bytemuck::cast_slice(&data.vertex_texcoords))?;
-            let zeros = vec![0u32; data.vertex_positions.len()];
-            for channel in [
-                &data.vertex_element_ids,
-                &data.vertex_topology_ids,
-                &data.vertex_edge_ids,
-            ] {
-                match channel {
-                    Some(ids) => staging_buffer
-                        .extend_from_slice(bytemuck::cast_slice(ids))?,
-                    None => staging_buffer
-                        .extend_from_slice(bytemuck::cast_slice(&zeros))?,
-                }
-            }
+            staging_buffer.extend_from_slice(&packed.vertices)?;
             staging_buffer.copy_to_buffer(
                 ctx.active_frame.before_view_builder_encoder.lock().get(),
                 &vertex_buffer_combined,
@@ -422,7 +471,11 @@ impl GpuMesh {
             vertex_buffer_combined
         };
 
-        let index_buffer_size = (size_of::<glam::UVec3>() * data.triangle_indices.len()) as u64;
+        let index_buffer_size = packed.indices.len() as u64;
+        debug_assert_eq!(
+            index_buffer_size,
+            (size_of::<glam::UVec3>() * data.triangle_indices.len()) as u64
+        );
         let index_buffer = {
             let index_buffer = pools.buffers.alloc(
                 device,
@@ -438,12 +491,12 @@ impl GpuMesh {
                 },
             );
 
-            let mut staging_buffer = ctx.cpu_write_gpu_read_belt.lock().allocate::<glam::UVec3>(
+            let mut staging_buffer = ctx.cpu_write_gpu_read_belt.lock().allocate::<u8>(
                 &ctx.device,
                 &ctx.gpu_resources.buffers,
-                data.triangle_indices.len(),
+                index_buffer_size as _,
             )?;
-            staging_buffer.extend_from_slice(bytemuck::cast_slice(&data.triangle_indices))?;
+            staging_buffer.extend_from_slice(&packed.indices)?;
             staging_buffer.copy_to_buffer(
                 ctx.active_frame.before_view_builder_encoder.lock().get(),
                 &index_buffer,
@@ -516,10 +569,8 @@ impl GpuMesh {
             vertex_buffer_colors_range: vb_colors_start..vb_normals_start,
             vertex_buffer_normals_range: vb_normals_start..vb_texcoord_start,
             vertex_buffer_texcoord_range: vb_texcoord_start..vb_element_ids_start,
-            vertex_buffer_element_ids_range: vb_element_ids_start
-                ..vb_topology_ids_start,
-            vertex_buffer_topology_ids_range: vb_topology_ids_start
-                ..vb_edge_ids_start,
+            vertex_buffer_element_ids_range: vb_element_ids_start..vb_topology_ids_start,
+            vertex_buffer_topology_ids_range: vb_topology_ids_start..vb_edge_ids_start,
             vertex_buffer_edge_ids_range: vb_edge_ids_start..vb_combined_size,
             index_buffer_range: 0..index_buffer_size,
             materials,
