@@ -333,6 +333,84 @@ pub(crate) mod gpu_data {
             }
         }
     }
+
+    #[cfg(test)]
+    mod material_uniform_layout_tests {
+        use super::MaterialUniformBuffer;
+        use std::mem::offset_of;
+
+        /// The WGSL that reads [`MaterialUniformBuffer`].
+        const SHADER: &str = include_str!("../shader/instanced_mesh_common.wgsl");
+
+        /// Every field must sit where the shader reads it.
+        ///
+        /// This guard replaces a "Keep in sync with ..." comment that did not keep
+        /// anything in sync. The two declarations drifted: the fields are
+        /// `U32RowPadded` here -- a `u32` plus three padding words, so 16 bytes
+        /// each -- while the WGSL declared bare `u32`s. That put `use_matcap` at
+        /// byte 32 on this side and byte 20 on the shader's, and byte 20 is
+        /// `texture_format`'s first padding word, which is always zero. Every mesh
+        /// therefore shaded as though `use_matcap` were 0, silently, for a month.
+        ///
+        /// `texture_format` is at byte 16 under BOTH layouts, which is what made
+        /// the bug so hard to see: half the struct kept working.
+        #[test]
+        fn rust_offsets_match_the_shader_declaration() {
+            assert_eq!(
+                offset_of!(MaterialUniformBuffer, albedo_factor),
+                0,
+                "albedo_factor must lead the buffer",
+            );
+            assert_eq!(
+                offset_of!(MaterialUniformBuffer, texture_format),
+                16,
+                "texture_format follows a vec4f",
+            );
+            assert_eq!(
+                offset_of!(MaterialUniformBuffer, use_matcap),
+                32,
+                "use_matcap follows a full 16-byte U32RowPadded row, not a u32",
+            );
+        }
+
+        /// And the shader must declare them as rows, not scalars.
+        ///
+        /// An offset assertion on this side alone would still pass if someone
+        /// changed only the WGSL, which is exactly the direction the drift went.
+        /// Asserting the declaration text is what makes the guard two-sided.
+        #[test]
+        fn the_shader_declares_both_flags_as_padded_rows() {
+            let struct_body = SHADER
+                .split_once("struct MaterialUniformBuffer {")
+                .expect("the shader declares MaterialUniformBuffer")
+                .1
+                .split_once('}')
+                .expect("the struct declaration is closed")
+                .0;
+
+            for field in ["texture_format", "use_matcap"] {
+                let declaration = struct_body
+                    .lines()
+                    .find(|line| line.trim_start().starts_with(field))
+                    .unwrap_or_else(|| panic!("the shader struct declares `{field}`"));
+                assert!(
+                    declaration.contains("vec4u"),
+                    "`{field}` is `U32RowPadded` (16 bytes) in Rust, so the \
+                     shader must declare it `vec4u` and read `.x`. A bare `u32` \
+                     silently shifts every field after it. Got: {declaration}",
+                );
+            }
+
+            assert!(
+                SHADER.contains("material.use_matcap.x"),
+                "a `vec4u` flag has to be read through `.x`",
+            );
+            assert!(
+                SHADER.contains("material.texture_format.x"),
+                "a `vec4u` flag has to be read through `.x`",
+            );
+        }
+    }
 }
 
 /// CPU-side vertex/index byte packing for [`GpuMesh::new`], split out so the

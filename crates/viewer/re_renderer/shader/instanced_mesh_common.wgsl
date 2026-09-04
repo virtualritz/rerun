@@ -19,11 +19,25 @@ var albedo_texture: texture_2d<f32>;
 const FORMAT_RGBA: u32 = 0;
 const FORMAT_GRAYSCALE: u32 = 1;
 
-// Keep in sync with `gpu_data::MaterialUniformBuffer` in mesh.rs
+// Keep in sync with `gpu_data::MaterialUniformBuffer` in mesh.rs.
+//
+// Both flags are `wgpu_buffer_types::U32RowPadded` on the Rust side: a `u32`
+// followed by three padding words, so each occupies a full 16-byte row. They
+// are declared `vec4u` here to match, and read through `.x`.
+//
+// Declaring them as bare `u32` put `use_matcap` at byte 20 while Rust wrote it
+// at byte 32 -- byte 20 being `texture_format`'s first padding word, which is
+// always zero. The shader therefore saw `use_matcap == 0` for every mesh and
+// took the textured path unconditionally, which is what broke face matcap
+// shading. `texture_format` happens to sit at byte 16 under both layouts, so
+// half the struct kept working and hid the other half.
 struct MaterialUniformBuffer {
     albedo_factor: vec4f,
-    texture_format: u32,
-    use_matcap: u32,
+    /// `.x` is the `TextureFormat` discriminant; `.yzw` is padding.
+    texture_format: vec4u,
+    /// `.x` is 1 to light with the matcap texture, 0 for standard shading;
+    /// `.yzw` is padding.
+    use_matcap: vec4u,
 };
 
 @group(1) @binding(1)
@@ -98,7 +112,7 @@ fn vs_main(in_vertex: VertexIn, in_instance: InstanceIn) -> VertexOut {
     return out;
 }
 
-// Matcap albedo, used when `material.use_matcap != 0`. The bound texture is a
+// Matcap albedo, used when `material.use_matcap.x != 0`. The bound texture is a
 // matcap, sampled by the view-space normal rather than by the mesh's texture
 // coordinates, so a mesh needs no UVs at all on this path. Returns linear
 // unmultiplied rgb in `.rgb` and separate alpha in `.a`.
@@ -138,7 +152,7 @@ fn shade_matcap(normal_world_space: vec3f, additive_tint_rgba: vec4f) -> vec4f {
     return vec4f(matcap_color, alpha);
 }
 
-// Textured albedo, used when `material.use_matcap == 0`. The bound texture is a
+// Textured albedo, used when `material.use_matcap.x == 0`. The bound texture is a
 // base-color map sampled at the interpolated corner UV, lit by a fixed two-light
 // diffuse rig so that surface form still reads. This restores the shading path
 // that the matcap work replaced, rather than inventing a second one. Returns
@@ -146,7 +160,7 @@ fn shade_matcap(normal_world_space: vec3f, additive_tint_rgba: vec4f) -> vec4f {
 fn shade_textured(texcoord: vec2f, vertex_color: vec3f, normal_world_space: vec3f, additive_tint_rgba: vec4f) -> vec4f {
     let sample = textureSample(albedo_texture, trilinear_sampler_repeat, texcoord);
     var texture_color: vec3f;
-    switch material.texture_format {
+    switch material.texture_format.x {
         case FORMAT_RGBA: { texture_color = linear_from_srgb(sample.rgb); }
         case FORMAT_GRAYSCALE: { texture_color = linear_from_srgb(sample.rrr); }
         default: { texture_color = vec3f(0.0); }
@@ -180,7 +194,7 @@ fn fs_main_shaded(in: VertexOut) -> @location(0) vec4f {
     // Matcap is the default and stays the untextured path; `use_matcap == 0`
     // opts into sampling the albedo texture at the interpolated corner UV.
     var shaded: vec4f;
-    if material.use_matcap != 0u {
+    if material.use_matcap.x != 0u {
         shaded = shade_matcap(in.normal_world_space, in.additive_tint_rgba);
     } else {
         shaded = shade_textured(in.texcoord, in.color, in.normal_world_space, in.additive_tint_rgba);
