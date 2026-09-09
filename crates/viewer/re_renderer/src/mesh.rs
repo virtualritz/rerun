@@ -314,6 +314,39 @@ pub(crate) mod gpu_data {
         end_padding: [wgpu_buffer_types::PaddingRow; 16 - 3],
     }
 
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Each scalar in the material uniform occupies a full 16-byte row.
+        ///
+        /// The Rust half of the pair asserted by `tests/shader_validation.rs`'s
+        /// `material_uniform_layout_matches_the_rust_struct`; both name the
+        /// same offsets, so drift on either side fails one of them.
+        ///
+        /// `U32RowPadded` is a `u32` plus three words of padding, so
+        /// `use_matcap` starts at 32 -- NOT at 20, which is where a WGSL twin
+        /// declaring bare `u32`s back to back would look for it. When the two
+        /// disagree the shader silently reads a padding word, which is always
+        /// zero: no validation error, no warning, and matcap shading simply
+        /// never appears while the CPU-side flag reads `true`.
+        ///
+        /// Lives inside `gpu_data` because the fields are private to it.
+        #[test]
+        fn material_uniform_offsets_are_row_padded() {
+            use core::mem::offset_of;
+
+            assert_eq!(offset_of!(MaterialUniformBuffer, albedo_factor), 0);
+            assert_eq!(offset_of!(MaterialUniformBuffer, texture_format), 16);
+            assert_eq!(
+                offset_of!(MaterialUniformBuffer, use_matcap),
+                32,
+                "`use_matcap` must start a fresh 16-byte row; if this moved, \
+                 `instanced_mesh_common.wgsl`'s padding must move with it"
+            );
+        }
+    }
+
     impl MaterialUniformBuffer {
         #[expect(dead_code)]
         pub fn new(albedo_factor: ecolor::Rgba, texture_format: TextureFormat) -> Self {
@@ -578,3 +611,4 @@ impl GpuMesh {
         })
     }
 }
+
