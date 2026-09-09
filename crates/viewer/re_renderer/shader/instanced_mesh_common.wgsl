@@ -19,10 +19,28 @@ var albedo_texture: texture_2d<f32>;
 const FORMAT_RGBA: u32 = 0;
 const FORMAT_GRAYSCALE: u32 = 1;
 
-// Keep in sync with `gpu_data::MaterialUniformBuffer` in mesh.rs
+// Keep in sync with `gpu_data::MaterialUniformBuffer` in mesh.rs.
+//
+// Both scalars are a `U32RowPadded` on the Rust side -- a u32 followed by
+// three words of padding -- so each occupies a full 16-byte row and the next
+// field starts 16 bytes later, not 4. WGSL gives a bare `u32` an alignment of
+// 4, so writing them back to back put `use_matcap` at offset 20 while Rust
+// wrote it at 32; the shader read `texture_format`'s first padding word, which
+// is always zero, and every mesh took the `use_matcap == 0` branch. Matcap
+// shading could never appear. `texture_format` was unaffected only because
+// offset 16 happens to be correct for both.
+//
+// `tests/shader_validation.rs` pins these offsets against the Rust struct.
 struct MaterialUniformBuffer {
     albedo_factor: vec4f,
     texture_format: u32,
+    // Padding out `texture_format`'s row. Three separate scalars, not a
+    // `vec3u` (alignment 16 -- it would jump to offset 32 itself and push
+    // `use_matcap` to 44) and not an `array<u32, 3>` (in the UNIFORM address
+    // space WGSL rounds array stride up to 16, making it 48 bytes wide).
+    _texture_format_padding_0: u32,
+    _texture_format_padding_1: u32,
+    _texture_format_padding_2: u32,
     use_matcap: u32,
 };
 

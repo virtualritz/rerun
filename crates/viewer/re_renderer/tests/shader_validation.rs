@@ -174,3 +174,76 @@ fn indent(s: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// The material uniform's WGSL layout must match `gpu_data::MaterialUniformBuffer`.
+///
+/// This pins a bug class that is silent by construction. The Rust struct spells
+/// its scalars `wgpu_buffer_types::U32RowPadded` -- a `u32` plus three words of
+/// padding, so each occupies a full 16-byte row -- while WGSL gives a bare
+/// `u32` an alignment of 4. Writing the WGSL fields back to back therefore put
+/// `use_matcap` at offset 20 where Rust wrote it at 32, so the shader read
+/// `texture_format`'s first padding word. That word is always zero, so
+/// `material.use_matcap != 0u` was always false and matcap shading could never
+/// appear -- with no validation error, no warning, and nothing to see on the
+/// CPU side, where the flag really was `true`.
+///
+/// `texture_format` masked the problem: offset 16 is correct for both spellings,
+/// so textured meshes rendered fine and only the field AFTER it was displaced.
+///
+/// Read through `instanced_mesh.wgsl` rather than `instanced_mesh_common.wgsl`:
+/// the latter is an include-only fragment that expects its includer to supply
+/// bindings, so it does not parse standalone.
+#[test]
+fn material_uniform_layout_matches_the_rust_struct() {
+    // Offsets of `gpu_data::MaterialUniformBuffer` in `mesh.rs`. That struct is
+    // `pub(crate)`, so an integration test cannot `offset_of!` it directly --
+    // the Rust half of this pair is asserted by
+    // `mesh::tests::material_uniform_offsets_are_row_padded`. Both halves must
+    // name the same numbers, so drift on either side fails one of them.
+    const EXPECTED: &[(&str, u32)] = &[
+        ("albedo_factor", 0),
+        ("texture_format", 16),
+        ("use_matcap", 32),
+    ];
+
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let shader_dir = crate_dir.join("shader");
+
+    let mut search_path = SearchPath::default();
+    search_path.push(&shader_dir);
+    let resolver = FileResolver::with_search_path(DiskFileSystem, search_path);
+
+    let shader = shader_dir.join("instanced_mesh.wgsl");
+    let interpolated = resolver
+        .populate(&shader)
+        .expect("instanced_mesh.wgsl should resolve its imports");
+    let source = &interpolated.contents;
+    let module = naga::front::wgsl::parse_str(source)
+        .unwrap_or_else(|err| panic!("{}", err.emit_to_string(source)));
+
+    let (_, ty) = module
+        .types
+        .iter()
+        .find(|(_, ty)| ty.name.as_deref() == Some("MaterialUniformBuffer"))
+        .expect("instanced_mesh.wgsl should declare MaterialUniformBuffer");
+
+    let naga::TypeInner::Struct { members, .. } = &ty.inner else {
+        panic!("MaterialUniformBuffer should be a struct");
+    };
+
+    for (name, expected_offset) in EXPECTED {
+        let member = members
+            .iter()
+            .find(|m| m.name.as_deref() == Some(*name))
+            .unwrap_or_else(|| {
+                panic!("MaterialUniformBuffer should have a `{name}` member")
+            });
+        assert_eq!(
+            member.offset, *expected_offset,
+            "`{name}` sits at WGSL offset {} but Rust writes it at {expected_offset}; \
+             the uniform's padding has drifted out of sync with \
+             `gpu_data::MaterialUniformBuffer`",
+            member.offset,
+        );
+    }
+}
