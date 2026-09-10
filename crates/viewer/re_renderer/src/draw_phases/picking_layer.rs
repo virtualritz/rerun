@@ -259,10 +259,12 @@ impl PickingLayerProcessor {
             frame_uniform_buffer_content,
         );
 
+        // The picking layer reads no occlusion, so it gets the white default.
         let bind_group_0 = ctx.global_bindings.create_bind_group(
             &ctx.gpu_resources,
             &ctx.device,
             frame_uniform_buffer,
+            ctx.texture_manager_2d.white_texture_unorm_handle().handle(),
         );
 
         let row_info_id =

@@ -5,8 +5,8 @@ use re_mutex::RwLock;
 use crate::allocator::{GpuReadbackIdentifier, create_and_fill_uniform_buffer};
 use crate::context::RenderContext;
 use crate::draw_phases::{
-    DrawPhase, OutlineConfig, OutlineMaskProcessor, PickingLayerError, PickingLayerProcessor,
-    ScreenshotProcessor,
+    DrawPhase, OcclusionConfig, OcclusionProcessor, OutlineConfig, OutlineMaskProcessor,
+    PickingLayerError, PickingLayerProcessor, ScreenshotProcessor,
 };
 use crate::global_bindings::FrameUniformBuffer;
 use crate::queueable_draw_data::QueueableDrawData;
@@ -34,6 +34,7 @@ pub struct ViewBuilder {
     outline_mask_processor: Option<OutlineMaskProcessor>,
     screenshot_processor: Option<ScreenshotProcessor>,
     picking_processor: Option<PickingLayerProcessor>,
+    occlusion_processor: Option<OcclusionProcessor>,
 }
 
 /// Stable identity of a rendered view.
@@ -269,6 +270,12 @@ pub struct TargetConfiguration {
 
     pub outline_config: Option<OutlineConfig>,
 
+    /// Screen-space ambient occlusion, if any (akatela SPEC-123).
+    ///
+    /// `None` runs no occlusion pass and binds a 1x1 white texture in its
+    /// place, so shaders read it without a branch.
+    pub occlusion_config: Option<OcclusionConfig>,
+
     /// How the `composite` step combines the view's result with the background.
     pub blend_with_background: BlendWithBackground,
 
@@ -294,6 +301,7 @@ impl Default for TargetConfiguration {
             viewport_transformation: RectTransform::IDENTITY,
             pixels_per_point: 1.0,
             outline_config: None,
+            occlusion_config: None,
             blend_with_background: BlendWithBackground::No,
             picking_config: None,
         }
@@ -711,10 +719,26 @@ impl ViewBuilder {
             frame_uniform_buffer_content,
         );
 
+        let occlusion_processor = config.occlusion_config.as_ref().map(|occlusion_config| {
+            OcclusionProcessor::new(
+                ctx,
+                occlusion_config,
+                &config.name,
+                config.resolution_in_pixel,
+                projection_from_view,
+            )
+        });
+        // Without occlusion the white default keeps the shader branch-free.
+        let occlusion_texture = occlusion_processor.as_ref().map_or_else(
+            || ctx.texture_manager_2d.white_texture_unorm_handle().handle(),
+            |processor| processor.occlusion_texture().handle,
+        );
+
         let bind_group_0 = ctx.global_bindings.create_bind_group(
             &ctx.gpu_resources,
             &ctx.device,
             frame_uniform_buffer,
+            occlusion_texture,
         );
 
         let mut debug_overlays: Vec<QueueableDrawData> = Vec::new();
@@ -767,6 +791,9 @@ impl ViewBuilder {
             if picking_processor.is_some() {
                 active_draw_phases |= DrawPhase::PickingLayer;
             }
+            if occlusion_processor.is_some() {
+                active_draw_phases |= DrawPhase::OcclusionPrepass;
+            }
             // TODO(andreas): should not always be active.
             // TODO(andreas): The fact that this is a draw phase is actually a bit dubious.
             //if screenshot_processor.is_some() {
@@ -800,6 +827,7 @@ impl ViewBuilder {
             outline_mask_processor,
             screenshot_processor: Default::default(),
             picking_processor,
+            occlusion_processor,
         };
 
         view_builder.queue_draw(
@@ -876,6 +904,24 @@ impl ViewBuilder {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some(setup.name.clone().get()),
             });
+
+        // Occlusion first: the main pass's mesh shader samples its result
+        // (akatela SPEC-123). It needs passes of its own, because nothing can
+        // run between the main pass's phases.
+        if let Some(occlusion_processor) = &self.occlusion_processor {
+            re_tracing::profile_scope!("occlusion");
+            {
+                let mut pass = occlusion_processor.begin_prepass(&mut encoder);
+                pass.set_bind_group(0, &setup.bind_group_0, &[]);
+                self.draw_phase_manager.draw(
+                    &renderers,
+                    &pipelines,
+                    DrawPhase::OcclusionPrepass,
+                    &mut pass,
+                );
+            }
+            occlusion_processor.compute_occlusion(&pipelines, &mut encoder)?;
+        }
 
         {
             re_tracing::profile_scope!("main target pass");

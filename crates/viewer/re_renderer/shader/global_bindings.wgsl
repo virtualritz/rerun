@@ -47,6 +47,13 @@ var nearest_sampler_clamped: sampler;
 @group(0) @binding(3)
 var trilinear_sampler_repeat: sampler;
 
+// Screen-space ambient occlusion, one value per pixel in `.r` (akatela
+// SPEC-123). A 1x1 white texture when the view has none. Read it with
+// `textureLoad` and a clamped coordinate: see `occlusion_at` in
+// `instanced_mesh_common.wgsl`.
+@group(0) @binding(4)
+var occlusion_texture: texture_2d<f32>;
+
 // See config.rs#DeviceTier
 const DEVICE_TIER_GLES = 0u;
 const DEVICE_TIER_WEBGPU = 1u;

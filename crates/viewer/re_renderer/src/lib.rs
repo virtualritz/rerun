@@ -91,9 +91,9 @@ pub use context::{
 };
 pub use depth_offset::DepthOffset;
 pub use draw_phases::{
-    DrawPhase, DrawPhaseManager, Drawable, DrawableCollector, OutlineConfig, OutlineMaskPreference,
-    OutlineMaskProcessor, PickingLayerId, PickingLayerInstanceId, PickingLayerObjectId,
-    PickingLayerProcessor, ScreenshotProcessor,
+    DrawPhase, DrawPhaseManager, Drawable, DrawableCollector, OcclusionConfig, OutlineConfig,
+    OutlineMaskPreference, OutlineMaskProcessor, PickingLayerId, PickingLayerInstanceId,
+    PickingLayerObjectId, PickingLayerProcessor, ScreenshotProcessor,
 };
 pub use label::Label;
 pub use resource_managers::AlphaChannelUsage;

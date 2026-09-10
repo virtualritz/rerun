@@ -2,11 +2,13 @@
 // Need to start to formalize this further and create implementers for all DrawPhases to build up our render graph.
 
 mod draw_phase_manager;
+mod occlusion;
 mod outlines;
 mod picking_layer;
 mod screenshot;
 
 pub use draw_phase_manager::{DrawPhaseManager, Drawable, DrawableCollector};
+pub use occlusion::{OcclusionConfig, OcclusionProcessor};
 pub use outlines::{OutlineConfig, OutlineMaskPreference, OutlineMaskProcessor};
 pub use picking_layer::{
     PickingLayerError, PickingLayerId, PickingLayerInstanceId, PickingLayerObjectId,
@@ -30,6 +32,12 @@ pub use screenshot::ScreenshotProcessor;
 pub enum DrawPhase {
     /// Depth-only geometry that must be available before visible opaque drawables.
     DepthPrepass = 0,
+
+    /// Opaque geometry drawn into the occlusion prepass: single-sampled depth and
+    /// view-space normals, in a render pass of its own before the main pass.
+    ///
+    /// Only drawn when the view has an [`OcclusionConfig`].
+    OcclusionPrepass,
 
     /// Opaque objects, performing reads/writes to the depth buffer.
     ///
