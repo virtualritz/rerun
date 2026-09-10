@@ -334,6 +334,29 @@ pub(crate) mod gpu_data {
         end_padding: [wgpu_buffer_types::PaddingRow; 16 - 4],
     }
 
+    impl MaterialUniformBuffer {
+        #[expect(dead_code)]
+        pub fn new(albedo_factor: ecolor::Rgba, texture_format: TextureFormat) -> Self {
+            // Fully rough: no matcap, so specular occlusion stays inert.
+            Self::with_matcap(albedo_factor, texture_format, false, 1.0)
+        }
+
+        pub fn with_matcap(
+            albedo_factor: ecolor::Rgba,
+            texture_format: TextureFormat,
+            use_matcap: bool,
+            specular_roughness: f32,
+        ) -> Self {
+            Self {
+                albedo_factor,
+                texture_format: (texture_format as u32).into(),
+                use_matcap: (use_matcap as u32).into(),
+                specular_roughness: specular_roughness.clamp(0.0, 1.0).into(),
+                end_padding: Default::default(),
+            }
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -369,29 +392,6 @@ pub(crate) mod gpu_data {
                 "`use_matcap` must start a fresh 16-byte row; if this moved, \
                  `instanced_mesh_common.wgsl`'s padding must move with it"
             );
-        }
-    }
-
-    impl MaterialUniformBuffer {
-        #[expect(dead_code)]
-        pub fn new(albedo_factor: ecolor::Rgba, texture_format: TextureFormat) -> Self {
-            // Fully rough: no matcap, so specular occlusion stays inert.
-            Self::with_matcap(albedo_factor, texture_format, false, 1.0)
-        }
-
-        pub fn with_matcap(
-            albedo_factor: ecolor::Rgba,
-            texture_format: TextureFormat,
-            use_matcap: bool,
-            specular_roughness: f32,
-        ) -> Self {
-            Self {
-                albedo_factor,
-                texture_format: (texture_format as u32).into(),
-                use_matcap: (use_matcap as u32).into(),
-                specular_roughness: specular_roughness.clamp(0.0, 1.0).into(),
-                end_padding: Default::default(),
-            }
         }
     }
 }

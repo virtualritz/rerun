@@ -120,12 +120,19 @@ fn cube_gpu_mesh(ctx: &RenderContext) -> Arc<GpuMesh> {
                 vertex_colors: vec![Rgba32Unmul::WHITE; vertex_positions.len()],
                 vertex_normals: vec![glam::Vec3::ZERO; vertex_positions.len()],
                 vertex_texcoords: vec![glam::Vec2::ZERO; vertex_positions.len()],
+                vertex_element_ids: None,
+                vertex_topology_ids: None,
+                vertex_edge_ids: None,
                 vertex_positions,
                 materials: smallvec![Material {
                     label: "opaque_material".into(),
                     index_range: 0..36,
                     albedo: ctx.texture_manager_2d.white_texture_unorm_handle().clone(),
                     albedo_factor: re_renderer::Rgba::WHITE,
+                    use_matcap: false,
+                    // Black adds nothing, so the albedo path shades unchanged.
+                    matcap_specular: ctx.texture_manager_2d.black_texture_unorm_handle().clone(),
+                    specular_roughness: 1.0,
                 }],
                 bbox,
             },
@@ -158,6 +165,9 @@ fn mesh_instances(
                 .into(),
                 outline_mask_ids: OutlineMaskPreference::NONE,
                 picking_layer_id: PickingLayerId::default(),
+                // Nothing is hovered or selected, so the tint is never read.
+                hover_element_id: 0,
+                selection_tint: [0.0; 3],
                 cull_mode: None,
             }
         })
