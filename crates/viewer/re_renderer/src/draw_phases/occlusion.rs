@@ -163,6 +163,10 @@ impl OcclusionProcessor {
         let occlusion_desc = TextureDesc {
             label: format!("{label}::raw_occlusion").into(),
             format: Self::OCCLUSION_FORMAT,
+            // Copyable, so a test can read the result back.
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC,
             ..normal_desc
         };
         let raw_occlusion = texture_pool.alloc(&ctx.device, &occlusion_desc);

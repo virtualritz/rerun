@@ -1,13 +1,15 @@
 // Screen-space ambient occlusion estimate (akatela SPEC-123).
 //
-// Normal-oriented disk sampling in the spirit of McGuire et al., "Scalable
-// Ambient Obscurance" (HPG 2012). Each tap is a nearby pixel's view-space
-// position. A tap above the surface and inside the radius occludes it.
+// McGuire et al., "Scalable Ambient Obscurance" (HPG 2012). Each tap is a
+// nearby pixel's view-space position. A tap above the surface and inside the
+// radius occludes it, and a NEAR tap occludes far more than a distant one:
+// the term divides the tap's rise by its squared distance. That weighting is
+// what makes a crease dark. An earlier version averaged the bare cosine and
+// left a right-angled crease only 13 % darker.
 //
-// Unlike SAO's own formula, every term here is a ratio of lengths: the
-// cosine to the tap, and a falloff over the radius. SAO's constants are
-// tuned in metres. This result holds across the viewport's whole scale
-// range, which SPEC-123 R7 requires.
+// SAO's constants are in metres. Here each is a fraction of the radius, and
+// the term is multiplied by the radius, so it has no units. The result holds
+// across the viewport's whole scale range, which SPEC-123 R7 requires.
 
 #import <../types.wgsl>
 #import <../screen_triangle_vertex.wgsl>
@@ -26,13 +28,18 @@ const TAU: f32 = 6.28318530718;
 // for 8 to 32 taps (SAO's choice).
 const SPIRAL_TURNS: f32 = 7.0;
 
-// A tap must sit this far above the tangent plane, as a cosine, to count.
-// Removes the self-occlusion a tessellated flat surface would otherwise show.
-const BIAS_COSINE: f32 = 0.1;
+// A tap must rise this far above the tangent plane to count, as a fraction
+// of the radius (SAO: 0.012 m). Removes the self-occlusion a tessellated flat
+// surface would otherwise show.
+const BIAS: f32 = 0.02;
 
-// Turns the mean occlusion into darkening. With it, a right-angled crease
-// lands near 0.35. The strength exponent tunes the rest.
-const INTENSITY: f32 = 2.0;
+// Keeps a tap right beside the centre from dividing by almost nothing, as a
+// fraction of the radius squared (SAO: 0.01 square metres).
+const EPSILON: f32 = 0.01;
+
+// SAO's intensity. One is the paper's value; the strength exponent tunes the
+// rest.
+const INTENSITY: f32 = 1.0;
 
 // A 4x4 ordered pattern of rotations. The blur's 4x4 window sees each
 // rotation exactly once, so the pattern cancels instead of smearing.
@@ -79,9 +86,13 @@ fn main(@builtin(position) frag_position: vec4f) -> @location(0) f32 {
         }
         let to_tap = view_position(params, tap, tap_depth) - position;
         let distance_squared = dot(to_tap, to_tap);
-        let cosine = dot(to_tap, normal) / max(sqrt(distance_squared), 1e-6 * radius);
+        let rise = dot(to_tap, normal);
+        // SAO's term with its units removed: the falloff cubed, times the
+        // rise over the squared distance, times the radius.
         let falloff = max(1.0 - distance_squared / radius_squared, 0.0);
-        sum += max(cosine - BIAS_COSINE, 0.0) * falloff;
+        sum += falloff * falloff * falloff * max(rise - BIAS * radius, 0.0) * radius
+            / (distance_squared + EPSILON * radius_squared);
     }
-    return max(0.0, 1.0 - INTENSITY * sum / f32(count));
+    // SAO's normalisation: five over the tap count.
+    return max(0.0, 1.0 - INTENSITY * 5.0 * sum / f32(count));
 }

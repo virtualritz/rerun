@@ -1108,6 +1108,180 @@ impl ViewBuilder {
 mod tests {
     use std::sync::Arc;
 
+    /// Occlusion darkens where two surfaces meet (akatela SPEC-123 OCC-017).
+    ///
+    /// Reproduces "switching occlusion changes nothing" without a window: a
+    /// floor meets a wall, the view runs its occlusion passes, and the result
+    /// is read back. All white would mean the passes produce nothing.
+    #[test]
+    fn occlusion_darkens_a_crease() {
+        use crate::draw_phases::OcclusionConfig;
+        use crate::mesh::{CpuMesh, GpuMesh, Material};
+        use crate::renderer::{GpuMeshInstance, MeshDrawData};
+
+        re_log::setup_logging();
+        re_log::PanicOnWarnScope::new();
+
+        const SIDE: u32 = 64;
+        const ROW: u32 = 256; // copy rows are padded to 256 bytes
+        // Not `RenderContext::new_test()`: that requests WebGL2 downlevel
+        // limits while reporting the full tier, so the mesh renderer's
+        // fragment storage buffer fails validation and nothing draws. Ask for
+        // the adapter's own limits, as the akatela app does.
+        let instance = wgpu::Instance::new(crate::device_caps::testing_instance_descriptor());
+        let adapter = pollster::block_on(crate::device_caps::select_testing_adapter(&instance));
+        let caps = crate::device_caps::DeviceCaps::from_adapter(&adapter).expect("device caps");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_limits: adapter.limits(),
+            ..caps.device_descriptor()
+        }))
+        .expect("device");
+        let mut ctx = RenderContext::new(
+            &adapter,
+            device,
+            queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            |_| crate::RenderConfig::testing(),
+        )
+        .expect("render context");
+        let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("occlusion readback"),
+            size: u64::from(ROW * SIDE),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        ctx.execute_test_frame(|ctx| {
+            // Floor y = 0 over z in 0..2, wall z = 0 over y in 0..2: one crease
+            // along x. Normals face each other across the crease.
+            let quad = |corners: [glam::Vec3; 4], normal: glam::Vec3| (corners, normal);
+            let quads = [
+                quad(
+                    [
+                        glam::vec3(-1.0, 0.0, 0.0),
+                        glam::vec3(1.0, 0.0, 0.0),
+                        glam::vec3(1.0, 0.0, 2.0),
+                        glam::vec3(-1.0, 0.0, 2.0),
+                    ],
+                    glam::Vec3::Y,
+                ),
+                quad(
+                    [
+                        glam::vec3(-1.0, 0.0, 0.0),
+                        glam::vec3(1.0, 0.0, 0.0),
+                        glam::vec3(1.0, 2.0, 0.0),
+                        glam::vec3(-1.0, 2.0, 0.0),
+                    ],
+                    glam::Vec3::Z,
+                ),
+            ];
+            let mut vertex_positions = Vec::new();
+            let mut vertex_normals = Vec::new();
+            let mut triangle_indices = Vec::new();
+            for (corners, normal) in quads {
+                let base = vertex_positions.len() as u32;
+                vertex_positions.extend(corners);
+                vertex_normals.extend([normal; 4]);
+                triangle_indices.push(glam::uvec3(base, base + 1, base + 2));
+                triangle_indices.push(glam::uvec3(base, base + 2, base + 3));
+            }
+            let count = vertex_positions.len();
+            let cpu_mesh = CpuMesh {
+                label: "crease".into(),
+                bbox: crate::util::bounding_box_from_points(vertex_positions.iter().copied()),
+                triangle_indices,
+                vertex_colors: vec![crate::Rgba32Unmul::WHITE; count],
+                vertex_normals,
+                vertex_texcoords: vec![glam::Vec2::ZERO; count],
+                vertex_element_ids: None,
+                vertex_topology_ids: None,
+                vertex_edge_ids: None,
+                vertex_positions,
+                materials: smallvec::smallvec![Material {
+                    label: "crease".into(),
+                    index_range: 0..12,
+                    albedo: ctx.texture_manager_2d.white_texture_unorm_handle().clone(),
+                    albedo_factor: crate::Rgba::WHITE,
+                    use_matcap: true,
+                    matcap_specular: ctx.texture_manager_2d.black_texture_unorm_handle().clone(),
+                    specular_roughness: 1.0,
+                }],
+            };
+            let mesh = Arc::new(GpuMesh::new(ctx, &cpu_mesh).expect("mesh uploads"));
+            let draw_data = MeshDrawData::new(ctx, &[GpuMeshInstance::new(mesh)])
+                .expect("draw data");
+
+            let config = TargetConfiguration {
+                resolution_in_pixel: [SIDE, SIDE],
+                view_from_world: macaw::IsoTransform::look_at_rh(
+                    glam::vec3(0.0, 1.6, 3.2),
+                    glam::vec3(0.0, 0.4, 0.4),
+                    glam::Vec3::Y,
+                )
+                .expect("camera"),
+                occlusion_config: Some(OcclusionConfig {
+                    sample_count: 16,
+                    world_radius: 0.5,
+                    pixel_radius_range: [4.0, 48.0],
+                    strength: 1.0,
+                }),
+                ..TargetConfiguration::default()
+            };
+            let mut view = ViewBuilder::new(ctx, config, super::ViewBuilderId::new(0))
+                .expect("view builds");
+            view.queue_draw(ctx, draw_data);
+            let draw = view.draw(ctx, crate::Rgba::BLACK).expect("view draws");
+
+            let occlusion = &view
+                .occlusion_processor
+                .as_ref()
+                .expect("an occlusion config makes a processor")
+                .occlusion_texture()
+                .texture;
+            let mut encoder = ctx.device.create_command_encoder(&Default::default());
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: occlusion,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(ROW),
+                        rows_per_image: Some(SIDE),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: SIDE,
+                    height: SIDE,
+                    depth_or_array_layers: 1,
+                },
+            );
+            [draw, encoder.finish()]
+        });
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |result| result.expect("readback maps"));
+        ctx.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_secs(10)),
+            })
+            .expect("readback completes");
+        let data = slice.get_mapped_range().expect("mapped range");
+        let values: Vec<u8> = (0..SIDE as usize)
+            .flat_map(|row| data[row * ROW as usize..][..SIDE as usize].to_vec())
+            .collect();
+        let min = *values.iter().min().expect("pixels");
+        let max = *values.iter().max().expect("pixels");
+        println!("occlusion min {min} max {max} (255 = unoccluded)");
+        assert!(min < 200, "no pixel is occluded: the passes produce nothing (min {min})");
+        assert!(max > 240, "everything is occluded (max {max})");
+    }
+
     use super::{TargetConfiguration, ViewBuilder};
     use crate::MsaaMode;
     use crate::RenderContext;
