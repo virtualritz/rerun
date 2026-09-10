@@ -274,11 +274,19 @@ impl DeviceCaps {
     }
 
     /// Wgpu limits required by the given device tier.
+    ///
+    /// The full tier asks for the WebGPU defaults. The `WebGL2` set allows no
+    /// storage buffers, and the mesh renderer binds one in the fragment stage
+    /// on that tier.
     pub fn limits(&self) -> wgpu::Limits {
+        let tier_limits = match self.tier {
+            DeviceCapabilityTier::Limited => wgpu::Limits::downlevel_webgl2_defaults(),
+            DeviceCapabilityTier::FullWebGpuSupport => wgpu::Limits::defaults(),
+        };
         wgpu::Limits {
             max_texture_dimension_2d: self.max_texture_dimension2d,
             max_buffer_size: self.max_buffer_size,
-            ..wgpu::Limits::downlevel_webgl2_defaults()
+            ..tier_limits
         }
     }
 

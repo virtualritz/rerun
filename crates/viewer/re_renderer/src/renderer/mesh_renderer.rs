@@ -1359,10 +1359,7 @@ mod tests {
                 albedo: ctx.texture_manager_2d.white_texture_unorm_handle().clone(),
                 albedo_factor: crate::Rgba::WHITE,
                 use_matcap: false,
-                matcap_specular: ctx
-                    .texture_manager_2d
-                    .black_texture_unorm_handle()
-                    .clone(),
+                matcap_specular: ctx.texture_manager_2d.black_texture_unorm_handle().clone(),
                 specular_roughness: 1.0
             }],
         )
@@ -1378,10 +1375,7 @@ mod tests {
                     albedo: ctx.texture_manager_2d.white_texture_unorm_handle().clone(),
                     albedo_factor: crate::Rgba::WHITE,
                     use_matcap: false,
-                    matcap_specular: ctx
-                        .texture_manager_2d
-                        .black_texture_unorm_handle()
-                        .clone(),
+                    matcap_specular: ctx.texture_manager_2d.black_texture_unorm_handle().clone(),
                     specular_roughness: 1.0
                 },
                 Material {
@@ -1390,10 +1384,7 @@ mod tests {
                     albedo: ctx.texture_manager_2d.white_texture_unorm_handle().clone(),
                     albedo_factor: crate::Rgba::TRANSPARENT,
                     use_matcap: false,
-                    matcap_specular: ctx
-                        .texture_manager_2d
-                        .black_texture_unorm_handle()
-                        .clone(),
+                    matcap_specular: ctx.texture_manager_2d.black_texture_unorm_handle().clone(),
                     specular_roughness: 1.0
                 }
             ],
@@ -1424,16 +1415,19 @@ mod tests {
             instance_no_tint_no_outline.clone(),
         ];
 
-        // This should create one bach each for the two active layers (picking & opaque).
+        // One batch each for the three active layers: opaque, the occlusion
+        // prepass it feeds, and picking.
         let draw_data = result_or_panic(
             MeshDrawData::new(&ctx, &instances),
             "opaque mesh draw data should build",
         );
-        assert_eq!(draw_data.batches.len(), 2);
+        assert_eq!(draw_data.batches.len(), 3);
         assert_eq!(draw_data.batches[0].instance_range.len(), 2);
         assert_eq!(draw_data.batches[0].draw_phase, DrawPhase::Opaque);
         assert_eq!(draw_data.batches[1].instance_range.len(), 2);
-        assert_eq!(draw_data.batches[1].draw_phase, DrawPhase::PickingLayer);
+        assert_eq!(draw_data.batches[1].draw_phase, DrawPhase::OcclusionPrepass);
+        assert_eq!(draw_data.batches[2].instance_range.len(), 2);
+        assert_eq!(draw_data.batches[2].draw_phase, DrawPhase::PickingLayer);
 
         let mut draw_phase_manager = DrawPhaseManager::new(EnumSet::all());
         draw_phase_manager.add_draw_data(&ctx, draw_data.into(), &test_view_info());
@@ -1444,7 +1438,7 @@ mod tests {
 
         let picking_drawables = draw_phase_manager.drawables_for_phase(DrawPhase::PickingLayer);
         assert_eq!(picking_drawables.len(), 1);
-        assert_eq!(picking_drawables[0].draw_data_payload, 1);
+        assert_eq!(picking_drawables[0].draw_data_payload, 2);
     }
 
     #[test]
@@ -1507,7 +1501,7 @@ mod tests {
             MeshDrawData::new(&ctx, &instances),
             "transparent-tint mesh draw data should build",
         );
-        assert_eq!(draw_data.batches.len(), 4);
+        assert_eq!(draw_data.batches.len(), 5);
         assert_eq!(draw_data.batches[0].instance_range.len(), 1);
         assert_eq!(draw_data.batches[0].draw_phase, DrawPhase::Transparent);
         assert!(draw_data.batches[1].has_transparent_tint);
@@ -1516,8 +1510,11 @@ mod tests {
         assert!(draw_data.batches[1].has_transparent_tint);
         assert_eq!(draw_data.batches[2].instance_range.len(), 2);
         assert_eq!(draw_data.batches[2].draw_phase, DrawPhase::Opaque);
-        assert_eq!(draw_data.batches[3].instance_range.len(), 4);
-        assert_eq!(draw_data.batches[3].draw_phase, DrawPhase::PickingLayer);
+        // Only the opaque instances occlude (SPEC-123 OCC-001).
+        assert_eq!(draw_data.batches[3].instance_range.len(), 2);
+        assert_eq!(draw_data.batches[3].draw_phase, DrawPhase::OcclusionPrepass);
+        assert_eq!(draw_data.batches[4].instance_range.len(), 4);
+        assert_eq!(draw_data.batches[4].draw_phase, DrawPhase::PickingLayer);
 
         let mut draw_phase_manager = DrawPhaseManager::new(EnumSet::all());
         draw_phase_manager.add_draw_data(&ctx, draw_data.into(), &test_view_info());
@@ -1533,7 +1530,7 @@ mod tests {
 
         let picking_drawables = draw_phase_manager.drawables_for_phase(DrawPhase::PickingLayer);
         assert_eq!(picking_drawables.len(), 1);
-        assert_eq!(picking_drawables[0].draw_data_payload, 3);
+        assert_eq!(picking_drawables[0].draw_data_payload, 4);
     }
 
     #[test]
@@ -1560,13 +1557,15 @@ mod tests {
             MeshDrawData::new(&ctx, &instances),
             "outline mesh draw data should build",
         );
-        assert_eq!(draw_data.batches.len(), 3);
+        assert_eq!(draw_data.batches.len(), 4);
         assert_eq!(draw_data.batches[0].instance_range.len(), 4); // All draw outlines.
         assert_eq!(draw_data.batches[0].draw_phase, DrawPhase::Opaque);
-        assert_eq!(draw_data.batches[1].instance_range.len(), 2); // Two outlines, batched together.
-        assert_eq!(draw_data.batches[1].draw_phase, DrawPhase::OutlineMask);
-        assert_eq!(draw_data.batches[2].instance_range.len(), 4); // All draw picking.
-        assert_eq!(draw_data.batches[2].draw_phase, DrawPhase::PickingLayer);
+        assert_eq!(draw_data.batches[1].instance_range.len(), 4); // All occlude.
+        assert_eq!(draw_data.batches[1].draw_phase, DrawPhase::OcclusionPrepass);
+        assert_eq!(draw_data.batches[2].instance_range.len(), 2); // Two outlines, batched together.
+        assert_eq!(draw_data.batches[2].draw_phase, DrawPhase::OutlineMask);
+        assert_eq!(draw_data.batches[3].instance_range.len(), 4); // All draw picking.
+        assert_eq!(draw_data.batches[3].draw_phase, DrawPhase::PickingLayer);
 
         let mut draw_phase_manager = DrawPhaseManager::new(EnumSet::all());
         draw_phase_manager.add_draw_data(&ctx, draw_data.into(), &test_view_info());
@@ -1577,11 +1576,11 @@ mod tests {
 
         let outline_drawables = draw_phase_manager.drawables_for_phase(DrawPhase::OutlineMask);
         assert_eq!(outline_drawables.len(), 1);
-        assert_eq!(outline_drawables[0].draw_data_payload, 1);
+        assert_eq!(outline_drawables[0].draw_data_payload, 2);
 
         let picking_drawables = draw_phase_manager.drawables_for_phase(DrawPhase::PickingLayer);
         assert_eq!(picking_drawables.len(), 1);
-        assert_eq!(picking_drawables[0].draw_data_payload, 2);
+        assert_eq!(picking_drawables[0].draw_data_payload, 3);
     }
 
     #[test]
@@ -1601,7 +1600,7 @@ mod tests {
             MeshDrawData::new(&ctx, &instances),
             "opaque-and-transparent mesh draw data should build",
         );
-        assert_eq!(draw_data.batches.len(), 4);
+        assert_eq!(draw_data.batches.len(), 5);
         assert_eq!(draw_data.batches[0].instance_range.len(), 1);
         assert_eq!(draw_data.batches[0].draw_phase, DrawPhase::Transparent);
         assert_eq!(draw_data.batches[1].instance_range.len(), 1);
@@ -1609,7 +1608,9 @@ mod tests {
         assert_eq!(draw_data.batches[2].instance_range.len(), 2);
         assert_eq!(draw_data.batches[2].draw_phase, DrawPhase::Opaque);
         assert_eq!(draw_data.batches[3].instance_range.len(), 2);
-        assert_eq!(draw_data.batches[3].draw_phase, DrawPhase::PickingLayer);
+        assert_eq!(draw_data.batches[3].draw_phase, DrawPhase::OcclusionPrepass);
+        assert_eq!(draw_data.batches[4].instance_range.len(), 2);
+        assert_eq!(draw_data.batches[4].draw_phase, DrawPhase::PickingLayer);
 
         let mut draw_phase_manager = DrawPhaseManager::new(EnumSet::all());
         draw_phase_manager.add_draw_data(&ctx, draw_data.into(), &test_view_info());
@@ -1625,6 +1626,6 @@ mod tests {
 
         let picking_drawables = draw_phase_manager.drawables_for_phase(DrawPhase::PickingLayer);
         assert_eq!(picking_drawables.len(), 1);
-        assert_eq!(picking_drawables[0].draw_data_payload, 3);
+        assert_eq!(picking_drawables[0].draw_data_payload, 4);
     }
 }

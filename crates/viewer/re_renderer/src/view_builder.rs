@@ -1136,26 +1136,7 @@ mod tests {
 
         const SIDE: u32 = 64;
         const ROW: u32 = 256; // copy rows are padded to 256 bytes
-        // Not `RenderContext::new_test()`: that requests WebGL2 downlevel
-        // limits while reporting the full tier, so the mesh renderer's
-        // fragment storage buffer fails validation and nothing draws. Ask for
-        // the adapter's own limits, as the akatela app does.
-        let instance = wgpu::Instance::new(crate::device_caps::testing_instance_descriptor());
-        let adapter = pollster::block_on(crate::device_caps::select_testing_adapter(&instance));
-        let caps = crate::device_caps::DeviceCaps::from_adapter(&adapter).expect("device caps");
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            required_limits: adapter.limits(),
-            ..caps.device_descriptor()
-        }))
-        .expect("device");
-        let mut ctx = RenderContext::new(
-            &adapter,
-            device,
-            queue,
-            wgpu::TextureFormat::Rgba8Unorm,
-            |_| crate::RenderConfig::testing(),
-        )
-        .expect("render context");
+        let mut ctx = RenderContext::new_test();
         let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("occlusion readback"),
             size: u64::from(ROW * SIDE),
