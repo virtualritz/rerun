@@ -240,6 +240,24 @@ pub struct Material {
     /// If true, uses the albedo texture as a matcap for view-dependent lighting.
     /// The texture is sampled using view-space normals instead of UV coordinates.
     pub use_matcap: bool,
+
+    /// The ADDED matcap lobe, sampled like `albedo` when `use_matcap` is set.
+    ///
+    /// A matcap bakes one lighting environment into one image. With the body
+    /// shading and the highlights multiplied together, every matcap reads as
+    /// metal. Splitting them lets the shader multiply the diffuse lobe and add
+    /// this one, which is what makes ceramic look unlike steel.
+    ///
+    /// Bind a 1x1 black texture for a single-lobe matcap. The added term then
+    /// contributes nothing and shading matches the unsplit result.
+    pub matcap_specular: GpuTexture2D,
+
+    /// How rough a surface `matcap_specular` depicts, in `[0, 1]`.
+    ///
+    /// A matcap carries no roughness of its own, so the caller either reads it
+    /// from the asset or estimates it from the specular image. It drives
+    /// specular occlusion; it does not change the lobes themselves.
+    pub specular_roughness: f32,
 }
 
 #[derive(Clone)]
@@ -311,7 +329,9 @@ pub(crate) mod gpu_data {
         texture_format: wgpu_buffer_types::U32RowPadded,
         /// 1 = use matcap texture for lighting, 0 = use standard shading
         use_matcap: wgpu_buffer_types::U32RowPadded,
-        end_padding: [wgpu_buffer_types::PaddingRow; 16 - 3],
+        /// Roughness of the specular matcap lobe, in `[0, 1]`.
+        specular_roughness: wgpu_buffer_types::F32RowPadded,
+        end_padding: [wgpu_buffer_types::PaddingRow; 16 - 4],
     }
 
     #[cfg(test)]
@@ -339,6 +359,11 @@ pub(crate) mod gpu_data {
             assert_eq!(offset_of!(MaterialUniformBuffer, albedo_factor), 0);
             assert_eq!(offset_of!(MaterialUniformBuffer, texture_format), 16);
             assert_eq!(
+                offset_of!(MaterialUniformBuffer, specular_roughness),
+                48,
+                "`specular_roughness` follows `use_matcap`'s row"
+            );
+            assert_eq!(
                 offset_of!(MaterialUniformBuffer, use_matcap),
                 32,
                 "`use_matcap` must start a fresh 16-byte row; if this moved, \
@@ -350,18 +375,21 @@ pub(crate) mod gpu_data {
     impl MaterialUniformBuffer {
         #[expect(dead_code)]
         pub fn new(albedo_factor: ecolor::Rgba, texture_format: TextureFormat) -> Self {
-            Self::with_matcap(albedo_factor, texture_format, false)
+            // Fully rough: no matcap, so specular occlusion stays inert.
+            Self::with_matcap(albedo_factor, texture_format, false, 1.0)
         }
 
         pub fn with_matcap(
             albedo_factor: ecolor::Rgba,
             texture_format: TextureFormat,
             use_matcap: bool,
+            specular_roughness: f32,
         ) -> Self {
             Self {
                 albedo_factor,
                 texture_format: (texture_format as u32).into(),
                 use_matcap: (use_matcap as u32).into(),
+                specular_roughness: specular_roughness.clamp(0.0, 1.0).into(),
                 end_padding: Default::default(),
             }
         }
@@ -551,6 +579,7 @@ impl GpuMesh {
                             gpu_data::TextureFormat::Rgba
                         },
                         material.use_matcap,
+                        material.specular_roughness,
                     )
                 }),
             );
@@ -570,7 +599,10 @@ impl GpuMesh {
                         label: material.label.clone(),
                         entries: smallvec![
                             BindGroupEntry::DefaultTextureView(material.albedo.handle()),
-                            uniform_buffer_binding
+                            uniform_buffer_binding,
+                            BindGroupEntry::DefaultTextureView(
+                                material.matcap_specular.handle()
+                            ),
                         ],
                         layout: mesh_bind_group_layout,
                     },

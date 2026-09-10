@@ -296,6 +296,11 @@ fn import_mesh(
             albedo,
             albedo_factor,
             use_matcap: false,
+            // A single-lobe matcap adds nothing: black is the identity
+            // for the addition, and full roughness keeps specular
+            // occlusion inert.
+            matcap_specular: texture_manager.black_texture_unorm_handle().clone(),
+            specular_roughness: 1.0,
         });
     }
     if vertex_positions.is_empty() || triangle_indices.is_empty() {
