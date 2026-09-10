@@ -122,6 +122,12 @@ pub fn init() {
     }
 
     {
+        let virtpath = Path::new("shader/occlusion/horizon.wgsl");
+        let content = include_str!("../shader/occlusion/horizon.wgsl").into();
+        fs.create_file(virtpath, content).unwrap();
+    }
+
+    {
         let virtpath = Path::new("shader/outlines/jumpflooding_init.wgsl");
         let content = include_str!("../shader/outlines/jumpflooding_init.wgsl").into();
         fs.create_file(virtpath, content).unwrap();
