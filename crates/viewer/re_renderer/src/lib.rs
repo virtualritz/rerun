@@ -100,7 +100,7 @@ pub use context::{
 };
 pub use depth_offset::DepthOffset;
 pub use draw_phases::{
-    DrawPhase, DrawPhaseManager, Drawable, DrawableCollector, OcclusionConfig, OutlineConfig,
+    DrawPhase, DrawPhaseManager, Drawable, DrawableCollector, OcclusionConfig, OcclusionMethod, OutlineConfig,
     OutlineMaskPreference, OutlineMaskProcessor, PickingLayerId, PickingLayerInstanceId,
     PickingLayerObjectId, PickingLayerProcessor, ScreenshotProcessor,
 };

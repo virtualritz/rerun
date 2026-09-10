@@ -268,6 +268,7 @@ impl PickingLayerProcessor {
             &ctx.device,
             frame_uniform_buffer,
             ctx.texture_manager_2d.white_texture_unorm_handle().handle(),
+            ctx.texture_manager_2d.zeroed_texture_float().handle,
         );
 
         let row_info_id =

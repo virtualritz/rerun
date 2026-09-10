@@ -96,6 +96,10 @@ struct VertexOut {
 
     @location(8) @interpolate(flat)
     selection_tint: vec3f,
+
+    // For the per-pixel view vector (akatela SPEC-123 D3b).
+    @location(9)
+    position_view: vec3f,
 };
 
 @vertex
@@ -124,6 +128,7 @@ fn vs_main(in_vertex: VertexIn, in_instance: InstanceIn) -> VertexOut {
     out.element_id = in_vertex.element_id;
     out.hover_element_id = in_instance.hover_element_id;
     out.selection_tint = in_instance.selection_tint;
+    out.position_view = frame.view_from_world * vec4f(world_position, 1.0);
 
     return out;
 }
@@ -135,6 +140,50 @@ fn occlusion_at(frag_position: vec4f) -> f32 {
     let size = textureDimensions(occlusion_texture);
     let pixel = min(vec2u(frag_position.xy), size - vec2u(1u));
     return textureLoad(occlusion_texture, pixel, 0).r;
+}
+
+// This pixel's bent normal and its presence flag (SPEC-123 D3a). See
+// `bent_normal_texture` in `global_bindings.wgsl`.
+fn bent_normal_at(frag_position: vec4f) -> vec4f {
+    let size = textureDimensions(bent_normal_texture);
+    let pixel = min(vec2u(frag_position.xy), size - vec2u(1u));
+    return textureLoad(bent_normal_texture, pixel, 0);
+}
+
+// The solid angle where two spherical caps overlap, from the cosines of their
+// half-angles and of the angle between their axes. After Oat and Sander
+// (2007), as Unity's SRP core implements it. Keep in sync with the Rust
+// reference in `draw_phases/occlusion.rs`.
+fn spherical_cap_intersection(cos_c1: f32, cos_c2: f32, cos_b: f32) -> f32 {
+    let r1 = acos(clamp(cos_c1, -1.0, 1.0));
+    let r2 = acos(clamp(cos_c2, -1.0, 1.0));
+    let rd = acos(clamp(cos_b, -1.0, 1.0));
+    let smaller_cap = 6.283185307 - 6.283185307 * max(cos_c1, cos_c2);
+    if rd <= max(r1, r2) - min(r1, r2) {
+        return smaller_cap; // one cap lies inside the other
+    }
+    if rd >= r1 + r2 {
+        return 0.0; // the caps do not meet
+    }
+    let diff = abs(r1 - r2);
+    let den = r1 + r2 - diff;
+    let x = 1.0 - saturate((rd - diff) / max(den, 0.0001));
+    return smoothstep(0.0, 1.0, x) * smaller_cap;
+}
+
+// Specular occlusion from a bent cone (SPEC-123 D3a), after Jimenez et al.,
+// "Practical Realtime Strategies for Accurate Indirect Occlusion" (SIGGRAPH
+// 2016), slide 129: the share of the reflection cone inside the visible cone
+// around the bent normal. Keep in sync with the Rust reference.
+fn specular_occlusion_cone(eye: vec3f, bent_normal: vec3f, normal: vec3f, ao: f32, roughness: f32) -> f32 {
+    // Occlusion is cosine weighted, so the visible cone's half-angle follows.
+    let cos_visible = sqrt(max(1.0 - ao, 0.0));
+    let r = max(roughness, 0.01);
+    // 10^(-r^2): the reflection cone widens with roughness.
+    let cos_reflection = exp2(-3.321928 * r * r);
+    let cos_between = dot(bent_normal, reflect(-eye, normal));
+    return saturate(spherical_cap_intersection(cos_visible, cos_reflection, cos_between)
+        / (6.283185307 * (1.0 - cos_reflection)));
 }
 
 // Specular occlusion from ambient occlusion (SPEC-123 R4), after Lagarde and
@@ -167,15 +216,38 @@ fn facing_view_normal(normal_world_space: vec3f, front_facing: bool) -> vec3f {
     return select(-view_normal, view_normal, front_facing);
 }
 
+// The unit vector from the surface toward the eye, in view space (SPEC-123
+// D3b). View space here looks down -Z, so it lies in the +Z hemisphere.
+// `tan_half_fov` is `f32::MAX` for an orthographic camera, where every pixel
+// shares one view direction.
+fn eye_vector(position_view: vec3f) -> vec3f {
+    let orthographic = frame.tan_half_fov.y > 1.0e30;
+    return select(normalize(-position_view), vec3f(0.0, 0.0, 1.0), orthographic);
+}
+
+// Blender's `matcap_uv_compute(I, N)` (workbench_matcap_lib.glsl), verbatim
+// but for the unused `flipped` flag. It builds an orthonormal basis around the
+// eye vector, so a perspective camera looks the matcap up correctly away from
+// the screen centre. With I = +Z it reduces to `N.xy`. The basis is singular
+// at I.z = -1, which the eye vector never reaches.
+fn matcap_uv_compute(eye: vec3f, normal: vec3f) -> vec2f {
+    let a = 1.0 / (1.0 + eye.z);
+    let b = -eye.x * eye.y * a;
+    let b1 = vec3f(1.0 - eye.x * eye.x * a, b, -eye.x);
+    let b2 = vec3f(b, 1.0 - eye.y * eye.y * a, -eye.y);
+    return vec2f(dot(b1, normal), dot(b2, normal)) * 0.496 + 0.5;
+}
+
 // Matcap albedo, used when `material.use_matcap != 0`. The bound texture is a
 // matcap, sampled by the view-space normal rather than by the mesh's texture
 // coordinates, so a mesh needs no UVs at all on this path. Returns linear
 // unmultiplied rgb in `.rgb` and separate alpha in `.a`.
-fn shade_matcap(normal_world_space: vec3f, additive_tint_rgba: vec4f, front_facing: bool, occlusion: f32) -> vec4f {
+fn shade_matcap(normal_world_space: vec3f, position_view: vec3f, additive_tint_rgba: vec4f, front_facing: bool, occlusion: f32, bent: vec4f) -> vec4f {
     let facing_normal = facing_view_normal(normal_world_space, front_facing);
+    let eye = eye_vector(position_view);
 
     // Map view-space normal XY from [-1,1] to [0,1] for texture lookup.
-    let matcap_uv = facing_normal.xy * 0.5 + 0.5;
+    let matcap_uv = matcap_uv_compute(eye, facing_normal);
 
     // No sRGB decode here. An `Rgba8UnormSrgb` texture is linearised by the
     // sampler, and an EXR lobe is linear already, so decoding would darken
@@ -191,10 +263,13 @@ fn shade_matcap(normal_world_space: vec3f, additive_tint_rgba: vec4f, front_faci
     //
     // Each lobe is masked on its own (SPEC-123 R2): ambient occlusion darkens
     // the body, and the specular lobe takes the specular occlusion derived
-    // from it. `abs(z)` stands in for N.V; it is exact for an orthographic
-    // camera and close for a perspective one.
-    let n_dot_v = saturate(abs(facing_normal.z));
-    let specular_mask = specular_occlusion(n_dot_v, occlusion, material.specular_roughness);
+    // from it. With a bent normal from the horizon method that is the cone
+    // overlap (D3a); without one, the analytic R4 formula.
+    let n_dot_v = saturate(dot(facing_normal, eye));
+    let cone_mask = specular_occlusion_cone(
+        eye, normalize(bent.rgb * 2.0 - 1.0), facing_normal, occlusion, material.specular_roughness);
+    let analytic_mask = specular_occlusion(n_dot_v, occlusion, material.specular_roughness);
+    let specular_mask = select(analytic_mask, cone_mask, bent.a > 0.5);
     var matcap_color = diffuse_lobe * material.albedo_factor.rgb * occlusion
         + specular_lobe * specular_mask;
 
@@ -247,12 +322,12 @@ fn shade_textured(texcoord: vec2f, vertex_color: vec3f, normal_world_space: vec3
 }
 
 // The shared body of the two shaded entry points.
-fn shade(in: VertexOut, front_facing: bool, occlusion: f32) -> vec4f {
+fn shade(in: VertexOut, front_facing: bool, occlusion: f32, bent: vec4f) -> vec4f {
     // Matcap is the default and stays the untextured path; `use_matcap == 0`
     // opts into sampling the albedo texture at the interpolated corner UV.
     var shaded: vec4f;
     if material.use_matcap != 0u {
-        shaded = shade_matcap(in.normal_world_space, in.additive_tint_rgba, front_facing, occlusion);
+        shaded = shade_matcap(in.normal_world_space, in.position_view, in.additive_tint_rgba, front_facing, occlusion, bent);
     } else {
         shaded = shade_textured(in.texcoord, in.color, in.normal_world_space, in.additive_tint_rgba, occlusion);
     }
@@ -283,14 +358,14 @@ fn shade(in: VertexOut, front_facing: bool, occlusion: f32) -> vec4f {
 
 @fragment
 fn fs_main_shaded(in: VertexOut, @builtin(front_facing) front_facing: bool) -> @location(0) vec4f {
-    return shade(in, front_facing, occlusion_at(in.position));
+    return shade(in, front_facing, occlusion_at(in.position), bent_normal_at(in.position));
 }
 
 // Transparent geometry neither writes nor receives occlusion (SPEC-123 R9).
 // The occlusion behind a transparent surface belongs to what is behind it.
 @fragment
 fn fs_main_shaded_unoccluded(in: VertexOut, @builtin(front_facing) front_facing: bool) -> @location(0) vec4f {
-    return shade(in, front_facing, 1.0);
+    return shade(in, front_facing, 1.0, vec4f(0.0));
 }
 
 // The occlusion prepass (SPEC-123): the view-space normal, mapped to [0, 1].

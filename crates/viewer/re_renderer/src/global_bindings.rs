@@ -119,6 +119,19 @@ impl GlobalBindings {
                             },
                             count: None,
                         },
+                        // The horizon method's bent normal: `.rgb` the view-space
+                        // direction, `.a` 1 where it was computed. An all-zero
+                        // texture when there is none (akatela SPEC-123 D3a).
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 5,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
                     ],
                 },
             ),
@@ -165,6 +178,7 @@ impl GlobalBindings {
         device: &wgpu::Device,
         frame_uniform_buffer_binding: BindGroupEntry,
         occlusion_texture: crate::wgpu_resources::GpuTextureHandle,
+        bent_normal_texture: crate::wgpu_resources::GpuTextureHandle,
     ) -> GpuBindGroup {
         pools.bind_groups.alloc(
             device,
@@ -178,6 +192,7 @@ impl GlobalBindings {
                     BindGroupEntry::Sampler(self.nearest_neighbor_sampler_clamped),
                     BindGroupEntry::Sampler(self.trilinear_sampler_repeat),
                     BindGroupEntry::DefaultTextureView(occlusion_texture),
+                    BindGroupEntry::DefaultTextureView(bent_normal_texture),
                 ],
                 layout: self.layout,
             },

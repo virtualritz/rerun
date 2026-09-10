@@ -14,7 +14,10 @@ struct OcclusionUniformBuffer {
     pixel_radius_min: f32,
     pixel_radius_max: f32,
     strength: f32,
+    // Disk samples, or horizon slices.
     sample_count: u32,
+    // Horizon method only: samples along each slice direction.
+    steps_per_slice: u32,
     // There is more padding in the buffer; the shader needs none of it.
 };
 

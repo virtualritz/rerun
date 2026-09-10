@@ -157,22 +157,26 @@ impl Projection {
 
                 // Note that we inverse z (by swapping near and far plane) to be consistent with our perspective projection.
                 match camera_mode {
-                    OrthographicCameraMode::NearPlaneCenter => glam::camera::rh::proj::directx::orthographic(
-                        -0.5 * horizontal_world_size,
-                        0.5 * horizontal_world_size,
-                        -0.5 * vertical_world_size,
-                        0.5 * vertical_world_size,
-                        far_plane_distance,
-                        0.0,
-                    ),
-                    OrthographicCameraMode::TopLeftCornerAndExtendZ => glam::camera::rh::proj::directx::orthographic(
-                        0.0,
-                        horizontal_world_size,
-                        vertical_world_size,
-                        0.0,
-                        far_plane_distance,
-                        -far_plane_distance,
-                    ),
+                    OrthographicCameraMode::NearPlaneCenter => {
+                        glam::camera::rh::proj::directx::orthographic(
+                            -0.5 * horizontal_world_size,
+                            0.5 * horizontal_world_size,
+                            -0.5 * vertical_world_size,
+                            0.5 * vertical_world_size,
+                            far_plane_distance,
+                            0.0,
+                        )
+                    }
+                    OrthographicCameraMode::TopLeftCornerAndExtendZ => {
+                        glam::camera::rh::proj::directx::orthographic(
+                            0.0,
+                            horizontal_world_size,
+                            vertical_world_size,
+                            0.0,
+                            far_plane_distance,
+                            -far_plane_distance,
+                        )
+                    }
                 }
             }
         }
@@ -734,11 +738,22 @@ impl ViewBuilder {
             |processor| processor.occlusion_texture().handle,
         );
 
+        // Alpha 0 everywhere means "no bent normal", which the zeroed texture is.
+
+        let bent_normal_texture = occlusion_processor
+            .as_ref()
+            .and_then(|processor| processor.bent_normal_texture())
+            .map_or_else(
+                || ctx.texture_manager_2d.zeroed_texture_float().handle,
+                |texture| texture.handle,
+            );
+
         let bind_group_0 = ctx.global_bindings.create_bind_group(
             &ctx.gpu_resources,
             &ctx.device,
             frame_uniform_buffer,
             occlusion_texture,
+            bent_normal_texture,
         );
 
         let mut debug_overlays: Vec<QueueableDrawData> = Vec::new();
@@ -1108,13 +1123,10 @@ impl ViewBuilder {
 mod tests {
     use std::sync::Arc;
 
-    /// Occlusion darkens where two surfaces meet (akatela SPEC-123 OCC-017).
-    ///
-    /// Reproduces "switching occlusion changes nothing" without a window: a
-    /// floor meets a wall, the view runs its occlusion passes, and the result
-    /// is read back. All white would mean the passes produce nothing.
-    #[test]
-    fn occlusion_darkens_a_crease() {
+    /// Draws a floor meeting a wall with `method`, runs the view's occlusion
+    /// passes and reads the result back. Returns the darkest and brightest
+    /// pixel, 255 being unoccluded.
+    fn crease_occlusion(method: crate::draw_phases::OcclusionMethod) -> (u8, u8, u8) {
         use crate::draw_phases::OcclusionConfig;
         use crate::mesh::{CpuMesh, GpuMesh, Material};
         use crate::renderer::{GpuMeshInstance, MeshDrawData};
@@ -1153,15 +1165,18 @@ mod tests {
 
         ctx.execute_test_frame(|ctx| {
             // Floor y = 0 over z in 0..2, wall z = 0 over y in 0..2: one crease
-            // along x. Normals face each other across the crease.
+            // along x. Normals face each other across the crease. Both quads
+            // wind counter-clockwise toward the camera: the prepass flips the
+            // normal of a back face, so a floor wound the other way points
+            // into itself.
             let quad = |corners: [glam::Vec3; 4], normal: glam::Vec3| (corners, normal);
             let quads = [
                 quad(
                     [
                         glam::vec3(-1.0, 0.0, 0.0),
-                        glam::vec3(1.0, 0.0, 0.0),
-                        glam::vec3(1.0, 0.0, 2.0),
                         glam::vec3(-1.0, 0.0, 2.0),
+                        glam::vec3(1.0, 0.0, 2.0),
+                        glam::vec3(1.0, 0.0, 0.0),
                     ],
                     glam::Vec3::Y,
                 ),
@@ -1208,8 +1223,8 @@ mod tests {
                 }],
             };
             let mesh = Arc::new(GpuMesh::new(ctx, &cpu_mesh).expect("mesh uploads"));
-            let draw_data = MeshDrawData::new(ctx, &[GpuMeshInstance::new(mesh)])
-                .expect("draw data");
+            let draw_data =
+                MeshDrawData::new(ctx, &[GpuMeshInstance::new(mesh)]).expect("draw data");
 
             let config = TargetConfiguration {
                 resolution_in_pixel: [SIDE, SIDE],
@@ -1220,15 +1235,15 @@ mod tests {
                 )
                 .expect("camera"),
                 occlusion_config: Some(OcclusionConfig {
-                    sample_count: 16,
+                    method,
                     world_radius: 0.5,
                     pixel_radius_range: [4.0, 48.0],
                     strength: 1.0,
                 }),
                 ..TargetConfiguration::default()
             };
-            let mut view = ViewBuilder::new(ctx, config, super::ViewBuilderId::new(0))
-                .expect("view builds");
+            let mut view =
+                ViewBuilder::new(ctx, config, super::ViewBuilderId::new(0)).expect("view builds");
             view.queue_draw(ctx, draw_data);
             let draw = view.draw(ctx, crate::Rgba::BLACK).expect("view draws");
 
@@ -1277,9 +1292,50 @@ mod tests {
             .collect();
         let min = *values.iter().min().expect("pixels");
         let max = *values.iter().max().expect("pixels");
-        println!("occlusion min {min} max {max} (255 = unoccluded)");
-        assert!(min < 200, "no pixel is occluded: the passes produce nothing (min {min})");
+        // Patches of open floor and open wall, away from the crease. Before the
+        // floor was wound toward the camera, its normal pointed into it: the
+        // disk method left it untouched and the horizon method turned it black.
+        let patch_min = |rows: std::ops::Range<usize>| {
+            rows.flat_map(|row| values[row * SIDE as usize..][24..40].iter().copied())
+                .min()
+                .expect("pixels")
+        };
+        let open = patch_min(44..52).min(patch_min(10..24));
+        (min, max, open)
+    }
+
+    /// Occlusion darkens where two surfaces meet (akatela SPEC-123 OCC-017).
+    ///
+    /// Reproduces "switching occlusion changes nothing" without a window. All
+    /// white would mean the passes produce nothing. Before SAO's 1/distance
+    /// weighting was restored, the crease reached only 221.
+    #[test]
+    fn occlusion_darkens_a_crease() {
+        let (min, max, open) =
+            crease_occlusion(crate::draw_phases::OcclusionMethod::Disk { sample_count: 16 });
+        println!("disk: occlusion min {min} max {max} open {open} (255 = unoccluded)");
+        assert!(
+            min < 200,
+            "no pixel is occluded: the passes produce nothing (min {min})"
+        );
         assert!(max > 240, "everything is occluded (max {max})");
+        assert!(open > 229, "an open surface is occluded (open {open})");
+    }
+
+    /// The horizon method, `Precise`, darkens the same crease (SPEC-123 D3a).
+    #[test]
+    fn horizon_occlusion_darkens_a_crease() {
+        let (min, max, open) = crease_occlusion(crate::draw_phases::OcclusionMethod::Horizon {
+            slice_count: 3,
+            steps_per_slice: 3,
+        });
+        println!("horizon: occlusion min {min} max {max} open {open} (255 = unoccluded)");
+        assert!(
+            min < 200,
+            "no pixel is occluded: the passes produce nothing (min {min})"
+        );
+        assert!(max > 240, "everything is occluded (max {max})");
+        assert!(open > 229, "an open surface is occluded (open {open})");
     }
 
     use super::{TargetConfiguration, ViewBuilder};
