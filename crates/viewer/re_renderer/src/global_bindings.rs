@@ -106,6 +106,19 @@ impl GlobalBindings {
                             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                             count: None,
                         },
+                        // Screen-space ambient occlusion, one value per pixel.
+                        // A 1x1 white texture when the view has none, so
+                        // shaders read it without a branch (akatela SPEC-123).
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 4,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
                     ],
                 },
             ),
@@ -151,6 +164,7 @@ impl GlobalBindings {
         pools: &WgpuResourcePools,
         device: &wgpu::Device,
         frame_uniform_buffer_binding: BindGroupEntry,
+        occlusion_texture: crate::wgpu_resources::GpuTextureHandle,
     ) -> GpuBindGroup {
         pools.bind_groups.alloc(
             device,
@@ -163,6 +177,7 @@ impl GlobalBindings {
                     BindGroupEntry::Sampler(self.nearest_neighbor_sampler_repeat),
                     BindGroupEntry::Sampler(self.nearest_neighbor_sampler_clamped),
                     BindGroupEntry::Sampler(self.trilinear_sampler_repeat),
+                    BindGroupEntry::DefaultTextureView(occlusion_texture),
                 ],
                 layout: self.layout,
             },

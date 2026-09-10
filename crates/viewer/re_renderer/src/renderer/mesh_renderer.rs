@@ -12,6 +12,7 @@ use smallvec::smallvec;
 
 use super::{DrawData, DrawError, RenderContext, Renderer};
 use crate::device_caps::DeviceCapabilityTier;
+use crate::draw_phases::OcclusionProcessor;
 use crate::draw_phases::{DrawPhase, OutlineMaskProcessor};
 use crate::mesh::gpu_data::MaterialUniformBuffer;
 use crate::mesh::{GpuMesh, mesh_vertices};
@@ -436,6 +437,7 @@ impl MeshDrawData {
                 for phase in [
                     DrawPhase::DepthPrepass,
                     DrawPhase::Opaque,
+                    DrawPhase::OcclusionPrepass,
                     DrawPhase::OutlineMask,
                 ] {
                     let mut instance_start = num_processed_instances;
@@ -645,6 +647,10 @@ pub struct MeshRenderer {
     rp_depth_only_cull_back: GpuRenderPipelineHandle,
     rp_depth_only_cull_front: GpuRenderPipelineHandle,
 
+    rp_occlusion_prepass: GpuRenderPipelineHandle,
+    rp_occlusion_prepass_cull_back: GpuRenderPipelineHandle,
+    rp_occlusion_prepass_cull_front: GpuRenderPipelineHandle,
+
     rp_shaded_alpha_blended_cull_back: GpuRenderPipelineHandle,
     rp_shaded_alpha_blended_cull_front: GpuRenderPipelineHandle,
 
@@ -668,6 +674,7 @@ impl MeshRenderer {
             phase,
             DrawPhase::DepthPrepass
                 | DrawPhase::Opaque
+                | DrawPhase::OcclusionPrepass
                 | DrawPhase::Transparent
                 | DrawPhase::PickingLayer
                 | DrawPhase::OutlineMask
@@ -929,8 +936,45 @@ impl Renderer for MeshRenderer {
             },
         );
 
+        // The occlusion prepass (akatela SPEC-123): view-space normals and
+        // single-sampled depth, into the targets `OcclusionProcessor` owns.
+        let rp_occlusion_prepass_desc = RenderPipelineDesc {
+            label: "MeshRenderer::rp_occlusion_prepass".into(),
+            fragment_entrypoint: "fs_main_occlusion_prepass".into(),
+            render_targets: smallvec![Some(OcclusionProcessor::NORMAL_FORMAT.into())],
+            depth_stencil: Some(ViewBuilder::MAIN_TARGET_DEFAULT_DEPTH_STATE),
+            multisample: wgpu::MultisampleState::default(),
+            ..rp_shaded_desc.clone()
+        };
+        let rp_occlusion_prepass = render_pipelines.get_or_create(ctx, &rp_occlusion_prepass_desc);
+        let rp_occlusion_prepass_cull_back = render_pipelines.get_or_create(
+            ctx,
+            &RenderPipelineDesc {
+                label: "MeshRenderer::rp_occlusion_prepass_cull_back".into(),
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: Some(wgpu::Face::Back),
+                    ..primitive
+                },
+                ..rp_occlusion_prepass_desc.clone()
+            },
+        );
+        let rp_occlusion_prepass_cull_front = render_pipelines.get_or_create(
+            ctx,
+            &RenderPipelineDesc {
+                label: "MeshRenderer::rp_occlusion_prepass_cull_front".into(),
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: Some(wgpu::Face::Front),
+                    ..primitive
+                },
+                ..rp_occlusion_prepass_desc
+            },
+        );
+
         let rp_shaded_alpha_blended_cull_back_desc = RenderPipelineDesc {
             label: "MeshRenderer::rp_shaded_alpha_blended_front".into(),
+            // Transparent geometry neither writes nor receives occlusion
+            // (akatela SPEC-123 R9): what lies under it is behind it.
+            fragment_entrypoint: "fs_main_shaded_unoccluded".into(),
             render_targets: smallvec![Some(wgpu::ColorTargetState {
                 format: ViewBuilder::MAIN_TARGET_COLOR_FORMAT,
                 blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
@@ -1027,6 +1071,9 @@ impl Renderer for MeshRenderer {
             rp_depth_only,
             rp_depth_only_cull_back,
             rp_depth_only_cull_front,
+            rp_occlusion_prepass,
+            rp_occlusion_prepass_cull_back,
+            rp_occlusion_prepass_cull_front,
             rp_shaded_alpha_blended_cull_back,
             rp_shaded_alpha_blended_cull_front,
             rp_picking_layer,
@@ -1145,6 +1192,13 @@ impl Renderer for MeshRenderer {
                         (DrawPhase::OutlineMask, Some(wgpu::Face::Front), _) => {
                             self.rp_outline_mask_cull_front
                         }
+                        (DrawPhase::OcclusionPrepass, None, _) => self.rp_occlusion_prepass,
+                        (DrawPhase::OcclusionPrepass, Some(wgpu::Face::Back), _) => {
+                            self.rp_occlusion_prepass_cull_back
+                        }
+                        (DrawPhase::OcclusionPrepass, Some(wgpu::Face::Front), _) => {
+                            self.rp_occlusion_prepass_cull_front
+                        }
                         _ => unreachable!(),
                     };
                     pass.set_pipeline(render_pipelines.get(pipeline)?);
@@ -1160,7 +1214,7 @@ impl Renderer for MeshRenderer {
                         continue;
                     }
                     if !mesh_batch.depth_only
-                        && phase == DrawPhase::Opaque
+                        && matches!(phase, DrawPhase::Opaque | DrawPhase::OcclusionPrepass)
                         && material.has_transparency
                     {
                         // Skip if this is to be handled by transparent drawables.
@@ -1230,6 +1284,8 @@ fn instance_draw_phases(
         }
         if !all_materials_transparent {
             phases.insert(DrawPhase::Opaque);
+            // The occluders are exactly the opaque surfaces (akatela SPEC-123).
+            phases.insert(DrawPhase::OcclusionPrepass);
         }
     } else {
         // Everything is transparently tinted.

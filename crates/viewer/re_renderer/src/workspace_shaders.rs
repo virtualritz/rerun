@@ -104,6 +104,24 @@ pub fn init() {
     }
 
     {
+        let virtpath = Path::new("shader/occlusion/blur.wgsl");
+        let content = include_str!("../shader/occlusion/blur.wgsl").into();
+        fs.create_file(virtpath, content).unwrap();
+    }
+
+    {
+        let virtpath = Path::new("shader/occlusion/common.wgsl");
+        let content = include_str!("../shader/occlusion/common.wgsl").into();
+        fs.create_file(virtpath, content).unwrap();
+    }
+
+    {
+        let virtpath = Path::new("shader/occlusion/estimate.wgsl");
+        let content = include_str!("../shader/occlusion/estimate.wgsl").into();
+        fs.create_file(virtpath, content).unwrap();
+    }
+
+    {
         let virtpath = Path::new("shader/outlines/jumpflooding_init.wgsl");
         let content = include_str!("../shader/outlines/jumpflooding_init.wgsl").into();
         fs.create_file(virtpath, content).unwrap();

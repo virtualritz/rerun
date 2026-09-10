@@ -225,14 +225,54 @@ fn material_uniform_layout_matches_the_rust_struct() {
         let member = members
             .iter()
             .find(|m| m.name.as_deref() == Some(*name))
-            .unwrap_or_else(|| {
-                panic!("MaterialUniformBuffer should have a `{name}` member")
-            });
+            .unwrap_or_else(|| panic!("MaterialUniformBuffer should have a `{name}` member"));
         assert_eq!(
             member.offset, *expected_offset,
             "`{name}` sits at WGSL offset {} but Rust writes it at {expected_offset}; \
              the uniform's padding has drifted out of sync with \
              `gpu_data::MaterialUniformBuffer`",
+            member.offset,
+        );
+    }
+}
+
+/// The occlusion uniform's WGSL layout must match `OcclusionUniformBuffer`
+/// (akatela SPEC-123).
+///
+/// The Rust half is `draw_phases::occlusion::tests::uniform_offsets_match_the_shader`.
+/// Both halves carry the same numbers, so neither side can drift alone.
+#[test]
+fn occlusion_uniform_layout_matches_the_rust_struct() {
+    const EXPECTED: &[(&str, u32)] = &[
+        ("view_from_projection", 0),
+        ("framebuffer_resolution", 64),
+        ("pixels_per_world_unit", 72),
+        ("perspective", 76),
+        ("world_radius", 80),
+        ("pixel_radius_min", 84),
+        ("pixel_radius_max", 88),
+        ("strength", 92),
+        ("sample_count", 96),
+    ];
+    let source = include_str!("../shader/occlusion/common.wgsl");
+    let module = naga::front::wgsl::parse_str(source)
+        .unwrap_or_else(|err| panic!("occlusion/common.wgsl should parse: {err}"));
+    let (_, ty) = module
+        .types
+        .iter()
+        .find(|(_, ty)| ty.name.as_deref() == Some("OcclusionUniformBuffer"))
+        .expect("occlusion/common.wgsl should declare OcclusionUniformBuffer");
+    let naga::TypeInner::Struct { members, .. } = &ty.inner else {
+        panic!("OcclusionUniformBuffer should be a struct");
+    };
+    for (name, expected_offset) in EXPECTED {
+        let member = members
+            .iter()
+            .find(|member| member.name.as_deref() == Some(*name))
+            .unwrap_or_else(|| panic!("OcclusionUniformBuffer should have `{name}`"));
+        assert_eq!(
+            member.offset, *expected_offset,
+            "`{name}` sits at WGSL offset {} but Rust writes it at {expected_offset}",
             member.offset,
         );
     }

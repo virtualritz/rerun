@@ -5,8 +5,8 @@ use re_mutex::RwLock;
 use crate::allocator::{GpuReadbackIdentifier, create_and_fill_uniform_buffer};
 use crate::context::RenderContext;
 use crate::draw_phases::{
-    DrawPhase, OutlineConfig, OutlineMaskProcessor, PickingLayerError, PickingLayerProcessor,
-    ScreenshotProcessor,
+    DrawPhase, OcclusionConfig, OcclusionProcessor, OutlineConfig, OutlineMaskProcessor,
+    PickingLayerError, PickingLayerProcessor, ScreenshotProcessor,
 };
 use crate::global_bindings::FrameUniformBuffer;
 use crate::queueable_draw_data::QueueableDrawData;
@@ -34,10 +34,25 @@ pub struct ViewBuilder {
     outline_mask_processor: Option<OutlineMaskProcessor>,
     screenshot_processor: Option<ScreenshotProcessor>,
     picking_processor: Option<PickingLayerProcessor>,
+    occlusion_processor: Option<OcclusionProcessor>,
+}
+
+/// Stable identity of a rendered view.
+///
+/// Reuse the same id when draw data is shared across frames so per-view renderer caches remain
+/// associated with the correct camera.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, re_byte_size::SizeBytes)]
+pub struct ViewBuilderId(u64);
+
+impl ViewBuilderId {
+    pub const fn new(id: u64) -> Self {
+        Self(id)
+    }
 }
 
 struct ViewTargetSetup {
     name: Label,
+    view_id: ViewBuilderId,
 
     camera_position: glam::Vec3A,
 
@@ -196,6 +211,30 @@ pub enum RenderMode {
     Deterministic,
 }
 
+/// How the `composite` step combines a view's render result with the background.
+///
+/// Discriminants are passed directly to `composite.wgsl` as a `u32` uniform — keep in sync.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlendWithBackground {
+    /// Don't blend; the view's result fully overwrites whatever was there before.
+    #[default]
+    No = 0,
+
+    /// Blend with the background, applying a workaround for alpha-to-coverage MSAA.
+    ///
+    /// Use this for views whose content relies on alpha-to-coverage for anti-aliasing
+    /// (e.g. 3D views with line/point primitives that use ATC).
+    /// See [`ViewBuilder::MAIN_TARGET_ALPHA_TO_COVERAGE_COLOR_STATE`] for context.
+    AlphaToCoverage = 1,
+
+    /// Blend with the background, treating the view's result as already premultiplied alpha.
+    ///
+    /// Use this for views whose content uses regular alpha blending and does not depend on
+    /// alpha-to-coverage (e.g. 2D plots rendered in screen space).
+    Premultiplied = 2,
+}
+
 /// Basic configuration for a target view.
 #[derive(Debug)]
 pub struct TargetConfiguration {
@@ -231,14 +270,14 @@ pub struct TargetConfiguration {
 
     pub outline_config: Option<OutlineConfig>,
 
-    /// If true, the `composite` step will blend the image with the background.
+    /// Screen-space ambient occlusion, if any (akatela SPEC-123).
     ///
-    /// Otherwise, this step will overwrite whatever was there before, drawing the view builder's result
-    /// as an opaque rectangle.
-    pub blend_with_background: bool,
+    /// `None` runs no occlusion pass and binds a 1x1 white texture in its
+    /// place, so shaders read it without a branch.
+    pub occlusion_config: Option<OcclusionConfig>,
 
-    /// If true, blended main target colors are already premultiplied.
-    pub blend_source_is_premultiplied: bool,
+    /// How the `composite` step combines the view's result with the background.
+    pub blend_with_background: BlendWithBackground,
 
     /// Configuration for the picking layer if any.
     ///
@@ -262,8 +301,8 @@ impl Default for TargetConfiguration {
             viewport_transformation: RectTransform::IDENTITY,
             pixels_per_point: 1.0,
             outline_config: None,
-            blend_with_background: false,
-            blend_source_is_premultiplied: false,
+            occlusion_config: None,
+            blend_with_background: BlendWithBackground::No,
             picking_config: None,
         }
     }
@@ -477,8 +516,13 @@ impl ViewBuilder {
         ..Self::MAIN_TARGET_DEFAULT_DEPTH_STATE
     };
 
-    pub fn new(ctx: &RenderContext, config: TargetConfiguration) -> Result<Self, ViewBuilderError> {
-        Self::new_internal(ctx, config, None)
+    /// Creates a view with an identity that can remain stable across builder instances.
+    pub fn new(
+        ctx: &RenderContext,
+        config: TargetConfiguration,
+        view_id: ViewBuilderId,
+    ) -> Result<Self, ViewBuilderError> {
+        Self::new_internal(ctx, config, view_id, None)
     }
 
     /// Creates a view builder that reuses a caller-supplied depth target for the main pass.
@@ -490,14 +534,16 @@ impl ViewBuilder {
     pub fn new_with_external_depth(
         ctx: &RenderContext,
         config: TargetConfiguration,
+        view_id: ViewBuilderId,
         external_depth_texture: GpuTexture,
     ) -> Result<Self, ViewBuilderError> {
-        Self::new_internal(ctx, config, Some(external_depth_texture))
+        Self::new_internal(ctx, config, view_id, Some(external_depth_texture))
     }
 
     fn new_internal(
         ctx: &RenderContext,
         config: TargetConfiguration,
+        view_id: ViewBuilderId,
         external_depth_texture: Option<GpuTexture>,
     ) -> Result<Self, ViewBuilderError> {
         re_tracing::profile_function!();
@@ -644,6 +690,10 @@ impl ViewBuilder {
         let camera_position = config.view_from_world.inverse().translation();
         let camera_forward = -view_from_world.row(2).truncate();
         let projection_from_world = projection_from_view * view_from_world;
+        let framebuffer_resolution = glam::vec2(
+            config.resolution_in_pixel[0] as _,
+            config.resolution_in_pixel[1] as _,
+        );
 
         // Setup frame uniform buffer
         let frame_uniform_buffer_content = FrameUniformBuffer {
@@ -660,11 +710,8 @@ impl ViewBuilder {
                 RenderMode::Beautiful => 0,
                 RenderMode::Deterministic => 1,
             },
-            framebuffer_resolution: glam::vec2(
-                config.resolution_in_pixel[0] as _,
-                config.resolution_in_pixel[1] as _,
-            )
-            .into(),
+            framebuffer_resolution,
+            focal_length_in_pixels: framebuffer_resolution / (2.0 * tan_half_fov),
         };
         let frame_uniform_buffer = create_and_fill_uniform_buffer(
             ctx,
@@ -672,10 +719,26 @@ impl ViewBuilder {
             frame_uniform_buffer_content,
         );
 
+        let occlusion_processor = config.occlusion_config.as_ref().map(|occlusion_config| {
+            OcclusionProcessor::new(
+                ctx,
+                occlusion_config,
+                &config.name,
+                config.resolution_in_pixel,
+                projection_from_view,
+            )
+        });
+        // Without occlusion the white default keeps the shader branch-free.
+        let occlusion_texture = occlusion_processor.as_ref().map_or_else(
+            || ctx.texture_manager_2d.white_texture_unorm_handle().handle(),
+            |processor| processor.occlusion_texture().handle,
+        );
+
         let bind_group_0 = ctx.global_bindings.create_bind_group(
             &ctx.gpu_resources,
             &ctx.device,
             frame_uniform_buffer,
+            occlusion_texture,
         );
 
         let mut debug_overlays: Vec<QueueableDrawData> = Vec::new();
@@ -728,6 +791,9 @@ impl ViewBuilder {
             if picking_processor.is_some() {
                 active_draw_phases |= DrawPhase::PickingLayer;
             }
+            if occlusion_processor.is_some() {
+                active_draw_phases |= DrawPhase::OcclusionPrepass;
+            }
             // TODO(andreas): should not always be active.
             // TODO(andreas): The fact that this is a draw phase is actually a bit dubious.
             //if screenshot_processor.is_some() {
@@ -741,6 +807,7 @@ impl ViewBuilder {
 
         let setup = ViewTargetSetup {
             name: config.name,
+            view_id,
             camera_position: camera_position.into(),
             bind_group_0,
             main_target_msaa,
@@ -760,6 +827,7 @@ impl ViewBuilder {
             outline_mask_processor,
             screenshot_processor: Default::default(),
             picking_processor,
+            occlusion_processor,
         };
 
         view_builder.queue_draw(
@@ -773,7 +841,6 @@ impl ViewBuilder {
                     .map(|p| p.final_voronoi_texture()),
                 config.outline_config.as_ref(),
                 config.blend_with_background,
-                config.blend_source_is_premultiplied,
             ),
         );
 
@@ -795,6 +862,7 @@ impl ViewBuilder {
         draw_data: impl Into<QueueableDrawData>,
     ) -> &mut Self {
         let view_info = DrawableCollectionViewInfo {
+            view_id: self.setup.view_id,
             camera_world_position: self.setup.camera_position,
         };
         self.draw_phase_manager
@@ -836,6 +904,24 @@ impl ViewBuilder {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some(setup.name.clone().get()),
             });
+
+        // Occlusion first: the main pass's mesh shader samples its result
+        // (akatela SPEC-123). It needs passes of its own, because nothing can
+        // run between the main pass's phases.
+        if let Some(occlusion_processor) = &self.occlusion_processor {
+            re_tracing::profile_scope!("occlusion");
+            {
+                let mut pass = occlusion_processor.begin_prepass(&mut encoder);
+                pass.set_bind_group(0, &setup.bind_group_0, &[]);
+                self.draw_phase_manager.draw(
+                    &renderers,
+                    &pipelines,
+                    DrawPhase::OcclusionPrepass,
+                    &mut pass,
+                );
+            }
+            occlusion_processor.compute_occlusion(&pipelines, &mut encoder)?;
+        }
 
         {
             re_tracing::profile_scope!("main target pass");
@@ -1053,6 +1139,7 @@ mod tests {
             let view = match ViewBuilder::new_with_external_depth(
                 ctx,
                 target_config,
+                super::ViewBuilderId::new(0),
                 external_depth.clone(),
             ) {
                 Ok(view) => view,
@@ -1104,6 +1191,7 @@ mod tests {
             let _ = match ViewBuilder::new_with_external_depth(
                 ctx,
                 target_config,
+                super::ViewBuilderId::new(0),
                 external_depth,
             ) {
                 Ok(view) => view,
