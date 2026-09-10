@@ -710,6 +710,19 @@ impl Renderer for MeshRenderer {
                         },
                         count: None,
                     },
+                    // The added matcap lobe. Bound always -- a 1x1 black
+                    // texture when the matcap has no specular group -- so the
+                    // pipeline layout never varies.
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
                 ],
             },
         );
@@ -1282,7 +1295,12 @@ mod tests {
                 index_range: 0..3,
                 albedo: ctx.texture_manager_2d.white_texture_unorm_handle().clone(),
                 albedo_factor: crate::Rgba::WHITE,
-                use_matcap: false
+                use_matcap: false,
+                matcap_specular: ctx
+                    .texture_manager_2d
+                    .black_texture_unorm_handle()
+                    .clone(),
+                specular_roughness: 1.0
             }],
         )
     }
@@ -1296,14 +1314,24 @@ mod tests {
                     index_range: 0..3,
                     albedo: ctx.texture_manager_2d.white_texture_unorm_handle().clone(),
                     albedo_factor: crate::Rgba::WHITE,
-                    use_matcap: false
+                    use_matcap: false,
+                    matcap_specular: ctx
+                        .texture_manager_2d
+                        .black_texture_unorm_handle()
+                        .clone(),
+                    specular_roughness: 1.0
                 },
                 Material {
                     label: "opaque_material".into(),
                     index_range: 0..3,
                     albedo: ctx.texture_manager_2d.white_texture_unorm_handle().clone(),
                     albedo_factor: crate::Rgba::TRANSPARENT,
-                    use_matcap: false
+                    use_matcap: false,
+                    matcap_specular: ctx
+                        .texture_manager_2d
+                        .black_texture_unorm_handle()
+                        .clone(),
+                    specular_roughness: 1.0
                 }
             ],
         )

@@ -15,6 +15,12 @@
 @group(1) @binding(0)
 var albedo_texture: texture_2d<f32>;
 
+// The ADDED matcap lobe, sampled by the same view-space normal as the diffuse
+// lobe. A 1x1 black texture when the matcap has no specular group, so the
+// added term contributes nothing and the binding never varies.
+@group(1) @binding(2)
+var specular_matcap_texture: texture_2d<f32>;
+
 // Keep in sync with `gpu_data::TextureFormat` in mesh.rs
 const FORMAT_RGBA: u32 = 0;
 const FORMAT_GRAYSCALE: u32 = 1;
@@ -42,6 +48,12 @@ struct MaterialUniformBuffer {
     _texture_format_padding_1: u32,
     _texture_format_padding_2: u32,
     use_matcap: u32,
+    // `use_matcap` is a `U32RowPadded` too, so its row must be filled before
+    // the next field, for the same reason as above.
+    _use_matcap_padding_0: u32,
+    _use_matcap_padding_1: u32,
+    _use_matcap_padding_2: u32,
+    specular_roughness: f32,
 };
 
 @group(1) @binding(1)
@@ -120,7 +132,7 @@ fn vs_main(in_vertex: VertexIn, in_instance: InstanceIn) -> VertexOut {
 // matcap, sampled by the view-space normal rather than by the mesh's texture
 // coordinates, so a mesh needs no UVs at all on this path. Returns linear
 // unmultiplied rgb in `.rgb` and separate alpha in `.a`.
-fn shade_matcap(normal_world_space: vec3f, additive_tint_rgba: vec4f) -> vec4f {
+fn shade_matcap(normal_world_space: vec3f, additive_tint_rgba: vec4f, front_facing: bool) -> vec4f {
     // Fallback to +Z if a normal is missing.
     let has_normal = any(normal_world_space != vec3f(0.0, 0.0, 0.0));
     let normal_world = normalize(select(
@@ -136,15 +148,26 @@ fn shade_matcap(normal_world_space: vec3f, additive_tint_rgba: vec4f) -> vec4f {
         dot(vec3f(frame.view_from_world[0].z, frame.view_from_world[1].z, frame.view_from_world[2].z), normal_world)
     ));
 
+    // The mesh pipeline sets `cull_mode: None`, so a back face arrives with a
+    // normal that points away from the viewer. Without this flip an open shell
+    // or a CAD interior samples the matcap upside-down.
+    let facing_normal = select(-view_normal, view_normal, front_facing);
+
     // Map view-space normal XY from [-1,1] to [0,1] for texture lookup.
-    let matcap_uv = view_normal.xy * 0.5 + 0.5;
+    let matcap_uv = facing_normal.xy * 0.5 + 0.5;
 
-    // Sample matcap texture (passed as albedo_texture).
+    // No sRGB decode here. An `Rgba8UnormSrgb` texture is linearised by the
+    // sampler, and an EXR lobe is linear already, so decoding would darken
+    // both. The previous `linear_from_srgb` call was a second decode.
+    let diffuse_lobe = textureSample(albedo_texture, trilinear_sampler_repeat, matcap_uv).rgb;
+    let specular_lobe = textureSample(specular_matcap_texture, trilinear_sampler_repeat, matcap_uv).rgb;
     let matcap_sample = textureSample(albedo_texture, trilinear_sampler_repeat, matcap_uv);
-    var matcap_color = linear_from_srgb(matcap_sample.rgb);
 
-    // Apply albedo factor for tinting.
-    matcap_color *= material.albedo_factor.rgb;
+    // Blender's rule: multiply the diffuse lobe, then ADD the specular lobe.
+    // The base colour therefore tints the body without washing out the
+    // highlights, which is what lets one matcap read as ceramic and another
+    // as steel.
+    var matcap_color = diffuse_lobe * material.albedo_factor.rgb + specular_lobe;
 
     // Apply additive tint.
     matcap_color += additive_tint_rgba.rgb;
@@ -194,12 +217,12 @@ fn shade_textured(texcoord: vec2f, vertex_color: vec3f, normal_world_space: vec3
 }
 
 @fragment
-fn fs_main_shaded(in: VertexOut) -> @location(0) vec4f {
+fn fs_main_shaded(in: VertexOut, @builtin(front_facing) front_facing: bool) -> @location(0) vec4f {
     // Matcap is the default and stays the untextured path; `use_matcap == 0`
     // opts into sampling the albedo texture at the interpolated corner UV.
     var shaded: vec4f;
     if material.use_matcap != 0u {
-        shaded = shade_matcap(in.normal_world_space, in.additive_tint_rgba);
+        shaded = shade_matcap(in.normal_world_space, in.additive_tint_rgba, front_facing);
     } else {
         shaded = shade_textured(in.texcoord, in.color, in.normal_world_space, in.additive_tint_rgba);
     }

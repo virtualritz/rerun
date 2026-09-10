@@ -159,6 +159,12 @@ impl From<TextureManager2DError<never::Never>> for ImageDataToTextureError {
 /// Has intertior mutability.
 pub struct TextureManager2D {
     white_texture_unorm: GpuTexture2D,
+    /// A single black pixel, for an ADDED term that must contribute nothing.
+    ///
+    /// White is the identity for a multiply, black is the identity for an
+    /// addition. A matcap without a specular group binds this, so the added
+    /// lobe vanishes instead of blowing the surface out.
+    black_texture_unorm: GpuTexture2D,
     zeroed_texture_float: GpuTexture2D,
     zeroed_texture_sint: GpuTexture2D,
     zeroed_texture_uint: GpuTexture2D,
@@ -237,6 +243,47 @@ impl TextureManager2D {
             },
         );
 
+        // Built the same ad hoc way as the white pixel above, and for the same
+        // reason: there is no render context yet.
+        let black_texture_unorm = GpuTexture2D {
+            alpha_channel_usage: AlphaChannelUsage::Opaque,
+            texture: texture_pool.alloc(
+                device,
+                &TextureDesc {
+                    label: "black pixel - unorm".into(),
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    size: wgpu::Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                },
+            ),
+        };
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &black_texture_unorm.texture.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[0, 0, 0, 255],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+
         let zeroed_texture_float =
             create_zero_texture(texture_pool, device, wgpu::TextureFormat::Rgba8Unorm);
         let zeroed_texture_sint =
@@ -246,6 +293,7 @@ impl TextureManager2D {
 
         Self {
             white_texture_unorm,
+            black_texture_unorm,
             zeroed_texture_float,
             zeroed_texture_sint,
             zeroed_texture_uint,
@@ -349,6 +397,11 @@ impl TextureManager2D {
     }
 
     /// Returns a single pixel white pixel with an rgba8unorm format.
+    /// A 1x1 black texture, for an added term that must contribute nothing.
+    pub fn black_texture_unorm_handle(&self) -> &GpuTexture2D {
+        &self.black_texture_unorm
+    }
+
     pub fn white_texture_unorm_handle(&self) -> &GpuTexture2D {
         &self.white_texture_unorm
     }

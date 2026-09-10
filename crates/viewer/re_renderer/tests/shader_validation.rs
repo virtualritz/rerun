@@ -193,6 +193,7 @@ fn material_uniform_layout_matches_the_rust_struct() {
         ("albedo_factor", 0),
         ("texture_format", 16),
         ("use_matcap", 32),
+        ("specular_roughness", 48),
     ];
 
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
