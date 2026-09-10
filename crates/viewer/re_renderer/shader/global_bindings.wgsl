@@ -54,6 +54,12 @@ var trilinear_sampler_repeat: sampler;
 @group(0) @binding(4)
 var occlusion_texture: texture_2d<f32>;
 
+// The horizon method's bent normal (akatela SPEC-123 D3a): `.rgb` the
+// view-space direction mapped to [0, 1], `.a` 1 where it was computed. An
+// all-zero texture when the view has none, so `.a` doubles as the flag.
+@group(0) @binding(5)
+var bent_normal_texture: texture_2d<f32>;
+
 // See config.rs#DeviceTier
 const DEVICE_TIER_GLES = 0u;
 const DEVICE_TIER_WEBGPU = 1u;

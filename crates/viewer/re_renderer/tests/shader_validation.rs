@@ -264,6 +264,7 @@ fn occlusion_uniform_layout_matches_the_rust_struct() {
         ("pixel_radius_max", 88),
         ("strength", 92),
         ("sample_count", 96),
+        ("steps_per_slice", 100),
     ];
     let source = include_str!("../shader/occlusion/common.wgsl");
     let module = naga::front::wgsl::parse_str(source)
