@@ -77,8 +77,10 @@ fn main(@builtin(position) frag_position: vec4f) -> @location(0) f32 {
     for (var i = 0u; i < count; i += 1u) {
         let fraction = (f32(i) + 0.5) / f32(count);
         let angle = fraction * SPIRAL_TURNS * TAU + rotation;
-        // The square root spreads the taps evenly over the disk's area.
-        let offset = vec2f(cos(angle), sin(angle)) * radius_pixels * sqrt(fraction);
+        // SAO equation 6 uses a linear radius. This keeps early taps close
+        // enough to detect small cavities while later taps cover the full
+        // world-space radius.
+        let offset = vec2f(cos(angle), sin(angle)) * radius_pixels * fraction;
         let tap = clamp(pixel + vec2i(round(offset)), vec2i(0), resolution - 1);
         let tap_depth = textureLoad(depth_texture, tap, 0);
         if tap_depth <= 0.0 {
