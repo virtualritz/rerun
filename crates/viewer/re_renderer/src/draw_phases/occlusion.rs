@@ -63,6 +63,26 @@ pub enum OcclusionMethod {
     },
 }
 
+/// Which occlusion term the mesh shader shows instead of the shading.
+///
+/// A debug view (akatela SPEC-123). It costs no pass: the choice travels in
+/// the frame uniform, and the mesh shader returns the term as grey.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u32)]
+pub enum OcclusionDebugView {
+    /// Shade as usual.
+    #[default]
+    Off = 0,
+
+    /// The ambient occlusion the fragment reads, which darkens the diffuse
+    /// lobe.
+    Ambient = 1,
+
+    /// The reflection occlusion the specular lobe is masked by. A surface
+    /// with no specular lobe shows white: it has nothing to occlude.
+    Specular = 2,
+}
+
 /// How a view estimates ambient occlusion.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OcclusionConfig {

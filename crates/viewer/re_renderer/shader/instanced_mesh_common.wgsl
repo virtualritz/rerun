@@ -171,6 +171,10 @@ fn spherical_cap_intersection(cos_c1: f32, cos_c2: f32, cos_b: f32) -> f32 {
     return smoothstep(0.0, 1.0, x) * smaller_cap;
 }
 
+// `frame.occlusion_debug`, in sync with `OcclusionDebugView`.
+const OCCLUSION_DEBUG_AMBIENT: u32 = 1u;
+const OCCLUSION_DEBUG_SPECULAR: u32 = 2u;
+
 // Specular occlusion from a bent cone (SPEC-123 D3a), after Jimenez et al.,
 // "Practical Realtime Strategies for Accurate Indirect Occlusion" (SIGGRAPH
 // 2016), slide 129: the share of the reflection cone inside the visible cone
@@ -270,6 +274,9 @@ fn shade_matcap(normal_world_space: vec3f, position_view: vec3f, additive_tint_r
         eye, normalize(bent.rgb * 2.0 - 1.0), facing_normal, occlusion, material.specular_roughness);
     let analytic_mask = specular_occlusion(n_dot_v, occlusion, material.specular_roughness);
     let specular_mask = select(analytic_mask, cone_mask, bent.a > 0.5);
+    if frame.occlusion_debug == OCCLUSION_DEBUG_SPECULAR {
+        return vec4f(vec3f(specular_mask), 1.0);
+    }
     var matcap_color = diffuse_lobe * material.albedo_factor.rgb * occlusion
         + specular_lobe * specular_mask;
 
@@ -323,13 +330,28 @@ fn shade_textured(texcoord: vec2f, vertex_color: vec3f, normal_world_space: vec3
 
 // The shared body of the two shaded entry points.
 fn shade(in: VertexOut, front_facing: bool, occlusion: f32, bent: vec4f) -> vec4f {
+    // A debug view shows the occlusion term itself, so what you see is what
+    // masks the lobe. The selection and hover tints are skipped below: the
+    // grey IS the value.
+    if frame.occlusion_debug == OCCLUSION_DEBUG_AMBIENT {
+        return vec4f(vec3f(occlusion), 1.0);
+    }
+
     // Matcap is the default and stays the untextured path; `use_matcap == 0`
     // opts into sampling the albedo texture at the interpolated corner UV.
     var shaded: vec4f;
     if material.use_matcap != 0u {
         shaded = shade_matcap(in.normal_world_space, in.position_view, in.additive_tint_rgba, front_facing, occlusion, bent);
     } else {
+        // A textured surface has no specular lobe, so nothing occludes it.
+        if frame.occlusion_debug == OCCLUSION_DEBUG_SPECULAR {
+            return vec4f(1.0);
+        }
         shaded = shade_textured(in.texcoord, in.color, in.normal_world_space, in.additive_tint_rgba, occlusion);
+    }
+
+    if frame.occlusion_debug != 0u {
+        return shaded;
     }
 
     var shaded_color = shaded.rgb;

@@ -600,9 +600,7 @@ impl GpuMesh {
                         entries: smallvec![
                             BindGroupEntry::DefaultTextureView(material.albedo.handle()),
                             uniform_buffer_binding,
-                            BindGroupEntry::DefaultTextureView(
-                                material.matcap_specular.handle()
-                            ),
+                            BindGroupEntry::DefaultTextureView(material.matcap_specular.handle()),
                         ],
                         layout: mesh_bind_group_layout,
                     },
@@ -643,4 +641,3 @@ impl GpuMesh {
         })
     }
 }
-

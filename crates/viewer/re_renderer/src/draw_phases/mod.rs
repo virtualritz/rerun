@@ -8,7 +8,7 @@ mod picking_layer;
 mod screenshot;
 
 pub use draw_phase_manager::{DrawPhaseManager, Drawable, DrawableCollector};
-pub use occlusion::{OcclusionConfig, OcclusionMethod, OcclusionProcessor};
+pub use occlusion::{OcclusionConfig, OcclusionDebugView, OcclusionMethod, OcclusionProcessor};
 pub use outlines::{OutlineConfig, OutlineMaskPreference, OutlineMaskProcessor};
 pub use picking_layer::{
     PickingLayerError, PickingLayerId, PickingLayerInstanceId, PickingLayerObjectId,

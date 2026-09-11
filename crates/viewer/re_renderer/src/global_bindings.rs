@@ -51,6 +51,14 @@ pub struct FrameUniformBuffer {
     ///
     /// Zero for orthographic projection.
     pub focal_length_in_pixels: glam::Vec2,
+
+    /// Which occlusion term to show instead of the shading, as
+    /// [`crate::OcclusionDebugView`] (akatela SPEC-123). Zero shades as usual.
+    pub occlusion_debug: wgpu_buffer_types::U32RowPadded,
+
+    /// A uniform buffer's size must be a multiple of 256 bytes, and the
+    /// fields above fill seventeen 16-byte rows.
+    pub(crate) end_padding: [wgpu_buffer_types::PaddingRow; 32 - 17],
 }
 
 /// Global bindings which are always available on bind group 0 for all [`crate::renderer::Renderer`].
@@ -197,5 +205,53 @@ impl GlobalBindings {
                 layout: self.layout,
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FrameUniformBuffer;
+    use wgpu::naga;
+
+    /// The frame uniform's WGSL layout must match the Rust struct.
+    ///
+    /// A uniform offset mismatch once hid all matcap shading, so both sides
+    /// are pinned (akatela SPEC-123 OCC-005). Each side reports its own
+    /// offsets here, so neither can drift alone.
+    #[test]
+    fn frame_uniform_offsets_match_the_shader() {
+        let source = include_str!("../shader/global_bindings.wgsl");
+        let module =
+            naga::front::wgsl::parse_str(source).expect("global_bindings.wgsl should parse");
+        let (_, ty) = module
+            .types
+            .iter()
+            .find(|(_, ty)| ty.name.as_deref() == Some("FrameUniformBuffer"))
+            .expect("global_bindings.wgsl should declare FrameUniformBuffer");
+        // The WGSL struct declares no end padding, so only the offsets of the
+        // fields it does declare are comparable.
+        let naga::TypeInner::Struct { members, .. } = &ty.inner else {
+            panic!("FrameUniformBuffer should be a struct");
+        };
+        let wgsl_offset = |name: &str| {
+            members
+                .iter()
+                .find(|member| member.name.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("FrameUniformBuffer should have a `{name}` member"))
+                .offset as usize
+        };
+
+        assert_eq!(
+            wgsl_offset("framebuffer_resolution"),
+            std::mem::offset_of!(FrameUniformBuffer, framebuffer_resolution)
+        );
+        assert_eq!(
+            wgsl_offset("focal_length_in_pixels"),
+            std::mem::offset_of!(FrameUniformBuffer, focal_length_in_pixels)
+        );
+        assert_eq!(
+            wgsl_offset("occlusion_debug"),
+            std::mem::offset_of!(FrameUniformBuffer, occlusion_debug)
+        );
     }
 }
