@@ -197,9 +197,20 @@ fn specular_occlusion(n_dot_v: f32, ao: f32, roughness: f32) -> f32 {
     return saturate(pow(n_dot_v + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao);
 }
 
-// The surface normal in view space, turned toward the viewer on back faces
-// (SPEC-123 R11). Falls back to +Z when the mesh carries no normal.
-fn facing_view_normal(normal_world_space: vec3f, front_facing: bool) -> vec3f {
+fn view_normal(normal_world: vec3f) -> vec3f {
+    // view_from_world is a mat4x3f, so extract the 3x3 rotation part.
+    return normalize(vec3f(
+        dot(vec3f(frame.view_from_world[0].x, frame.view_from_world[1].x, frame.view_from_world[2].x), normal_world),
+        dot(vec3f(frame.view_from_world[0].y, frame.view_from_world[1].y, frame.view_from_world[2].y), normal_world),
+        dot(vec3f(frame.view_from_world[0].z, frame.view_from_world[1].z, frame.view_from_world[2].z), normal_world)
+    ));
+}
+
+// The surface normal in world space, turned toward the eye (SPEC-123 R11).
+// The eye test uses the supplied normal instead of triangle winding: imported
+// normals, analytic SDF/B-rep normals, and reflected instances can disagree
+// with the rasterizer's front-face flag even when each normal is valid.
+fn facing_world_normal(normal_world_space: vec3f, position_view: vec3f) -> vec3f {
     let has_normal = any(normal_world_space != vec3f(0.0, 0.0, 0.0));
     let normal_world = normalize(select(
         vec3f(0.0, 0.0, 1.0),
@@ -207,17 +218,15 @@ fn facing_view_normal(normal_world_space: vec3f, front_facing: bool) -> vec3f {
         vec3<bool>(has_normal, has_normal, has_normal),
     ));
 
-    // view_from_world is a mat4x3f, so extract the 3x3 rotation part.
-    let view_normal = normalize(vec3f(
-        dot(vec3f(frame.view_from_world[0].x, frame.view_from_world[1].x, frame.view_from_world[2].x), normal_world),
-        dot(vec3f(frame.view_from_world[0].y, frame.view_from_world[1].y, frame.view_from_world[2].y), normal_world),
-        dot(vec3f(frame.view_from_world[0].z, frame.view_from_world[1].z, frame.view_from_world[2].z), normal_world)
-    ));
+    let normal_view = view_normal(normal_world);
+    let eye = eye_vector(position_view);
+    return select(-normal_world, normal_world, dot(normal_view, eye) >= 0.0);
+}
 
-    // The mesh pipeline sets `cull_mode: None`, so a back face arrives with a
-    // normal that points away from the viewer. Without this flip an open shell
-    // or a CAD interior samples the matcap upside-down, and occludes wrongly.
-    return select(-view_normal, view_normal, front_facing);
+// The same eye-facing normal in view space. Falls back to world +Z when the
+// mesh carries no normal.
+fn facing_view_normal(normal_world_space: vec3f, position_view: vec3f) -> vec3f {
+    return view_normal(facing_world_normal(normal_world_space, position_view));
 }
 
 // The unit vector from the surface toward the eye, in view space (SPEC-123
@@ -246,8 +255,8 @@ fn matcap_uv_compute(eye: vec3f, normal: vec3f) -> vec2f {
 // matcap, sampled by the view-space normal rather than by the mesh's texture
 // coordinates, so a mesh needs no UVs at all on this path. Returns linear
 // unmultiplied rgb in `.rgb` and separate alpha in `.a`.
-fn shade_matcap(normal_world_space: vec3f, position_view: vec3f, additive_tint_rgba: vec4f, front_facing: bool, occlusion: f32, bent: vec4f) -> vec4f {
-    let facing_normal = facing_view_normal(normal_world_space, front_facing);
+fn shade_matcap(normal_world_space: vec3f, position_view: vec3f, additive_tint_rgba: vec4f, occlusion: f32, bent: vec4f) -> vec4f {
+    let facing_normal = facing_view_normal(normal_world_space, position_view);
     let eye = eye_vector(position_view);
 
     // Map view-space normal XY from [-1,1] to [0,1] for texture lookup.
@@ -295,7 +304,7 @@ fn shade_matcap(normal_world_space: vec3f, position_view: vec3f, additive_tint_r
 // diffuse rig so that surface form still reads. This restores the shading path
 // that the matcap work replaced, rather than inventing a second one. Returns
 // linear unmultiplied rgb in `.rgb` and separate alpha in `.a`.
-fn shade_textured(texcoord: vec2f, vertex_color: vec3f, normal_world_space: vec3f, additive_tint_rgba: vec4f, occlusion: f32) -> vec4f {
+fn shade_textured(texcoord: vec2f, vertex_color: vec3f, normal_world_space: vec3f, position_view: vec3f, additive_tint_rgba: vec4f, occlusion: f32) -> vec4f {
     let sample = textureSample(albedo_texture, trilinear_sampler_repeat, texcoord);
     var texture_color: vec3f;
     switch material.texture_format {
@@ -317,7 +326,7 @@ fn shade_textured(texcoord: vec2f, vertex_color: vec3f, normal_world_space: vec3
     // without normals stays unshaded rather than going black.
     var shading = 1.0;
     if any(normal_world_space != vec3f(0.0, 0.0, 0.0)) {
-        let normal = normalize(normal_world_space);
+        let normal = facing_world_normal(normal_world_space, position_view);
         shading = 0.2;
         shading += 1.0 * clamp(dot(normalize(vec3f(1.0, 2.0, 3.0)), normal), 0.0, 1.0);
         shading += 0.5 * clamp(dot(normalize(vec3f(-1.0, -3.0, -5.0)), normal), 0.0, 1.0);
@@ -329,7 +338,7 @@ fn shade_textured(texcoord: vec2f, vertex_color: vec3f, normal_world_space: vec3
 }
 
 // The shared body of the two shaded entry points.
-fn shade(in: VertexOut, front_facing: bool, occlusion: f32, bent: vec4f) -> vec4f {
+fn shade(in: VertexOut, occlusion: f32, bent: vec4f) -> vec4f {
     // A debug view shows the occlusion term itself, so what you see is what
     // masks the lobe. The selection and hover tints are skipped below: the
     // grey IS the value.
@@ -341,13 +350,13 @@ fn shade(in: VertexOut, front_facing: bool, occlusion: f32, bent: vec4f) -> vec4
     // opts into sampling the albedo texture at the interpolated corner UV.
     var shaded: vec4f;
     if material.use_matcap != 0u {
-        shaded = shade_matcap(in.normal_world_space, in.position_view, in.additive_tint_rgba, front_facing, occlusion, bent);
+        shaded = shade_matcap(in.normal_world_space, in.position_view, in.additive_tint_rgba, occlusion, bent);
     } else {
         // A textured surface has no specular lobe, so nothing occludes it.
         if frame.occlusion_debug == OCCLUSION_DEBUG_SPECULAR {
             return vec4f(1.0);
         }
-        shaded = shade_textured(in.texcoord, in.color, in.normal_world_space, in.additive_tint_rgba, occlusion);
+        shaded = shade_textured(in.texcoord, in.color, in.normal_world_space, in.position_view, in.additive_tint_rgba, occlusion);
     }
 
     if frame.occlusion_debug != 0u {
@@ -379,21 +388,21 @@ fn shade(in: VertexOut, front_facing: bool, occlusion: f32, bent: vec4f) -> vec4
 }
 
 @fragment
-fn fs_main_shaded(in: VertexOut, @builtin(front_facing) front_facing: bool) -> @location(0) vec4f {
-    return shade(in, front_facing, occlusion_at(in.position), bent_normal_at(in.position));
+fn fs_main_shaded(in: VertexOut) -> @location(0) vec4f {
+    return shade(in, occlusion_at(in.position), bent_normal_at(in.position));
 }
 
 // Transparent geometry neither writes nor receives occlusion (SPEC-123 R9).
 // The occlusion behind a transparent surface belongs to what is behind it.
 @fragment
-fn fs_main_shaded_unoccluded(in: VertexOut, @builtin(front_facing) front_facing: bool) -> @location(0) vec4f {
-    return shade(in, front_facing, 1.0, vec4f(0.0));
+fn fs_main_shaded_unoccluded(in: VertexOut) -> @location(0) vec4f {
+    return shade(in, 1.0, vec4f(0.0));
 }
 
 // The occlusion prepass (SPEC-123): the view-space normal, mapped to [0, 1].
 @fragment
-fn fs_main_occlusion_prepass(in: VertexOut, @builtin(front_facing) front_facing: bool) -> @location(0) vec4f {
-    return vec4f(facing_view_normal(in.normal_world_space, front_facing) * 0.5 + 0.5, 1.0);
+fn fs_main_occlusion_prepass(in: VertexOut) -> @location(0) vec4f {
+    return vec4f(facing_view_normal(in.normal_world_space, in.position_view) * 0.5 + 0.5, 1.0);
 }
 
 @fragment
