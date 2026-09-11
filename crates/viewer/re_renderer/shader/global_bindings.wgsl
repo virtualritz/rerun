@@ -35,6 +35,10 @@ struct FrameUniformBuffer {
     /// Focal length in pixels: `framebuffer_resolution / (2 * tan_half_fov)`.
     /// Zero for orthographic projection.
     focal_length_in_pixels: vec2f,
+
+    /// Which occlusion term to show instead of the shading (akatela
+    /// SPEC-123): 0 shades, 1 is ambient occlusion, 2 reflection occlusion.
+    occlusion_debug: u32,
 };
 
 @group(0) @binding(0)

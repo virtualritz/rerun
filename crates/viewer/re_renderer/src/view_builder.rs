@@ -5,8 +5,8 @@ use re_mutex::RwLock;
 use crate::allocator::{GpuReadbackIdentifier, create_and_fill_uniform_buffer};
 use crate::context::RenderContext;
 use crate::draw_phases::{
-    DrawPhase, OcclusionConfig, OcclusionProcessor, OutlineConfig, OutlineMaskProcessor,
-    PickingLayerError, PickingLayerProcessor, ScreenshotProcessor,
+    DrawPhase, OcclusionConfig, OcclusionDebugView, OcclusionProcessor, OutlineConfig,
+    OutlineMaskProcessor, PickingLayerError, PickingLayerProcessor, ScreenshotProcessor,
 };
 use crate::global_bindings::FrameUniformBuffer;
 use crate::queueable_draw_data::QueueableDrawData;
@@ -280,6 +280,11 @@ pub struct TargetConfiguration {
     /// place, so shaders read it without a branch.
     pub occlusion_config: Option<OcclusionConfig>,
 
+    /// Which occlusion term to show instead of the shading (akatela SPEC-123).
+    ///
+    /// A debug view, and free: the choice rides in the frame uniform.
+    pub occlusion_debug: OcclusionDebugView,
+
     /// How the `composite` step combines the view's result with the background.
     pub blend_with_background: BlendWithBackground,
 
@@ -306,6 +311,7 @@ impl Default for TargetConfiguration {
             pixels_per_point: 1.0,
             outline_config: None,
             occlusion_config: None,
+            occlusion_debug: OcclusionDebugView::Off,
             blend_with_background: BlendWithBackground::No,
             picking_config: None,
         }
@@ -716,6 +722,8 @@ impl ViewBuilder {
             },
             framebuffer_resolution,
             focal_length_in_pixels: framebuffer_resolution / (2.0 * tan_half_fov),
+            occlusion_debug: (config.occlusion_debug as u32).into(),
+            end_padding: Default::default(),
         };
         let frame_uniform_buffer = create_and_fill_uniform_buffer(
             ctx,

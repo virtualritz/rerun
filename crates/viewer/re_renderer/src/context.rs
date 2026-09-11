@@ -7,10 +7,10 @@ use re_mutex::Mutex;
 // On multi-threaded (atomics) wasm the renderers hold wgpu types that are not `Send + Sync`,
 // so the concurrent `TypeMap` (which requires `Send + Sync` values) can't store them. The
 // non-concurrent variant has the same API and is fine since wgpu is main-thread-only there.
-#[cfg(not(target_feature = "atomics"))]
-use type_map::concurrent::TypeMap;
 #[cfg(target_feature = "atomics")]
 use type_map::TypeMap;
+#[cfg(not(target_feature = "atomics"))]
+use type_map::concurrent::TypeMap;
 
 use crate::allocator::{CpuWriteGpuReadBelt, GpuReadbackBelt};
 use crate::device_caps::DeviceCaps;

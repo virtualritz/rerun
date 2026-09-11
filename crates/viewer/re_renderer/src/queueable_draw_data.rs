@@ -54,7 +54,9 @@ impl<D: DrawData + wgpu::WasmNotSendSync + 'static> TypeErasedDrawData for D {
 /// Type erased draw data that can be submitted directly to the view builder.
 pub struct QueueableDrawData(Box<dyn TypeErasedDrawData>);
 
-impl<D: TypeErasedDrawData + DrawData + wgpu::WasmNotSendSync + 'static> From<D> for QueueableDrawData {
+impl<D: TypeErasedDrawData + DrawData + wgpu::WasmNotSendSync + 'static> From<D>
+    for QueueableDrawData
+{
     fn from(draw_data: D) -> Self {
         Self(Box::new(draw_data))
     }
