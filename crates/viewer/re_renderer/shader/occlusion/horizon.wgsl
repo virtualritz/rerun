@@ -94,7 +94,10 @@ fn main(@builtin(position) frag_position: vec4f) -> Output {
         return out;
     }
 
-    let pix_center_pos = flip_z(view_position(params, pixel, depth));
+    // XeGTAO moves the centre slightly toward the camera before it compares
+    // taps. Without this FP32-depth offset, quantisation lets the visible
+    // surface occlude itself, with an error that follows its facing angle.
+    let pix_center_pos = flip_z(view_position(params, pixel, depth)) * 0.99999;
     let view_vec = normalize(-pix_center_pos);
     let viewspace_normal = normalize(flip_z(textureLoad(normal_texture, pixel, 0).xyz * 2.0 - 1.0));
 
