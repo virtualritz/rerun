@@ -116,7 +116,10 @@ fn fs_main_shaded(in: VertexOut) -> @location(0) vec4f {
     ));
 
     // Map view-space normal XY from [-1,1] to [0,1] for texture lookup.
-    let matcap_uv = view_normal.xy * 0.5 + 0.5;
+    // Texture coordinates start at the image's top edge while view-space +Y
+    // points upward. Matcap captures use the latter convention, so invert Y
+    // here. X already agrees with the camera's right-handed screen axis.
+    let matcap_uv = vec2f(view_normal.x, -view_normal.y) * 0.5 + 0.5;
 
     // Sample matcap texture (passed as albedo_texture).
     let matcap_sample = textureSample(albedo_texture, trilinear_sampler_repeat, matcap_uv);
