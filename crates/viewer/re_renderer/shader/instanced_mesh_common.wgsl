@@ -239,7 +239,7 @@ fn eye_vector(position_view: vec3f) -> vec3f {
 }
 
 // Blender's `matcap_uv_compute(I, N)` (workbench_matcap_lib.glsl), verbatim
-// but for the unused `flipped` flag. It builds an orthonormal basis around the
+// with its vertical `flipped` convention. It builds an orthonormal basis around the
 // eye vector, so a perspective camera looks the matcap up correctly away from
 // the screen centre. With I = +Z it reduces to `N.xy`. The basis is singular
 // at I.z = -1, which the eye vector never reaches.
@@ -248,7 +248,10 @@ fn matcap_uv_compute(eye: vec3f, normal: vec3f) -> vec2f {
     let b = -eye.x * eye.y * a;
     let b1 = vec3f(1.0 - eye.x * eye.x * a, b, -eye.x);
     let b2 = vec3f(b, 1.0 - eye.y * eye.y * a, -eye.y);
-    return vec2f(dot(b1, normal), dot(b2, normal)) * 0.496 + 0.5;
+    // Texture V grows downward while view-space +Y grows upward. Blender's
+    // matcap lookup therefore flips the basis' second coordinate. The first
+    // coordinate already agrees with the camera's screen-right axis.
+    return vec2f(dot(b1, normal), -dot(b2, normal)) * 0.496 + 0.5;
 }
 
 // Matcap albedo, used when `material.use_matcap != 0`. The bound texture is a
