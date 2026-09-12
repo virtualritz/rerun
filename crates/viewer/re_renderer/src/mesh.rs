@@ -488,7 +488,7 @@ impl GpuMesh {
         let vb_edge_ids_size = vb_element_ids_size;
 
         let vb_combined_size = packed.vertices.len() as u64;
-        debug_assert_eq!(
+        re_log::debug_assert_eq!(
             vb_combined_size,
             vb_positions_size
                 + vb_color_size
@@ -533,7 +533,7 @@ impl GpuMesh {
         };
 
         let index_buffer_size = packed.indices.len() as u64;
-        debug_assert_eq!(
+        re_log::debug_assert_eq!(
             index_buffer_size,
             (size_of::<glam::UVec3>() * data.triangle_indices.len()) as u64
         );

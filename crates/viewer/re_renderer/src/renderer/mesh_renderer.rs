@@ -509,7 +509,7 @@ impl MeshDrawData {
     /// `selected_ids` contains encoded pick IDs of selected faces. The shader
     /// searches this buffer to determine if a fragment should be tinted.
     ///
-    /// On the [`DeviceCapabilityTier::Limited`] tier (WebGL2) the ids go into
+    /// On the [`DeviceCapabilityTier::Limited`] tier (`WebGL2`) the ids go into
     /// a fixed-capacity uniform buffer instead of a storage buffer; ids beyond
     /// [`MAX_SELECTED_IDS_LIMITED_TIER`] are dropped from the tint.
     pub fn new_with_selection(
@@ -634,13 +634,13 @@ enum MeshDrawMode {
 }
 
 /// Maximum number of selected element ids on the [`DeviceCapabilityTier::Limited`]
-/// tier, where the ids are passed in a fixed-size uniform buffer (WebGL2 has no
+/// tier, where the ids are passed in a fixed-size uniform buffer (`WebGL2` has no
 /// storage buffers). Keep in sync with `instanced_mesh_limited.wgsl`.
 pub const MAX_SELECTED_IDS_LIMITED_TIER: usize = 4092;
 
 /// Size of the `Limited`-tier selection uniform buffer: 16 header bytes
 /// (`count` as a vec4u) + 1023 * 16 id bytes = 16384 bytes, the guaranteed
-/// minimum uniform buffer size on WebGL2.
+/// minimum uniform buffer size on `WebGL2`.
 const SELECTION_UNIFORM_BUFFER_SIZE: u64 = 16384;
 
 pub struct MeshRenderer {
