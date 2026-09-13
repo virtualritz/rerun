@@ -57,10 +57,6 @@ re_quota_channel.workspace = true
 re_span.workspace = true
 re_tracing.workspace = true
 re_video = { workspace = true, default-features = true }
-# This crate only uses `re_web::browser`; keeping `fs` off preserves the
-# atomics-WASM build because the file wrapper is not `Send`/`Sync`.
-re_web = { workspace = true, default-features = false }
-
 ahash.workspace = true
 anyhow.workspace = true
 bitflags.workspace = true
@@ -100,6 +96,9 @@ notify.workspace = true
 
 # web
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+# Only used for browser-specific backend selection. Keeping `fs` off preserves
+# the atomics-WASM build because the file wrapper is not `Send`/`Sync`.
+re_web = { workspace = true, default-features = false }
 getrandom = { workspace = true, features = [
   "wasm_js",
 ] } # getrandom needs the `js` feature to be enabled. It is dragged in indirectly.

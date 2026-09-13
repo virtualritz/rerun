@@ -1,3 +1,4 @@
+#[cfg(target_arch = "wasm32")]
 use re_web::browser;
 
 /// Device tiers `re_renderer` distinguishes.
@@ -508,7 +509,8 @@ pub fn select_adapter(
 ///
 /// Other backend might work as well, but lack of support isn't regarded as a bug.
 pub fn default_backends() -> wgpu::Backends {
-    if cfg!(native) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
         // Native: Everything but DX12
         // * Wgpu's DX12 impl isn't in a great shape yet and there's now reason to add more variation
         //   when we can just use Vulkan
@@ -521,12 +523,17 @@ pub fn default_backends() -> wgpu::Backends {
         // For changing the backend we use standard wgpu env var, i.e. WGPU_BACKEND.
         wgpu::Backends::from_env()
             .unwrap_or(wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::GL)
-    } else if browser::is_safari() || browser::is_firefox() {
-        // TODO(#12788): Safari WebGPU broken on 26.4 (3D content fails to render)
-        // TODO(#11009): Fix videos on WebGPU firefox
-        wgpu::Backends::GL
-    } else {
-        wgpu::Backends::GL | wgpu::Backends::BROWSER_WEBGPU
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        if browser::is_safari() || browser::is_firefox() {
+            // TODO(#12788): Safari WebGPU broken on 26.4 (3D content fails to render)
+            // TODO(#11009): Fix videos on WebGPU firefox
+            wgpu::Backends::GL
+        } else {
+            wgpu::Backends::GL | wgpu::Backends::BROWSER_WEBGPU
+        }
     }
 }
 
