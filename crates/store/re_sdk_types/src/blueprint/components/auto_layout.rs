@@ -16,21 +16,23 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::wildcard_imports)]
 
+use ::arrow::array::ArrayRef;
 use ::re_types_core::SerializationResult;
+use ::re_types_core::SerializedComponentBatch;
 use ::re_types_core::try_serialize_field;
-use ::re_types_core::{ComponentBatch as _, SerializedComponentBatch};
 use ::re_types_core::{ComponentDescriptor, ComponentType};
 use ::re_types_core::{DeserializationError, DeserializationResult};
+use ::std::borrow::Cow;
 
 /// **Component**: Whether the viewport layout is determined automatically.
 ///
 /// ⚠️ **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**
 #[derive(Clone, Debug, Copy, ::re_byte_size::SizeBytes)]
 #[repr(transparent)]
-pub struct AutoLayout(pub crate::datatypes::Bool);
+pub struct AutoLayout(pub crate::encodings::Bool);
 
 impl ::re_types_core::WrapperComponent for AutoLayout {
-    type Datatype = crate::datatypes::Bool;
+    type Encoding = crate::encodings::Bool;
 
     #[inline]
     fn name() -> ComponentType {
@@ -38,38 +40,38 @@ impl ::re_types_core::WrapperComponent for AutoLayout {
     }
 
     #[inline]
-    fn into_inner(self) -> Self::Datatype {
+    fn into_inner(self) -> Self::Encoding {
         self.0
     }
 }
 
 ::re_types_core::macros::impl_into_cow!(AutoLayout);
 
-impl<T: Into<crate::datatypes::Bool>> From<T> for AutoLayout {
+impl<T: Into<crate::encodings::Bool>> From<T> for AutoLayout {
     fn from(v: T) -> Self {
         Self(v.into())
     }
 }
 
-impl std::borrow::Borrow<crate::datatypes::Bool> for AutoLayout {
+impl std::borrow::Borrow<crate::encodings::Bool> for AutoLayout {
     #[inline]
-    fn borrow(&self) -> &crate::datatypes::Bool {
+    fn borrow(&self) -> &crate::encodings::Bool {
         &self.0
     }
 }
 
 impl std::ops::Deref for AutoLayout {
-    type Target = crate::datatypes::Bool;
+    type Target = crate::encodings::Bool;
 
     #[inline]
-    fn deref(&self) -> &crate::datatypes::Bool {
+    fn deref(&self) -> &crate::encodings::Bool {
         &self.0
     }
 }
 
 impl std::ops::DerefMut for AutoLayout {
     #[inline]
-    fn deref_mut(&mut self) -> &mut crate::datatypes::Bool {
+    fn deref_mut(&mut self) -> &mut crate::encodings::Bool {
         &mut self.0
     }
 }

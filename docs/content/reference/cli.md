@@ -42,6 +42,15 @@ The Rerun command-line interface:
 
 **Options**
 
+* `--asset <PATH>`
+> A path to a `.rrd` file to register as an asset of every dataset containing a specified local recording.
+>
+> Assets hold static data, such as a mesh or a robot model, that is shared by every recording in the dataset. Can be specified multiple times. Every asset applies to all local `.rrd` recordings on the command line, regardless of argument order, so `rerun --asset mesh.rrd robot.rrd other.rrd --asset urdf.rrd` registers both assets with the datasets of both recordings.
+>
+> See <https://www.rerun.io/docs/concepts/query-and-transform/catalog-object-model#assets>
+>
+> The files are then loaded through the Viewer catalog, which turns on the "Load files via Viewer catalog" setting if it is off.
+
 * `--bind <BIND>`
 > What bind address IP to use.
 >
@@ -492,6 +501,23 @@ Reports timelines that disagree on row ordering, whole-topic ordering conflicts,
 >
 > [Default: `false`]
 
+## rerun viewer-mcp
+
+Run an MCP server that controls a running Rerun Viewer.
+
+Register it with your agent using `claude mcp add rerun -- rerun viewer-mcp` or `codex mcp add rerun -- rerun viewer-mcp`, or add an `mcp.json` entry with `"command": "rerun"` and `"args": ["viewer-mcp"]`.
+
+See <https://rerun.io/docs/reference/viewer/mcp> for details.
+
+**Usage**: `rerun viewer-mcp [OPTIONS]`
+
+**Options**
+
+* `--endpoint <ENDPOINT>`
+> gRPC endpoint of the viewer to connect to on startup, e.g. `http://127.0.0.1:9876`.
+>
+> Without it, the server starts unconnected and the agent picks a viewer with its `connect` tool.
+
 ## rerun rrd
 
 Manipulate the contents of .rrd and .rbl files.
@@ -723,7 +749,11 @@ Examples:
 * `--split-size-ratio <SPLIT_SIZE_RATIO>`
 > If set, split chunks so no two archetype groups sharing a chunk differ in byte size by more than this factor. Values should be `>= 1`; at `1.0`, every archetype is forced into its own chunk.
 >
-> This keeps "thick" columns (images, videos, blobs) out of the same chunk as "thin" columns (scalars, transforms, text), so the viewer can fetch just the thin data without dragging along the thick payload. Components belonging to the same archetype are always kept together.
+> This keeps "thick" columns (images, videos, blobs) out of the same chunk as "thin" columns (scalars, transforms, text), so the viewer can fetch just the thin data without dragging along the thick payload.
+>
+> Components belonging to the same archetype are always kept together, because an archetype's components are only meaningful as a set: an `EncodedImage:blob` cannot be decoded without its `EncodedImage:media_type`. Splitting them would only force a reader to fetch both chunks anyway.
+>
+> The exception is a component that always gets a chunk of its own, such as `VideoStream:is_keyframe`. Those are separated out first, whether or not this is set.
 >
 > A good starting value is 10.0. If unset, the profile's value is used.
 

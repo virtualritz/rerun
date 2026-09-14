@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "../datatypes/mixed_fields.hpp"
+#include "../encodings/mixed_fields.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -19,21 +19,21 @@ namespace arrow {
 
 namespace rerun::components {
     struct AffixFuzzer5 {
-        std::optional<rerun::datatypes::MixedFields> single_optional;
+        std::optional<rerun::encodings::MixedFields> single_optional;
 
       public:
         AffixFuzzer5() = default;
 
-        AffixFuzzer5(std::optional<rerun::datatypes::MixedFields> single_optional_)
+        AffixFuzzer5(std::optional<rerun::encodings::MixedFields> single_optional_)
             : single_optional(std::move(single_optional_)) {}
 
-        AffixFuzzer5& operator=(std::optional<rerun::datatypes::MixedFields> single_optional_) {
+        AffixFuzzer5& operator=(std::optional<rerun::encodings::MixedFields> single_optional_) {
             single_optional = std::move(single_optional_);
             return *this;
         }
 
-        /// Cast to the underlying MixedFields datatype
-        operator std::optional<rerun::datatypes::MixedFields>() const {
+        /// Cast to the underlying MixedFields encoding
+        operator std::optional<rerun::encodings::MixedFields>() const {
             return single_optional;
         }
     };
@@ -49,7 +49,7 @@ namespace rerun {
         static constexpr std::string_view ComponentType = "rerun.testing.components.AffixFuzzer5";
 
         /// Returns the arrow data type this type corresponds to.
-        static const std::shared_ptr<arrow::DataType>& arrow_datatype();
+        static const std::shared_ptr<arrow::DataType>& arrow_data_type();
 
         /// Serializes an array of `rerun::components::AffixFuzzer5` into an arrow array.
         static Result<std::shared_ptr<arrow::Array>> to_arrow(

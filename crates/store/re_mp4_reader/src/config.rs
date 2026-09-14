@@ -1,6 +1,6 @@
 use re_chunk::TimePoint;
 use re_log_types::{TimeType, TimelineName};
-use re_video::Mp4TranscodeOptions;
+use re_video::{Mp4TranscodeOptions, TimeWindow};
 
 /// Configuration for [`crate::load_mp4_from_bytes`].
 #[derive(Clone, Debug)]
@@ -31,6 +31,7 @@ impl Default for Mp4Config {
             mode: Mode::Stream {
                 chunk_by_gop: true,
                 transcode: Mp4TranscodeOptions::default(),
+                time_window: None,
             },
             timeline_name: "video".into(),
             timeline_type: TimeType::DurationNs,
@@ -49,8 +50,9 @@ pub enum Mode {
     /// timeline plus any `created_at` / `modified_at` cells.
     Asset { timepoint: TimePoint },
 
-    /// Emit a static `VideoStream(codec=…)` chunk followed by per-sample
-    /// `VideoSample` chunks at PTS.
+    /// Emit a static `VideoStream(codec=…)` chunk, per-sample (or per-GOP)
+    /// `VideoSample` chunks at PTS, and a trailing dedicated `IsKeyframe` chunk
+    /// holding one sparse `true` row per keyframe.
     ///
     /// The timeline used for the samples is named [`Mp4Config::timeline_name`]
     /// and typed [`Mp4Config::timeline_type`].
@@ -73,5 +75,10 @@ pub enum Mode {
         /// The default is a no-op: a B-frame-free source is read directly without
         /// invoking ffmpeg.
         transcode: Mp4TranscodeOptions,
+
+        /// Exclusive time window of the source video to read. `None` reads the whole file.
+        ///
+        /// Uses ffmpeg if the window doesn't exactly line up with a GOP start.
+        time_window: Option<TimeWindow>,
     },
 }

@@ -3,7 +3,7 @@
 
 #include "affix_fuzzer16.hpp"
 
-#include "../datatypes/scalar_union.hpp"
+#include "../encodings/scalar_union.hpp"
 
 #include <arrow/builder.h>
 #include <arrow/type_fwd.h>
@@ -11,9 +11,9 @@
 namespace rerun::components {}
 
 namespace rerun {
-    const std::shared_ptr<arrow::DataType>& Loggable<components::AffixFuzzer16>::arrow_datatype() {
+    const std::shared_ptr<arrow::DataType>& Loggable<components::AffixFuzzer16>::arrow_data_type() {
         static const auto datatype = arrow::list(
-            arrow::field("item", Loggable<rerun::datatypes::ScalarUnion>::arrow_datatype(), true)
+            arrow::field("item", Loggable<rerun::encodings::ScalarUnion>::arrow_data_type(), true)
         );
         return datatype;
     }
@@ -23,7 +23,7 @@ namespace rerun {
     ) {
         // TODO(andreas): Allow configuring the memory pool.
         arrow::MemoryPool* pool = arrow::default_memory_pool();
-        auto datatype = arrow_datatype();
+        auto datatype = arrow_data_type();
 
         ARROW_ASSIGN_OR_RAISE(auto builder, arrow::MakeBuilder(datatype, pool))
         if (instances && num_instances > 0) {
@@ -59,7 +59,7 @@ namespace rerun {
             const auto& element = elements[elem_idx];
             ARROW_RETURN_NOT_OK(builder->Append());
             if (element.many_required_unions.data()) {
-                RR_RETURN_NOT_OK(Loggable<rerun::datatypes::ScalarUnion>::fill_arrow_array_builder(
+                RR_RETURN_NOT_OK(Loggable<rerun::encodings::ScalarUnion>::fill_arrow_array_builder(
                     value_builder,
                     element.many_required_unions.data(),
                     element.many_required_unions.size()

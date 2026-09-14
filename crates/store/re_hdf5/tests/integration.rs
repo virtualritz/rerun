@@ -14,7 +14,9 @@ use hdf5_pure::{
     AttrValue, CharacterSet, CompoundTypeBuilder, Datatype, FileBuilder, StringPadding,
 };
 use itertools::Itertools as _;
+use std::assert_matches;
 
+use re_arrow_util::ArrowArrayDowncastRef as _;
 use re_chunk::{Chunk, EntityPath};
 use re_hdf5::{DatasetDtype, Hdf5Config, Hdf5Error, IndexColumn, IndexType, TimeUnit};
 use re_log_types::TimeType;
@@ -82,7 +84,10 @@ fn dimensionality_mapping() {
     // 1-D → one scalar per row.
     let v1 = data.components().get_array("v1".into()).unwrap();
     assert_eq!(v1.len(), 4);
-    let v1_values = v1.values().as_any().downcast_ref::<Float64Array>().unwrap();
+    let v1_values = v1
+        .values()
+        .try_downcast_array_ref::<Float64Array>()
+        .unwrap();
     assert_eq!(v1_values.values(), &[0.0, 1.0, 2.0, 3.0]);
 
     // 2-D [N, K] → one FixedSizeList<K> per row.
@@ -90,28 +95,25 @@ fn dimensionality_mapping() {
     assert_eq!(m2.len(), 4);
     let m2_values = m2
         .values()
-        .as_any()
-        .downcast_ref::<FixedSizeListArray>()
+        .try_downcast_array_ref::<FixedSizeListArray>()
         .unwrap();
     assert_eq!(m2_values.value_length(), 3);
     assert_eq!(m2_values.len(), 4);
     let m2_inner = m2_values
         .values()
-        .as_any()
-        .downcast_ref::<Float32Array>()
+        .try_downcast_array_ref::<Float32Array>()
         .unwrap();
     assert_eq!(m2_inner.len(), 12);
 
     // 3-D+ [N, d1, …] → one row-major blob (List) per row.
     let t3 = data.components().get_array("t3".into()).unwrap();
     assert_eq!(t3.len(), 4);
-    let t3_values = t3.values().as_any().downcast_ref::<ListArray>().unwrap();
+    let t3_values = t3.values().try_downcast_array_ref::<ListArray>().unwrap();
     assert_eq!(t3_values.len(), 4);
     assert_eq!(t3_values.value_length(0), 4); // 2*2 values per row
     let t3_inner = t3_values
         .values()
-        .as_any()
-        .downcast_ref::<UInt8Array>()
+        .try_downcast_array_ref::<UInt8Array>()
         .unwrap();
     assert_eq!(t3_inner.len(), 16);
 
@@ -120,7 +122,7 @@ fn dimensionality_mapping() {
     assert_eq!(statics.entity_path(), &EntityPath::from("/"));
     assert_eq!(statics.num_rows(), 1);
     let s0 = statics.components().get_array("s0".into()).unwrap();
-    let s0_values = s0.values().as_any().downcast_ref::<Int64Array>().unwrap();
+    let s0_values = s0.values().try_downcast_array_ref::<Int64Array>().unwrap();
     assert_eq!(s0_values.values(), &[7]);
 }
 
@@ -158,8 +160,7 @@ fn string_datasets() {
         let array = data.components().get_array(component.into()).unwrap();
         let values = array
             .values()
-            .as_any()
-            .downcast_ref::<StringArray>()
+            .try_downcast_array_ref::<StringArray>()
             .unwrap();
         assert_eq!(values.iter().map(Option::unwrap).collect_vec(), expected);
     }
@@ -307,8 +308,7 @@ fn unsorted_index_rows_are_stably_reordered() {
     let value = chunks[0].components().get_array("value".into()).unwrap();
     let values = value
         .values()
-        .as_any()
-        .downcast_ref::<Float64Array>()
+        .try_downcast_array_ref::<Float64Array>()
         .unwrap();
     assert_eq!(values.values(), &[2.0, 3.0, 1.0]);
 }
@@ -400,8 +400,7 @@ fn vlen_strings_are_row_windowed() {
             let array = chunk.components().get_array("labels".into()).unwrap();
             let strings = array
                 .values()
-                .as_any()
-                .downcast_ref::<StringArray>()
+                .try_downcast_array_ref::<StringArray>()
                 .unwrap();
             strings
                 .iter()
@@ -450,13 +449,11 @@ fn wide_rows_are_windowed_by_bytes() {
     let wide = chunks[1].components().get_array("wide".into()).unwrap();
     let window = wide
         .values()
-        .as_any()
-        .downcast_ref::<FixedSizeListArray>()
+        .try_downcast_array_ref::<FixedSizeListArray>()
         .unwrap();
     let inner = window
         .values()
-        .as_any()
-        .downcast_ref::<Float64Array>()
+        .try_downcast_array_ref::<Float64Array>()
         .unwrap();
     #[expect(clippy::cast_precision_loss)]
     let expected = (16 * K) as f64;
@@ -492,13 +489,11 @@ fn chunked_storage_windows_correctly() {
             let list = chunk.components().get_array("value".into()).unwrap();
             let window = list
                 .values()
-                .as_any()
-                .downcast_ref::<FixedSizeListArray>()
+                .try_downcast_array_ref::<FixedSizeListArray>()
                 .unwrap();
             let inner = window
                 .values()
-                .as_any()
-                .downcast_ref::<Float64Array>()
+                .try_downcast_array_ref::<Float64Array>()
                 .unwrap();
             inner.values().to_vec()
         })
@@ -538,11 +533,10 @@ fn inner_chunked_dataset_windows_correctly() {
         .iter()
         .flat_map(|chunk| {
             let list = chunk.components().get_array("t3".into()).unwrap();
-            let blobs = list.values().as_any().downcast_ref::<ListArray>().unwrap();
+            let blobs = list.values().try_downcast_array_ref::<ListArray>().unwrap();
             let inner = blobs
                 .values()
-                .as_any()
-                .downcast_ref::<Float64Array>()
+                .try_downcast_array_ref::<Float64Array>()
                 .unwrap();
             inner.values().to_vec()
         })
@@ -586,7 +580,7 @@ fn root_group_scopes_to_subtree() {
     let err = re_hdf5::load_hdf5(&path, &Hdf5Config::default())
         .err()
         .unwrap();
-    assert!(matches!(err, Hdf5Error::RowAlignment { .. }), "{err}");
+    assert_matches!(err, Hdf5Error::RowAlignment { .. }, "{err}");
 
     // Scoped to one episode it loads, with the index resolved *relative* to
     // the root group and entity paths relative to it as well.
@@ -661,20 +655,20 @@ fn root_group_validation_errors() {
     let err = re_hdf5::validate_layout(&path, &with_root("/nope"))
         .err()
         .unwrap();
-    assert!(matches!(err, Hdf5Error::RootGroupNotFound { .. }), "{err}");
+    assert_matches!(err, Hdf5Error::RootGroupNotFound { .. }, "{err}");
     assert!(err.is_config_error());
 
     let err = re_hdf5::validate_layout(&path, &with_root("/demo_0/t"))
         .err()
         .unwrap();
-    assert!(matches!(err, Hdf5Error::RootGroupNotAGroup { .. }), "{err}");
+    assert_matches!(err, Hdf5Error::RootGroupNotAGroup { .. }, "{err}");
     assert!(err.is_config_error());
 
     // An explicit `/` root group behaves exactly like `None`.
     let err = re_hdf5::validate_layout(&path, &with_root("/"))
         .err()
         .unwrap();
-    assert!(matches!(err, Hdf5Error::RowAlignment { .. }), "{err}");
+    assert_matches!(err, Hdf5Error::RowAlignment { .. }, "{err}");
 }
 
 // ---------------------------------------------------------------------------
@@ -692,7 +686,7 @@ fn misaligned_datasets_error_and_ignore_resolves() {
     let err = re_hdf5::load_hdf5(&path, &Hdf5Config::default())
         .err()
         .unwrap();
-    assert!(matches!(err, Hdf5Error::RowAlignment { .. }), "{err}");
+    assert_matches!(err, Hdf5Error::RowAlignment { .. }, "{err}");
     assert!(err.is_config_error());
     assert!(err.to_string().contains("/b (shape [6])"), "{err}");
 
@@ -700,7 +694,7 @@ fn misaligned_datasets_error_and_ignore_resolves() {
     let err = re_hdf5::validate_layout(&path, &Hdf5Config::default())
         .err()
         .unwrap();
-    assert!(matches!(err, Hdf5Error::RowAlignment { .. }), "{err}");
+    assert_matches!(err, Hdf5Error::RowAlignment { .. }, "{err}");
 
     // Explicitly ignoring the offender resolves the mismatch.
     let config = Hdf5Config {
@@ -772,8 +766,7 @@ fn attributes_become_static_components() {
     let version = root_props.components().get_array("version".into()).unwrap();
     let version_values = version
         .values()
-        .as_any()
-        .downcast_ref::<Int64Array>()
+        .try_downcast_array_ref::<Int64Array>()
         .unwrap();
     assert_eq!(version_values.values(), &[1]);
 
@@ -783,8 +776,7 @@ fn attributes_become_static_components() {
     let freq = g_props.components().get_array("freq".into()).unwrap();
     let freq_values = freq
         .values()
-        .as_any()
-        .downcast_ref::<Float64Array>()
+        .try_downcast_array_ref::<Float64Array>()
         .unwrap();
     assert_eq!(freq_values.values(), &[30.0]);
 
@@ -792,8 +784,7 @@ fn attributes_become_static_components() {
     assert_eq!(vec_array.len(), 1);
     let vec_values = vec_array
         .values()
-        .as_any()
-        .downcast_ref::<FixedSizeListArray>()
+        .try_downcast_array_ref::<FixedSizeListArray>()
         .unwrap();
     assert_eq!(vec_values.value_length(), 3);
 
@@ -802,8 +793,7 @@ fn attributes_become_static_components() {
     let unit = d_props.components().get_array("unit".into()).unwrap();
     let unit_values = unit
         .values()
-        .as_any()
-        .downcast_ref::<StringArray>()
+        .try_downcast_array_ref::<StringArray>()
         .unwrap();
     assert_eq!(unit_values.value(0), "m");
 }
@@ -824,15 +814,13 @@ fn unsigned_array_attribute_keeps_its_width() {
 
     let list = ids
         .values()
-        .as_any()
-        .downcast_ref::<FixedSizeListArray>()
+        .try_downcast_array_ref::<FixedSizeListArray>()
         .unwrap();
     assert_eq!(list.value_length(), 2);
 
     let values = list
         .values()
-        .as_any()
-        .downcast_ref::<UInt64Array>()
+        .try_downcast_array_ref::<UInt64Array>()
         .unwrap();
     assert_eq!(values.values(), &[1, big]);
 }
@@ -896,15 +884,13 @@ fn use_structs_packs_group_datasets() {
     let data = g.components().get_array("data".into()).unwrap();
     let structs = data
         .values()
-        .as_any()
-        .downcast_ref::<StructArray>()
+        .try_downcast_array_ref::<StructArray>()
         .unwrap();
     assert_eq!(structs.num_columns(), 2);
     assert_eq!(structs.column_by_name("a").unwrap().len(), 2);
     let m_field = structs.column_by_name("m").unwrap();
     let m_field = m_field
-        .as_any()
-        .downcast_ref::<FixedSizeListArray>()
+        .try_downcast_array_ref::<FixedSizeListArray>()
         .unwrap();
     assert_eq!(m_field.value_length(), 2);
 
@@ -1081,7 +1067,7 @@ fn validate_layout_index_errors() {
     let err = re_hdf5::validate_layout(&path, &config_with_index("/missing"))
         .err()
         .unwrap();
-    assert!(matches!(err, Hdf5Error::IndexNotFound { .. }), "{err}");
+    assert_matches!(err, Hdf5Error::IndexNotFound { .. }, "{err}");
     assert!(err.is_config_error());
 
     let err = re_hdf5::validate_layout(&path, &config_with_index("/matrix"))
@@ -1095,7 +1081,7 @@ fn validate_layout_index_errors() {
     let err = re_hdf5::validate_layout(&path, &config_with_index("/names"))
         .err()
         .unwrap();
-    assert!(matches!(err, Hdf5Error::IndexNotNumeric { .. }), "{err}");
+    assert_matches!(err, Hdf5Error::IndexNotNumeric { .. }, "{err}");
 
     assert!(re_hdf5::validate_layout(&path, &config_with_index("/value")).is_ok());
 }
@@ -1123,8 +1109,7 @@ fn reads_h5py_written_file() {
     let qpos = data.components().get_array("qpos".into()).unwrap();
     let qpos_values = qpos
         .values()
-        .as_any()
-        .downcast_ref::<FixedSizeListArray>()
+        .try_downcast_array_ref::<FixedSizeListArray>()
         .unwrap();
     assert_eq!(qpos_values.value_length(), 3);
 
@@ -1133,8 +1118,7 @@ fn reads_h5py_written_file() {
             .get_array(name.into())
             .unwrap()
             .values()
-            .as_any()
-            .downcast_ref::<Float32Array>()
+            .try_downcast_array_ref::<Float32Array>()
             .unwrap()
             .values()
             .to_vec()
@@ -1147,8 +1131,7 @@ fn reads_h5py_written_file() {
     let version = props.components().get_array("version".into()).unwrap();
     let version_values = version
         .values()
-        .as_any()
-        .downcast_ref::<Int64Array>()
+        .try_downcast_array_ref::<Int64Array>()
         .unwrap();
     assert_eq!(version_values.values(), &[2]);
 

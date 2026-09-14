@@ -62,6 +62,8 @@ mod mcap_message;
 mod mcap_schema;
 #[path = "archetypes/mcap_statistics.def.rs"]
 mod mcap_statistics;
+#[path = "archetypes/measurements.def.rs"]
+mod measurements;
 #[path = "archetypes/mesh3d.def.rs"]
 mod mesh3d;
 #[path = "archetypes/pinhole.def.rs"]
@@ -100,6 +102,8 @@ mod video_frame_reference;
 mod video_stream;
 #[path = "archetypes/view_coordinates.def.rs"]
 mod view_coordinates;
+#[path = "archetypes/volume_3d.def.rs"]
+mod volume_3d;
 #[path = "archetypes/voxel_grid_map.def.rs"]
 mod voxel_grid_map;
 
@@ -134,6 +138,7 @@ pub use self::mcap_channel::*;
 pub use self::mcap_message::*;
 pub use self::mcap_schema::*;
 pub use self::mcap_statistics::*;
+pub use self::measurements::*;
 pub use self::mesh3d::*;
 pub use self::pinhole::*;
 pub use self::points2d::*;
@@ -153,4 +158,5 @@ pub use self::transform3d::*;
 pub use self::video_frame_reference::*;
 pub use self::video_stream::*;
 pub use self::view_coordinates::*;
+pub use self::volume_3d::*;
 pub use self::voxel_grid_map::*;

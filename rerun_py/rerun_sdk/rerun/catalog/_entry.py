@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
     import datafusion
 
-    from rerun.experimental import LazyStore
+    from rerun.chunk import LazyStore
 
     from . import (
         CatalogClient,
@@ -639,18 +639,28 @@ class DatasetEntry(Entry[DatasetEntryInternal]):
 
         return RegistrationHandle(self._internal.register_prefix(recordings_prefix, layer_name, on_duplicate))
 
-    def segment_store(self, segment_id: str) -> LazyStore:
+    def segment_store(self, segment_id: str, *, include_assets: bool = True) -> LazyStore:
         """
-        Open a remote segment as a [`LazyStore`][rerun.experimental.LazyStore].
+        Open a remote segment as a [`LazyStore`][rerun.chunk.LazyStore].
 
         The manifest is fetched immediately; chunk data is loaded on demand
-        via [`LazyStore.stream`][rerun.experimental.LazyStore.stream]. To fully
-        materialize into a [`ChunkStore`][rerun.experimental.ChunkStore], call
+        via [`LazyStore.stream`][rerun.chunk.LazyStore.stream]. To fully
+        materialize into a [`ChunkStore`][rerun.chunk.ChunkStore], call
         `lazy.stream().collect()`.
-        """
-        from rerun.experimental import LazyStore
 
-        return LazyStore(self._internal.segment_store(segment_id))
+        Parameters
+        ----------
+        segment_id:
+            The segment to open.
+        include_assets:
+            Whether the assets registered for this dataset are part of the store.
+            Their manifests are fetched alongside the segment's own, which costs one
+            request to list the assets and one for each of their manifests.
+
+        """
+        from rerun.chunk import LazyStore
+
+        return LazyStore(self._internal.segment_store(segment_id, include_assets=include_assets))
 
     @with_tracing("DatasetEntry.filter_segments")
     def filter_segments(self, segment_ids: str | Sequence[str] | datafusion.DataFrame) -> DatasetView:
@@ -854,8 +864,28 @@ class DatasetEntry(Entry[DatasetEntryInternal]):
         cleanup_before: datetime | None = None,
         unsafe_allow_recent_cleanup: bool = False,
     ) -> None:
-        """Perform maintenance tasks on the datasets."""
+        """
+        Perform maintenance tasks on the datasets.
 
+        Parameters
+        ----------
+        optimize_indexes:
+            Incrementally update the dataset's indexes: newly ingested data is folded into each
+            index as the server's consolidation policy dictates.
+        retrain_indexes:
+            Fully consolidate every index, ignoring the server's segment-count threshold that
+            normally bounds how often indexes are merged — the manual drain lever for
+            accumulated index segments and deferred index-remap debt. Implies
+            `optimize_indexes`.
+        compact_fragments:
+            Rewrite small or fragmented storage fragments into denser ones.
+        cleanup_before:
+            If set, delete unreferenced storage versions older than this timestamp.
+        unsafe_allow_recent_cleanup:
+            Allow `cleanup_before` timestamps more recent than the server's safety margin.
+            ⚠️ Improper use will lead to data loss.
+
+        """
         return self._internal.do_maintenance(
             optimize_indexes, retrain_indexes, compact_fragments, cleanup_before, unsafe_allow_recent_cleanup
         )

@@ -70,9 +70,19 @@ ignore = [
 multiple-versions = "deny"
 wildcards = "allow" # We use them for examples
 deny = [
+  # Deny `auto_generate_cdp` for anything but integration tests, since it's GPL.
+  { name = "auto_generate_cdp", wrappers = [
+    "headless_chrome",
+  ], reason = "May only ever be used in tests since it's GPL-3.0" },
+  { name = "headless_chrome", wrappers = [
+    "re_integration_test",
+  ], reason = "Pulls in a GPL-3.0 crate so may only ever be used in tests." },
+
   { name = "cgmath", reason = "We use glam" },
   { name = "cmake", reason = "Never again" },
-  { name = "derive_more", reason = "Is very slow to compile; see https://github.com/rerun-io/rerun/issues/1316" },
+  { name = "derive_more", wrappers = [
+    "agent-client-protocol-schema",
+  ], reason = "Is very slow to compile; see https://github.com/rerun-io/rerun/issues/1316. Only allowed via the ACP schema crate, which we do not control." },
   { name = "egui_glow", reason = "We use wgpu" },
   { name = "openssl-sys", reason = "We prefer rustls" },
   { name = "openssl", reason = "We prefer rustls" },
@@ -102,7 +112,6 @@ skip = [
   { name = "kurbo" }, # Different versions in egui_extras/resvg and epaint/vello_cpu
   { name = "libloading" }, # datafusion-ffi needs an older version than wgpu
   { name = "linux-raw-sys" }, # because of two rustix versions.
-  { name = "lz4_flex" }, # the Arrow ecosystem is a bit behind, but it's fine, this is a very tiny, flat dependency
   { name = "memmap2" }, # because of walkers
   { name = "objc2-app-kit" }, # `accesskit_macos` uses a different version than `arboard`
   { name = "objc2-foundation" }, # `accesskit_macos` uses a different version than `arboard`
@@ -110,14 +119,22 @@ skip = [
   { name = "ordered-float" }, # Old version being used by parquet, but super small!
   { name = "png" }, # `resvg` (via egui_extras) still uses 0.17, `walkers` forces us on 0.18 via `image`.
   { name = "pollster" }, # `rfd` still uses 0.4, we use 1.0
+  { name = "strum" }, # `agent-client-protocol-schema` uses 0.28, we are still on 0.26
+  { name = "strum_macros" }, # `agent-client-protocol-schema` uses 0.28, we are still on 0.26
   { name = "prettyplease" }, # `prost-build`/`tonic-build` use 0.2; `re_types_builder` uses 0.3, which takes the `syn` 3 AST. Build-time only.
   { name = "quick-xml" }, # because of urdf-rs
   { name = "redox_syscall" }, # Plenty of versions in the wild
   { name = "rustc-hash" }, # numpy with compatible pyo3 requires different version than wgpu
   { name = "rustix" }, # tantivy uses an old version.
   { name = "sha2" }, # DataFusion 54 uses 0.11 while the rest of the ecosystem uses 0.10.
-  { name = "socket2" }, # `egui_mcp` pulls `tokio` (→ socket2 0.6) into the non-dev graph; the viewer otherwise uses 0.5 via `hyper-util`.
   { name = "unicode-width" }, # walkers depends on 0.1 via http-cache-request / cacache
+
+  # Duplicated by `headless_chrome`, pulled in only by the `browser` feature of the
+  # `re_integration_test` browser integration-test harness.
+  { name = "convert_case" },
+  { name = "cpufeatures" },
+  { name = "rand" },
+  { name = "rand_core" },
 ]
 skip-tree = [
   # PREFER `skip` (above): `skip-tree` exempts the crate AND its whole transitive subtree from the
@@ -154,7 +171,12 @@ allow = [
   "Unicode-3.0", # https://www.unicode.org/license.txt
   "Zlib", # https://tldrlegal.com/license/zlib-libpng-license-(zlib)
 ]
-exceptions = []
+exceptions = [
+  # Pulled in via headless-chrome. Only used during testing and never linked to any released binaries.
+  { name = "auto_generate_cdp", allow = [
+    "GPL-3.0-or-later",
+  ] },
+]
 
 [[licenses.clarify]]
 name = "webpki"
@@ -169,10 +191,15 @@ license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-allow-git = [
-  # Temporary: `walkers` 0.56 still targets egui 0.35. Remove once upstream releases an egui 0.36 version.
-  "https://github.com/lucasmerlin/walkers",
-]
+# The `walkers` entry that used to live here is gone: it carried the exit condition
+# "remove once upstream releases an egui 0.36 version", and #3076 met it.
+allow-git = []
 
+# There are currently no git dependencies at all, so `cargo deny` reports the two
+# organizations below as unmatched. They are kept anyway, and the warning accepted,
+# because `Cargo.toml` carries a commented-out block of `emilk/egui`, `rerun-io/kittest`
+# and `rerun-io/arrow-datafusion` git dependencies that is uncommented whenever we need
+# to track an upstream branch. Deleting these would make that a two-file change and the
+# failure would arrive as an unrelated `unknown-git` CI error.
 [sources.allow-org]
 github = ["emilk", "rerun-io"]

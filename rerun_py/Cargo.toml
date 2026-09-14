@@ -1,5 +1,6 @@
 [package]
 name = "rerun_py" # name of the rust crate
+description = "The Rerun Python SDK"
 edition.workspace = true
 license.workspace = true
 publish = false
@@ -59,11 +60,12 @@ re_arrow_util.workspace = true
 re_auth.workspace = true
 re_build_info.workspace = true
 re_chunk.workspace = true
+re_chunk_optimizer.workspace = true
 re_lenses_core.workspace = true
 re_lenses.workspace = true
 re_chunk_store.workspace = true
 re_format.workspace = true
-re_importer.workspace = true
+re_importer = { workspace = true, features = ["all"] }
 re_datafusion.workspace = true
 re_error.workspace = true
 re_redap_client.workspace = true
@@ -81,6 +83,7 @@ re_quota_channel.workspace = true
 re_sdk = { workspace = true, features = ["importers"] }
 re_sdk_types = { workspace = true, features = ["video"] }
 re_sorbet.workspace = true
+re_span.workspace = true
 re_tracing = { workspace = true, features = ["server"] }
 re_tuid.workspace = true
 re_types_core.workspace = true
@@ -130,6 +133,7 @@ re_perf_telemetry = { workspace = true, features = ["session_id_reader"], option
 
 
 [dev-dependencies]
+re_uri.workspace = true
 tempfile.workspace = true
 
 

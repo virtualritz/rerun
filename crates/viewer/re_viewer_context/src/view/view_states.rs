@@ -42,7 +42,7 @@ pub struct PreviewState {
     active_previews: ahash::HashMap<StoreId, ActivePreview>,
 
     /// URIs that have already been requested.
-    pub requested_uris: ahash::HashSet<re_uri::DatasetSegmentUri>,
+    pub requested_uris: ahash::HashSet<re_uri::DatasetUri>,
 }
 
 impl PreviewState {
@@ -253,5 +253,22 @@ impl ViewStates {
         self.view_reports
             .get(&(store_id.clone(), view_id))
             .map_or(&[], Vec::as_slice)
+    }
+
+    /// Every diagnostic for a view: the view's own reports followed by those of its visualizers.
+    pub fn all_reports(
+        &self,
+        store_id: &StoreId,
+        view_id: ViewId,
+    ) -> impl Iterator<Item = &ViewerDiagnostic> {
+        let visualizer_reports = self
+            .per_visualizer_type_reports(store_id, view_id)
+            .into_iter()
+            .flat_map(|reports| reports.values())
+            .flat_map(VisualizerTypeReport::diagnostics);
+        std::iter::chain(
+            self.view_reports(store_id, view_id).iter(),
+            visualizer_reports,
+        )
     }
 }

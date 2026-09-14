@@ -19,8 +19,8 @@ pub enum CodecError {
         "Data from Rerun version {file}, which is incompatible with the local Rerun version {local}"
     )]
     IncompatibleRerunVersion {
-        file: Box<CrateVersion>,
-        local: Box<CrateVersion>,
+        file: Box<CrateVersion<'static>>,
+        local: Box<CrateVersion<'static>>,
     },
 
     #[error("{0}")]
@@ -43,6 +43,13 @@ pub enum CodecError {
 
     #[error("Arrow IPC deserialization error: {0}")]
     ArrowDeserialization(::arrow::error::ArrowError),
+
+    #[error(transparent)]
+    GetColumn(#[from] re_arrow_util::GetColumnError),
+
+    /// A column was missing, had the wrong datatype, or had unexpected nulls.
+    #[error(transparent)]
+    Quiver(#[from] quiver::Error),
 
     #[error("Arrow IPC serialization error: {0}")]
     ArrowSerialization(::arrow::error::ArrowError),

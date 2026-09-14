@@ -8,7 +8,7 @@ use arrow::datatypes::DataType;
 use egui::NumExt as _;
 use parking_lot::RwLock;
 use re_byte_size::SizeBytes as _;
-use re_chunk::{ChunkId, EntityPath, Span, TimelineName};
+use re_chunk::{ChunkId, EntityPath, RowId, TimelineName};
 use re_chunk_store::{
     ChunkDirectLineageReport, ChunkStoreDiff, ChunkStoreEvent, ChunkTrackingMode,
 };
@@ -17,8 +17,11 @@ use re_log::{debug_assert, debug_panic};
 use re_log_types::{EntityPathHash, TimeType};
 use re_sdk_types::archetypes::VideoStream;
 use re_sdk_types::components;
+use re_span::Span;
 use re_video::player::GetVideoSource;
-use re_video::{DecodeSettings, SampleMetadataState, StableIndexDeque, VideoSource};
+use re_video::{
+    DecodeSettings, SampleIndexSpan, SampleMetadataState, StableIndexDeque, VideoSource,
+};
 
 use crate::Cache;
 
@@ -35,41 +38,44 @@ pub struct VideoStoreSource<'a> {
 
 impl GetVideoSource for VideoStoreSource<'_> {
     fn get_video_chunk(&self, source: VideoSource) -> &[u8] {
-        let lookup = |id: re_log_types::external::re_tuid::Tuid,
-                      sub_id: Option<re_log_types::external::re_tuid::Tuid>|
+        let lookup = |container_id: re_log_types::external::re_tuid::Tuid,
+                      sample_id: Option<re_log_types::external::re_tuid::Tuid>|
          -> Option<&[u8]> {
             let chunk = if self.indicate {
                 self.store
-                    .use_chunk_or_report_missing(&ChunkId::from_tuid(id))
+                    .use_chunk_or_report_missing(&ChunkId::from_tuid(container_id))
             } else {
                 self.store
-                    .use_transient_chunk_or_report_missing(&ChunkId::from_tuid(id))
+                    .use_transient_chunk_or_report_missing(&ChunkId::from_tuid(container_id))
             }?;
-            let sub_id = sub_id?;
+            let sample_id = sample_id?;
             let (offsets, buffer) = re_arrow_util::blob_arrays_offsets_and_buffer(
                 chunk.raw_component_array(self.sample_component)?,
             )?;
-            let row_idx = chunk.row_index_of(re_sdk_types::RowId::from_tuid(sub_id))?;
+            let row_idx = chunk.row_index_of(re_sdk_types::RowId::from_tuid(sample_id))?;
             let start = offsets[row_idx] as usize;
             let end = offsets[row_idx + 1] as usize;
             Some(&buffer.as_slice()[start..end])
         };
 
         match source {
-            VideoSource::Id { id, sub_id } => lookup(id, sub_id).unwrap_or(&[]),
+            VideoSource::Id {
+                container_id,
+                sample_id,
+            } => lookup(container_id, sample_id).unwrap_or(&[]),
             VideoSource::Span(_) => &[],
         }
     }
 
     fn require_video_source(&self, source: VideoSource) {
         match source {
-            VideoSource::Id { id, sub_id: _ } => {
+            VideoSource::Id { container_id, .. } => {
                 if self.indicate {
                     self.store
-                        .use_chunk_or_report_missing(&ChunkId::from_tuid(id));
+                        .use_chunk_or_report_missing(&ChunkId::from_tuid(container_id));
                 } else {
                     self.store
-                        .use_transient_chunk_or_report_missing(&ChunkId::from_tuid(id));
+                        .use_transient_chunk_or_report_missing(&ChunkId::from_tuid(container_id));
                 }
             }
             VideoSource::Span(_) => {}
@@ -78,12 +84,13 @@ impl GetVideoSource for VideoStoreSource<'_> {
 
     fn indicate_video_source(&self, source: VideoSource) {
         match source {
-            VideoSource::Id { id, sub_id: _ } => {
+            VideoSource::Id { container_id, .. } => {
                 if self.indicate {
-                    self.store.use_chunk_or_indicate(&ChunkId::from_tuid(id));
+                    self.store
+                        .use_chunk_or_indicate(&ChunkId::from_tuid(container_id));
                 } else {
                     self.store
-                        .use_transient_chunk_or_report_missing(&ChunkId::from_tuid(id));
+                        .use_transient_chunk_or_report_missing(&ChunkId::from_tuid(container_id));
                 }
             }
             VideoSource::Span(_) => {}
@@ -540,7 +547,7 @@ fn handle_deletion(
 
     let (sample_count, other_min, other_max) = video_data
         .samples
-        .iter_index_range_clamped(&known_range.idx_range())
+        .iter_index_range_clamped(known_range.idx_range())
         .fold(
             (
                 0usize,
@@ -604,7 +611,7 @@ fn handle_deletion(
 
     let mut samples = video_data
         .samples
-        .iter_index_range_clamped_mut(&known_range.idx_range());
+        .iter_index_range_clamped_mut(known_range.idx_range());
 
     if clear_start {
         rrd_manifest_chunks
@@ -704,7 +711,7 @@ fn handle_compacted_chunk_addition(
         .filter_map(|(range, chunk)| {
             video_data
                 .samples
-                .iter_index_range_clamped_mut(&range.idx_range())
+                .iter_index_range_clamped_mut(range.idx_range())
                 .filter(|(_, s)| s.source_primary_id() == Some(chunk.id().as_tuid()))
                 .find(|(_, s)| s.is_unloaded())
                 .map(|(idx, _)| idx)
@@ -738,7 +745,7 @@ fn handle_compacted_chunk_addition(
     for (range, reused_chunk) in reused_chunks {
         for (idx, sample) in video_data
             .samples
-            .iter_index_range_clamped_mut(&range.idx_range())
+            .iter_index_range_clamped_mut(range.idx_range())
             .filter(|(_, s)| s.source_primary_id() == Some(reused_chunk.id().as_tuid()))
         {
             update_min_max(idx);
@@ -747,14 +754,16 @@ fn handle_compacted_chunk_addition(
         }
     }
 
-    for unseen_chunk in unseen_chunks {
-        let Some(chunk_samples) =
-            ChunkSamples::from_physical(unseen_chunk, timeline, sample_component)
-        else {
-            continue;
-        };
+    let mut unseen_samples: Vec<_> = unseen_chunks
+        .into_iter()
+        .filter_map(|chunk| ChunkSamples::from_physical(chunk, timeline, sample_component))
+        .collect();
+    unseen_samples.sort_by_key(|chunk_samples| chunk_samples.sort_key());
 
-        for mut sample in chunk_samples.samples {
+    for chunk_samples in unseen_samples {
+        for queued in chunk_samples.samples {
+            let mut sample = queued.sample;
+
             // Use the compacted chunk's source_id so that `read_samples_from_known_chunk`
             // can find these samples when filtering by the compacted chunk's id.
             sample.set_source_primary_id(compacted_chunk.id().as_tuid());
@@ -833,7 +842,7 @@ fn handle_split_chunk_addition(
 
     let mut samples = video_data
         .samples
-        .iter_index_range_clamped_mut(&old_known_range.idx_range())
+        .iter_index_range_clamped_mut(old_known_range.idx_range())
         .filter(|(_, s)| s.source_primary_id() == Some(original_chunk.id().as_tuid()));
 
     flatten_chunk_samples(
@@ -1051,8 +1060,8 @@ impl ChunkSampleRange {
         );
     }
 
-    fn idx_range(&self) -> std::ops::Range<re_video::SampleIndex> {
-        self.first_sample..self.last_sample + 1
+    fn idx_range(&self) -> SampleIndexSpan {
+        SampleIndexSpan::from_start_end(self.first_sample, self.last_sample + 1)
     }
 }
 
@@ -1099,7 +1108,7 @@ fn read_samples_from_known_chunk(
     let end_keyframes = keyframe_indices.drain(split_idx..).collect::<Vec<_>>();
 
     let mut samples_iter = samples
-        .iter_index_range_clamped_mut(&load_range.idx_range())
+        .iter_index_range_clamped_mut(load_range.idx_range())
         .filter(|(_, c)| c.source_primary_id() == Some(chunk.id().as_tuid()));
 
     let rows = std::iter::zip(
@@ -1236,7 +1245,7 @@ fn is_sample_sync(
 /// Fill out durations for all new samples plus the first existing sample for which we didn't know the duration yet.
 /// (We set the duration for the last sample to `None` since we don't know how long it will last.)
 fn update_sample_durations(
-    known_range: std::ops::Range<re_video::SampleIndex>,
+    known_range: SampleIndexSpan,
     samples: &mut StableIndexDeque<SampleMetadataState>,
 ) -> Result<(), VideoStreamProcessingError> {
     let mut start = known_range.start.at_least(samples.min_index());
@@ -1249,7 +1258,7 @@ fn update_sample_durations(
             break;
         }
     }
-    let mut end = known_range.end.at_most(samples.next_index());
+    let mut end = known_range.end().at_most(samples.next_index());
     while let Some(new_end) = end.checked_add(1)
         && let Some(sample) = samples.get(new_end - 1)
     {
@@ -1554,8 +1563,32 @@ impl re_byte_size::MemUsageTreeCapture for VideoStreamCache {
     }
 }
 
+/// A sample waiting to be placed in the video description.
+///
+/// Samples that fall onto the same time are ordered by `row_id`.
+struct QueuedSample {
+    sample: SampleMetadataState,
+
+    /// `None` for samples known only through the rrd manifest.
+    row_id: Option<RowId>,
+}
+
+impl QueuedSample {
+    fn sort_key(&self) -> (re_video::Time, Option<RowId>) {
+        (self.sample.decode_timestamp(), self.row_id)
+    }
+}
+
+/// Row the sample was read from, if known.
+fn sample_row_id(sample: &SampleMetadataState) -> Option<RowId> {
+    match sample.source() {
+        VideoSource::Id { sample_id, .. } => sample_id.map(RowId::from_tuid),
+        VideoSource::Span(_) => None,
+    }
+}
+
 struct ChunkSamples {
-    samples: VecDeque<SampleMetadataState>,
+    samples: VecDeque<QueuedSample>,
 }
 
 impl ChunkSamples {
@@ -1566,19 +1599,25 @@ impl ChunkSamples {
     ) -> Option<Self> {
         if chunk.is_static() {
             Some(Self {
-                samples: std::iter::once(SampleMetadataState::Unloaded {
-                    source_id: chunk.id().as_tuid(),
-                    min_dts: re_video::Time::ZERO,
+                samples: std::iter::once(QueuedSample {
+                    sample: SampleMetadataState::Unloaded {
+                        source_id: chunk.id().as_tuid(),
+                        min_dts: re_video::Time::ZERO,
+                    },
+                    // A static chunk resolves to the row with the highest `RowId`.
+                    row_id: chunk.row_ids().max(),
                 })
                 .collect(),
             })
         } else {
             let mut samples: Vec<_> = chunk
-                .iter_component_timepoints(sample_component)
-                .filter_map(|t| t.get(&timeline))
-                .map(|time| SampleMetadataState::Unloaded {
-                    source_id: chunk.id().as_tuid(),
-                    min_dts: re_video::Time::new(time.get()),
+                .iter_component_indices(timeline, sample_component)
+                .map(|(time, row_id)| QueuedSample {
+                    sample: SampleMetadataState::Unloaded {
+                        source_id: chunk.id().as_tuid(),
+                        min_dts: re_video::Time::new(time.as_i64()),
+                    },
+                    row_id: Some(row_id),
                 })
                 .collect();
 
@@ -1586,7 +1625,7 @@ impl ChunkSamples {
                 return None;
             }
 
-            samples.sort_by_key(|s| s.decode_timestamp());
+            samples.sort_by_key(|s| s.sort_key());
 
             Some(Self {
                 samples: VecDeque::from(samples),
@@ -1596,9 +1635,12 @@ impl ChunkSamples {
 
     fn from_static_root(id: ChunkId) -> Self {
         Self {
-            samples: vec![SampleMetadataState::Unloaded {
-                source_id: id.as_tuid(),
-                min_dts: re_video::Time::ZERO,
+            samples: vec![QueuedSample {
+                sample: SampleMetadataState::Unloaded {
+                    source_id: id.as_tuid(),
+                    min_dts: re_video::Time::ZERO,
+                },
+                row_id: None,
             }]
             .into(),
         }
@@ -1621,30 +1663,37 @@ impl ChunkSamples {
         Some(Self {
             // All samples are assumed to be at the start of the time range.
             samples: (0..entry.num_rows)
-                .map(|_| SampleMetadataState::Unloaded {
-                    source_id: id.as_tuid(),
-                    min_dts: re_video::Time::new(entry.time_range.min.as_i64()),
+                .map(|_| QueuedSample {
+                    sample: SampleMetadataState::Unloaded {
+                        source_id: id.as_tuid(),
+                        min_dts: re_video::Time::new(entry.time_range.min.as_i64()),
+                    },
+                    row_id: None,
                 })
                 .collect(),
         })
     }
 
     fn min_time(&self) -> re_video::Time {
+        self.sort_key().0
+    }
+
+    /// Sort key of the front sample.
+    fn sort_key(&self) -> (re_video::Time, Option<RowId>) {
         let front = self.samples.front();
 
         debug_assert!(front.is_some(), "`ChunkSamples` should never be empty");
 
         front
-            .map(|s| s.decode_timestamp())
-            .unwrap_or(re_video::Time::MAX)
+            .map(|s| s.sort_key())
+            .unwrap_or((re_video::Time::MAX, None))
     }
 }
 
 // Custom ordering for binary heap.
 impl PartialEq for ChunkSamples {
     fn eq(&self, other: &Self) -> bool {
-        self.samples.front().map(|s| s.decode_timestamp())
-            == other.samples.front().map(|s| s.decode_timestamp())
+        self.samples.front().map(|s| s.sort_key()) == other.samples.front().map(|s| s.sort_key())
     }
 }
 
@@ -1660,7 +1709,7 @@ impl Ord for ChunkSamples {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         use std::cmp::Ordering;
         match (self.samples.front(), other.samples.front()) {
-            (Some(l), Some(r)) => l.decode_timestamp().cmp(&r.decode_timestamp()).reverse(),
+            (Some(l), Some(r)) => l.sort_key().cmp(&r.sort_key()).reverse(),
             (Some(_), None) => Ordering::Greater,
             (None, Some(_)) => Ordering::Less,
             (None, None) => Ordering::Equal,
@@ -1678,7 +1727,7 @@ impl ChunkSampleIterators {
         self.iterators.push(samples);
     }
 
-    fn next_if(&mut self, f: impl FnOnce(re_video::Time) -> bool) -> Option<SampleMetadataState> {
+    fn next_if(&mut self, f: impl FnOnce(re_video::Time) -> bool) -> Option<QueuedSample> {
         let mut next = self.iterators.peek_mut()?;
 
         debug_assert!(
@@ -1688,7 +1737,7 @@ impl ChunkSampleIterators {
 
         let sample = next
             .samples
-            .pop_front_if(|sample| f(sample.decode_timestamp()))?;
+            .pop_front_if(|sample| f(sample.sample.decode_timestamp()))?;
 
         // Don't keep empty queues around.
         if next.samples.is_empty() {
@@ -1705,9 +1754,9 @@ impl ChunkSampleIterators {
         mut handle_sample: impl FnMut(SampleMetadataState) -> usize,
     ) {
         while let Some(sample) = self.next_if(&predicate) {
-            let chunk_id = sample.source_primary_id();
+            let chunk_id = sample.sample.source_primary_id();
             // This is loaded, but will be populated later.
-            let idx = handle_sample(sample);
+            let idx = handle_sample(sample.sample);
 
             let Some(chunk_id) = chunk_id else { continue };
             known_chunk_ranges
@@ -1721,7 +1770,7 @@ impl ChunkSampleIterators {
 }
 
 /// Calls `handle_sample` with all the samples from `samples`. With them sorted
-/// by time.
+/// by time, then by row id.
 ///
 /// `handle_sample` should return the [`re_video::SampleIndex`] that the sample
 /// receives. This index is then used to update `known_chunk_ranges`.
@@ -1730,15 +1779,17 @@ fn flatten_chunk_samples(
     known_chunk_ranges: &mut BTreeMap<ChunkId, ChunkSampleRange>,
     mut handle_sample: impl FnMut(SampleMetadataState) -> usize,
 ) {
-    samples.sort_by_key(|c| c.min_time());
+    samples.sort_by_key(|c| c.sort_key());
     let mut loaded_samples_timepoint_iterators = ChunkSampleIterators::default();
 
     for next_chunk in samples {
         let next_timepoint = next_chunk.min_time();
 
+        // Samples on `next_timepoint` stay queued, so they get ordered by row id
+        // against the ones in `next_chunk`.
         loaded_samples_timepoint_iterators.handle_samples(
             known_chunk_ranges,
-            |t| t <= next_timepoint,
+            |t| t < next_timepoint,
             &mut handle_sample,
         );
 
@@ -1872,12 +1923,14 @@ fn find_affected_sample_range(
         .samples
         .front()
         .expect("ChunkSamples::from_physical guarantees non-empty")
+        .sample
         .decode_timestamp();
 
     let affected_range_max = conflicting_chunk_samples
         .samples
         .back()
         .expect("ChunkSamples::from_physical guarantees non-empty")
+        .sample
         .decode_timestamp();
 
     // Can't binary search keyframes since decode timestamps may be
@@ -1898,10 +1951,13 @@ fn find_affected_sample_range(
         .map(|idx| video_descr.keyframe_indices[idx])
         .unwrap_or_else(|| video_descr.samples.min_index());
 
-    let range = known_range
-        .as_ref()
-        .map(|r| r.first_sample.min(start))
-        .unwrap_or(start)..video_descr.samples.next_index();
+    let range = SampleIndexSpan::from_start_end(
+        known_range
+            .as_ref()
+            .map(|r| r.first_sample.min(start))
+            .unwrap_or(start),
+        video_descr.samples.next_index(),
+    );
 
     let mut start_sample = None;
     let mut end_sample = None;
@@ -1909,7 +1965,7 @@ fn find_affected_sample_range(
     let mut last_timestamp = None;
 
     // Find the index range we have to re-order.
-    for (idx, sample) in video_descr.samples.iter_index_range_clamped(&range) {
+    for (idx, sample) in video_descr.samples.iter_index_range_clamped(range) {
         // Skip the conflicting samples if there are any.
         if sample.source_primary_id() == Some(conflicting_chunk.id().as_tuid()) {
             if start_sample.is_none() {
@@ -1994,9 +2050,13 @@ fn handle_out_of_order_chunk(
 
     let mut chunk_samples = BTreeMap::<ChunkId, ChunkSamples>::default();
 
-    for (_, sample) in video_descr
-        .samples
-        .iter_index_range_clamped(&(*sample_range.start()..sample_range.end() + 1))
+    for (_, sample) in
+        video_descr
+            .samples
+            .iter_index_range_clamped(SampleIndexSpan::from_start_end(
+                *sample_range.start(),
+                sample_range.end() + 1,
+            ))
     {
         let Some(primary_id) = sample.source_primary_id() else {
             continue;
@@ -2015,7 +2075,10 @@ fn handle_out_of_order_chunk(
                 samples: VecDeque::new(),
             })
             .samples
-            .push_back(sample.clone());
+            .push_back(QueuedSample {
+                row_id: sample_row_id(sample),
+                sample: sample.clone(),
+            });
     }
 
     let old_count = sample_range.end() - sample_range.start() + 1;
@@ -2143,9 +2206,13 @@ fn handle_out_of_order_chunk(
 
     // Correct frame_nr for all samples after `start_sample`:
     let samples_end = video_descr.samples.next_index();
-    for (idx, sample) in video_descr
-        .samples
-        .iter_index_range_clamped_mut(&(*sample_range.start()..samples_end))
+    for (idx, sample) in
+        video_descr
+            .samples
+            .iter_index_range_clamped_mut(SampleIndexSpan::from_start_end(
+                *sample_range.start(),
+                samples_end,
+            ))
     {
         if let SampleMetadataState::Present(meta) = sample {
             meta.frame_nr = idx as re_video::FrameNumber;
@@ -2153,7 +2220,7 @@ fn handle_out_of_order_chunk(
     }
 
     update_sample_durations(
-        *sample_range.start()..sample_range.start() + new_count,
+        SampleIndexSpan::from_start_len(*sample_range.start(), new_count),
         &mut video_descr.samples,
     )?;
 
@@ -2194,6 +2261,7 @@ fn adjust_keyframes_for_removed_samples(descr: &mut re_video::VideoDataDescripti
 #[cfg(test)]
 mod tests {
     #![expect(clippy::cast_possible_wrap)] // u64 -> i64 is fine
+    use std::assert_matches;
 
     use re_chunk::{ChunkBuilder, RowId, TimePoint, Timeline};
     use re_chunk_store::ChunkStoreDiff;
@@ -2264,10 +2332,10 @@ mod tests {
 
         assert_eq!(codec, re_video::VideoCodec::H264);
         assert_eq!(timescale, None); // Sequence timeline doesn't have a timescale.
-        assert!(matches!(
+        assert_matches!(
             delivery_method,
             re_video::VideoDeliveryMethod::Stream { .. }
-        ));
+        );
         assert!(samples_statistics.dts_always_equal_pts);
         assert!(samples_statistics.has_sample_highest_pts_so_far.is_none());
         assert!(mp4_tracks.is_empty());
@@ -2304,6 +2372,24 @@ mod tests {
         if num_frames_submitted > 40 {
             assert_eq!(keyframe_indices[4], 40);
         }
+    }
+
+    /// Check that the samples point at the given rows, in the given order.
+    fn assert_sample_row_ids(video_stream: &PlayableVideoStream, expected_row_ids: &[RowId]) {
+        let row_ids = video_stream
+            .video_descr()
+            .samples
+            .iter()
+            .map(sample_row_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            row_ids,
+            expected_row_ids
+                .iter()
+                .copied()
+                .map(Some)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -2375,6 +2461,118 @@ mod tests {
         let video_stream = video_stream_lock.read();
 
         validate_stream_from_test_data(&video_stream, NUM_FRAMES);
+    }
+
+    /// All frames of a video land on the same time, in chunks that reach the store in a
+    /// different order than the frames were logged in. Samples should come out in logging order.
+    #[test]
+    fn video_stream_cache_from_chunks_on_a_single_time() {
+        let mut cache = VideoStreamCache::default();
+        let enable_viewer_indexes = false;
+        let mut store = re_entity_db::EntityDb::with_store_config(
+            StoreId::random(re_log_types::StoreKind::Recording, "test_app"),
+            enable_viewer_indexes,
+            re_chunk_store::ChunkStoreConfig::COMPACTION_DISABLED,
+        );
+        let timeline = Timeline::new_sequence("frame");
+
+        // Rows are created in frame order …
+        let rows = iter_h264_frames(RAW_H264_DATA)
+            .map(|frame_bytes| (RowId::new(), frame_bytes))
+            .collect::<Vec<_>>();
+
+        // … but the chunk with the first frames gets the newest `ChunkId`.
+        let older_chunk_id = ChunkId::new();
+        let newer_chunk_id = ChunkId::new();
+        let (first_rows, remaining_rows) = rows.split_at(5);
+
+        for (chunk_id, rows) in [
+            (newer_chunk_id, first_rows),
+            (older_chunk_id, remaining_rows),
+        ] {
+            let mut chunk_builder = ChunkBuilder::new(chunk_id, "vid".into());
+            for (row_id, frame_bytes) in rows {
+                chunk_builder = chunk_builder.with_archetype(
+                    *row_id,
+                    TimePoint::from_iter([(timeline, 0)]),
+                    &VideoStream::new(VideoCodec::H264).with_sample(*frame_bytes),
+                );
+            }
+            store
+                .add_chunk(&Arc::new(chunk_builder.build().unwrap()))
+                .unwrap();
+        }
+
+        let video_stream_lock = cache
+            .video_entry(
+                &store,
+                &"vid".into(),
+                *timeline.name(),
+                DecodeSettings::default(),
+                ChunkTrackingMode::Report,
+            )
+            .unwrap();
+        let video_stream = video_stream_lock.read();
+
+        validate_stream_from_test_data(&video_stream, NUM_FRAMES);
+
+        let expected_row_ids = rows.iter().map(|(row_id, _)| *row_id).collect::<Vec<_>>();
+        assert_sample_row_ids(&video_stream, &expected_row_ids);
+    }
+
+    /// Two chunks land on the same time and their rows interleave, so the chunks overlap in
+    /// `RowId` alone. No chunk ordering can recover the logging order, the samples of both
+    /// chunks have to be merged.
+    #[test]
+    fn video_stream_cache_from_interleaved_chunks_on_a_single_time() {
+        let mut cache = VideoStreamCache::default();
+        let enable_viewer_indexes = false;
+        let mut store = re_entity_db::EntityDb::with_store_config(
+            StoreId::random(re_log_types::StoreKind::Recording, "test_app"),
+            enable_viewer_indexes,
+            re_chunk_store::ChunkStoreConfig::COMPACTION_DISABLED,
+        );
+        let timeline = Timeline::new_sequence("frame");
+
+        // Rows are created in frame order …
+        let rows = iter_h264_frames(RAW_H264_DATA)
+            .map(|frame_bytes| (RowId::new(), frame_bytes))
+            .collect::<Vec<_>>();
+
+        // … but every other frame goes to the other chunk, and the chunk with the odd frames
+        // gets the older `ChunkId`.
+        let odd_rows = rows.iter().skip(1).step_by(2).collect::<Vec<_>>();
+        let even_rows = rows.iter().step_by(2).collect::<Vec<_>>();
+
+        for chunk_rows in [odd_rows, even_rows] {
+            let mut chunk_builder = ChunkBuilder::new(ChunkId::new(), "vid".into());
+            for (row_id, frame_bytes) in chunk_rows {
+                chunk_builder = chunk_builder.with_archetype(
+                    *row_id,
+                    TimePoint::from_iter([(timeline, 0)]),
+                    &VideoStream::new(VideoCodec::H264).with_sample(*frame_bytes),
+                );
+            }
+            store
+                .add_chunk(&Arc::new(chunk_builder.build().unwrap()))
+                .unwrap();
+        }
+
+        let video_stream_lock = cache
+            .video_entry(
+                &store,
+                &"vid".into(),
+                *timeline.name(),
+                DecodeSettings::default(),
+                ChunkTrackingMode::Report,
+            )
+            .unwrap();
+        let video_stream = video_stream_lock.read();
+
+        validate_stream_from_test_data(&video_stream, NUM_FRAMES);
+
+        let expected_row_ids = rows.iter().map(|(row_id, _)| *row_id).collect::<Vec<_>>();
+        assert_sample_row_ids(&video_stream, &expected_row_ids);
     }
 
     #[test]
@@ -2630,9 +2828,9 @@ mod tests {
         // Exactly one sample, sourced from the highest-`RowId` row.
         assert_eq!(data_descr.samples.num_elements(), 1);
         let sample = data_descr.samples.iter().next().unwrap().sample().unwrap();
-        let re_video::VideoSource::Id { sub_id, .. } = sample.source else {
+        let re_video::VideoSource::Id { sample_id, .. } = sample.source else {
             panic!("expected an id-based video source");
         };
-        assert_eq!(sub_id, Some(high_row_id.as_tuid()));
+        assert_eq!(sample_id, Some(high_row_id.as_tuid()));
     }
 }

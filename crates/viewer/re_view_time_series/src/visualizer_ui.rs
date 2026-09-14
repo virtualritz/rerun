@@ -3,10 +3,10 @@
 use arrayvec::ArrayVec;
 use re_component_ui::color_swatch::ColorSwatch;
 use re_log_types::external::arrow::array::AsArray as _;
-use re_sdk_types::archetypes::{SeriesLines, SeriesPoints};
+use re_sdk_types::archetypes::{Measurements, SeriesLines, SeriesPoints};
 use re_sdk_types::blueprint::archetypes::ActiveVisualizers;
 use re_sdk_types::components::{self, Color, Name};
-use re_sdk_types::{ComponentDescriptor, Loggable as _};
+use re_sdk_types::{ComponentDescriptor, FromArrow as _};
 use re_ui::UiExt as _;
 use re_ui::egui_ext::response_ext::ResponseExt as _;
 use re_viewer_context::external::re_entity_db::InstancePath;
@@ -14,6 +14,7 @@ use re_viewer_context::{
     DataResultInteractionAddress, IdentifiedViewSystem as _, Item, SystemCommandSender as _,
 };
 
+use crate::measurements_visualizer_system::MeasurementsSeriesSystem;
 use crate::point_visualizer_system::SeriesPointsSystem;
 
 /// We only show this many colors directly.
@@ -38,8 +39,14 @@ pub fn visualizer_ui_element(
                 SeriesPoints::descriptor_colors(),
                 SeriesPoints::descriptor_visible_series(),
             )
+        } else if instruction.visualizer_type == MeasurementsSeriesSystem::identifier() {
+            (
+                Measurements::descriptor_names(),
+                Measurements::descriptor_colors(),
+                Measurements::descriptor_visible_series(),
+            )
         } else {
-            // if instruction.visualizer_type == SeriesLinesSystem::identifier() {
+            // SeriesLines (default).
             (
                 SeriesLines::descriptor_names(),
                 SeriesLines::descriptor_colors(),
@@ -263,7 +270,7 @@ impl TimeSeriesColors {
 
         // Draw color boxes from right to left
         for color in self.colors[..num_boxes].iter().rev() {
-            let rgba = re_sdk_types::datatypes::Rgba32::from(*color);
+            let rgba = re_sdk_types::encodings::Rgba32::from(*color);
             let mut color_ref = re_viewer_context::MaybeMutRef::Ref(&rgba);
             ui.add(ColorSwatch::new(&mut color_ref));
         }

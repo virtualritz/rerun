@@ -14,7 +14,7 @@ use crate::ViewSystemIdentifier;
 ///
 /// Two components can be related on three different levels:
 /// * the *semantic* component type (e.g. `rerun.components.Position3D`),
-/// * the *encoding*, i.e. the Rerun datatype the component is built from (e.g. `rerun.datatypes.Vec3D`),
+/// * the *encoding*, i.e. the Rerun datatype the component is built from (e.g. `rerun.encodings.Vec3D`),
 /// * the *physical* Arrow datatype (e.g. `FixedSizeList(3 x non-null Float32)`).
 ///
 /// Only the semantic type and the Arrow datatype are known at runtime — the encoding isn't tracked
@@ -23,7 +23,7 @@ use crate::ViewSystemIdentifier;
 pub enum DatatypeMatch {
     /// Only the physical datatype was matched, but semantics aren't the native ones.
     PhysicalDatatypeOnly {
-        arrow_datatype: arrow::datatypes::DataType,
+        arrow_data_type: arrow::datatypes::DataType,
 
         /// The semantic component type if any.
         ///
@@ -41,7 +41,7 @@ pub enum DatatypeMatch {
     /// For example the native type for a Rerun point cloud is `rerun.components.Position3D`.
     /// This is *not* concerned with the column name of the data, only the datatype.
     NativeSemantics {
-        arrow_datatype: arrow::datatypes::DataType,
+        arrow_data_type: arrow::datatypes::DataType,
 
         /// The semantic component type if any.
         ///
@@ -58,10 +58,14 @@ impl DatatypeMatch {
         }
     }
 
-    pub fn arrow_datatype(&self) -> &arrow::datatypes::DataType {
+    pub fn arrow_data_type(&self) -> &arrow::datatypes::DataType {
         match self {
-            Self::PhysicalDatatypeOnly { arrow_datatype, .. }
-            | Self::NativeSemantics { arrow_datatype, .. } => arrow_datatype,
+            Self::PhysicalDatatypeOnly {
+                arrow_data_type, ..
+            }
+            | Self::NativeSemantics {
+                arrow_data_type, ..
+            } => arrow_data_type,
         }
     }
 }
@@ -147,7 +151,7 @@ impl VisualizableReason {
     /// i.e. its semantics are *not* the ones the visualizer natively works with.
     ///
     /// For example, `GaussianSplats3D:scales` (`Scale3D`) matches the `Points3D:positions`
-    /// (`Position3D`) slot only physically, since both share the `rerun.datatypes.Vec3D` encoding.
+    /// (`Position3D`) slot only physically, since both share the `rerun.encodings.Vec3D` encoding.
     ///
     /// Unlike the negation of [`Self::full_native_match`], components that aren't part of this
     /// match at all are *not* reported as physical-only.

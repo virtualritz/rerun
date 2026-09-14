@@ -33,6 +33,7 @@ from .mcap_channel import McapChannel
 from .mcap_message import McapMessage
 from .mcap_schema import McapSchema
 from .mcap_statistics import McapStatistics
+from .measurements import Measurements
 from .mesh3d import Mesh3D
 from .pinhole import Pinhole
 from .points2d import Points2D
@@ -52,6 +53,7 @@ from .transform_axes3d import TransformAxes3D
 from .video_frame_reference import VideoFrameReference
 from .video_stream import VideoStream
 from .view_coordinates import ViewCoordinates
+from .volume3d import Volume3D
 from .voxel_grid_map import VoxelGridMap
 
 __all__ = [
@@ -86,6 +88,7 @@ __all__ = [
     "McapMessage",
     "McapSchema",
     "McapStatistics",
+    "Measurements",
     "Mesh3D",
     "Pinhole",
     "Points2D",
@@ -105,5 +108,6 @@ __all__ = [
     "VideoFrameReference",
     "VideoStream",
     "ViewCoordinates",
+    "Volume3D",
     "VoxelGridMap",
 ]

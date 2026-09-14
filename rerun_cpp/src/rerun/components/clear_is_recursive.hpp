@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "../datatypes/bool.hpp"
+#include "../encodings/bool.hpp"
 #include "../result.hpp"
 
 #include <cstdint>
@@ -13,14 +13,14 @@ namespace rerun::components {
     /// **Component**: Configures how a clear operation should behave - recursive or not.
     struct ClearIsRecursive {
         /// If true, also clears all recursive children entities.
-        rerun::datatypes::Bool recursive;
+        rerun::encodings::Bool recursive;
 
       public:
         ClearIsRecursive() = default;
 
-        ClearIsRecursive(rerun::datatypes::Bool recursive_) : recursive(recursive_) {}
+        ClearIsRecursive(rerun::encodings::Bool recursive_) : recursive(recursive_) {}
 
-        ClearIsRecursive& operator=(rerun::datatypes::Bool recursive_) {
+        ClearIsRecursive& operator=(rerun::encodings::Bool recursive_) {
             recursive = recursive_;
             return *this;
         }
@@ -32,15 +32,15 @@ namespace rerun::components {
             return *this;
         }
 
-        /// Cast to the underlying Bool datatype
-        operator rerun::datatypes::Bool() const {
+        /// Cast to the underlying Bool encoding
+        operator rerun::encodings::Bool() const {
             return recursive;
         }
     };
 } // namespace rerun::components
 
 namespace rerun {
-    static_assert(sizeof(rerun::datatypes::Bool) == sizeof(components::ClearIsRecursive));
+    static_assert(sizeof(rerun::encodings::Bool) == sizeof(components::ClearIsRecursive));
 
     /// \private
     template <>
@@ -48,8 +48,8 @@ namespace rerun {
         static constexpr std::string_view ComponentType = "rerun.components.ClearIsRecursive";
 
         /// Returns the arrow data type this type corresponds to.
-        static const std::shared_ptr<arrow::DataType>& arrow_datatype() {
-            return Loggable<rerun::datatypes::Bool>::arrow_datatype();
+        static const std::shared_ptr<arrow::DataType>& arrow_data_type() {
+            return Loggable<rerun::encodings::Bool>::arrow_data_type();
         }
 
         /// Serializes an array of `rerun::components::ClearIsRecursive` into an arrow array.
@@ -57,14 +57,14 @@ namespace rerun {
             const components::ClearIsRecursive* instances, size_t num_instances
         ) {
             if (num_instances == 0) {
-                return Loggable<rerun::datatypes::Bool>::to_arrow(nullptr, 0);
+                return Loggable<rerun::encodings::Bool>::to_arrow(nullptr, 0);
             } else if (instances == nullptr) {
                 return rerun::Error(
                     ErrorCode::UnexpectedNullArgument,
                     "Passed array instances is null when num_elements> 0."
                 );
             } else {
-                return Loggable<rerun::datatypes::Bool>::to_arrow(
+                return Loggable<rerun::encodings::Bool>::to_arrow(
                     &instances->recursive,
                     num_instances
                 );

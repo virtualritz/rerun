@@ -1,25 +1,22 @@
 use std::str::FromStr as _;
 
 use ahash::HashMap;
-use re_chunk::TimelineName;
 use re_entity_db::LogSource;
 use re_log_channel::{
-    DataSourceMessage, DataSourceUiCommand, InspectError, RecordingOpenBehavior,
-    SaveScreenshotError,
+    BlueprintTarget, DataSourceMessage, DataSourceUiCommand, DefaultBlueprintRegistration,
+    RecordingOpenBehavior, SaveScreenshotError,
 };
-use re_log_types::{LogMsg, StoreId, StoreKind, TableMsg, TimeReal, TimeType};
-use re_protos::common::v1alpha1::TimeType as ProtoTimeType;
-use re_protos::sdk_comms::v1alpha1::{
-    GetViewerStateResponse, SetTimeCursorResponse, TimeCursor, ViewerRecording, ViewerTimeline,
-};
+use re_log_types::{LogMsg, StoreId, StoreKind, TableMsg};
+use re_protos::sdk_comms::v1alpha1::GetViewerLogsResponse;
 use re_sdk_types::external::uuid;
 use re_viewer_context::{
-    Item, Route, StoreHub, SystemCommand, SystemCommandSender as _, TableStore, TimeControlCommand,
+    Item, Route, StoreHub, SystemCommand, SystemCommandSender as _, TableStore,
     open_url::{OpenUrlOptions, ViewerOpenUrl},
 };
 
 use crate::app_blueprint::AppBlueprint;
 
+use super::viewer_control::serve_inspect_request;
 use super::{App, WindowDecorationsRequest};
 
 impl App {
@@ -154,9 +151,9 @@ impl App {
         while let Some((channel_source, msg)) = self.rx_log.try_recv() {
             re_log::trace!("Received a message from {channel_source:?}"); // Used by `test_ui_wakeup` test app!
 
-            if let Some(re_uri::RedapUri::DatasetData(uri)) = channel_source.redap_uri() {
-                self.connection_registry.clear_uri_error(uri);
-            }
+            self.state
+                .last_loading_error
+                .retain(|source, _| !source.is_same_ignoring_uri_fragments(&channel_source));
 
             let msg = match msg.payload {
                 re_log_channel::SmartMessagePayload::Msg(msg) => msg,
@@ -169,24 +166,19 @@ impl App {
 
                 re_log_channel::SmartMessagePayload::Quit(err) => {
                     if let Some(err) = err {
-                        re_log::error!("Data source failed: {err}\nSource: {}", msg.source);
-                        if let Some(re_uri::RedapUri::DatasetData(uri)) = channel_source.redap_uri()
-                        {
-                            self.connection_registry.set_uri_error(uri, err.to_string());
-                        }
+                        re_log::error!(
+                            "{}",
+                            re_error::format_with_details(
+                                format!("Data source failed: {err}"),
+                                format!("Source: {}", msg.source),
+                            )
+                        );
+                        let error = err.to_string();
+                        self.state
+                            .last_loading_error
+                            .insert(channel_source.as_ref().clone(), error);
                     } else {
                         re_log::debug!("Data source {} has finished", msg.source);
-                        if let LogSource::RedapGrpcStream {
-                            table_blueprint: Some(table_blueprint),
-                            ..
-                        } = channel_source.as_ref()
-                            && let Err(err) = store_hub.associate_table_blueprint(
-                                table_blueprint.table_id.clone(),
-                                &table_blueprint.blueprint_id,
-                            )
-                        {
-                            re_log::warn!("Failed to register table blueprint: {err}");
-                        }
                     }
                     continue;
                 }
@@ -199,7 +191,9 @@ impl App {
                 DataSourceMessage::RrdManifest(store_id, _)
                 | DataSourceMessage::RrdManifestComplete(store_id) => Some(store_id.clone()),
                 DataSourceMessage::LogMsg(log_msg) => Some(log_msg.store_id().clone()),
-                DataSourceMessage::TableMsg(_) | DataSourceMessage::UiCommand(_) => None,
+                DataSourceMessage::DefaultBlueprintRegistration(_)
+                | DataSourceMessage::TableMsg(_)
+                | DataSourceMessage::UiCommand(_) => None,
             };
 
             let maybe_new_store = msg_store_id
@@ -234,6 +228,10 @@ impl App {
                     self.receive_log_msg(&msg, store_hub, egui_ctx, &channel_source);
                 }
 
+                DataSourceMessage::DefaultBlueprintRegistration(registration) => {
+                    self.receive_default_blueprint_registration(registration, store_hub);
+                }
+
                 DataSourceMessage::TableMsg(table) => {
                     self.receive_table_msg(store_hub, egui_ctx, table);
                 }
@@ -263,6 +261,41 @@ impl App {
         // Run pending system commands in case any of the messages resulted in additional commands.
         // This avoid further frame delays on these commands.
         self.run_pending_system_commands(store_hub, egui_ctx);
+    }
+
+    fn receive_default_blueprint_registration(
+        &mut self,
+        registration: DefaultBlueprintRegistration,
+        store_hub: &mut StoreHub,
+    ) {
+        let DefaultBlueprintRegistration {
+            blueprint_id,
+            target,
+        } = registration;
+
+        match target {
+            BlueprintTarget::Application(app_id) => {
+                if blueprint_id.application_id() != &app_id {
+                    re_log::warn!(
+                        "Received a blueprint registration whose application target does not match its store ID"
+                    );
+                    return;
+                }
+                if let Err(err) = store_hub.set_default_blueprint_for_app(&blueprint_id) {
+                    re_log::warn!("Failed to register application blueprint: {err}");
+                }
+            }
+
+            BlueprintTarget::Table(table_ref) => {
+                if let Err(err) = self.table_blueprints.set_default_blueprint(
+                    &table_ref,
+                    &blueprint_id,
+                    store_hub,
+                ) {
+                    re_log::warn!("Failed to register table blueprint: {err}");
+                }
+            }
+        }
     }
 
     /// There is logic duplicated between this and [`Self::prefetch_chunks`].
@@ -316,9 +349,10 @@ impl App {
             // Now we _hopefully_ do. The `LogMsg` could also belong to the blueprint, so
             // we need to check for that as well.
             if let LogSource::RedapGrpcStream { uri, .. } = channel_source
-                && &uri.store_id() == store_id
+                && let Some(uri_store_id) = uri.store_id()
+                && &uri_store_id == store_id
             {
-                self.go_to_dataset_data(uri.store_id(), uri.fragment.clone());
+                self.go_to_dataset_data(uri_store_id, uri.fragment.clone());
             }
         }
 
@@ -575,9 +609,7 @@ impl App {
                             "Failed to parse view id from {view_id:?}. Expected a UUID."
                         );
                         if let Some(on_done) = on_done {
-                            on_done
-                                .unbounded_send(Err(SaveScreenshotError::InvalidViewId { view_id }))
-                                .ok();
+                            on_done.call(Err(SaveScreenshotError::InvalidViewId { view_id }));
                         }
                         return;
                     }
@@ -606,7 +638,21 @@ impl App {
             // Report current viewer state (re_viewer_mcp's `GetViewerState`).
             DataSourceUiCommand::GetViewerState { on_done } => {
                 let state = self.collect_viewer_state(store_hub);
-                on_done.unbounded_send(state).ok();
+                on_done.call(state);
+            }
+
+            DataSourceUiCommand::CloseRecordings { target, on_done } => {
+                on_done.call(self.apply_close_recordings(store_hub, target));
+            }
+
+            // Report recent log messages (re_viewer_mcp's `GetViewerLogs`).
+            DataSourceUiCommand::GetViewerLogs {
+                after_sequence,
+                on_done,
+            } => {
+                on_done.call(GetViewerLogsResponse {
+                    entries: self.viewer_log.entries_after(after_sequence),
+                });
             }
 
             // Open a URL in the viewer (re_viewer_mcp's `OpenUrl`).
@@ -620,12 +666,10 @@ impl App {
                 match result {
                     Ok(open_url) => {
                         open_url.open(egui_ctx, &OpenUrlOptions::default(), &self.command_sender);
-                        on_done.unbounded_send(Ok(())).ok();
+                        on_done.call(Ok(()));
                     }
                     Err(err) => {
-                        on_done
-                            .unbounded_send(Err(format!("Failed to open URL {url:?}: {err}")))
-                            .ok();
+                        on_done.call(Err(format!("Failed to open URL {url:?}: {err}")));
                     }
                 }
             }
@@ -646,150 +690,9 @@ impl App {
                     play,
                     egui_ctx,
                 );
-                on_done.unbounded_send(result).ok();
+                on_done.call(result);
             }
         }
-    }
-
-    /// Snapshot the current viewer state for `re_viewer_mcp`'s `GetViewerState`:
-    /// the active recording, the current page as a sharable URL, and every open recording's
-    /// timelines with their time ranges and current time cursor.
-    fn collect_viewer_state(&self, store_hub: &StoreHub) -> GetViewerStateResponse {
-        let active_id = self.state.active_recording_id().cloned();
-        let route = self.state.navigation.current();
-
-        // Best-effort sharable URL for the current page; some routes (e.g. local tables) can't be
-        // turned into a URL, in which case we leave it empty.
-        let url = ViewerOpenUrl::from_route(store_hub, route)
-            .and_then(|open_url| open_url.sharable_url(None))
-            .unwrap_or_default();
-
-        let recordings = store_hub
-            .store_bundle()
-            .recordings()
-            .map(|db| {
-                let store_id = db.store_id();
-                let timelines = db
-                    .timelines()
-                    .values()
-                    .map(|timeline| {
-                        let name = timeline.name();
-                        let range = db.time_range_for(name);
-                        ViewerTimeline {
-                            timeline: Some((*name).into()),
-                            time_type: ProtoTimeType::from(timeline.typ()) as i32,
-                            time_range: range.map(Into::into),
-                        }
-                    })
-                    .collect();
-
-                let current_time = self
-                    .state
-                    .time_control(store_id)
-                    .map(|time_ctrl| TimeCursor {
-                        timeline: Some((*time_ctrl.timeline_name()).into()),
-                        time_type: time_ctrl.time_type().map(|t| ProtoTimeType::from(t) as i32),
-                        time: time_ctrl.time_int().map(|t| t.as_i64().into()),
-                    });
-
-                ViewerRecording {
-                    store_id: Some(store_id.clone().into()),
-                    timelines,
-                    current_time,
-                }
-            })
-            .collect();
-
-        GetViewerStateResponse {
-            url,
-            active_store_id: active_id.map(Into::into),
-            recordings,
-        }
-    }
-
-    /// Resolve and apply a time-cursor move for `re_viewer_mcp`'s `SetTimeCursor`.
-    ///
-    /// Returns what was applied, or an error string if the recording or timeline could not
-    /// be resolved.
-    fn apply_set_time_cursor(
-        &self,
-        store_hub: &StoreHub,
-        store_id: Option<StoreId>,
-        timeline: Option<&str>,
-        time: i64,
-        play: bool,
-        egui_ctx: &egui::Context,
-    ) -> Result<SetTimeCursorResponse, String> {
-        use re_sdk_types::blueprint::components::PlayState;
-
-        let store_id = store_id
-            .or_else(|| self.state.active_recording_id().cloned())
-            .ok_or_else(|| "no active recording to set the time for".to_owned())?;
-
-        let db = store_hub
-            .entity_db(&store_id)
-            .ok_or_else(|| format!("recording {} is not open", store_id.recording_id().as_str()))?;
-
-        let timelines = db.timelines();
-        if timelines.is_empty() {
-            return Err(format!(
-                "recording {} has no timelines yet",
-                store_id.recording_id().as_str()
-            ));
-        }
-
-        // Resolve the target timeline: explicit, else the active one, else the first.
-        let timeline_name = if let Some(tl) = timeline {
-            let name = TimelineName::try_new(tl).map_err(|err| err.to_string())?;
-            if !timelines.contains_key(&name) {
-                let available: Vec<&str> = timelines.keys().map(|n| n.as_str()).collect();
-                return Err(format!(
-                    "recording {} has no timeline {tl:?}; available: {available:?}",
-                    store_id.recording_id().as_str()
-                ));
-            }
-            name
-        } else {
-            let active = self
-                .state
-                .time_control(&store_id)
-                .map(|tc| *tc.timeline_name());
-            match active {
-                Some(name) if timelines.contains_key(&name) => name,
-                _ => *timelines.keys().next().expect("non-empty checked above"),
-            }
-        };
-
-        let time_type = timelines
-            .get(&timeline_name)
-            .map_or(TimeType::Sequence, |t| t.typ());
-
-        let play_state = if play {
-            PlayState::Playing
-        } else {
-            PlayState::Paused
-        };
-
-        // The order of these commands matters.
-        let time_commands = vec![
-            TimeControlCommand::SetActiveTimeline(timeline_name),
-            TimeControlCommand::SetPlayState(play_state),
-            TimeControlCommand::SetTime(TimeReal::from(time)),
-        ];
-
-        self.command_sender
-            .send_system(SystemCommand::TimeControlCommands {
-                store_id: store_id.clone(),
-                time_commands,
-            });
-        egui_ctx.request_repaint();
-
-        Ok(SetTimeCursorResponse {
-            store_id: Some(store_id.into()),
-            timeline: Some(timeline_name.into()),
-            time_type: ProtoTimeType::from(time_type) as i32,
-            time: Some(time.into()),
-        })
     }
 
     /// Receive in-transit chunks (previously prefetched):
@@ -811,14 +714,16 @@ impl App {
                 let store = storage_engine.store();
 
                 #[expect(clippy::iter_over_hash_type)] // sanity checks don't care about order
-                for missing_chunk_id in store.tracked_chunk_ids().missing_virtual {
+                for (missing_chunk_id, reported_at) in store.tracked_chunk_ids().missing_virtual {
                     let roots = store.find_root_chunks(&missing_chunk_id);
                     re_log::debug_assert!(!roots.is_empty(), "Missing chunk has no roots");
 
+                    // An entry can outlive the chunk being loaded, so only count the roots
+                    // that were already loaded when the query ran.
                     let all_roots_are_fully_loaded = roots.iter().all(|root_id| {
                         let root_info = db.rrd_manifest_index().root_chunk_info(root_id);
                         if let Some(root_info) = root_info {
-                            root_info.is_fully_loaded()
+                            root_info.was_fully_loaded_at(reported_at)
                         } else {
                             re_log::debug_warn_once!("Failed to find root chunk");
                             false
@@ -868,10 +773,6 @@ impl App {
                 // we give each fetch as much time as possible to finish.
                 db.rrd_manifest_index_mut()
                     .cancel_outdated_requests(self.egui_ctx.time());
-
-                if db.rrd_manifest_index_mut().chunk_requests().has_pending() {
-                    self.egui_ctx.request_repaint(); // check back for more
-                }
             }
         }
     }
@@ -922,16 +823,17 @@ impl App {
             // For speed, we don't care about the order of the following log statements, so we silence this warning
             for component_descr in chunk.components().component_descriptors() {
                 if let Some(archetype_name) = component_descr.archetype {
-                    if let Some(archetype) = self.reflection.archetypes.get(&archetype_name) {
-                        for &view_type in archetype.view_types {
-                            if !cfg!(feature = "map_view") && view_type == "MapView" {
-                                re_log::warn_once!(
-                                    "Found map-related archetype, but viewer was not compiled with the `map_view` feature."
-                                );
-                            }
-                        }
-                    } else {
+                    if !self.reflection.archetypes.contains_key(&archetype_name) {
                         re_log::trace_once!("Unknown archetype: {archetype_name}");
+                        continue;
+                    }
+
+                    for view_class in self.reflection.views_for_archetype(archetype_name) {
+                        if self.view_class_registry.class_entry(view_class).is_none() {
+                            re_log::warn_once!(
+                                "Found data associated with unavailable view class {view_class}. This viewer was compiled without support for that view class."
+                            );
+                        }
                     }
                 }
             }
@@ -945,48 +847,68 @@ impl App {
         use re_memory::MemoryUse;
 
         let limit = self.app_options().memory_limit;
-        let mut mem_use_before = MemoryUse::capture();
-
         let default_limit = re_memory::MemoryLimit::default_for_current_platform();
 
         // If we are at the default limit, which is derived from system memory,
-        // we actually do want to count external to OOM.
+        // we actually do want to count external to avoid OOM.
         let external_mem = if limit.as_bytes() >= default_limit.as_bytes()
-            || default_limit.is_exceeded_by(&mem_use_before).is_some()
+            || default_limit
+                .is_exceeded_by(&MemoryUse::capture())
+                .is_some()
         {
             0
         } else {
-            let external_mem = self.external_memory_users.total_external_memory();
-
-            if let Some(counted) = &mut mem_use_before.counted {
-                *counted -= external_mem;
-            }
-
-            if let Some(resident) = &mut mem_use_before.resident {
-                *resident -= external_mem;
-            }
-
-            external_mem
+            self.external_memory_users.total_external_memory()
         };
 
-        if let Some(minimum_fraction_to_purge) = limit.is_exceeded_by(&mem_use_before) {
-            re_log::info_once!("Reached memory limit of {limit}. Freeing up data…");
+        // Memory use as the limit sees it. We measure again between the steps of a purge, so that
+        // each step only has to deal with what the previous ones left behind.
+        let memory_use = || {
+            let mut mem_use = MemoryUse::capture();
 
+            if let Some(counted) = &mut mem_use.counted {
+                *counted = counted.saturating_sub(external_mem);
+            }
+
+            if let Some(resident) = &mut mem_use.resident {
+                *resident = resident.saturating_sub(external_mem);
+            }
+
+            mem_use
+        };
+
+        let mem_use_before = memory_use();
+
+        if limit.is_exceeded_by(&mem_use_before).is_none() {
+            return;
+        }
+
+        re_log::info_once!("Reached memory limit of {limit}. Freeing up data…");
+
+        re_log::trace!("RAM limit: {limit}");
+        if let Some(resident) = mem_use_before.resident {
+            re_log::trace!("Resident: {}", format_bytes(resident as _),);
+        }
+        if let Some(counted) = mem_use_before.counted {
+            re_log::trace!("Counted: {}", format_bytes(counted as _));
+        }
+        if external_mem > 0 {
+            re_log::trace!("External: {}", format_bytes(external_mem as _));
+        }
+
+        re_tracing::profile_scope!("pruning");
+
+        // Free data in order of how expensive it is to get back, and re-check the limit between
+        // each step, so that we never drop more than we have to.
+
+        // The app caches hold data the viewer derives locally, so they are the cheapest to rebuild.
+        self.state.app_caches.purge_memory();
+
+        let mem_use_after_app_caches = memory_use();
+        if let Some(minimum_fraction_to_purge) = limit.is_exceeded_by(&mem_use_after_app_caches) {
             let fraction_to_purge = (minimum_fraction_to_purge + 0.2).clamp(0.25, 1.0);
 
-            re_log::trace!("RAM limit: {limit}");
-            if let Some(resident) = mem_use_before.resident {
-                re_log::trace!("Resident: {}", format_bytes(resident as _),);
-            }
-            if let Some(counted) = mem_use_before.counted {
-                re_log::trace!("Counted: {}", format_bytes(counted as _));
-            }
-            if external_mem > 0 {
-                re_log::trace!("External: {}", format_bytes(external_mem as _));
-            }
-
-            re_tracing::profile_scope!("pruning");
-            if let Some(counted) = mem_use_before.counted {
+            if let Some(counted) = mem_use_after_app_caches.counted {
                 re_log::trace!(
                     "Attempting to purge {:.1}% of used RAM ({})…",
                     100.0 * fraction_to_purge,
@@ -999,37 +921,43 @@ impl App {
                 self.active_recording_id(),
                 &|store_id| self.state.time_cursor_for(store_id).map(|t| t.time_cursor),
             );
-            self.state.app_caches.purge_memory();
-
-            let mem_use_after = MemoryUse::capture();
-
-            let freed_memory = mem_use_before - mem_use_after;
-
-            if let (Some(counted_before), Some(counted_diff)) =
-                (mem_use_before.counted, freed_memory.counted)
-                && 0 < counted_diff
-            {
-                re_log::debug!(
-                    "GC result: -{} (-{:.1}%).",
-                    format_bytes(counted_diff as _),
-                    100.0 * counted_diff as f32 / counted_before as f32
-                );
-            }
-
-            // Cache app overhead = total memory use minus all recording chunk data.
-            // This captures fonts, UI state, indices, and other unevictable memory.
-            if let Some(current_mem_use) = mem_use_after.counted.or(mem_use_after.resident) {
-                let total_chunk_bytes: u64 = store_hub
-                    .store_bundle()
-                    .recordings()
-                    .map(|r| r.byte_size_of_physical_chunks())
-                    .sum();
-                self.cached_app_overhead_bytes =
-                    Some(current_mem_use.saturating_sub(total_chunk_bytes));
-            }
-
-            self.dev_panel.note_memory_purge();
         }
+
+        // The network-level chunk cache goes last. Its chunks are shared between segments, so
+        // dropping them means downloading the same asset again for the next segment that wants it,
+        // which is exactly what the cache exists to avoid.
+        if limit.is_exceeded_by(&memory_use()).is_some() {
+            self.connection_registry.purge_memory();
+        }
+
+        let mem_use_after = MemoryUse::capture();
+
+        let freed_memory = mem_use_before - mem_use_after;
+
+        if let (Some(counted_before), Some(counted_diff)) =
+            (mem_use_before.counted, freed_memory.counted)
+            && 0 < counted_diff
+        {
+            re_log::debug!(
+                "GC result: -{} (-{:.1}%).",
+                format_bytes(counted_diff as _),
+                100.0 * counted_diff as f32 / counted_before as f32
+            );
+        }
+
+        // Cache app overhead = total memory use minus all recording chunk data.
+        // This captures fonts, UI state, indices, and other unevictable memory.
+        if let Some(current_mem_use) = mem_use_after.counted.or(mem_use_after.resident) {
+            let total_chunk_bytes: u64 = store_hub
+                .store_bundle()
+                .recordings()
+                .map(|r| r.byte_size_of_physical_chunks())
+                .sum();
+            self.cached_app_overhead_bytes =
+                Some(current_mem_use.saturating_sub(total_chunk_bytes));
+        }
+
+        self.dev_panel.note_memory_purge();
     }
 
     /// Prefetch chunks for the open recording (stream from server)
@@ -1142,6 +1070,7 @@ impl App {
 
         crate::prefetch_chunks::prefetch_chunks_for_recordings(
             &self.egui_ctx,
+            &self.async_runtime,
             store_hub.store_bundle_mut(),
             &recordings_info,
             total_bytes_in_memory,
@@ -1152,37 +1081,4 @@ impl App {
             },
         );
     }
-}
-
-/// Handle a `egui_inspection` request.
-fn serve_inspect_request(
-    egui_ctx: &egui::Context,
-    request: &[u8],
-    on_done: futures::channel::mpsc::UnboundedSender<Result<Vec<u8>, InspectError>>,
-) {
-    use egui_inspection::{InspectionPlugin, Request, protocol};
-
-    let req: Request = match protocol::decode_body(request) {
-        Ok(req) => req,
-        Err(err) => {
-            on_done
-                .unbounded_send(Err(InspectError::DecodeRequest(err.to_string())))
-                .ok();
-            return;
-        }
-    };
-
-    if egui_ctx.plugin_opt::<InspectionPlugin>().is_none() {
-        egui_ctx.add_plugin(InspectionPlugin::new(Some("rerun viewer".to_owned())));
-    }
-
-    egui_ctx.with_plugin::<InspectionPlugin, _>(|plugin| {
-        plugin.submit(req, move |resp| {
-            let encoded = protocol::encode_body(&resp)
-                .map_err(|err| InspectError::EncodeResponse(err.to_string()));
-            on_done.unbounded_send(encoded).ok();
-        });
-    });
-
-    egui_ctx.request_repaint();
 }

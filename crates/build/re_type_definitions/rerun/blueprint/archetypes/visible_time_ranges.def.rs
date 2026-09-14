@@ -8,10 +8,10 @@
 /// query the latest data available for each component type.
 ///
 /// The default visual time range depends on the type of view this property applies to:
-/// - For time series views, the default is to show the entire timeline.
+/// - For time series and state timeline views, the default is to show the entire timeline.
 /// - For any other view, the default is to apply latest-at semantics.
 #[rerun::rerun_type]
-#[python(aliases = "datatypes.VisibleTimeRangeLike | Sequence[datatypes.VisibleTimeRangeLike]")]
+#[python(aliases = "encodings.VisibleTimeRangeLike | Sequence[encodings.VisibleTimeRangeLike]")]
 #[rerun(scope = "blueprint")]
 #[rust(derive(Default))]
 #[rerun(state = "unstable")]

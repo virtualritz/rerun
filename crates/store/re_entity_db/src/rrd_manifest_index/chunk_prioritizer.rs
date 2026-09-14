@@ -642,7 +642,7 @@ impl ChunkPrioritizer {
                 }
             }
         }
-        for missing_virtual_chunk_id in chain!(missing_virtual, indicated_virtual) {
+        for missing_virtual_chunk_id in chain!(missing_virtual.keys(), indicated_virtual) {
             for root_id in store.find_root_chunks(missing_virtual_chunk_id) {
                 if let Some(components) = self.component_paths_from_root_id.get(&root_id) {
                     self.components_of_interest
@@ -674,7 +674,7 @@ impl ChunkPrioritizer {
         }
 
         for chunk_id in chain!(
-            missing_virtual,
+            missing_virtual.keys(),
             transient_missing_virtual,
             indicated_virtual,
         ) {
@@ -887,7 +887,7 @@ impl ChunkFetcher<'_> {
             match &mut self.fetch_stage {
                 ChunkPriorityStage::Start => {
                     let mut missing_roots = Vec::new();
-                    for missing_virtual_chunk_id in &self.tracker.missing_virtual {
+                    for missing_virtual_chunk_id in self.tracker.missing_virtual.keys() {
                         self.store
                             .collect_root_ids(missing_virtual_chunk_id, &mut missing_roots);
                     }
@@ -899,60 +899,55 @@ impl ChunkFetcher<'_> {
                 ChunkPriorityStage::Missing(missing) => {
                     if let Some(missing) = missing.next() {
                         return Some(PrioritizedRootChunk::required(missing));
-                    } else {
-                        self.fetch_stage = ChunkPriorityStage::HighPrioBefore(IterState::Uninited);
                     }
+                    self.fetch_stage = ChunkPriorityStage::HighPrioBefore(IterState::Uninited);
                 }
                 ChunkPriorityStage::HighPrioBefore(_) => {
                     if let Some(prioritized) = self.high_prio_chunk_stage() {
                         return Some(prioritized);
-                    } else {
-                        let mut indicated_roots = Vec::new();
-                        for missing_virtual_chunk_id in std::iter::chain(
-                            self.tracker.transient_missing_virtual.iter(),
-                            &self.tracker.indicated_virtual,
-                        ) {
-                            self.store
-                                .collect_root_ids(missing_virtual_chunk_id, &mut indicated_roots);
-                        }
-                        indicated_roots.sort();
-                        indicated_roots.dedup();
-
-                        self.fetch_stage =
-                            ChunkPriorityStage::Indicated(indicated_roots.into_iter());
                     }
+
+                    let mut indicated_roots = Vec::new();
+                    for missing_virtual_chunk_id in std::iter::chain(
+                        self.tracker.transient_missing_virtual.iter(),
+                        &self.tracker.indicated_virtual,
+                    ) {
+                        self.store
+                            .collect_root_ids(missing_virtual_chunk_id, &mut indicated_roots);
+                    }
+                    indicated_roots.sort();
+                    indicated_roots.dedup();
+
+                    self.fetch_stage = ChunkPriorityStage::Indicated(indicated_roots.into_iter());
                 }
 
                 ChunkPriorityStage::Indicated(indicated) => {
                     if let Some(indicated) = indicated.next() {
                         return Some(PrioritizedRootChunk::indicated(indicated));
-                    } else {
-                        self.fetch_stage = ChunkPriorityStage::HighPrioAfter {
-                            idx: IterState::Uninited,
-                            // Load 5 wall-clock seconds ahead of high prio chunks.
-                            buffer_time: 5.0,
-                        };
                     }
+                    self.fetch_stage = ChunkPriorityStage::HighPrioAfter {
+                        idx: IterState::Uninited,
+                        // Load 5 wall-clock seconds ahead of high prio chunks.
+                        buffer_time: 5.0,
+                    };
                 }
                 ChunkPriorityStage::HighPrioAfter { .. } => {
                     if let Some(prioritized) = self.high_prio_chunk_stage() {
                         return Some(prioritized);
-                    } else {
-                        self.fetch_stage = ChunkPriorityStage::Static(0);
                     }
+                    self.fetch_stage = ChunkPriorityStage::Static(0);
                 }
                 ChunkPriorityStage::Static(idx) => {
                     if let Some(c) = self.prioritizer.static_chunk_ids.get(*idx) {
                         *idx += 1;
 
                         return Some(PrioritizedRootChunk::indicated(*c));
-                    } else {
-                        self.fetch_stage = ChunkPriorityStage::TimeQuery {
-                            stage: TimeRangeStage::AfterCursor,
-                            iter_state: None,
-                            interesting: true,
-                        };
                     }
+                    self.fetch_stage = ChunkPriorityStage::TimeQuery {
+                        stage: TimeRangeStage::AfterCursor,
+                        iter_state: None,
+                        interesting: true,
+                    };
                 }
 
                 ChunkPriorityStage::TimeQuery {
@@ -992,9 +987,8 @@ impl ChunkFetcher<'_> {
                 ChunkPriorityStage::Everything(chunks) => {
                     if let Some(chunk_id) = chunks.next() {
                         return Some(PrioritizedRootChunk::everything(*chunk_id));
-                    } else {
-                        self.fetch_stage = ChunkPriorityStage::Done;
                     }
+                    self.fetch_stage = ChunkPriorityStage::Done;
                 }
                 ChunkPriorityStage::Done => return None,
             }
@@ -1040,13 +1034,13 @@ impl ChunkFetcher<'_> {
                 IterState::Done => None,
             }
             && let Some(c) = chunks_on_timeline.get(current_idx)
-            && if !before {
+            && if before {
+                true
+            } else {
                 // After load `buffer_time` wall-clock seconds into the future
                 (c.time_range.min - time_cursor.time_cursor.time).as_f64()
                     / time_cursor.speed_if_unpaused
                     < buffer_time
-            } else {
-                true
             }
         {
             *idx = if let Some(idx) = if before {
@@ -1205,7 +1199,7 @@ impl ChunkFetcher<'_> {
             self.state.all_required_are_loaded = Some(true);
         }
 
-        let entity_paths = batcher.manifest.col_chunk_entity_path_raw();
+        let entity_paths = batcher.manifest.col_chunk_entity_path();
 
         loop {
             // Peek before consuming so we can stop without eating the first optional
@@ -1387,6 +1381,7 @@ pub struct ChunkFetchResult {
 
 #[cfg(test)]
 mod tests {
+
     use std::collections::HashSet;
     use std::sync::Arc;
 
@@ -1453,14 +1448,8 @@ mod tests {
 
     /// Chunk IDs in a batch passed to the load callback, in the order the manifest gave us.
     fn chunk_ids_in_batch(rb: &RecordBatch) -> Vec<ChunkId> {
-        let col = rb
-            .column_by_name(RrdManifest::FIELD_CHUNK_ID)
-            .expect("missing chunk_id column");
-        let arr = col
-            .as_any()
-            .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
-            .expect("chunk_id column should be FixedSizeBinaryArray");
-        ChunkId::try_slice_from_arrow(arr)
+        RrdManifest::COLUMN_CHUNK_ID
+            .extract(rb)
             .expect("chunk_id should decode")
             .to_vec()
     }

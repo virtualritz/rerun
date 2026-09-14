@@ -9,8 +9,16 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import numpy as np
 
-__version__ = "0.36.0-alpha.1+dev"
-__version_info__ = (0, 36, 0, "alpha.1")
+__version__ = "0.38.0-alpha.1+dev"
+__version_info__ = (0, 38, 0, "alpha.1")
+
+if sys.version_info < (3, 11):
+    warnings.warn(
+        "Python 3.10 reaches end-of-life in October 2026 (https://devguide.python.org/versions/). "
+        "Rerun version 0.39 will drop support/testing of Python 3.10.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
 
 if sys.version_info < (3, 10):  # noqa: UP036
     raise RuntimeError("Rerun SDK requires Python 3.10 or later.")
@@ -26,6 +34,7 @@ import rerun_bindings as bindings
 from . import (
     blueprint as blueprint,
     catalog as catalog,
+    chunk as chunk,
     experimental as experimental,
     server as server,
     urdf as urdf,
@@ -68,6 +77,7 @@ from ._script_helpers import (
     script_setup as script_setup,
     script_teardown as script_teardown,
 )
+from ._send_chunks import send_chunks as send_chunks
 from ._send_columns import (
     TimeColumn as TimeColumn,
     TimeColumnLike as TimeColumnLike,
@@ -130,6 +140,7 @@ from .archetypes import (
     McapMessage as McapMessage,
     McapSchema as McapSchema,
     McapStatistics as McapStatistics,
+    Measurements as Measurements,
     Mesh3D as Mesh3D,
     Pinhole as Pinhole,
     Points2D as Points2D,
@@ -148,6 +159,7 @@ from .archetypes import (
     VideoFrameReference as VideoFrameReference,
     VideoStream as VideoStream,
     ViewCoordinates as ViewCoordinates,
+    Volume3D as Volume3D,
     VoxelGridMap as VoxelGridMap,
 )
 from .archetypes.boxes2d_ext import (
@@ -169,7 +181,10 @@ from .components import (
     TransformRelation as TransformRelation,
     VideoCodec as VideoCodec,
 )
-from .datatypes import (
+from .dynamic_archetype import (
+    DynamicArchetype as DynamicArchetype,
+)
+from .encodings import (
     Angle as Angle,
     AnnotationInfo as AnnotationInfo,
     ChannelDatatype as ChannelDatatype,
@@ -184,9 +199,6 @@ from .datatypes import (
     TimeRange as TimeRange,
     TimeRangeBoundary as TimeRangeBoundary,
     VisibleTimeRange as VisibleTimeRange,
-)
-from .dynamic_archetype import (
-    DynamicArchetype as DynamicArchetype,
 )
 from .error_utils import (
     set_strict_mode as set_strict_mode,
@@ -261,6 +273,10 @@ def __getattr__(name: str) -> Any:
             stacklevel=2,
         )
         return EXTERNAL_IMPORTER_INCOMPATIBLE_EXIT_CODE
+    if name == "datatypes":
+        from . import datatypes  # The module itself warns.
+
+        return datatypes
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

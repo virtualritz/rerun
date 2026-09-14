@@ -1,16 +1,22 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
+use arrow::pyarrow::ToPyArrow as _;
 use pyo3::prelude::*;
 
 use re_chunk::{Chunk, ChunkId};
 use re_chunk_store::LazyStore;
-use re_log_encoding::{RrdManifest, RrdManifestStaticMap, RrdManifestTemporalMap};
+use re_log_encoding::{
+    ChunkProvider as _, RrdManifest, RrdManifestStaticMap, RrdManifestTemporalMap,
+};
 use re_log_types::EntityPath;
 use re_types_core::{ComponentIdentifier, TimelineName};
 
 use super::engine::FilterStream;
 use super::error::ChunkPipelineError;
+use super::optimized_stream::{
+    OptimizedStreamFactory, OwnChunkRuleArgs, build_optimization_settings,
+};
 use super::py_stream::PyLazyChunkStreamInternal;
 use super::stream::{ChunkPredicateView, LazyChunkStream, StructuredFilter};
 use super::summary::{SummaryRow, format_summary};
@@ -54,7 +60,7 @@ impl PyLazyStoreInternal {
 
     /// The total number of chunks described by the manifest (virtual and physical).
     fn num_chunks(&self) -> usize {
-        self.inner.manifest().num_chunks()
+        self.inner.num_chunks()
     }
 
     /// Monotonic count of chunks physically loaded from this store since it was opened.
@@ -76,8 +82,8 @@ impl PyLazyStoreInternal {
     fn summary(&self) -> String {
         let manifest = self.inner.manifest();
         let chunk_ids = manifest.col_chunk_ids();
-        let entity_paths = manifest.col_chunk_entity_path_raw();
-        let is_static_iter: Vec<bool> = manifest.col_chunk_is_static().collect();
+        let entity_paths = manifest.col_chunk_entity_path();
+        let is_static_iter: Vec<bool> = manifest.col_chunk_is_static_iter().collect();
         let num_rows = manifest.col_chunk_num_rows();
 
         // Per-chunk (timelines, cols), using BTreeSet for sorted-by-construction order.
@@ -122,6 +128,40 @@ impl PyLazyStoreInternal {
     fn stream(&self) -> PyLazyChunkStreamInternal {
         PyLazyChunkStreamInternal::new(LazyChunkStream::from_factory(Arc::clone(&self.inner)))
     }
+
+    /// The store's chunk index (its raw RRD manifest), as `(store_id, RecordBatch)`.
+    //TODO(RR-5531): make this API public when it stabilizes.
+    fn _chunk_index(&self, py: Python<'_>) -> PyResult<(String, Py<PyAny>)> {
+        let raw = self.inner.raw_manifest();
+        Ok((raw.store_id.to_string(), raw.data.to_pyarrow(py)?.unbind()))
+    }
+
+    /// Return a lazy stream of vertically optimized chunks.
+    //TODO(ab): this is the new WIP optimizer. We will clean up this API and make it public when it
+    //stabilizes.
+    #[pyo3(signature = (*, chunk_max_bytes=None, chunk_max_rows=None, chunk_max_rows_if_unsorted=None, target_timeline=None, own_chunk=None))]
+    fn _optimized_stream(
+        &self,
+        chunk_max_bytes: Option<u64>,
+        chunk_max_rows: Option<u64>,
+        chunk_max_rows_if_unsorted: Option<u64>,
+        target_timeline: Option<String>,
+        own_chunk: Option<Vec<OwnChunkRuleArgs>>,
+    ) -> PyResult<PyLazyChunkStreamInternal> {
+        let factory = OptimizedStreamFactory {
+            provider: Arc::clone(&self.inner) as _,
+            settings: build_optimization_settings(
+                chunk_max_bytes,
+                chunk_max_rows,
+                chunk_max_rows_if_unsorted,
+                target_timeline,
+                own_chunk,
+            )?,
+        };
+        Ok(PyLazyChunkStreamInternal::new(
+            LazyChunkStream::from_factory(factory),
+        ))
+    }
 }
 
 /// `Arc<LazyStore>` is itself the factory: it owns the manifest and serves on-demand chunk
@@ -160,13 +200,13 @@ fn evaluate_filter_on_manifest(
 ) -> (Vec<ChunkId>, Option<StructuredFilter>) {
     let chunk_ids = manifest.col_chunk_ids();
 
-    //TODO(perf): `col_chunk_entity_path()` parses+interns one `EntityPath` per chunk.
+    //TODO(perf): `col_chunk_entity_path_iter()` parses+interns one `EntityPath` per chunk.
     // When `filter.content.is_none()`, we don't need the parsed form at all, and could
-    // iterate `col_chunk_entity_path_raw()` (a `&StringArray`) instead, parsing only when
+    // iterate `col_chunk_entity_path()` (a `&StringArray`) instead, parsing only when
     // a temporal/static_map lookup actually requires it. Skipped for v1; revisit when
     // profiling points here.
-    let entity_paths: Vec<EntityPath> = manifest.col_chunk_entity_path().collect();
-    let is_static_col: Vec<bool> = manifest.col_chunk_is_static().collect();
+    let entity_paths: Vec<EntityPath> = manifest.col_chunk_entity_path_iter().collect();
+    let is_static_col: Vec<bool> = manifest.col_chunk_is_static_iter().collect();
 
     let temporal_map = manifest.temporal_map();
     let static_map = manifest.static_map();
@@ -288,7 +328,7 @@ impl IndexedChunkStream {
     /// Stream only the given chunk IDs (used by pushdown).
     ///
     /// IDs that do not appear in the manifest are tolerated — `next_batch_end` assigns
-    /// them a size of `0` via [`LazyStore::chunk_row_index`]'s `None` branch, and
+    /// them a size of `0` via [`LazyStore::chunk_byte_size`]'s `None` branch, and
     /// `load_chunks` is the layer that would ultimately reject them. Manifest membership
     /// is the caller's invariant.
     fn new_with_ids(lazy: Arc<LazyStore>, chunk_ids: Vec<ChunkId>) -> Self {
@@ -304,15 +344,10 @@ impl IndexedChunkStream {
     /// chosen so the cumulative byte size stays under [`Self::BATCH_BYTE_BUDGET`].
     /// Always advances by at least one chunk to guarantee progress on huge chunks.
     fn next_batch_end(&self) -> usize {
-        let sizes = self.lazy.manifest().col_chunk_byte_size();
         let mut end = self.next_id;
         let mut accumulated: u64 = 0;
         while end < self.chunk_ids.len() {
-            let size = self
-                .lazy
-                .chunk_row_index(&self.chunk_ids[end])
-                .map(|row| sizes[row])
-                .unwrap_or(0);
+            let size = self.lazy.chunk_byte_size(&self.chunk_ids[end]).unwrap_or(0);
             if end > self.next_id && accumulated.saturating_add(size) > Self::BATCH_BYTE_BUDGET {
                 break;
             }
@@ -443,7 +478,7 @@ mod pushdown_tests {
                     builder = match spec.component {
                         TestComponent::Points => {
                             #[expect(clippy::cast_possible_truncation)]
-                            let points = MyPoint::from_iter(frame as u32..frame as u32 + 1);
+                            let points = MyPoint::from_iter((frame as u32)..=(frame as u32));
                             builder.with_sparse_component_batches(
                                 row_id,
                                 timepoint,
@@ -505,7 +540,7 @@ mod pushdown_tests {
     fn ids_for_entity(store: &LazyStore, entity: &str) -> Vec<ChunkId> {
         let path = EntityPath::from(entity);
         let manifest = store.manifest();
-        let entity_paths: Vec<EntityPath> = manifest.col_chunk_entity_path().collect();
+        let entity_paths: Vec<EntityPath> = manifest.col_chunk_entity_path_iter().collect();
         std::iter::zip(manifest.col_chunk_ids(), &entity_paths)
             .filter_map(|(id, p)| if p == &path { Some(*id) } else { None })
             .collect()
@@ -675,8 +710,8 @@ mod pushdown_tests {
         let (matching, _) = evaluate_filter_on_manifest(&filter, store.manifest());
 
         let manifest = store.manifest();
-        let is_static_col: Vec<bool> = manifest.col_chunk_is_static().collect();
-        let entity_paths: Vec<EntityPath> = manifest.col_chunk_entity_path().collect();
+        let is_static_col: Vec<bool> = manifest.col_chunk_is_static_iter().collect();
+        let entity_paths: Vec<EntityPath> = manifest.col_chunk_entity_path_iter().collect();
         let expected: Vec<ChunkId> =
             itertools::izip!(manifest.col_chunk_ids(), &entity_paths, &is_static_col)
                 .filter_map(|(id, ep, &is_static)| {

@@ -31,6 +31,16 @@ You can also drag and drop MCAP files into the Rerun Viewer or load them using t
 
 snippet: howto/load_mcap
 
+### Python `McapReader`
+
+For custom ingestion or processing pipelines, use the Python [`McapReader`](https://ref.rerun.io/docs/python/stable/chunk?speculative-link#rerun.chunk.McapReader) to read an MCAP file into a [`LazyChunkStream`](https://ref.rerun.io/docs/python/stable/experimental/#rerun.chunk.LazyChunkStream) that can be used to build custom data wrangling pipelines.
+For example, you can inspect file metadata with `reader.info()`, select decoders, filter topics or time ranges, transform chunks using [Lenses](../../concepts/query-and-transform/lenses.md), and write the result to RRD:
+
+snippet: howto/process_mcap[example]
+
+See the [Chunk Processing API](../../concepts/logging-and-ingestion/chunk-processing-api.md) for examples of filtering and transforming MCAP chunks.
+For a comprehensive example covering a full robotics pre-processing pipeline, see the [robot_data_preprocessing example](https://github.com/rerun-io/rerun/tree/main/examples/python/robot_data_preprocessing).
+
 ### Basic conversion
 
 Convert MCAP files to Rerun's native format for faster loading:
@@ -53,11 +63,11 @@ To map MCAP messages to Rerun entities we make the following assumptions:
 * The contents of an MCAP message will be extracted to Rerun components and grouped under a corresponding Rerun archetype.
 * `message_log_time` and `message_publish_time` of an MCAP message will be carried over to Rerun as two distinct [timelines](../../concepts/logging-and-ingestion/timelines.md).
 
-### Layered architecture
+### Decoder architecture
 
-Rerun uses a _layered architecture_ to process MCAP files at different levels of abstraction. This design allows the same MCAP file to be ingested in multiple ways simultaneously, from raw bytes to semantically meaningful visualizations.
+Rerun uses _decoders_ to process MCAP files at different levels of abstraction. This design allows to choose up to which level the MCAP message payloads are converted to RRD, from keeping only raw bytes up to a full semantic conversion to Rerun archetypes.
 
-Each layer extracts different types of information from the MCAP source and each of the following layers will create distinct Rerun archetypes:
+Each decoder extracts different types of information from the MCAP source:
 
 - **`raw`**: Logs the unprocessed message bytes as Rerun blobs without any interpretation
 - **`schema`**: Extracts metadata about channels, topics, and schemas

@@ -92,12 +92,12 @@ impl<'chunk> ChunkWithComponent<'chunk> {
 /// for example due to errors in parsing the selector. This is codified in this struct and forces the
 /// visualizer to handle the errors.
 #[derive(Debug, Clone)]
-pub struct MaybeChunksWithComponent<'chunk> {
-    pub maybe_chunks: Result<Cow<'chunk, [Chunk]>, ComponentMappingError>,
+pub struct MaybeChunksWithComponent<'a> {
+    pub maybe_chunks: Result<Cow<'a, [Chunk]>, &'a ComponentMappingError>,
     pub component: ComponentIdentifier,
 }
 
-impl MaybeChunksWithComponent<'_> {
+impl<'a> MaybeChunksWithComponent<'a> {
     /// Iterates over chunks, or reports an error if chunk resolution failed.
     ///
     /// If the chunks were successfully resolved, returns an iterator over them.
@@ -137,7 +137,7 @@ impl MaybeChunksWithComponent<'_> {
 
     /// Creates a new instance representing a failure to resolve chunks.
     #[inline]
-    pub fn error(component: ComponentIdentifier, err: ComponentMappingError) -> Self {
+    pub fn error(component: ComponentIdentifier, err: &'a ComponentMappingError) -> Self {
         Self {
             maybe_chunks: Err(err),
             component,
@@ -146,7 +146,7 @@ impl MaybeChunksWithComponent<'_> {
 }
 
 impl<'a> TryFrom<MaybeChunksWithComponent<'a>> for ChunksWithComponent<'a> {
-    type Error = ComponentMappingError;
+    type Error = &'a ComponentMappingError;
 
     #[inline]
     fn try_from(value: MaybeChunksWithComponent<'a>) -> Result<Self, Self::Error> {

@@ -65,6 +65,7 @@ impl VisualizerSystem for GeoLineStringsVisualizer {
                 ctx,
                 view_query,
                 instruction,
+                None, // Doesn't support annotation context.
             );
             let results = VisualizerInstructionQueryResults::new(instruction, &results, &output);
 
@@ -195,7 +196,7 @@ impl GeoLineStringsOutput {
             }
         }
 
-        view_builder.queue_draw(render_ctx, lines.into_draw_data()?);
+        view_builder.queue_draw(render_ctx, lines.into_draw_data()?)?;
 
         Ok(())
     }

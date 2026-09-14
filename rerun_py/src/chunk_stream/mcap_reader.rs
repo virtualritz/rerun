@@ -7,6 +7,7 @@ use pyo3::prelude::*;
 use re_chunk::Chunk;
 use re_log_types::TimeType;
 use re_mcap::{DecoderIdentifier, SelectedDecoders, TopicFilter};
+use re_span::Span;
 
 use super::error::ChunkPipelineError;
 use super::py_stream::PyLazyChunkStreamInternal;
@@ -52,15 +53,7 @@ impl PyMcapReaderInternal {
             )));
         }
 
-        let timeline_type = match timeline_type {
-            "timestamp" => TimeType::TimestampNs,
-            "duration" => TimeType::DurationNs,
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "Invalid timeline_type: {other:?}. Expected \"timestamp\" or \"duration\""
-                )));
-            }
-        };
+        let timeline_type = crate::timeline_type::parse_temporal_timeline_type(timeline_type)?;
 
         let selected_decoders = match decoders {
             None => SelectedDecoders::All,
@@ -150,7 +143,14 @@ impl PyMcapReaderInternal {
             )
         };
 
+        // Use the cached summary, if it was already read.
         if let Some(summary) = self.mcap_file.cached_summary() {
+            return bounds_from_summary(&summary);
+        }
+
+        // With recovery disabled, read and cache the embedded summary before computing its bounds.
+        if !self.mcap_file.recover() {
+            let summary = self.summary()?;
             return bounds_from_summary(&summary);
         }
 
@@ -171,24 +171,18 @@ impl PyMcapReaderInternal {
 
         match re_mcap::read_summary(std::io::Cursor::new(self.mcap_file.bytes())) {
             Ok(Some(summary)) => bounds_from_summary(&summary),
-            Ok(None) if self.mcap_file.recover() => {
+            Ok(None) => {
                 re_log::warn!(
                     "MCAP file has no summary; scanning the chunk index for time bounds. The file may be truncated"
                 );
                 bounds_from_scan()
             }
-            Err(err) if self.mcap_file.recover() => {
+            Err(err) => {
                 re_log::warn!(
                     "Failed to read the MCAP summary ({err}); scanning the chunk index for time bounds. The file may be truncated"
                 );
                 bounds_from_scan()
             }
-            Ok(None) => Err(PyValueError::new_err(
-                "MCAP file does not contain a summary",
-            )),
-            Err(err) => Err(PyValueError::new_err(format!(
-                "Failed to read MCAP summary: {err}"
-            ))),
         }
     }
 
@@ -578,7 +572,7 @@ fn compile_topic_filter(
 fn compile_time_range(
     start_time_ns: Option<i64>,
     end_time_ns: Option<i64>,
-) -> PyResult<Option<(u64, u64)>> {
+) -> PyResult<Option<Span<u64>>> {
     if start_time_ns.is_none() && end_time_ns.is_none() {
         return Ok(None);
     }
@@ -602,13 +596,13 @@ fn compile_time_range(
         None => u64::MAX,
     };
 
-    if start >= end {
+    let Some(span) = Span::try_from_start_end(start, end).filter(|span| !span.is_empty()) else {
         return Err(PyValueError::new_err(format!(
             "start_time_ns ({start}) must be less than end_time_ns ({end}); the range is half-open [start, end)"
         )));
-    }
+    };
 
-    Ok(Some((start, end)))
+    Ok(Some(span))
 }
 
 fn mmap_file(path: &Path) -> Result<memmap2::Mmap, ChunkPipelineError> {

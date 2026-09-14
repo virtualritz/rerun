@@ -471,13 +471,20 @@ pub fn paint_loaded_indicator_bar(
 
             let offset = (time * speed) % (gap as f64 + line as f64) - line as f64;
 
-            let dashed_line = egui::Shape::dashed_line_with_offset(
+            let dashed_line = egui::Shape::Vec(egui::Shape::dashed_line_with_offset(
                 &[egui::pos2(x_range.min, y), egui::pos2(x_range.max, y)],
                 stroke,
                 &[line],
                 &[gap],
                 offset as f32,
-            );
+            ));
+
+            ui.interact(
+                dashed_line.visual_bounding_rect(),
+                ui.id().with("chunk_fetching_indicator"),
+                egui::Sense::hover(),
+            )
+            .widget_info(|| egui::WidgetInfo::new(egui::WidgetType::ProgressIndicator));
 
             ui.painter()
                 // Need to clip because offsetting the dashed line may end up outside otherwise
@@ -730,14 +737,6 @@ impl DensityGraphBuilderConfig {
         max_total_chunk_events: 0,
         max_events_in_unsorted_chunk: 0,
         max_events_in_sorted_chunk: 0,
-    };
-
-    /// All sorted chunks will be rendered as individual events,
-    /// and all unsorted chunks will be rendered whole.
-    pub const ALWAYS_SPLIT_SORTED_CHUNKS: Self = Self {
-        max_total_chunk_events: u64::MAX,
-        max_events_in_unsorted_chunk: 0,
-        max_events_in_sorted_chunk: u64::MAX,
     };
 
     /// All chunks will be rendered as individual events.

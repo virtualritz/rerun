@@ -16,14 +16,16 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::wildcard_imports)]
 
+use ::arrow::array::ArrayRef;
 use ::re_types_core::SerializationResult;
+use ::re_types_core::SerializedComponentBatch;
 use ::re_types_core::try_serialize_field;
-use ::re_types_core::{ComponentBatch as _, SerializedComponentBatch};
 use ::re_types_core::{ComponentDescriptor, ComponentType};
 use ::re_types_core::{DeserializationError, DeserializationResult};
+use ::std::borrow::Cow;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, ::re_byte_size::SizeBytes)]
-pub struct AffixFuzzer22(pub Option<crate::testing::datatypes::FixedSizeBytes>);
+pub struct AffixFuzzer22(pub Option<crate::testing::encodings::FixedSizeBytes>);
 
 impl ::re_types_core::Component for AffixFuzzer22 {
     #[inline]
@@ -34,9 +36,9 @@ impl ::re_types_core::Component for AffixFuzzer22 {
 
 ::re_types_core::macros::impl_into_cow!(AffixFuzzer22);
 
-impl ::re_types_core::Loggable for AffixFuzzer22 {
+impl ::re_types_core::ArrowDataType for AffixFuzzer22 {
     #[inline]
-    fn arrow_datatype() -> arrow::datatypes::DataType {
+    fn arrow_data_type() -> arrow::datatypes::DataType {
         use arrow::datatypes::*;
         DataType::Struct(Fields::from(vec![Field::new(
             "fixed_sized_native",
@@ -47,22 +49,27 @@ impl ::re_types_core::Loggable for AffixFuzzer22 {
             false,
         )]))
     }
+}
 
-    fn to_arrow_opt<'a>(
-        data: impl IntoIterator<Item = Option<impl Into<::std::borrow::Cow<'a, Self>>>>,
-    ) -> SerializationResult<arrow::array::ArrayRef>
+impl ::re_types_core::ToArrow for AffixFuzzer22 {
+    fn to_arrow<'a>(
+        data: impl IntoIterator<Item = impl Into<Cow<'a, Self>>>,
+    ) -> SerializationResult<ArrayRef>
     where
         Self: Clone + 'a,
     {
         #![allow(clippy::manual_is_variant_and)]
-        use ::re_types_core::{Loggable as _, ResultExt as _, arrow_helpers::as_array_ref};
+        use ::re_types_core::{
+            ArrowDataType as _, ResultExt as _, ToArrow as _, ToArrowOpt as _,
+            arrow_helpers::as_array_ref,
+        };
         use arrow::{array::*, buffer::*, datatypes::*};
         Ok({
             let (somes, data0): (Vec<_>, Vec<_>) = data
                 .into_iter()
                 .map(|datum| {
-                    let datum: Option<::std::borrow::Cow<'a, Self>> = datum.map(Into::into);
-                    let datum = datum.map(|datum| datum.into_owned().0).flatten();
+                    let datum: Cow<'a, Self> = datum.into();
+                    let datum = datum.into_owned().0;
                     (datum.is_some(), datum)
                 })
                 .unzip();
@@ -71,58 +78,58 @@ impl ::re_types_core::Loggable for AffixFuzzer22 {
                 any_nones.then(|| somes.into())
             };
             {
-                _ = data0_validity;
-                crate::testing::datatypes::FixedSizeBytes::to_arrow_opt(data0)?
+                let _ = data0_validity;
+                crate::testing::encodings::FixedSizeBytes::to_arrow_opt(data0)?
             }
         })
     }
+}
 
-    fn from_arrow_opt(
-        arrow_data: &dyn arrow::array::Array,
-    ) -> DeserializationResult<Vec<Option<Self>>>
-    where
-        Self: Sized,
-    {
-        use ::re_types_core::{Loggable as _, ResultExt as _, arrow_zip_validity::ZipValidity};
+impl ::re_types_core::FromArrow for AffixFuzzer22 {
+    fn from_arrow(arrow_data: &dyn arrow::array::Array) -> DeserializationResult<Vec<Self>> {
+        use ::re_types_core::{
+            ArrowDataType as _, FromArrow as _, FromArrowOpt as _, ResultExt as _,
+            arrow_helpers::*, arrow_zip_validity::ZipValidity,
+        };
         use arrow::{array::*, buffer::*, datatypes::*};
         Ok(
-            crate::testing::datatypes::FixedSizeBytes::from_arrow_opt(arrow_data)
+            crate::testing::encodings::FixedSizeBytes::from_arrow_opt(arrow_data)
                 .with_context("rerun.testing.components.AffixFuzzer22#nullable_nested_array")?
                 .into_iter()
                 .map(Ok)
-                .map(|res| res.map(|v| Some(Self(v))))
-                .collect::<DeserializationResult<Vec<Option<_>>>>()
+                .map(|res| res.map(Self))
+                .collect::<DeserializationResult<Vec<_>>>()
                 .with_context("rerun.testing.components.AffixFuzzer22#nullable_nested_array")
                 .with_context("rerun.testing.components.AffixFuzzer22")?,
         )
     }
 }
 
-impl<T: Into<Option<crate::testing::datatypes::FixedSizeBytes>>> From<T> for AffixFuzzer22 {
+impl<T: Into<Option<crate::testing::encodings::FixedSizeBytes>>> From<T> for AffixFuzzer22 {
     fn from(v: T) -> Self {
         Self(v.into())
     }
 }
 
-impl std::borrow::Borrow<Option<crate::testing::datatypes::FixedSizeBytes>> for AffixFuzzer22 {
+impl std::borrow::Borrow<Option<crate::testing::encodings::FixedSizeBytes>> for AffixFuzzer22 {
     #[inline]
-    fn borrow(&self) -> &Option<crate::testing::datatypes::FixedSizeBytes> {
+    fn borrow(&self) -> &Option<crate::testing::encodings::FixedSizeBytes> {
         &self.0
     }
 }
 
 impl std::ops::Deref for AffixFuzzer22 {
-    type Target = Option<crate::testing::datatypes::FixedSizeBytes>;
+    type Target = Option<crate::testing::encodings::FixedSizeBytes>;
 
     #[inline]
-    fn deref(&self) -> &Option<crate::testing::datatypes::FixedSizeBytes> {
+    fn deref(&self) -> &Option<crate::testing::encodings::FixedSizeBytes> {
         &self.0
     }
 }
 
 impl std::ops::DerefMut for AffixFuzzer22 {
     #[inline]
-    fn deref_mut(&mut self) -> &mut Option<crate::testing::datatypes::FixedSizeBytes> {
+    fn deref_mut(&mut self) -> &mut Option<crate::testing::encodings::FixedSizeBytes> {
         &mut self.0
     }
 }

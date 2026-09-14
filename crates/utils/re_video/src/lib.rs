@@ -10,6 +10,7 @@ mod nalu;
 pub mod player;
 mod stable_index_deque;
 mod time;
+mod time_window;
 mod transcode_options;
 mod vp8;
 mod vp9;
@@ -23,9 +24,9 @@ pub use decode::{
     Result as DecodeResult, YuvMatrixCoefficients, YuvPixelLayout, YuvRange, new_decoder,
 };
 pub use demux::{
-    ChromaSubsamplingModes, FrameNumber, KeyframeIndex, SampleIndex, SampleMetadata,
-    SampleMetadataState, SamplesStatistics, VideoCodec, VideoDataDescription, VideoDeliveryMethod,
-    VideoEncodingDetails, VideoLoadError, VideoSource,
+    ChromaSubsamplingModes, FrameNumber, KeyframeIndex, SampleIndex, SampleIndexSpan,
+    SampleMetadata, SampleMetadataState, SamplesStatistics, VideoCodec, VideoDataDescription,
+    VideoDeliveryMethod, VideoEncodingDetails, VideoLoadError, VideoSource,
 };
 pub use gop_detection::{
     DetectGopStartError, GopStartDetection, detect_gop_start, is_start_of_gop,
@@ -46,6 +47,7 @@ pub use {
     time::{Time, Timescale},
 };
 
+pub use self::time_window::TimeWindow;
 pub use self::transcode_options::{HwAccel, Mp4TranscodeOptions};
 
 #[cfg(with_ffmpeg)]

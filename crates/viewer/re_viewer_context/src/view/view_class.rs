@@ -143,11 +143,6 @@ impl ViewClassUiOutput {
         self.reports.push(report);
         self
     }
-
-    pub fn with_reports(mut self, reports: impl IntoIterator<Item = ViewerDiagnostic>) -> Self {
-        self.reports.extend(reports);
-        self
-    }
 }
 
 /// Defines a class of view without any concrete types making it suitable for storage and interfacing.
@@ -327,6 +322,17 @@ pub trait ViewClass: Send + Sync {
         _view_id: ViewId,
     ) -> Result<(), ViewSystemExecutionError> {
         Ok(())
+    }
+
+    /// By default, views accept any drag-and-dropped entity that a visualizer can show. That might
+    /// be too loose for some views. In that case, this method can be overridden to reject entities
+    /// before visualizability is checked.
+    fn reject_entity_drop_reason(
+        &self,
+        _ctx: &ViewerContext<'_>,
+        _entity_path: &EntityPath,
+    ) -> Option<&'static str> {
+        None
     }
 
     /// Handle components being dragged over a view of this class.

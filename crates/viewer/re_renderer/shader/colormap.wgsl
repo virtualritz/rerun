@@ -46,6 +46,8 @@ fn colormap_srgba(which: u32, t_unsaturated: f32) -> vec4f {
         return colormap_rviz_costmap_srgba(t);
     } else if which == COLORMAP_COSTMAP {
         return colormap_costmap_srgba(t);
+    } else {
+        return ERROR_RGBA;
     }
     return ERROR_RGBA;
 }
@@ -312,6 +314,7 @@ fn colormap_costmap_srgba(t: f32) -> vec4f {
     } else if value < 255.0 {
         // 128-254 (illegal negative): red -> ramp yellow
         return vec4f(mix(RERUN_RED, RERUN_YELLOW, (value - 128.0) / (254.0 - 128.0)), 1.0);
+    } else {
+        return vec4f(112.0 / 255.0, 137.0 / 255.0, 134.0 / 255.0, 1.0); // 255 == -1: teal-gray (unknown, matches RViz)
     }
-    return vec4f(112.0 / 255.0, 137.0 / 255.0, 134.0 / 255.0, 1.0); // 255 == -1: teal-gray (unknown, matches RViz)
 }

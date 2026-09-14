@@ -24,8 +24,8 @@ use datafusion::common::{Result as DataFusionResult, exec_err};
 use datafusion::logical_expr::{Expr, TypeSignature, col, not};
 use jiff::{RoundMode, Timestamp, TimestampRound, ToSpan as _};
 use re_log_types::TimestampFormat;
-use re_types_core::Loggable as _;
-use re_types_core::datatypes::TimeInt;
+use re_types_core::ArrowDataType as _;
+use re_types_core::encodings::TimeInt;
 use re_ui::syntax_highlighting::SyntaxHighlightedBuilder;
 use re_ui::{DesignTokens, SyntaxHighlighting, UiExt as _};
 use strum::VariantArray as _;
@@ -119,27 +119,6 @@ impl TimestampFilter {
     pub fn yesterday() -> Self {
         Self {
             kind: TimestampFilterKind::Yesterday,
-            ..Default::default()
-        }
-    }
-
-    pub fn last_24_hours() -> Self {
-        Self {
-            kind: TimestampFilterKind::Last24Hours,
-            ..Default::default()
-        }
-    }
-
-    pub fn this_week() -> Self {
-        Self {
-            kind: TimestampFilterKind::ThisWeek,
-            ..Default::default()
-        }
-    }
-
-    pub fn last_week() -> Self {
-        Self {
-            kind: TimestampFilterKind::LastWeek,
             ..Default::default()
         }
     }
@@ -764,7 +743,7 @@ impl FilterUdf for ResolvedTimestampFilter {
 
     fn is_valid_primitive_input_type(data_type: &DataType) -> bool {
         match data_type {
-            _data_type if _data_type == &TimeInt::arrow_datatype() => true,
+            _data_type if _data_type == &TimeInt::arrow_data_type() => true,
             DataType::Timestamp(_, _) => true,
             _ => false,
         }
@@ -782,7 +761,7 @@ impl FilterUdf for ResolvedTimestampFilter {
         }
 
         match array.data_type() {
-            _data_type if _data_type == &TimeInt::arrow_datatype() => {
+            _data_type if _data_type == &TimeInt::arrow_data_type() => {
                 timestamp_case!(apply_nanoseconds, as_int64_array, self)
             }
 
@@ -808,6 +787,7 @@ impl FilterUdf for ResolvedTimestampFilter {
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::unreadable_literal)]
     use jiff::civil::date;
 
     use super::*;

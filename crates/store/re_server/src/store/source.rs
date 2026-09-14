@@ -6,9 +6,10 @@ use arrow::datatypes::Schema;
 use arrow::error::ArrowError;
 use itertools::Itertools as _;
 use re_byte_size::SizeBytes as _;
-use re_log_encoding::RawRrdManifest;
+use re_log_encoding::{ChunkProvider as _, RawRrdManifest};
 use re_log_types::{AbsoluteTimeRange, Timeline};
 use re_protos::cloud::v1alpha1::ext::DataSourceKind;
+use url::Url;
 
 use crate::store::LayerInfo;
 
@@ -29,6 +30,12 @@ pub struct Source {
     /// .rrd, .mcap, …
     data_source_kind: DataSourceKind,
 
+    /// The URI this layer was registered from.
+    ///
+    /// A layer registered from a file keeps its `file://` URI. A layer written straight into the
+    /// server by `write_chunks` has no file behind it and gets `memory:///store/{store_slot_id}`.
+    storage_url: Url,
+
     /// All sources in the same layer share the same [`LayerInfo`].
     layer_info: Arc<LayerInfo>,
 }
@@ -38,6 +45,7 @@ impl Source {
         store_slot_id: StoreSlotId,
         resolved: ResolvedStore,
         data_source_kind: DataSourceKind,
+        storage_url: Url,
         layer_info: Arc<LayerInfo>,
     ) -> Self {
         Self {
@@ -45,6 +53,7 @@ impl Source {
             resolved,
             registration_time: jiff::Timestamp::now(),
             data_source_kind,
+            storage_url,
             layer_info,
         }
     }
@@ -59,6 +68,10 @@ impl Source {
 
     pub fn store_slot_id(&self) -> StoreSlotId {
         self.store_slot_id
+    }
+
+    pub fn storage_url(&self) -> &Url {
+        &self.storage_url
     }
 
     pub fn resolved_store(&self) -> &ResolvedStore {
@@ -153,7 +166,7 @@ impl Source {
         let mut manifest = (**lazy.raw_manifest()).clone();
 
         let chunk_keys: Vec<_> = manifest
-            .col_chunk_id()
+            .col_chunk_id_iter()
             .map_err(|err| super::Error::RrdLoadingError(err.into()))?
             .map(|chunk_id| {
                 super::ChunkKey {
@@ -260,7 +273,7 @@ fn append_chunk_key_column(
     let schema = {
         let mut schema = Arc::unwrap_or_clone(schema);
         let mut fields = schema.fields.to_vec();
-        fields.push(Arc::new(RawRrdManifest::field_chunk_key()));
+        fields.push(RawRrdManifest::COLUMN_CHUNK_KEY.arrow_field_ref());
         schema.fields = fields.into();
         schema
     };
@@ -282,8 +295,6 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::Path;
 
-    use arrow::array::Array as _;
-    use re_arrow_util::ArrowArrayDowncastRef as _;
     use re_chunk_store::external::re_chunk;
     use re_chunk_store::{Chunk, ChunkStore, ChunkStoreConfig, ChunkStoreHandle, LazyStore};
     use re_log_encoding::EncodingOptions;
@@ -308,7 +319,7 @@ mod tests {
                 let points = MyPoint::from_iter(
                     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     {
-                        frame_idx as u32..frame_idx as u32 + 1
+                        (frame_idx as u32)..=(frame_idx as u32)
                     },
                 );
                 let chunk = Chunk::builder(entity_path)
@@ -376,6 +387,7 @@ mod tests {
             StoreSlotId::new(),
             ResolvedStore::Eager(ChunkStoreHandle::new(eager_store)),
             DataSourceKind::Rrd,
+            Url::parse("memory:///store/eager").expect("valid url"),
             test_layer_info.clone(),
         );
 
@@ -400,6 +412,7 @@ mod tests {
             StoreSlotId::new(),
             ResolvedStore::Lazy(lazy),
             DataSourceKind::Rrd,
+            Url::from_file_path(&rrd_path).expect("test RRD path should be absolute"),
             test_layer_info,
         );
 
@@ -419,11 +432,11 @@ mod tests {
 
         // Chunk IDs match as sets (per-row order is not part of the contract).
         let lazy_ids: BTreeSet<ChunkId> = lazy_manifest
-            .col_chunk_id()
+            .col_chunk_id_iter()
             .expect("lazy manifest should contain chunk IDs")
             .collect();
         let eager_ids: BTreeSet<ChunkId> = eager_manifest
-            .col_chunk_id()
+            .col_chunk_id_iter()
             .expect("eager manifest should contain chunk IDs")
             .collect();
         assert_eq!(lazy_ids, eager_ids, "chunk IDs differ");
@@ -432,7 +445,7 @@ mod tests {
         // sort by chunk_id first.
         let sort_by_chunk_id = |manifest: &RawRrdManifest| -> Vec<usize> {
             let mut indexed: Vec<(usize, ChunkId)> = manifest
-                .col_chunk_id()
+                .col_chunk_id_iter()
                 .expect("manifest should contain chunk IDs")
                 .enumerate()
                 .collect();
@@ -443,22 +456,22 @@ mod tests {
         let eager_order = sort_by_chunk_id(&eager_manifest);
 
         let lazy_entity_paths = lazy_manifest
-            .col_chunk_entity_path_raw()
+            .col_chunk_entity_path()
             .expect("lazy manifest should contain entity paths");
         let eager_entity_paths = eager_manifest
-            .col_chunk_entity_path_raw()
+            .col_chunk_entity_path()
             .expect("eager manifest should contain entity paths");
         let lazy_is_static = lazy_manifest
-            .col_chunk_is_static_raw()
+            .col_chunk_is_static()
             .expect("lazy manifest should contain static flags");
         let eager_is_static = eager_manifest
-            .col_chunk_is_static_raw()
+            .col_chunk_is_static()
             .expect("eager manifest should contain static flags");
         let lazy_num_rows = lazy_manifest
-            .col_chunk_num_rows_raw()
+            .col_chunk_num_rows()
             .expect("lazy manifest should contain row counts");
         let eager_num_rows = eager_manifest
-            .col_chunk_num_rows_raw()
+            .col_chunk_num_rows()
             .expect("eager manifest should contain row counts");
 
         for (li, ei) in std::iter::zip(&lazy_order, &eager_order) {
@@ -496,15 +509,12 @@ mod tests {
 
         // `chunk_key` column is present on both and decodes to in-manifest chunk IDs.
         let decode_keys = |manifest: &RawRrdManifest| -> BTreeSet<ChunkId> {
-            let keys: &BinaryArray = manifest
-                .data
-                .column_by_name(RawRrdManifest::FIELD_CHUNK_KEY)
-                .expect("chunk_key column missing")
-                .downcast_array_ref::<BinaryArray>()
-                .expect("chunk_key column should be binary");
-            (0..keys.len())
-                .map(|i| {
-                    ChunkKey::decode(keys.value(i))
+            let keys = RawRrdManifest::COLUMN_CHUNK_KEY
+                .extract(&manifest.data)
+                .unwrap();
+            keys.iter()
+                .map(|key| {
+                    ChunkKey::decode(key)
                         .expect("chunk_key should decode")
                         .chunk_id
                 })

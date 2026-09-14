@@ -57,6 +57,7 @@ re_tracing.workspace = true
 re_types_core.workspace = true
 
 # External:
+ahash.workspace = true
 arrow = { workspace = true, features = ["ipc"] }
 async-trait.workspace = true
 crossbeam.workspace = true
@@ -65,6 +66,7 @@ itertools.workspace = true
 jiff.workspace = true
 lz4_flex = { workspace = true }
 parking_lot.workspace = true
+quiver.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

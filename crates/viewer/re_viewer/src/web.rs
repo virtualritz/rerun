@@ -18,6 +18,7 @@ use re_viewer_context::{SystemCommand, SystemCommandSender as _, TimeControlComm
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
+use crate::saving::RrdSnapshot;
 use crate::web_history::install_popstate_listener;
 use crate::web_tools::{Callback, JsResultExt as _, StringOrStringArray};
 
@@ -54,8 +55,12 @@ impl WebHandle {
 
         let app_options: Option<AppOptions> = serde_wasm_bindgen::from_value(app_options)?;
 
-        let connection_registry =
-            re_redap_client::ConnectionRegistry::new_with_stored_credentials();
+        // Don't use persistent credentials when running tests
+        let connection_registry = if integration_test() {
+            re_redap_client::ConnectionRegistry::new_without_stored_credentials()
+        } else {
+            re_redap_client::ConnectionRegistry::new_with_stored_credentials()
+        };
 
         Ok(Self {
             runner: eframe::WebRunner::new(),
@@ -122,6 +127,33 @@ impl WebHandle {
         Ok(())
     }
 
+    /// Handle an encoded `egui_inspection` request.
+    #[wasm_bindgen]
+    pub async fn inspect(&self, request_bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
+        let egui_ctx = {
+            let Some(app) = self.runner.app_mut::<crate::App>() else {
+                return Err(JsValue::from_str("Viewer is not running"));
+            };
+            app.egui_ctx.clone()
+        };
+
+        let (reply_tx, reply_rx) = futures::channel::oneshot::channel();
+        crate::app::serve_inspect_request(
+            &egui_ctx,
+            request_bytes,
+            re_log_channel::UiCallback::new(move |result| {
+                reply_tx.send(result).ok();
+            }),
+        );
+
+        reply_rx
+            .await
+            .map_err(|_err| JsValue::from_str("Inspection request produced no reply"))?
+            .map_err(|err| {
+                JsValue::from_str(&format!("Failed to encode inspection response: {err}"))
+            })
+    }
+
     #[wasm_bindgen]
     pub fn toggle_panel_overrides(&self, value: Option<bool>) {
         let Some(mut app) = self.runner.app_mut::<crate::App>() else {
@@ -172,6 +204,51 @@ impl WebHandle {
     #[wasm_bindgen]
     pub fn destroy(&self) {
         self.runner.destroy();
+    }
+
+    /// Encode the active recording as RRD data.
+    #[wasm_bindgen]
+    pub fn save_recording(&self) -> Result<Vec<u8>, JsValue> {
+        let app = self
+            .runner
+            .app_mut::<crate::App>()
+            .ok_or_else(|| JsValue::from_str("Viewer is not running"))?;
+        let recording_id = app
+            .active_recording_id()
+            .cloned()
+            .ok_or_else(|| JsValue::from_str("No active recording to save"))?;
+        let recording = app
+            .store_hub
+            .as_ref()
+            .and_then(|store_hub| store_hub.entity_db(&recording_id))
+            .ok_or_else(|| JsValue::from_str("Active recording is unavailable"))?;
+
+        RrdSnapshot::recording(recording, None)
+            .encode()
+            .map_err(|err| JsValue::from_str(&format!("Failed to save recording: {err}")))
+    }
+
+    /// Encode the active blueprint as RRD data.
+    #[wasm_bindgen]
+    pub fn save_blueprint(&self) -> Result<Vec<u8>, JsValue> {
+        let app = self
+            .runner
+            .app_mut::<crate::App>()
+            .ok_or_else(|| JsValue::from_str("Viewer is not running"))?;
+        let recording_id = app
+            .active_recording_id()
+            .cloned()
+            .ok_or_else(|| JsValue::from_str("No active recording for blueprint"))?;
+        let blueprint = app
+            .store_hub
+            .as_ref()
+            .and_then(|store_hub| store_hub.active_blueprint_for_app(recording_id.application_id()))
+            .ok_or_else(|| JsValue::from_str("No active blueprint to save"))?;
+        let undo_state = app.state.blueprint_undo_state.get(blueprint.store_id());
+
+        RrdSnapshot::blueprint(blueprint, undo_state)
+            .and_then(RrdSnapshot::encode)
+            .map_err(|err| JsValue::from_str(&format!("Failed to save blueprint: {err}")))
     }
 
     #[wasm_bindgen]
@@ -715,8 +792,15 @@ fn create_app(
 ) -> Result<crate::App, re_renderer::RenderContextError> {
     let build_info = re_build_info::build_info!();
 
-    let app_env = crate::AppEnvironment::Web {
-        url: cc.integration_info.web_info.location.url.clone(),
+    // Don't persist storage when running tests.
+    let integration_test = integration_test();
+
+    let app_env = if integration_test {
+        crate::AppEnvironment::Test
+    } else {
+        crate::AppEnvironment::Web {
+            url: cc.integration_info.web_info.location.url.clone(),
+        }
     };
 
     let AppOptions {
@@ -759,7 +843,8 @@ fn create_app(
 
     let startup_options = crate::StartupOptions {
         location: Some(cc.integration_info.web_info.location.clone()),
-        persist_state: true,
+        // Don't persist state in integration-test mode.
+        persist_state: !integration_test,
         is_in_notebook: notebook.unwrap_or(false),
         expect_data_soon: None,
         force_wgpu_backend: render_backend.clone(),
@@ -784,25 +869,6 @@ fn create_app(
     };
     crate::customize_eframe_and_setup_renderer(cc)?;
 
-    if let Some(theme) = theme {
-        match theme.to_ascii_lowercase().as_str() {
-            "dark" => cc
-                .egui_ctx
-                .options_mut(|o| o.theme_preference = egui::ThemePreference::Dark),
-            "light" => cc
-                .egui_ctx
-                .options_mut(|o| o.theme_preference = egui::ThemePreference::Light),
-            "system" => cc
-                .egui_ctx
-                .options_mut(|o| o.theme_preference = egui::ThemePreference::System),
-            _ => {
-                re_log::warn!(
-                    "Ignoring unknown `theme` value {theme:?}; expected `dark`, `light`, or `system`."
-                );
-            }
-        }
-    }
-
     let mut app = crate::App::new(
         main_thread_token,
         build_info,
@@ -812,6 +878,26 @@ fn create_app(
         Some(connection_registry),
         AsyncRuntimeHandle::from_current_tokio_runtime_or_wasmbindgen().expect("Infallible on web"),
     );
+
+    // An explicit web option takes precedence over the restored theme preference.
+    if let Some(theme) = theme {
+        match theme.to_ascii_lowercase().as_str() {
+            "dark" => app
+                .egui_ctx
+                .options_mut(|o| o.theme_preference = egui::ThemePreference::Dark),
+            "light" => app
+                .egui_ctx
+                .options_mut(|o| o.theme_preference = egui::ThemePreference::Light),
+            "system" => app
+                .egui_ctx
+                .options_mut(|o| o.theme_preference = egui::ThemePreference::System),
+            _ => {
+                re_log::warn!(
+                    "Ignoring unknown `theme` value {theme:?}; expected `dark`, `light`, or `system`."
+                );
+            }
+        }
+    }
 
     if enable_history {
         install_popstate_listener(&mut app).ok_or_log_error();
@@ -842,6 +928,17 @@ fn create_app(
     }
 
     Ok(app)
+}
+
+/// Whether we are running inside a test.
+///
+/// Set via the `integration_test` url query param in integration tests.
+fn integration_test() -> bool {
+    let Some(search) = web_sys::window().and_then(|w| w.location().search().ok()) else {
+        return false;
+    };
+    web_sys::UrlSearchParams::new_with_str(&search)
+        .is_ok_and(|params| params.has("integration_test"))
 }
 
 /// Used to set the "email" property in the analytics config,

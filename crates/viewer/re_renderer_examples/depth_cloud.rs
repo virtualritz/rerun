@@ -132,11 +132,11 @@ impl RenderDepthClouds {
         let command_buffer = view_builder
             .queue_draw(
                 re_ctx,
-                GenericSkyboxDrawData::new(re_ctx, Default::default()),
-            )
-            .queue_draw(re_ctx, point_cloud_draw_data)
-            .queue_draw(re_ctx, frame_draw_data)
-            .queue_draw(re_ctx, image_draw_data)
+                GenericSkyboxDrawData::new(re_ctx, Default::default())?,
+            )?
+            .queue_draw(re_ctx, point_cloud_draw_data)?
+            .queue_draw(re_ctx, frame_draw_data)?
+            .queue_draw(re_ctx, image_draw_data)?
             .draw(re_ctx, re_renderer::Rgba::TRANSPARENT)?;
 
         Ok(framework::ViewDrawResult {
@@ -214,11 +214,11 @@ impl RenderDepthClouds {
         let command_buffer = view_builder
             .queue_draw(
                 re_ctx,
-                GenericSkyboxDrawData::new(re_ctx, Default::default()),
-            )
-            .queue_draw(re_ctx, depth_cloud_draw_data)
-            .queue_draw(re_ctx, frame_draw_data)
-            .queue_draw(re_ctx, image_draw_data)
+                GenericSkyboxDrawData::new(re_ctx, Default::default())?,
+            )?
+            .queue_draw(re_ctx, depth_cloud_draw_data)?
+            .queue_draw(re_ctx, frame_draw_data)?
+            .queue_draw(re_ctx, image_draw_data)?
             .draw(re_ctx, re_renderer::Rgba::TRANSPARENT)?;
 
         Ok(framework::ViewDrawResult {
@@ -441,7 +441,6 @@ impl DepthTexture {
 
 struct AlbedoTexture {
     dimensions: glam::UVec2,
-    rgba8: Vec<u8>,
     texture: GpuTexture2D,
 }
 
@@ -472,14 +471,7 @@ impl AlbedoTexture {
 
         Self {
             dimensions,
-            rgba8,
             texture,
         }
-    }
-
-    #[expect(dead_code)]
-    pub fn get(&self, x: u32, y: u32) -> [u8; 4] {
-        let p = &self.rgba8[(x + y * self.dimensions.x) as usize * 4..];
-        [p[0], p[1], p[2], p[3]]
     }
 }

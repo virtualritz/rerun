@@ -18,8 +18,8 @@ use re_sdk_types::archetypes;
 use re_sdk_types::components::Timestamp;
 
 use crate::{
-    ActiveStoreContext, BlueprintUndoState, RecordingOrTable, Route, StorageContext, StoreCache,
-    TableStore, TableStores, TimeControl, ViewClassRegistry,
+    ActiveStoreContext, BlueprintUndoState, RecordingOrLocalTable, Route, StorageContext,
+    StoreCache, TableReference, TableStore, TableStores, TimeControl, ViewClassRegistry,
 };
 
 // ---
@@ -122,9 +122,6 @@ pub struct StoreHub {
     default_blueprint_by_app_id: HashMap<ApplicationId, StoreId>,
     active_blueprint_by_app_id: HashMap<ApplicationId, StoreId>,
 
-    /// Blueprints associated with tables rather than [`ApplicationId`]
-    table_blueprints: HashMap<TableId, StoreId>,
-
     data_source_order: DataSourceOrder,
     store_bundle: StoreBundle,
     table_stores: HashMap<TableId, TableStore>,
@@ -164,27 +161,39 @@ impl DataSourceOrder {
     }
 }
 
+/// Identifies a persisted application or table blueprint.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum BlueprintPersistenceKey {
+    Recording(ApplicationId),
+    Table(Box<TableReference>),
+}
+
 /// Load a blueprint from persisted storage, e.g. disk.
 /// Returns `Ok(None)` if no blueprint is found.
 pub type BlueprintLoader =
-    dyn Fn(&ApplicationId) -> anyhow::Result<Option<StoreBundle>> + Send + Sync;
+    dyn Fn(&BlueprintPersistenceKey) -> anyhow::Result<Option<StoreBundle>> + Send + Sync;
 
 /// Save a blueprint to persisted storage, e.g. disk.
-pub type BlueprintSaver = dyn Fn(&ApplicationId, &EntityDb) -> anyhow::Result<()> + Send + Sync;
+pub type BlueprintSaver =
+    dyn Fn(&BlueprintPersistenceKey, &EntityDb) -> anyhow::Result<()> + Send + Sync;
 
 /// Validate a blueprint against the current blueprint schema requirements.
 pub type BlueprintValidator = dyn Fn(&EntityDb) -> bool + Send + Sync;
 
 /// Delete a persisted blueprint from storage, e.g. disk.
-pub type BlueprintDeleter = dyn Fn(&ApplicationId) -> anyhow::Result<()> + Send + Sync;
+pub type BlueprintDeleter = dyn Fn(&BlueprintPersistenceKey) -> anyhow::Result<()> + Send + Sync;
 
-/// How to save and load blueprints
+/// Delete all persisted table blueprints from storage.
+pub type TableBlueprintClearer = dyn Fn() -> anyhow::Result<()> + Send + Sync;
+
+/// How to save and load blueprints.
 #[derive(Default)]
 pub struct BlueprintPersistence {
     pub loader: Option<Box<BlueprintLoader>>,
     pub saver: Option<Box<BlueprintSaver>>,
     pub validator: Option<Box<BlueprintValidator>>,
     pub deleter: Option<Box<BlueprintDeleter>>,
+    pub table_blueprint_clearer: Option<Box<TableBlueprintClearer>>,
 }
 
 /// Convenient information used for `DevPanel`.
@@ -229,15 +238,7 @@ impl StoreHub {
 
     /// Used only for tests
     pub fn test_hub() -> Self {
-        Self::new(
-            BlueprintPersistence {
-                loader: None,
-                saver: None,
-                validator: None,
-                deleter: None,
-            },
-            &|_| {},
-        )
+        Self::new(BlueprintPersistence::default(), &|_| {})
     }
 
     /// Create a new [`StoreHub`].
@@ -279,7 +280,6 @@ impl StoreHub {
             store_usages: Default::default(),
 
             table_stores: TableStores::default(),
-            table_blueprints: Default::default(),
         }
     }
 
@@ -536,39 +536,10 @@ impl StoreHub {
         self.table_stores.insert(id, store)
     }
 
-    /// Register a fully-loaded blueprint store as the blueprint for a table.
-    pub fn associate_table_blueprint(
-        &mut self,
-        table_id: TableId,
-        store_id: &StoreId,
-    ) -> anyhow::Result<()> {
-        let store = self
-            .store_bundle
-            .get(store_id)
-            .with_context(|| format!("missing table blueprint store: {store_id:?}"))?;
-
-        anyhow::ensure!(
-            store.store_kind() == StoreKind::Blueprint,
-            "table blueprint store must be a blueprint store, got {:?}",
-            store.store_kind()
-        );
-
-        if let Some(old_store_id) = self.table_blueprints.insert(table_id, store_id.clone())
-            && &old_store_id != store_id
-        {
-            self.remove_store(&old_store_id);
-        }
-
-        Ok(())
-    }
-
-    /// Look up the decoded blueprint [`EntityDb`] for a table, if one was stored.
-    pub fn table_blueprint(&self, table_id: &TableId) -> Option<&EntityDb> {
-        let store_id = self.table_blueprints.get(table_id)?;
-        self.store_bundle.get(store_id)
-    }
-
-    fn remove_store(&mut self, store_id: &StoreId) {
+    /// Removes a store and its `StoreHub`-owned references.
+    ///
+    /// The caller must first remove references owned outside `StoreHub`, such as table-blueprint associations.
+    pub fn remove_store(&mut self, store_id: &StoreId) {
         _ = self.store_caches.remove(store_id);
         let removed_store = self.store_bundle.remove(store_id);
 
@@ -598,32 +569,35 @@ impl StoreHub {
             }
         }
 
-        // Drop the store itself on a separate thread,
-        // so that recursing through it and freeing the memory doesn’t block the UI thread.
-        #[allow(
-            clippy::allow_attributes,
-            clippy::disallowed_types,
-            reason = "If this thread spawn fails due to running on Wasm (or for any other reason),
-                      the error will be ignored and the store will be dropped on this thread."
-        )]
-        let (Ok(_) | Err(_)) = std::thread::Builder::new()
-            .name("drop-removed-store".into())
-            .spawn(|| {
-                re_tracing::profile_scope!("drop store");
-                drop(removed_store);
-            });
+        drop_store_off_thread(removed_store);
     }
 
-    pub fn remove(&mut self, entry: &RecordingOrTable) {
+    /// Drops a recording's data, keeping the recording in the hub under the same store id.
+    ///
+    /// The recording keeps its data source and its app keeps its blueprints, so it can be streamed
+    /// again. See [`Self::remove`] to take a recording out of the hub for good.
+    pub fn clear_recording_data(&mut self, store_id: &StoreId) {
+        let Some(slot) = self.store_bundle.get_mut(store_id) else {
+            return;
+        };
+
+        let mut empty_store = EntityDb::new(store_id.clone());
+        empty_store.data_source = slot.data_source.clone();
+        let cleared_store = std::mem::replace(slot, empty_store);
+
+        // The caches hold data derived from the chunks we drop.
+        _ = self.store_caches.remove(store_id);
+
+        drop_store_off_thread(cleared_store);
+    }
+
+    pub fn remove(&mut self, entry: &RecordingOrLocalTable) {
         match entry {
-            RecordingOrTable::Recording { store_id } => {
+            RecordingOrLocalTable::Recording { store_id } => {
                 self.remove_store(store_id);
             }
-            RecordingOrTable::Table { table_id } => {
+            RecordingOrLocalTable::LocalTable { table_id } => {
                 self.table_stores.remove(table_id);
-                if let Some(blueprint_store_id) = self.table_blueprints.remove(table_id) {
-                    self.store_bundle.remove(&blueprint_store_id);
-                }
             }
         }
     }
@@ -641,7 +615,7 @@ impl StoreHub {
             })
             .collect();
         for store in stores_to_remove {
-            self.remove(&RecordingOrTable::Recording { store_id: store });
+            self.remove(&RecordingOrLocalTable::Recording { store_id: store });
         }
     }
 
@@ -679,7 +653,6 @@ impl StoreHub {
             .retain(|store_id, _| store_ids_retained.contains(store_id));
 
         self.table_stores.clear();
-        self.table_blueprints.clear();
     }
 
     // ---------------------
@@ -1007,11 +980,11 @@ impl StoreHub {
             self.clear_active_blueprint_for_app_id(app_id);
         }
 
-        if let Some(deleter) = &self.persistence.deleter {
-            for app_id in &affected_app_ids {
-                if let Err(err) = (deleter)(app_id) {
-                    re_log::warn!("Failed to delete persisted blueprint for {app_id}: {err}");
-                }
+        for app_id in &affected_app_ids {
+            if let Err(err) =
+                self.delete_persisted_blueprint(&BlueprintPersistenceKey::Recording(app_id.clone()))
+            {
+                re_log::warn!("Failed to delete persisted blueprint for {app_id}: {err}");
             }
         }
     }
@@ -1171,11 +1144,12 @@ impl StoreHub {
     }
 
     /// Find a recording whose redap URI matches the given `uri`, ignoring fragments.
-    pub fn find_recording_by_uri(&self, uri: &re_uri::DatasetSegmentUri) -> Option<&EntityDb> {
+    pub fn find_recording_by_uri(&self, uri: &re_uri::DatasetUri) -> Option<&EntityDb> {
         self.store_bundle.recordings().find(|db| {
             db.redap_uri().is_some_and(|redap_uri| {
                 redap_uri.origin == uri.origin
                     && redap_uri.dataset_id == uri.dataset_id
+                    && redap_uri.resource == uri.resource
                     && redap_uri.segment_id == uri.segment_id
             })
         })
@@ -1203,50 +1177,48 @@ impl StoreHub {
         });
     }
 
+    /// Drops all but the latest data for every blueprint.
+    /// Preserves usable undo points in the process.
     pub fn gc_blueprints(&mut self, undo_state: &HashMap<StoreId, BlueprintUndoState>) {
         re_tracing::profile_function!();
 
-        for blueprint_id in std::iter::chain(
-            self.active_blueprint_by_app_id.values(),
-            self.default_blueprint_by_app_id.values(),
-        ) {
-            if let Some(blueprint) = self.store_bundle.get_mut(blueprint_id) {
-                if self.blueprint_last_gc.get(blueprint_id) == Some(&blueprint.generation()) {
-                    continue; // no change since last gc
-                }
-
-                let mut protected_time_ranges = IntMap::default();
-                if let Some(undo) = undo_state.get(blueprint_id)
-                    && let Some(time) = undo.oldest_undo_point()
-                {
-                    // Save everything that we could want to undo to:
-                    protected_time_ranges.insert(
-                        crate::blueprint_timeline(),
-                        AbsoluteTimeRange::new(time, re_chunk::TimeInt::MAX),
-                    );
-                }
-
-                let store_events = blueprint.gc(&GarbageCollectionOptions {
-                    // TODO(#8249): configure blueprint GC to remove an entity if all that remains of it is a recursive clear
-                    target: GarbageCollectionTarget::Everything,
-                    protect_latest: 1, // keep the latest instance of everything, or we will forget things that haven't changed in a while
-                    time_budget: re_entity_db::DEFAULT_GC_TIME_BUDGET,
-                    protected_time_ranges,
-                    protected_chunks: HashSet::default(),
-                    furthest_from: None,
-                    // There is no point in keeping old virtual indices for blueprint data.
-                    perform_deep_deletions: true,
-                });
-                if !store_events.is_empty() {
-                    re_log::debug!("Garbage-collected blueprint store");
-                    if let Some(cache) = self.store_caches.get_mut(blueprint_id) {
-                        cache.on_store_events(&store_events, blueprint);
-                    }
-                }
-
-                self.blueprint_last_gc
-                    .insert(blueprint_id.clone(), blueprint.generation());
+        for blueprint in self.store_bundle.blueprints_mut() {
+            let blueprint_id = blueprint.store_id();
+            if self.blueprint_last_gc.get(blueprint_id) == Some(&blueprint.generation()) {
+                continue; // no change since last gc
             }
+
+            let mut protected_time_ranges = IntMap::default();
+            if let Some(undo) = undo_state.get(blueprint_id)
+                && let Some(time) = undo.oldest_undo_point()
+            {
+                // Save everything that we could want to undo to:
+                protected_time_ranges.insert(
+                    crate::blueprint_timeline(),
+                    AbsoluteTimeRange::new(time, re_chunk::TimeInt::MAX),
+                );
+            }
+
+            let store_events = blueprint.gc(&GarbageCollectionOptions {
+                // TODO(#8249): configure blueprint GC to remove an entity if all that remains of it is a recursive clear
+                target: GarbageCollectionTarget::Everything,
+                protect_latest: 1, // keep the latest instance of everything, or we will forget things that haven't changed in a while
+                time_budget: re_entity_db::DEFAULT_GC_TIME_BUDGET,
+                protected_time_ranges,
+                protected_chunks: HashSet::default(),
+                furthest_from: None,
+                // There is no point in keeping old virtual indices for blueprint data.
+                perform_deep_deletions: true,
+            });
+            if !store_events.is_empty() {
+                re_log::debug!("Garbage-collected blueprint store");
+                if let Some(cache) = self.store_caches.get_mut(blueprint_id) {
+                    cache.on_store_events(&store_events, blueprint);
+                }
+            }
+
+            self.blueprint_last_gc
+                .insert(blueprint_id.clone(), blueprint.generation());
         }
     }
 
@@ -1297,36 +1269,118 @@ impl StoreHub {
 
     /// Persist any in-use blueprints to durable storage.
     pub fn save_app_blueprints(&mut self) -> anyhow::Result<()> {
-        let Some(saver) = &self.persistence.saver else {
-            return Ok(());
-        };
-
         re_tracing::profile_function!();
 
-        // Because we save blueprints based on their `ApplicationId`, we only
-        // save the blueprints referenced by `blueprint_by_app_id`, even though
-        // there may be other Blueprints in the Hub.
+        // Save only blueprints referenced by the application association map, even though the hub
+        // can contain other blueprint stores.
+        let blueprints: Vec<_> = self
+            .active_blueprint_by_app_id
+            .iter()
+            .filter(|(app_id, _)| *app_id != Self::welcome_screen_app_id())
+            .map(|(app_id, store_id)| (app_id.clone(), store_id.clone()))
+            .collect();
 
-        #[expect(clippy::iter_over_hash_type)]
-        for (app_id, blueprint_id) in &self.active_blueprint_by_app_id {
-            if app_id == Self::welcome_screen_app_id() {
-                continue; // Don't save changes to the welcome screen
-            }
-
-            let Some(blueprint) = self.store_bundle.get_mut(blueprint_id) else {
-                re_log::debug!("Failed to find blueprint {blueprint_id:?}.");
-                continue;
-            };
-            if self.blueprint_last_save.get(blueprint_id) == Some(&blueprint.generation()) {
-                continue; // no change since last save
-            }
-
-            (saver)(app_id, blueprint)?;
-            self.blueprint_last_save
-                .insert(blueprint_id.clone(), blueprint.generation());
+        for (app_id, store_id) in blueprints {
+            self.save_persisted_blueprint_if_changed(
+                &BlueprintPersistenceKey::Recording(app_id),
+                &store_id,
+            )?;
         }
 
         Ok(())
+    }
+
+    /// Load one persisted blueprint without activating it.
+    pub fn load_persisted_blueprint(
+        &self,
+        key: &BlueprintPersistenceKey,
+    ) -> anyhow::Result<Option<EntityDb>> {
+        let Some(loader) = &self.persistence.loader else {
+            return Ok(None);
+        };
+        let Some(mut bundle) = (loader)(key)? else {
+            return Ok(None);
+        };
+
+        let mut stores = bundle.drain_entity_dbs();
+        let blueprint = match (stores.next(), stores.next()) {
+            (Some(blueprint), None) if blueprint.store_kind() != StoreKind::Blueprint => Err(
+                anyhow::anyhow!("Found a recording in a persisted blueprint file"),
+            ),
+            (Some(blueprint), None)
+                if self
+                    .persistence
+                    .validator
+                    .as_ref()
+                    .is_some_and(|validator| !(validator)(&blueprint)) =>
+            {
+                Err(anyhow::anyhow!("Persisted blueprint failed validation"))
+            }
+            (Some(blueprint), None) => Ok(blueprint),
+            _ => Err(anyhow::anyhow!(
+                "Persisted blueprint file must contain exactly one store"
+            )),
+        };
+
+        match blueprint {
+            Ok(blueprint) => Ok(Some(blueprint)),
+            Err(err) => {
+                if let Err(delete_err) = self.delete_persisted_blueprint(key) {
+                    re_log::warn!("Failed to delete invalid persisted blueprint: {delete_err}");
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Mark a loaded blueprint as already persisted.
+    pub fn mark_blueprint_persisted(&mut self, store_id: &StoreId) {
+        if let Some(blueprint) = self.store_bundle.get(store_id) {
+            self.blueprint_last_save
+                .insert(store_id.clone(), blueprint.generation());
+        }
+    }
+
+    /// Save a blueprint when its generation has changed since the last save.
+    pub fn save_persisted_blueprint_if_changed(
+        &mut self,
+        key: &BlueprintPersistenceKey,
+        store_id: &StoreId,
+    ) -> anyhow::Result<()> {
+        let Some(saver) = &self.persistence.saver else {
+            return Ok(());
+        };
+        let blueprint = self
+            .store_bundle
+            .get(store_id)
+            .with_context(|| format!("Missing blueprint store: {store_id:?}"))?;
+        if blueprint.store_kind() != StoreKind::Blueprint {
+            anyhow::bail!("Store is not a blueprint: {store_id:?}");
+        }
+        if self.blueprint_last_save.get(store_id) == Some(&blueprint.generation()) {
+            return Ok(());
+        }
+
+        (saver)(key, blueprint)?;
+        self.blueprint_last_save
+            .insert(store_id.clone(), blueprint.generation());
+        Ok(())
+    }
+
+    /// Delete one persisted blueprint.
+    pub fn delete_persisted_blueprint(&self, key: &BlueprintPersistenceKey) -> anyhow::Result<()> {
+        let Some(deleter) = &self.persistence.deleter else {
+            return Ok(());
+        };
+        (deleter)(key)
+    }
+
+    /// Delete all persisted table blueprints, including blueprints for unopened tables.
+    pub fn clear_persisted_table_blueprints(&self) -> anyhow::Result<()> {
+        let Some(clearer) = &self.persistence.table_blueprint_clearer else {
+            return Ok(());
+        };
+        (clearer)()
     }
 
     /// Try to load the persisted blueprint for the given `ApplicationId`.
@@ -1335,9 +1389,10 @@ impl StoreHub {
     fn try_to_load_persisted_blueprint(&mut self, app_id: &ApplicationId) -> anyhow::Result<()> {
         re_tracing::profile_function!();
 
-        if let Some(loader) = &self.persistence.loader
-            && let Some(bundle) = (loader)(app_id)?
-        {
+        let key = BlueprintPersistenceKey::Recording(app_id.clone());
+        if let Some(blueprint) = self.load_persisted_blueprint(&key)? {
+            let mut bundle = StoreBundle::default();
+            bundle.insert(blueprint);
             self.load_blueprint_store(bundle, app_id)?;
         }
 
@@ -1393,7 +1448,6 @@ impl StoreHub {
             active_blueprint_by_app_id: _,
             store_bundle,
             table_stores,
-            table_blueprints: _,
             data_source_order: _,
             should_enable_heuristics_by_app_id: _,
 
@@ -1439,6 +1493,23 @@ impl StoreHub {
     }
 }
 
+/// Drops a store on a separate thread, so that recursing through it and freeing the memory doesn’t
+/// block the UI thread.
+fn drop_store_off_thread(store: EntityDb) {
+    #[allow(
+        clippy::allow_attributes,
+        clippy::disallowed_types,
+        reason = "If this thread spawn fails due to running on Wasm (or for any other reason),
+                  the error will be ignored and the store will be dropped on this thread."
+    )]
+    let (Ok(_) | Err(_)) = std::thread::Builder::new()
+        .name("drop-removed-store".into())
+        .spawn(|| {
+            re_tracing::profile_scope!("drop store");
+            drop(store);
+        });
+}
+
 impl MemUsageTreeCapture for StoreHub {
     #[expect(clippy::iter_over_hash_type)]
     fn capture_mem_usage_tree(&self) -> MemUsageTree {
@@ -1453,7 +1524,6 @@ impl MemUsageTreeCapture for StoreHub {
             persistence: _,
             default_blueprint_by_app_id: _,
             active_blueprint_by_app_id: _,
-            table_blueprints: _,
             data_source_order: _,
             should_enable_heuristics_by_app_id: _,
 

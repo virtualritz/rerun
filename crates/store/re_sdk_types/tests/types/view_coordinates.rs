@@ -3,9 +3,10 @@ use std::sync::Arc;
 use arrow::array::{FixedSizeListArray, UInt8Array};
 use arrow::datatypes::{DataType, Field};
 use re_sdk_types::archetypes::ViewCoordinates;
-use re_sdk_types::datatypes::{self, ViewDir};
+use re_sdk_types::encodings::{self, ViewDir};
 use re_sdk_types::{
-    Archetype as _, AsComponents as _, ComponentBatch as _, Loggable as _, components,
+    Archetype as _, ArrowDataType as _, AsComponents as _, ComponentBatch as _, FromArrow as _,
+    components,
 };
 
 #[test]
@@ -39,7 +40,7 @@ fn legacy_arrow_layout_is_compatible() {
     let legacy_datatype =
         DataType::FixedSizeList(Arc::new(Field::new("item", DataType::UInt8, false)), 3);
     assert_eq!(
-        datatypes::ViewCoordinates::arrow_datatype(),
+        encodings::ViewCoordinates::arrow_data_type(),
         legacy_datatype
     );
 
@@ -49,11 +50,11 @@ fn legacy_arrow_layout_is_compatible() {
         Arc::new(UInt8Array::from(vec![3, 2, 5])),
         None,
     );
-    let decoded = datatypes::ViewCoordinates::from_arrow(&legacy_array).unwrap();
+    let decoded = encodings::ViewCoordinates::from_arrow(&legacy_array).unwrap();
 
     assert_eq!(
         decoded,
-        vec![datatypes::ViewCoordinates([
+        vec![encodings::ViewCoordinates([
             ViewDir::Right,
             ViewDir::Down,
             ViewDir::Forward,

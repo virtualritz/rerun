@@ -109,17 +109,11 @@ impl ViewSystemRegistrator<'_> {
 
                     let visualizer_query_info = visualizer.visualizer_query_info(app_options);
 
-                    let entity_config = VisualizerEntityConfig {
-                        visualizer: T::identifier(),
-                        relevant_archetype: visualizer_query_info.relevant_archetype,
-                        constraints: Arc::new(visualizer_query_info.constraints),
-                        known_builtin_enum_components,
-                    };
-
                     VisualizerTypeRegistryEntry {
                         factory_method: Box::new(|| Box::<T>::default()),
                         used_by: Default::default(),
-                        entity_config,
+                        query_info: Arc::new(visualizer_query_info),
+                        known_builtin_enum_components,
                     }
                 })
                 .used_by
@@ -193,8 +187,9 @@ struct VisualizerTypeRegistryEntry {
     factory_method: Box<dyn Fn() -> Box<dyn VisualizerSystem> + Send + Sync>,
     used_by: HashSet<ViewClassIdentifier>,
 
-    /// Configuration data for building per-store [`VisualizerEntitySubscriber`] instances.
-    entity_config: VisualizerEntityConfig,
+    /// Query metadata shared by querying and per-store entity subscribers.
+    query_info: Arc<crate::VisualizerQueryInfo>,
+    known_builtin_enum_components: Arc<IntSet<ComponentType>>,
 }
 
 /// Registry of all known view types.
@@ -209,6 +204,25 @@ pub struct ViewClassRegistry {
 }
 
 impl ViewClassRegistry {
+    /// Returns the visualizability constraints registered for a visualizer.
+    pub fn visualizer_constraints(
+        &self,
+        visualizer: ViewSystemIdentifier,
+    ) -> Option<&crate::VisualizabilityConstraints> {
+        self.visualizer_query_info(visualizer)
+            .map(|query_info| &query_info.constraints)
+    }
+
+    /// Returns the query metadata registered for a visualizer.
+    pub fn visualizer_query_info(
+        &self,
+        visualizer: ViewSystemIdentifier,
+    ) -> Option<&crate::VisualizerQueryInfo> {
+        self.visualizers
+            .get(&visualizer)
+            .map(|entry| entry.query_info.as_ref())
+    }
+
     /// Adds a new view class.
     ///
     /// Fails if a view class with the same name was already registered.
@@ -307,26 +321,6 @@ impl ViewClassRegistry {
         Ok(())
     }
 
-    /// Removes a view class from the registry.
-    pub fn remove_class<T: ViewClass + Sized>(&mut self) -> Result<(), ViewClassRegistryError> {
-        let identifier = T::identifier();
-        if self.view_classes.remove(&identifier).is_none() {
-            return Err(ViewClassRegistryError::UnknownClassIdentifier(identifier));
-        }
-
-        self.context_systems.retain(|_, context_system_entry| {
-            context_system_entry.used_by.remove(&identifier);
-            !context_system_entry.used_by.is_empty()
-        });
-
-        self.visualizers.retain(|_, visualizer_entry| {
-            visualizer_entry.used_by.remove(&identifier);
-            !visualizer_entry.used_by.is_empty()
-        });
-
-        Ok(())
-    }
-
     /// Registers an additional [`ViewContextSystem`] for a view class.
     ///
     /// Usually, context systems are registered in [`ViewClass::on_register`] which is called when
@@ -417,14 +411,26 @@ impl ViewClassRegistry {
 
     /// Create a set of empty entity subscribers for a new store.
     ///
-    /// Each subscriber is built from the config stored in the registry,
-    /// with empty per-store data.
+    /// Each subscriber is built from the registered query metadata with empty per-store data.
     pub fn create_entity_subscribers(
         &self,
     ) -> IntMap<ViewSystemIdentifier, VisualizerEntitySubscriber> {
         self.visualizers
             .iter()
-            .map(|(id, entry)| (*id, entry.entity_config.create_subscriber()))
+            .map(|(id, entry)| {
+                (
+                    *id,
+                    VisualizerEntityConfig {
+                        visualizer: *id,
+                        relevant_archetype: entry.query_info.relevant_archetype,
+                        constraints: Arc::new(entry.query_info.constraints.clone()),
+                        known_builtin_enum_components: Arc::clone(
+                            &entry.known_builtin_enum_components,
+                        ),
+                    }
+                    .create_subscriber(),
+                )
+            })
             .collect()
     }
 

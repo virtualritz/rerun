@@ -12,8 +12,8 @@ a 2D RGB Image, the shape would be `[height, width, channel]`.
 These dimensions are combined with an index to look up values from the `buffer` field,
 which stores a contiguous array of typed values.
 
-## Rerun datatype
-[`TensorData`](../datatypes/tensor_data.md)
+## Rerun encoding
+[`TensorData`](../encodings/tensor_data.md)
 
 
 ## Arrow datatype
@@ -48,3 +48,4 @@ Struct(
 
 * [`BarChart`](../archetypes/bar_chart.md)
 * [`Tensor`](../archetypes/tensor.md)
+* [`Volume3D`](../archetypes/volume3d.md?speculative-link)

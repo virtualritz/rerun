@@ -2,21 +2,27 @@ use re_data_source::{LogDataSource, LogDataSourceAnalytics};
 use re_entity_db::LogSource;
 use re_log_channel::{LogReceiver, RecordingOpenBehavior};
 use re_log_encoding::RrdMetadata;
-use re_log_types::StoreId;
-use re_viewer_context::{StoreHub, SystemCommand, SystemCommandSender as _};
+use re_log_types::{EntryId, StoreId};
+use re_uri::DatasetUri;
+use re_viewer_context::{Route, StoreHub, SystemCommand, SystemCommandSender as _};
 
 use super::App;
 
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use re_protos::cloud::v1alpha1::ext::DataSource;
 use re_protos::common::v1alpha1::ext::{IfDuplicateBehavior, SegmentId};
 
+const REGISTRATION_TIMEOUT: Duration = Duration::from_mins(1);
+
 impl App {
-    #[expect(clippy::needless_pass_by_ref_mut)]
     pub fn add_log_receiver(&mut self, rx: LogReceiver) {
         re_log::debug!("Adding new log receiver: {}", rx.source());
+        self.state
+            .last_loading_error
+            .retain(|source, _| !source.is_same_ignoring_uri_fragments(rx.source()));
 
         // Make sure we wake up when a new message is available:
         rx.set_waker({
@@ -101,6 +107,8 @@ impl App {
 
             LogDataSource::File {
                 path,
+                #[cfg(not(target_arch = "wasm32"))]
+                assets,
                 #[cfg(target_arch = "wasm32")]
                 file,
                 ..
@@ -109,6 +117,8 @@ impl App {
                     self.register_via_internal_catalog(
                         path,
                         data_source.analytics(),
+                        #[cfg(not(target_arch = "wasm32"))]
+                        assets,
                         #[cfg(target_arch = "wasm32")]
                         file.clone(),
                     );
@@ -122,9 +132,8 @@ impl App {
                         .and_then(|ext| ext.to_str())
                         .is_some_and(|ext| ext.eq_ignore_ascii_case("rrd"))
                     {
-                        // TODO(RR-5258): Remove this hint when the Viewer catalog is enabled by default.
                         re_log::error!(
-                            "Failed to load file: this file is larger than the web Viewer's 4 GiB direct-load limit. Enable \"Load files via Viewer catalog\" in Settings, then open the file again.\nFile path: {}",
+                            "Failed to load file: this file is larger than the web Viewer's 4 GiB direct-load limit. Under Settings → Viewer catalog, enable \"Load files via Viewer catalog\", then open the file again.\nFile path: {}",
                             path.display()
                         );
                     } else {
@@ -173,10 +182,14 @@ impl App {
             }
 
             LogDataSource::RedapDatasetSegment { uri, open_behavior } => {
+                let Some(store_id) = uri.store_id() else {
+                    re_log::error!(?uri, "Cannot load a dataset that names no segment");
+                    return;
+                };
+
                 let new_source = LogSource::RedapGrpcStream {
                     uri: uri.clone(),
                     open_behavior: *open_behavior,
-                    table_blueprint: None,
                 };
                 if all_sources.any(|source| source.is_same_ignoring_uri_fragments(&new_source)) {
                     // We're already receiving from the exact same data source!
@@ -185,7 +198,7 @@ impl App {
                     match *open_behavior {
                         RecordingOpenBehavior::Background => {}
                         RecordingOpenBehavior::Open => {
-                            store_hub.set_opened(&uri.store_id(), true);
+                            store_hub.set_opened(&store_id, true);
                         }
                         RecordingOpenBehavior::OpenAndSelect => {
                             // First make the recording itself active.
@@ -193,17 +206,13 @@ impl App {
                             // since `go_to_dataset_data` does not change the active recording.
                             // `make_store_active_and_highlight` also fetches the blueprint we skipped
                             // while this was a preview.
-                            self.make_store_active_and_highlight(
-                                store_hub,
-                                egui_ctx,
-                                &uri.store_id(),
-                            );
+                            self.make_store_active_and_highlight(store_hub, egui_ctx, &store_id);
                         }
                     }
 
                     // Note that applying the fragment changes the per-recording settings like the active time cursor.
                     // Therefore, we apply it even when open_behavior is Background.
-                    self.go_to_dataset_data(uri.store_id(), uri.fragment.clone());
+                    self.go_to_dataset_data(store_id, uri.fragment.clone());
 
                     return;
                 }
@@ -247,7 +256,14 @@ impl App {
         match stream {
             Ok(rx) => self.add_log_receiver(rx),
             Err(err) => {
-                re_log::error!("Failed to open data source: {}", re_error::format(err));
+                let error = re_error::format(err);
+                if let Route::Loading(source) = self.state.navigation.current() {
+                    self.state
+                        .last_loading_error
+                        .insert(source.as_ref().clone(), error);
+                } else {
+                    re_log::error!("Failed to open data source: {error}");
+                }
             }
         }
     }
@@ -289,6 +305,93 @@ impl App {
         }
     }
 
+    /// Streams every segment of a dataset that the viewer already has again.
+    ///
+    /// Segments keep their store id, so the route, blueprint and time cursor survive. Their data is
+    /// dropped first, so data the server no longer serves goes with it.
+    pub(super) fn reload_dataset_segments(
+        &mut self,
+        store_hub: &mut StoreHub,
+        origin: &re_uri::Origin,
+        dataset_id: EntryId,
+        unregistered_asset: Option<&SegmentId>,
+    ) {
+        let mut segments: Vec<(DatasetUri, StoreId, RecordingOpenBehavior)> = Vec::new();
+
+        // The recording of the unregistered asset, if the viewer has it open.
+        let mut asset_to_close: Option<StoreId> = None;
+
+        for db in store_hub.store_bundle().recordings() {
+            let Some(LogSource::RedapGrpcStream { uri, open_behavior }) = &db.data_source else {
+                continue;
+            };
+
+            if uri.origin != *origin || EntryId::from(uri.dataset_id) != dataset_id {
+                continue;
+            }
+
+            // A uri that names no segment is the dataset itself, which has nothing to reload.
+            let Some(store_id) = uri.store_id() else {
+                continue;
+            };
+
+            if let Some(unregistered_asset) = unregistered_asset
+                && uri.resource == re_uri::DatasetResource::Assets
+                && uri.segment_id.as_ref() == Some(unregistered_asset)
+            {
+                asset_to_close = Some(store_id);
+                continue;
+            }
+
+            segments.push((uri.clone(), store_id, *open_behavior));
+        }
+
+        // The server dropped the segment the asset was streamed from, so there is nothing left to
+        // show.
+        if let Some(store_id) = asset_to_close {
+            self.command_sender
+                .send_system(SystemCommand::CloseRecordingOrTable(store_id.into()));
+        }
+
+        for (uri, store_id, open_behavior) in segments {
+            // Reusing the source keeps this one segment where the viewer keys off it, like the
+            // recording panel.
+            let source = LogSource::RedapGrpcStream {
+                uri: uri.clone(),
+                open_behavior,
+            };
+
+            let data_source = LogDataSource::RedapDatasetSegment {
+                uri: uri.clone(),
+                open_behavior,
+            };
+
+            match data_source.stream_with_options(
+                &self.async_runtime,
+                Self::auth_error_handler(self.command_sender.clone()),
+                &self.connection_registry,
+                // Downloading the blueprint again would throw away the user's edits.
+                re_redap_client::StreamingOptions {
+                    download: re_redap_client::SegmentDownload::SEGMENT,
+                    ..Default::default()
+                },
+            ) {
+                Ok(rx) => {
+                    // Anything still streaming into this store started before the change.
+                    self.rx_log.remove(&source);
+                    store_hub.clear_recording_data(&store_id);
+                    self.add_log_receiver(rx);
+                }
+                Err(err) => {
+                    re_log::error!(
+                        "Failed to reload segment, leaving it as it is: {}\nSegment: {uri}",
+                        re_error::format(err)
+                    );
+                }
+            }
+        }
+    }
+
     /// Makes the first recording store active that is found for a given data source if any.
     fn try_make_recording_from_source_active(
         &mut self,
@@ -304,25 +407,28 @@ impl App {
     }
 
     fn should_register_via_internal_catalog(&self, path: &Path) -> bool {
-        // TODO(RR-5309): Keep `.rbl` files on the legacy importer until the server supports
-        // blueprint management and catalog registration can preserve `ApplicationId` retargeting.
         path.extension()
             .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("rrd"))
-            && self.app_options().experimental.use_internal_catalog
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("rrd") || ext.eq_ignore_ascii_case("rbl"))
+            && self.app_options().use_viewer_catalog
             && self.connection_registry.internal_origin().is_some()
     }
 
     /// Registers a file with the internal catalog, then opens the segment it produced.
+    ///
+    /// Assets from the data source are registered with the same dataset.
     fn register_via_internal_catalog(
         &self,
         path: &Path,
         data_source_analytics: LogDataSourceAnalytics,
+        #[cfg(not(target_arch = "wasm32"))] assets: &[std::path::PathBuf],
         #[cfg(target_arch = "wasm32")] file: web_sys::File,
     ) {
         let connection_registry = self.connection_registry.clone();
         let sender = self.command_sender.clone();
         let path = path.to_owned();
+        #[cfg(not(target_arch = "wasm32"))]
+        let assets = assets.to_vec();
         self.async_runtime.spawn_future(async move {
             let registration = register_file(
                 &connection_registry,
@@ -331,8 +437,17 @@ impl App {
                 file,
             )
             .await;
+
+            // Register the assets before opening the segment, so the segment streams with its
+            // asset layers.
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Ok(target) = &registration {
+                super::assets::register_assets(&connection_registry, &sender, target, &assets)
+                    .await;
+            }
+
             match registration {
-                Ok(uri) => {
+                Ok(RegistrationTarget::DatasetSegment(uri)) => {
                     record_catalog_load_analytics(data_source_analytics, Some("internal"), true);
                     // Refresh the dataset if it is open.
                     sender.send_system(SystemCommand::RefreshRedapEntry {
@@ -341,10 +456,24 @@ impl App {
                     });
                     sender.send_system(SystemCommand::LoadDataSource(
                         LogDataSource::RedapDatasetSegment {
-                            uri,
+                            uri: *uri,
                             open_behavior: RecordingOpenBehavior::OpenAndSelect,
                         },
                     ));
+                }
+                Ok(RegistrationTarget::Entry(entry_id)) => {
+                    record_catalog_load_analytics(data_source_analytics, Some("internal"), true);
+                    if let Some(origin) = connection_registry.internal_origin() {
+                        sender.send_system(SystemCommand::RefreshRedapEntry {
+                            origin: origin.clone(),
+                            entry_id,
+                        });
+                        let entry = re_uri::EntryUri::new(origin, entry_id);
+                        sender.send_system(SystemCommand::set_selection(
+                            re_viewer_context::Item::from(entry.clone()),
+                        ));
+                        sender.send_system(SystemCommand::SetRoute(entry.into()));
+                    }
                 }
                 Err(err) => {
                     record_catalog_load_analytics(data_source_analytics, Some("internal"), false);
@@ -387,7 +516,7 @@ async fn register_file(
     connection_registry: &re_redap_client::ConnectionRegistryHandle,
     path: &Path,
     #[cfg(target_arch = "wasm32")] file: web_sys::File,
-) -> anyhow::Result<re_uri::DatasetSegmentUri> {
+) -> anyhow::Result<RegistrationTarget> {
     #[cfg(not(target_arch = "wasm32"))]
     let (reader, abs_path) = {
         let abs_path = std::path::absolute(path).with_context(|| {
@@ -445,11 +574,8 @@ async fn copy_to_opfs(
     })?;
     let fingerprint = re_log_encoding::RrdFingerprint::compute_for_rrd(reader)
         .await
-        .with_context(|| format!("failed to fingerprint RRD\nFile path: {}", path.display()))?
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+        .with_context(|| format!("failed to fingerprint RRD\nFile path: {}", path.display()))?;
+    let fingerprint = re_log_encoding::sha256_to_hex(fingerprint.as_bytes());
     let file_name = path
         .file_name()
         .filter(|file_name| !file_name.is_empty())
@@ -507,12 +633,21 @@ async fn opfs_upload_matches(path: &Path, expected_size: u64) -> anyhow::Result<
     }
 }
 
+/// Depending on the content of the file, we want to navigate to different parts of the catalog.
+pub enum RegistrationTarget {
+    /// Whenever there is a recording in the file.
+    DatasetSegment(Box<re_uri::DatasetUri>),
+
+    /// Used when there is no recording, e.g. in an `.rbl` file.
+    Entry(EntryId),
+}
+
 /// Register a `file://` URL the server can read with the internal catalog.
 async fn register_rrd_file_url(
     connection_registry: &re_redap_client::ConnectionRegistryHandle,
     file_url: url::Url,
     rrd_metadata: re_log_encoding::RrdMetadata,
-) -> anyhow::Result<re_uri::DatasetSegmentUri> {
+) -> anyhow::Result<RegistrationTarget> {
     let application_id = rrd_metadata
         .store_ids
         .first()
@@ -529,104 +664,123 @@ async fn register_rrd_file_url(
         );
     }
 
-    let origin = connection_registry
-        .internal_origin()
+    let connection = connection_registry
+        .internal_connection_handle()
         .context("internal catalog is not running")?;
-    let mut client = connection_registry.client(origin.clone()).await?;
+    let origin = connection.origin().clone();
     let data_source = DataSource::new_rrd_url(file_url);
     let dataset_name = re_log_types::EntryName::from(application_id.clone());
 
-    // TODO(RR-5309): Handle RRDs without recording stores as standalone blueprints.
-    let (dataset_id, segment_id) = client
-        .ensure_dataset_and_register(
-            &dataset_name,
-            vec![data_source.clone()],
-            IfDuplicateBehavior::Overwrite,
-        )
+    // If there are recordings in the file, register them with the dataset.
+    // Otherwise, create the dataset so it can hold the blueprints.
+    let dataset_id = connection
+        .client()
+        .await?
+        .find_or_create_dataset(&dataset_name)
         .await?;
+    let segment_id = if rrd_metadata.store_ids.iter().any(StoreId::is_recording) {
+        connection
+            .register_with_dataset(
+                dataset_id,
+                vec![data_source.clone()],
+                IfDuplicateBehavior::Overwrite,
+            )
+            .await?
+            .wait(REGISTRATION_TIMEOUT)
+            .await?
+            .into_iter()
+            .next()
+            .context("server did not successfully register any recording segments")?
+            .into()
+    } else {
+        None
+    };
 
-    if let Err(err) = update_default_blueprint(
-        &mut client,
+    if let Err(err) = register_blueprints(
+        &connection,
         dataset_id,
-        &segment_id,
         data_source,
         &rrd_metadata,
+        application_id,
     )
     .await
     {
-        re_log::warn!("Failed to update default blueprint for catalog RRD load: {err:#}");
+        re_log::warn!("Failed to register blueprints for catalog RRD load: {err:#}");
     }
 
-    Ok(re_uri::DatasetSegmentUri {
-        origin,
-        dataset_id: dataset_id.id,
-        segment_id,
-        fragment: Default::default(),
-    })
+    if let Some(segment_id) = segment_id {
+        let uri = DatasetUri {
+            origin,
+            dataset_id: dataset_id.id,
+            resource: re_uri::DatasetResource::Segments,
+            segment_id: Some(segment_id),
+            fragment: Default::default(),
+        };
+        Ok(RegistrationTarget::DatasetSegment(Box::new(uri)))
+    } else {
+        Ok(RegistrationTarget::Entry(dataset_id))
+    }
 }
 
-/// Registers the recording's embedded default blueprint (if any) into the dataset's hidden
-/// blueprint dataset and records it as the dataset's default blueprint segment.
+/// Registers all embedded blueprints into the dataset's hidden blueprint dataset.
 ///
-/// The blueprint lives in the same RRD, so we register the same `file://` URL into the blueprint
-/// dataset; the server picks out the blueprint store and serves it lazily.
-async fn update_default_blueprint(
-    client: &mut re_redap_client::ConnectionClient,
-    dataset_id: re_log_types::EntryId,
-    segment_id: &SegmentId,
+/// The blueprint stores live in the same RRD, so the server can select and serve them lazily from
+/// the same data source.
+async fn register_blueprints(
+    connection: &re_redap_client::ConnectionHandle,
+    dataset_id: EntryId,
     data_source: DataSource,
-    rrd_metadata: &re_log_encoding::RrdMetadata,
+    rrd_metadata: &RrdMetadata,
+    application_id: &re_log_types::ApplicationId,
 ) -> anyhow::Result<()> {
-    // TODO(RR-5309): Register embedded blueprints that lack a `make_default` command once the
-    // server supports blueprint management.
-    if rrd_metadata.default_blueprint_by_app_id.is_empty() {
+    if !rrd_metadata.store_ids.iter().any(StoreId::is_blueprint) {
         return Ok(());
     }
 
-    let Some(recording_store_id) = rrd_metadata.store_ids.iter().find(|store_id| {
-        store_id.is_recording() && SegmentId::from(store_id.recording_id()) == *segment_id
-    }) else {
-        re_log::warn!("Could not match registered segment {segment_id} to an RRD recording store");
-        return Ok(());
-    };
-
-    let Some(default_blueprint_store_id) = rrd_metadata
-        .default_blueprint_by_app_id
-        .get(recording_store_id.application_id())
-    else {
-        return Ok(());
-    };
-
+    let mut client = connection.client().await?;
     let mut dataset_details = client.read_dataset_entry(dataset_id).await?.dataset_details;
     let Some(blueprint_dataset_id) = dataset_details.blueprint_dataset else {
-        re_log::warn!(
-            "Dataset {dataset_id} has no hidden blueprint dataset; cannot set default blueprint"
-        );
+        re_log::warn!("Dataset {dataset_id} has no hidden blueprint dataset");
         return Ok(());
     };
 
-    let expected_blueprint_segment_id = SegmentId::from(default_blueprint_store_id.recording_id());
-    let (_trace_id, tasks) = client
+    let registration = connection
         .register_with_dataset(
             blueprint_dataset_id,
             vec![data_source],
             IfDuplicateBehavior::Overwrite,
         )
         .await?;
+    let segment_ids = registration.wait(REGISTRATION_TIMEOUT).await?;
 
-    if !tasks
-        .iter()
-        .any(|task| task.segment_id == expected_blueprint_segment_id)
-    {
+    let Some(default_blueprint_store_id) =
+        rrd_metadata.default_blueprint_by_app_id.get(application_id)
+    else {
+        if !rrd_metadata.default_blueprint_by_app_id.is_empty() {
+            let blueprint_application_ids = rrd_metadata
+                .default_blueprint_by_app_id
+                .keys()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            re_log::warn!(
+                "RRD contains default blueprints for application ids [{blueprint_application_ids}], \
+                 but not for dataset application id {application_id}; keeping the existing default blueprint"
+            );
+        }
+        return Ok(());
+    };
+
+    let default_blueprint_segment_id = SegmentId::from(default_blueprint_store_id.recording_id());
+    if !segment_ids.contains(&default_blueprint_segment_id) {
         re_log::warn!(
             "Registered RRD into the blueprint dataset, but default blueprint segment \
-             {expected_blueprint_segment_id} was not returned; keeping the existing default blueprint"
+             {default_blueprint_segment_id} was not returned; keeping the existing default blueprint"
         );
         return Ok(());
     }
 
-    dataset_details.default_blueprint_segment = Some(expected_blueprint_segment_id);
-
+    dataset_details.default_blueprint_segment = Some(default_blueprint_segment_id);
     client
         .update_dataset_entry(dataset_id, dataset_details)
         .await?;

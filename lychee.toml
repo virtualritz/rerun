@@ -85,12 +85,18 @@ exclude_path = [
 ]
 # Exclude URLs and mail addresses from checking (supports regex).
 exclude = [
-  # Skip speculative links
+  # Skip speculative links.
+  #
+  # Append `?speculative-link` to a link that is correct but not live yet,
+  # e.g. a rerun.io/docs page added by the same PR, or an API reference for an
+  # unreleased type. The release process strips these markers again,
+  # see the "Clean up documentation links" step in `RELEASES.md`.
   '.*?speculative-link',
 
   # Strings with replacements.
   '/__VIEWER_VERSION__/', # Replacement variable __VIEWER_VERSION__.
   '/\$', # Replacement variable $.
+  '\$pr_number', # Shell variable in release workflow.
   '\$$', # URL ending in `$`: stripped template variable (e.g. `${{ inputs.X }}`).
   '/GIT_HASH/', # Replacement variable GIT_HASH.
   '\{\}', # Ignore links with string interpolation.
@@ -125,20 +131,35 @@ exclude = [
   'https://github.com/rerun-io/rerun/issues/\.*', # Ignore links to our own issues.
 
   # Intentionally faked links.
+  'https?://(rerun|example)\.invalid/.*', # URL-rendering tests in re_ui notifications.
+  'mailto:help@example\.invalid', # URL-rendering tests in re_ui notifications.
+  '^https://github/$',
   'file:///does/not/exist.rrd',
   'file:///path/to/file',
   'file:///tmp/droidnano/Fri_Aug_18_09:46:43_2023.rrd',
-  'file://cors.json', # AWS CLI `--cors-configuration file://…` syntax in BUCKET_CORS.md, not a real link.
+  'file://cors.json', # AWS CLI `--cors-configuration file://…` syntax in docs/content/hub/bucket-cors.md, not a real link.
   'file://foo',
   'file://path/to/file.rrd',
   'file://somehost/file/path.rrd',
   'http://foo.*',
   'http://x/',
-  'https://x/',
   'https://foo.*',
+  'https://github\.com/rerun-io/rerun/n',
   'https://link.to',
+  'https://private-user-images\.githubusercontent\.com/demo\.mp4\?x=1&y=2',
   'https://rerun.rs',
+  'https://private-user-images.githubusercontent.com/123/456/demo.mp4.*',
+  'https://static.rerun.io/demo.mp4',
   'https://static.rerun.io/my_screenshot/',
+  'https://static/',
+  'https://static\.rerun\.io/abc_github-01234567\.mp4',
+  'https://static\.rerun\.io/commented\.mp4',
+  'https://static\.rerun\.io/demo\.mp4',
+  'https://static\.rerun\.io/demo\.mp4/n',
+  'https://static\.rerun\.io/example\.mp4',
+  'https://static\.rerun\.io/hash_demo\.mp4',
+  'https://user-images/',
+  'https://x/',
   'https://your-hosted-asset-url.com/re_viewer_bg.wasm',
   'https://your-hosted-asset-url.com/widget.js',
   'rerun://localhost:51234/recording/some-recording-id',
@@ -152,6 +173,11 @@ exclude = [
   'file:///uri1.rrd',
   'file:///uri2.rrd',
   'file:///recordings/data.rrd', # Example URL in the url-pill tests.
+
+  # Fake URLs in the `extract_standalone_url` tests in `re_ui`'s `ui_layout.rs`.
+  'file:///tmp/recording\.rrd',
+  'h2c://example\.com/path',
+  '^https://exam/$', # Lychee truncates the test string `https://exam\tple.com` at the tab.
 
   # Link fragments and data links in examples.
   'https://raw.githubusercontent.com/googlefonts/noto-emoji/', # URL fragment.
@@ -180,6 +206,7 @@ exclude = [
   'https://www.shadertoy.com/*', # 403 on CI
   'https://www.tensorflow.org/*', # tensorflow.org apparently blocks CI.
   'https://www.unicode.org/license.txt', # Gives network error on CI.
+  'https://www\.image-engineering\.de/library/technotes/714-color-spaces-rec-709-vs-srgb', # Two consecutive CI runs had their connections reset by the server.
 
   # `CHANGELOG.md` links to a release's changeset page, which only goes live with the docs deploy
   # that follows the release — so the newest links 404 until then.

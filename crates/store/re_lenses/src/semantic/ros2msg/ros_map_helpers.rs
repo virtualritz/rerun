@@ -3,10 +3,10 @@ use std::sync::Arc;
 use arrow::array::{
     Array as _, ArrayRef, Int8Array, ListArray, ListBuilder, StructArray, UInt8Builder, UInt32Array,
 };
-use re_lenses_core::combinators::Error;
-use re_sdk_types::Loggable as _;
+use re_lenses_core::combinators::{Error, try_downcast};
+use re_sdk_types::ToArrow as _;
 use re_sdk_types::components::{Colormap, ImageFormat};
-use re_sdk_types::datatypes::{ChannelDatatype, ColorModel};
+use re_sdk_types::encodings::{ChannelDatatype, ColorModel};
 
 use crate::semantic::helpers::get_field_as;
 
@@ -21,28 +21,13 @@ pub(crate) fn map_buffer_to_image_buffer(
     height_field: &'static str,
 ) -> impl Fn(&ArrayRef) -> Result<Option<ArrayRef>, Error> + Send + Sync {
     move |source: &ArrayRef| {
-        let source = source
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .ok_or_else(|| Error::TypeMismatch {
-                expected: "StructArray".to_owned(),
-                actual: source.data_type().clone(),
-                context: "map_buffer_to_image_buffer input".to_owned(),
-            })?;
+        let source = try_downcast::<StructArray>(source, "map_buffer_to_image_buffer input")?;
 
         let data = get_field_as::<ListArray>(source, "data")?;
         let metadata = get_field_as::<StructArray>(source, metadata_field)?;
         let width = get_field_as::<UInt32Array>(&metadata, width_field)?;
         let height = get_field_as::<UInt32Array>(&metadata, height_field)?;
-        let values = data
-            .values()
-            .as_any()
-            .downcast_ref::<Int8Array>()
-            .ok_or_else(|| Error::TypeMismatch {
-                expected: "Int8Array".to_owned(),
-                actual: data.values().data_type().clone(),
-                context: "map_buffer_to_image_buffer values".to_owned(),
-            })?;
+        let values = try_downcast::<Int8Array>(data.values(), "map_buffer_to_image_buffer values")?;
 
         ros_map_buffer_to_image_buffer(source, &data, &metadata, &width, &height, |builder, idx| {
             // Preserve ROS occupancy byte conventions, in particular `-1 -> 255` for unknown cells.
@@ -56,14 +41,8 @@ pub(crate) fn map_buffer_to_image_buffer(
 pub(crate) fn map_dimensions_to_l8_image_format()
 -> impl Fn(&ArrayRef) -> Result<Option<ArrayRef>, Error> + Send + Sync {
     move |source: &ArrayRef| {
-        let source = source
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .ok_or_else(|| Error::TypeMismatch {
-                expected: "StructArray".to_owned(),
-                actual: source.data_type().clone(),
-                context: "map_dimensions_to_l8_image_format input".to_owned(),
-            })?;
+        let source =
+            try_downcast::<StructArray>(source, "map_dimensions_to_l8_image_format input")?;
 
         let width_array = get_field_as::<UInt32Array>(source, "width")?;
         let height_array = get_field_as::<UInt32Array>(source, "height")?;
@@ -78,7 +57,7 @@ pub(crate) fn map_dimensions_to_l8_image_format()
             })
             .collect();
 
-        ImageFormat::to_arrow_opt(formats.iter().map(Some))
+        ImageFormat::to_arrow(formats.iter())
             .map(Some)
             .map_err(|err| Error::Other(err.to_string()))
     }
@@ -91,7 +70,7 @@ pub(crate) fn default_ros_map_colormap(
 ) -> impl Fn(&ArrayRef) -> Result<Option<ArrayRef>, Error> + Send + Sync {
     move |source: &ArrayRef| {
         let len = source.len();
-        Colormap::to_arrow_opt(std::iter::repeat_n(Some(colormap), len))
+        Colormap::to_arrow(std::iter::repeat_n(colormap, len))
             .map(Some)
             .map_err(|err| Error::Other(err.to_string()))
     }

@@ -108,9 +108,11 @@ mod webcodecs;
 pub use webcodecs::WebVideoFrame;
 
 mod rvl_decoder;
+mod tiff_decoder;
 
 use crate::{
-    FrameNumber, SampleIndex, Time, VideoDataDescription, player::VideoPlaybackIssueSeverity,
+    FrameNumber, SampleIndex, Time, VideoDataDescription, VideoSource,
+    player::VideoPlaybackIssueSeverity,
 };
 
 #[derive(thiserror::Error, Debug, Clone, re_byte_size::SizeBytes)]
@@ -288,6 +290,15 @@ pub fn new_decoder(
                             Box::new(rvl_decoder::RvlDecoder),
                             output_sender,
                         )))
+                    } else if video.image_codec_mime_type() == Some("image/tiff") {
+                        // Must be matched before `WebImageDecoder`: browsers can't decode TIFF,
+                        // and its CPU fallback (the `image` crate) can't represent
+                        // single-channel floating point images.
+                        Ok(Box::new(sync_decoder_wrapper::SyncDecoderWrapper::new(
+                            "tiff decoder".to_owned(),
+                            Box::new(tiff_decoder::TiffDecoder),
+                            output_sender,
+                        )))
                     } else if let Some(decoder) =
                         web_image_decoder::WebImageDecoder::try_new(video, output_sender.clone())
                     {
@@ -317,7 +328,10 @@ pub fn new_decoder(
                         re_log::trace!("Decoding AV1…");
                         return Ok(Box::new(sync_decoder_wrapper::SyncDecoderWrapper::new(
                             debug_name.to_owned(),
-                            Box::new(av1::SyncDav1dDecoder::new(debug_name.to_owned())?),
+                            Box::new(av1::SyncDav1dDecoder::new(
+                                debug_name.to_owned(),
+                                decode_settings.allow_slow_av1_decoding,
+                            )?),
                             output_sender,
                         )));
                     }
@@ -340,6 +354,15 @@ pub fn new_decoder(
                         Ok(Box::new(sync_decoder_wrapper::SyncDecoderWrapper::new(
                             "rvl decoder".to_owned(),
                             Box::new(rvl_decoder::RvlDecoder),
+                            output_sender,
+                        )))
+                    } else if video.image_codec_mime_type() == Some("image/tiff") {
+                        // Must be matched before `SyncImageDecoder`, which also accepts TIFF
+                        // but decodes through the `image` crate, which can't represent
+                        // single-channel floating point images.
+                        Ok(Box::new(sync_decoder_wrapper::SyncDecoderWrapper::new(
+                            "tiff decoder".to_owned(),
+                            Box::new(tiff_decoder::TiffDecoder),
                             output_sender,
                         )))
                     } else if let Some(decoder) = image_decoder::SyncImageDecoder::try_new(video) {
@@ -393,6 +416,12 @@ pub struct Chunk {
     /// Do *not* use this to index into the video data description!
     /// Use [`Self::sample_idx`] instead.
     pub frame_nr: FrameNumber,
+
+    /// Where the sample this chunk came from has its bytes.
+    ///
+    /// This identifies the sample no matter where it ends up in the video data description,
+    /// unlike [`Self::sample_idx`] which shifts whenever samples are inserted or removed before it.
+    pub source: VideoSource,
 
     /// Decode timestamp of this sample.
     /// Chunks are expected to be submitted in the order of decode timestamp.
@@ -487,18 +516,6 @@ pub struct FrameInfo {
     /// None = unknown.
     pub is_sync: Option<bool>,
 
-    /// Which sample in the video is this from?
-    ///
-    /// We always assume one sample leads one frame
-    /// (but may provide arbitrary additional information which may be needed for other frames in the GOP).
-    ///
-    /// This is the order of which the samples appear in the container,
-    /// which is ordered by [`Self::latest_decode_timestamp`].
-    /// I.e. this is NOT ordered by [`Self::presentation_timestamp`].
-    ///
-    /// None = unknown.
-    pub sample_idx: Option<SampleIndex>,
-
     /// Which frame is this?
     ///
     /// This is on the assumption that each sample produces a single frame,
@@ -508,6 +525,15 @@ pub struct FrameInfo {
     ///
     /// None = unknown.
     pub frame_nr: Option<FrameNumber>,
+
+    /// Where the sample this frame was decoded from has its bytes.
+    ///
+    /// This identifies the sample no matter where it ends up in the video data description,
+    /// unlike a sample index which shifts whenever samples are inserted or removed before it.
+    /// Use [`VideoDataDescription::sample_index_of_source`] to get back to a sample index.
+    ///
+    /// None = unknown.
+    pub source: Option<VideoSource>,
 
     /// Time at which this frame appears in the frame stream, in time units.
     ///
@@ -653,6 +679,10 @@ pub enum DecodeHardwareAcceleration {
 pub struct DecodeSettings {
     /// How the video should be decoded.
     pub hw_acceleration: DecodeHardwareAcceleration,
+
+    /// Allow native AV1 decoding without assembly optimizations.
+    #[serde(default)]
+    pub allow_slow_av1_decoding: bool,
 
     /// Custom path for the ffmpeg binary.
     ///

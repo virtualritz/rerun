@@ -17,20 +17,22 @@
 //!
 
 mod compact;
+mod compaction_election;
 mod dataframe;
 
 mod drop_time_range;
 pub mod entity_tree;
 mod events;
 mod gc;
+mod insert_rrd_manifest;
 mod lazy_store;
 mod lineage;
+mod lineage_dropping;
 mod missing_chunk_reporter;
 mod profile;
 mod properties;
 mod query;
 mod rebatch_videos;
-mod split_thick_thin;
 mod stats;
 mod store;
 mod store_schema;
@@ -41,8 +43,8 @@ mod writes;
 #[doc(no_inline)]
 pub use {
     re_chunk::{
-        Chunk, ChunkId, ChunkShared, LatestAtQuery, RangeQuery, RangeQueryOptions, RowId, Span,
-        UnitChunkShared,
+        Chunk, ChunkId, ChunkShared, EarliestAtQuery, LatestAtQuery, RangeQuery, RangeQueryOptions,
+        RowId, Span, UnitChunkShared,
     },
     re_log_types::{AbsoluteTimeRange, TimeInt, TimeType, Timeline},
     re_sorbet::{ColumnDescriptor, ComponentColumnDescriptor, IndexColumnDescriptor},
@@ -74,6 +76,7 @@ pub use self::store_schema::StoreSchema;
 pub use self::subscribers::{
     ChunkStoreSubscriber, ChunkStoreSubscriberHandle, PerStoreChunkSubscriber,
 };
+pub use self::writes::preserves_static_transforms;
 
 pub use self::lazy_store::LazyStore;
 

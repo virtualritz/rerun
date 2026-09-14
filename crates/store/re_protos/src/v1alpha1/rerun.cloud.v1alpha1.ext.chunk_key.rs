@@ -111,8 +111,7 @@ impl From<ChunkKey> for crate::cloud::v1alpha1::ChunkKey {
 #[derive(Debug, Clone)]
 pub struct RrdChunkLocation {
     pub url: url::Url,
-    pub offset: u64,
-    pub length: u64,
+    pub byte_span: re_span::Span<u64>,
 }
 
 impl RrdChunkLocation {
@@ -155,8 +154,7 @@ impl TryFrom<crate::cloud::v1alpha1::RrdChunkLocation> for RrdChunkLocation {
 
         Ok(Self {
             url,
-            offset,
-            length,
+            byte_span: re_span::Span::from_start_len(offset, length),
         })
     }
 }
@@ -165,8 +163,8 @@ impl From<RrdChunkLocation> for crate::cloud::v1alpha1::RrdChunkLocation {
     fn from(value: RrdChunkLocation) -> Self {
         Self {
             url: Some(value.url.to_string()),
-            offset: Some(value.offset),
-            length: Some(value.length),
+            offset: Some(value.byte_span.start),
+            length: Some(value.byte_span.len),
         }
     }
 }
@@ -268,7 +266,8 @@ impl From<RrdManifestKey> for crate::cloud::v1alpha1::RrdManifestKey {
 
 /// User-facing message returned (server-side) and surfaced (client-side) when
 /// drift between the registered source object and the live one is detected.
-pub const SOURCE_CHANGED_MESSAGE: &str = "the source object has changed since this dataset was registered; re-register to pick up the new version";
+pub const SOURCE_CHANGED_MESSAGE: &str =
+    "the source object changed; re-register it to pick up the new version";
 
 /// Typed wrapper around an HTTP `ETag` value (RFC 7232).
 ///

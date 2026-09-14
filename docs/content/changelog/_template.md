@@ -31,15 +31,17 @@ hidden: true
 
 ## Highlights
 
-<!-- A few sentences selling the release. Feature leads can fill in their item. -->
-
-TODO(release_manager): write the highlights
+<!--
+One `### <heading>` per flagship change.
+Remove this section if there are no highlights.
+-->
 
 ## New features
 
 <!--
 One `### <heading>` per user-facing feature. Each should link to docs and/or an
-example, and include a screenshot/GIF if it has any visual component.
+example, and include visual media if it has any visual component.
+Use permanent website assets with normal Markdown or HTML markup, not GitHub-hosted assets or bare URLs.
 -->
 
 <!--

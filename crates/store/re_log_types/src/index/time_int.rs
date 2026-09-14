@@ -175,6 +175,13 @@ impl TimeInt {
             None => Self::STATIC,
         }
     }
+
+    pub fn saturating_add(&self, arg: i64) -> Self {
+        match self.0 {
+            Some(t) => Self::new_temporal(t.get().saturating_add(arg)),
+            None => Self::STATIC,
+        }
+    }
 }
 
 impl TryFrom<i64> for TimeInt {
@@ -222,16 +229,16 @@ impl From<TimeInt> for Duration {
     }
 }
 
-impl From<TimeInt> for re_types_core::datatypes::TimeInt {
+impl From<TimeInt> for re_types_core::encodings::TimeInt {
     #[inline]
     fn from(time: TimeInt) -> Self {
         Self(time.as_i64())
     }
 }
 
-impl From<re_types_core::datatypes::TimeInt> for TimeInt {
+impl From<re_types_core::encodings::TimeInt> for TimeInt {
     #[inline]
-    fn from(time: re_types_core::datatypes::TimeInt) -> Self {
+    fn from(time: re_types_core::encodings::TimeInt) -> Self {
         Self::new_temporal(time.0)
     }
 }

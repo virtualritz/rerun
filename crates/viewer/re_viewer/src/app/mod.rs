@@ -32,9 +32,16 @@ use crate::startup_options::StartupOptions;
 use crate::{AppState, command_palette::CommandPaletteAction};
 
 mod add_data_source;
+#[cfg(not(target_arch = "wasm32"))]
+mod assets;
 mod command_handling;
 mod logic;
 mod ui;
+mod viewer_control;
+
+/// Only `web.rs` needs this by name; on native, `logic` calls it directly.
+#[cfg(target_arch = "wasm32")]
+pub(crate) use viewer_control::serve_inspect_request;
 
 // ----------------------------------------------------------------------------
 
@@ -80,16 +87,18 @@ pub struct App {
     app_env: crate::AppEnvironment,
 
     startup_options: StartupOptions,
+
     start_time: web_time::Instant,
     ram_limit_warner: re_memory::RamLimitWarner,
     pub(crate) egui_ctx: egui::Context,
+    egui_renderer: Option<Arc<egui::epaint::mutex::RwLock<egui_wgpu::Renderer>>>,
     screenshotter: crate::screenshotter::Screenshotter,
     texture_readback: crate::texture_readback::TextureReadbacks,
 
     /// Notifiers waiting for a file-path screenshot to finish writing.
     pending_screenshot_notifiers: std::collections::HashMap<
         camino::Utf8PathBuf,
-        futures::channel::mpsc::UnboundedSender<Result<(), SaveScreenshotError>>,
+        re_log_channel::UiCallback<Result<(), SaveScreenshotError>>,
     >,
 
     #[cfg(target_arch = "wasm32")]
@@ -122,11 +131,20 @@ pub struct App {
     /// Interface for all recordings and blueprints
     pub(crate) store_hub: Option<StoreHub>,
 
+    pub(crate) table_blueprints: re_dataframe_ui::TableBlueprints,
+
     /// Notification panel.
     pub(crate) notifications: notifications::NotificationUi,
 
+    /// Recent log messages, served to agents through `re_viewer_mcp`.
+    pub(crate) viewer_log: crate::viewer_log::ViewerLog,
+
     dev_panel: crate::dev_panel::DevPanel,
     dev_panel_open: bool,
+
+    #[cfg(agent_panel)]
+    agent_panel: crate::agent_panel::ViewerAgentPanel,
+
     pub(crate) external_memory_users: crate::external_memory::ExternalMemoryUsers,
 
     /// Cached app overhead: total memory use minus sum of all recording chunk sizes.
@@ -217,6 +235,10 @@ impl App {
         re_tracing::profile_function!();
 
         let is_test = app_env.is_test();
+        let egui_renderer = creation_context
+            .wgpu_render_state
+            .as_ref()
+            .map(|render_state| render_state.renderer.clone());
 
         let connection_registry_was_provided = connection_registry.is_some();
         let connection_registry = connection_registry
@@ -275,7 +297,7 @@ impl App {
             // Check if the user has recently upgraded Rerun.
             if let Some(storage) = creation_context.storage {
                 let current_version = build_info.version;
-                let previous_version: Option<CrateVersion> =
+                let previous_version: Option<CrateVersion<'_>> =
                     storage.get_string(RERUN_VERSION_KEY).and_then(|version| {
                         // `CrateVersion::try_parse` is `const` (for good reasons), and needs a `&'static str`.
                         // In order to accomplish this, we need to leak the string here.
@@ -306,6 +328,18 @@ impl App {
         if is_test {
             creation_context.egui_ctx.mark_as_test();
             state.app_options = AppOptions::test();
+
+            // Disable animations and override the theme to ensure consistent snapshot tests.
+            creation_context.egui_ctx.set_theme(egui::Theme::Dark);
+            creation_context.egui_ctx.all_styles_mut(|style| {
+                style.visuals.text_cursor.blink = false;
+                style.scroll_animation = egui::style::ScrollAnimation::none();
+                style.animation_time = 0.0;
+            });
+        }
+
+        if state.app_options.check_for_updates_on_startup {
+            crate::version_check::check_for_new_version(build_info.version, &app_env, ehttp::fetch);
         }
 
         let connection_registry = {
@@ -322,18 +356,13 @@ impl App {
                     }
                 };
 
-                connection_registry.with_internal((catalog.origin, catalog.connection))
+                connection_registry.with_internal(catalog.connection)
             } else {
                 connection_registry
             }
         };
 
-        let reflection = re_sdk_types::reflection::generate_reflection().unwrap_or_else(|err| {
-            re_log::error!(
-                "Failed to create list of serialized default values for components: {err}"
-            );
-            Default::default()
-        });
+        let reflection = re_sdk_types::reflection::reflection().clone();
 
         // The blueprint validator needs to know the expected datatype of every component.
         // `Reflection::components` is never mutated after this point (unlike the archetype
@@ -468,9 +497,11 @@ impl App {
             build_info,
             app_env,
             startup_options,
+
             start_time: web_time::Instant::now(),
             ram_limit_warner: re_memory::RamLimitWarner::warn_at_fraction_of_max(0.75),
             egui_ctx: creation_context.egui_ctx.clone(),
+            egui_renderer,
             screenshotter,
             texture_readback: Default::default(),
             pending_screenshot_notifiers: Default::default(),
@@ -502,10 +533,15 @@ impl App {
                 },
                 &crate::app_blueprint::setup_welcome_screen_blueprint,
             )),
+            table_blueprints: Default::default(),
             notifications: notifications::NotificationUi::new(creation_context.egui_ctx.clone()),
+            viewer_log: Default::default(),
 
             dev_panel: Default::default(),
             dev_panel_open: false,
+
+            #[cfg(agent_panel)]
+            agent_panel: Default::default(),
             external_memory_users: crate::external_memory::ExternalMemoryUsers::default_users(),
             cached_app_overhead_bytes: None,
 
@@ -546,6 +582,21 @@ impl App {
         &self.connection_registry
     }
 
+    /// Calls `callback` with the renderer context if WGPU rendering is available.
+    ///
+    /// The callback executes while the egui renderer lock is held, so it must not access the egui
+    /// renderer recursively.
+    pub fn with_render_ctx_mut<T>(
+        &self,
+        callback: impl FnOnce(&mut re_renderer::RenderContext) -> T,
+    ) -> Option<T> {
+        let mut egui_renderer = self.egui_renderer.as_ref()?.write();
+        let render_ctx = egui_renderer
+            .callback_resources
+            .get_mut::<re_renderer::RenderContext>()?;
+        Some(callback(render_ctx))
+    }
+
     pub fn set_examples_manifest_url(&mut self, url: String) {
         re_log::info!("Using manifest_url={url:?}");
         self.state.set_examples_manifest_url(&self.egui_ctx, url);
@@ -571,6 +622,30 @@ impl App {
         self.state.app_options_mut()
     }
 
+    /// Open the dev panel, showing the given tab.
+    pub fn show_dev_panel_tab(&mut self, tab: crate::dev_panel::DevPanelTab) {
+        self.dev_panel_open = true;
+        self.dev_panel.select_tab(tab);
+    }
+
+    /// Whether the agent panel is shown. Requires the experimental setting.
+    #[cfg(agent_panel)]
+    pub fn agent_panel_open(&self) -> bool {
+        self.app_options().experimental.agent_panel && self.state.agent_panel_open
+    }
+
+    #[cfg(agent_panel)]
+    pub fn toggle_agent_panel(&mut self) {
+        if self.app_options().experimental.agent_panel {
+            self.state.agent_panel_open ^= true;
+            if self.state.agent_panel_open {
+                self.agent_panel.request_input_focus();
+            }
+        } else {
+            re_log::info!("The agent panel is disabled. Enable it under Settings → Experimental.");
+        }
+    }
+
     pub fn app_env(&self) -> &crate::AppEnvironment {
         &self.app_env
     }
@@ -587,11 +662,30 @@ impl App {
         self.state.active_recording_id()
     }
 
+    /// The route for `item`, filling in what the catalog knows about a redap entry.
+    ///
+    /// An [`Item`] names no entry kind, so [`Route::from_item`] leaves it unresolved.
+    pub(crate) fn route_for_item(&self, item: &Item) -> Option<Route> {
+        let mut route = Route::from_item(item)?;
+
+        if let Route::RedapEntry {
+            origin,
+            entry_id,
+            kind,
+        } = &mut route
+            && kind.is_none()
+        {
+            *kind = self.state.redap_servers.entry_kind(origin, *entry_id);
+        }
+
+        Some(route)
+    }
+
     /// Select `item` and navigate the viewer to it (if it maps to a route).
     fn select_and_navigate_to(&self, item: &Item) {
         self.command_sender
             .send_system(SystemCommand::set_selection(item.clone()));
-        if let Some(route) = Route::from_item(item) {
+        if let Some(route) = self.route_for_item(item) {
             self.command_sender
                 .send_system(SystemCommand::SetRoute(route));
         }
@@ -769,15 +863,28 @@ impl App {
             .insert(archetype_name, archetype_reflection);
     }
 
-    /// Adds a new view class to the viewer.
+    /// Adds a new view class to the viewer and sets its reflection metadata.
     pub fn add_view_class<T: ViewClass + Default + 'static>(
         &mut self,
+        view_reflection: re_sdk_types::reflection::ViewReflection,
     ) -> Result<(), ViewClassRegistryError> {
         self.view_class_registry.add_class::<T>(
             &self.reflection,
             &self.state.app_options,
             &mut self.component_fallback_registry,
-        )
+        )?;
+        self.reflection
+            .views
+            .insert(T::identifier(), view_reflection);
+        Ok(())
+    }
+
+    /// Edits the viewer's runtime reflection metadata.
+    pub fn edit_reflection(
+        &mut self,
+        edit: impl FnOnce(&mut re_sdk_types::reflection::Reflection),
+    ) {
+        edit(&mut self.reflection);
     }
 
     /// Extends an already registered view class with additional systems (visualizers, context systems, fallbacks, etc.).
@@ -805,6 +912,10 @@ impl App {
     ///
     /// Otherwise this updates the viewer tracked history.
     fn update_history(&mut self, store_hub: &StoreHub) {
+        if self.state.is_resolving_route() {
+            return;
+        }
+
         if self.startup_options().web_history_enabled() {
             // We don't want to spam the web history API with changes, because
             // otherwise it will start complaining about it being an insecure
@@ -829,7 +940,8 @@ impl App {
 
     /// Updates the viewer tracked history
     fn update_viewer_history(&mut self, store_hub: &StoreHub) {
-        let route = self.state.navigation.current();
+        let route = self.state.navigation.history_route();
+
         let time_ctrl = route
             .recording_id()
             .and_then(|id| self.state.time_control(id));
@@ -847,7 +959,8 @@ impl App {
     /// Updates the web address and web history.
     #[cfg(target_arch = "wasm32")]
     fn update_web_history(&self, store_hub: &StoreHub) {
-        let route = self.state.navigation.current();
+        let route = self.state.navigation.history_route();
+
         let time_ctrl = route
             .recording_id()
             .and_then(|id| self.state.time_control(id));
@@ -893,16 +1006,19 @@ impl App {
             let current_entry = history.current_entry().ok_or_log_js_error().flatten();
             let new_entry = HistoryEntry::new(url);
             if Some(&new_entry) != current_entry.as_ref() {
-                // If only the fragment has changed, we replace history instead of pushing it.
-                if current_entry
+                // A browser startup entry has no Rerun state, so replace it to record the stable
+                // route without adding a duplicate history entry.
+                // If only the fragment has changed, replace the current entry as well.
+                let only_fragment_changed = current_entry
+                    .as_ref()
                     .and_then(|entry| {
                         Some((
-                            entry.to_query_string().ok_or_log_js_error()?,
-                            new_entry.to_query_string().ok_or_log_js_error()?,
+                            entry.to_url().ok_or_log_js_error()?,
+                            new_entry.to_url().ok_or_log_js_error()?,
                         ))
                     })
-                    .is_some_and(|(current, new)| strip_fragment(&current) == strip_fragment(&new))
-                {
+                    .is_some_and(|(current, new)| strip_fragment(&current) == strip_fragment(&new));
+                if current_entry.is_none() || only_fragment_changed {
                     history.replace_entry(new_entry).ok_or_log_js_error();
                 } else {
                     history.push_entry(new_entry).ok_or_log_js_error();
@@ -1046,6 +1162,7 @@ impl App {
                                 force_store_info,
                             },
                             path: file.path().to_owned(),
+                            assets: Vec::new(),
                         },
                     ));
                 }
@@ -1129,9 +1246,7 @@ impl App {
                             ) else {
                                 re_log::error!("Failed to create image from screenshot data");
                                 if let Some(notifier) = notifier {
-                                    notifier
-                                        .unbounded_send(Err(SaveScreenshotError::InvalidImageData))
-                                        .ok();
+                                    notifier.call(Err(SaveScreenshotError::InvalidImageData));
                                 }
                                 return;
                             };
@@ -1162,7 +1277,7 @@ impl App {
                             };
 
                             if let Some(notifier) = notifier {
-                                notifier.unbounded_send(result).ok();
+                                notifier.call(result);
                             }
                         }
                     }
@@ -1193,6 +1308,10 @@ impl eframe::App for App {
         }
     }
 
+    fn persist_egui_memory(&self) -> bool {
+        self.startup_options.persist_state
+    }
+
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         if !self.startup_options.persist_state {
             return;
@@ -1218,7 +1337,10 @@ impl eframe::App for App {
             }
 
             if let Err(err) = hub.save_app_blueprints() {
-                re_log::error!("Saving blueprints failed: {err}");
+                re_log::error!("Saving application blueprints failed: {err}");
+            }
+            if let Err(err) = self.table_blueprints.save_persisted_blueprints(hub) {
+                re_log::error!("Saving table blueprints failed: {err}");
             }
         } else {
             re_log::error!("Could not save blueprints: the store hub is not available");
@@ -1392,13 +1514,11 @@ impl eframe::App for App {
                     self.state.navigation.replace(Route::LocalRecording {
                         recording_id: store_id,
                     });
-                } else if let Some(re_uri::RedapUri::DatasetData(uri)) = source.redap_uri()
-                    && self.connection_registry.error_for_uri(uri).is_some()
-                {
-                    // Do nothing, the loading screen will show the error and a button to go back to start screen.
-                } else {
-                    re_log::debug!("No recording found from loading source, resetting navigation");
-                    self.state.navigation.reset();
+                } else if self.state.last_loading_error_for(source).is_none() {
+                    self.state.last_loading_error.insert(
+                        (**source).clone(),
+                        "Data source finished without loading a recording".to_owned(),
+                    );
                 }
             }
         } else if !matches!(
@@ -1443,6 +1563,14 @@ impl eframe::App for App {
 
         {
             let active_route = self.state.navigation.current();
+
+            if let Some(table_ref) = active_route.table_reference()
+                && let Err(err) = self
+                    .table_blueprints
+                    .ensure_active_blueprint(&table_ref, &mut store_hub)
+            {
+                re_log::error_once!("Failed to ensure an active table blueprint: {err}");
+            }
 
             // Read-only copy of time control state (to avoid borrow checker issues with mutable state access).
             let active_time_ctrl = active_route
@@ -1494,9 +1622,11 @@ impl eframe::App for App {
             // The Redap entry currently being viewed (if any), so its commands (e.g. refresh)
             // are offered in the command palette.
             let current_redap_entry = match self.state.navigation.current() {
-                Route::RedapEntry { origin, kind } => {
-                    kind.entry_id().map(|entry_id| (origin.clone(), entry_id))
-                }
+                Route::RedapEntry {
+                    origin,
+                    entry_id,
+                    kind: _,
+                } => Some((origin.clone(), *entry_id)),
                 _ => None,
             };
 
@@ -1708,6 +1838,10 @@ impl MemUsageTreeCapture for App {
         node.add("rx_log", self.rx_log.capture_mem_usage_tree());
         node.add("store_hub", self.store_hub.capture_mem_usage_tree());
         node.add(
+            "connection_registry",
+            self.connection_registry.capture_mem_usage_tree(),
+        );
+        node.add(
             "store_subscribers",
             re_chunk_store::ChunkStore::capture_all_subscribers_mem_usage_tree(),
         );
@@ -1736,50 +1870,50 @@ fn noop_blueprint_loader(
     component_reflection: Arc<ComponentReflectionMap>,
 ) -> BlueprintPersistence {
     BlueprintPersistence {
-        loader: None,
-        saver: None,
         validator: Some(Box::new(move |blueprint| {
             crate::blueprint::is_valid_blueprint(blueprint, &component_reflection)
         })),
-        deleter: None,
+        ..Default::default()
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn blueprint_loader(component_reflection: Arc<ComponentReflectionMap>) -> BlueprintPersistence {
+    use anyhow::Context as _;
     use re_entity_db::{EntityDb, StoreBundle};
-    use re_log_types::{ApplicationId, StoreKind};
+    use re_viewer_context::store_hub::BlueprintPersistenceKey;
+
+    fn blueprint_path(key: &BlueprintPersistenceKey) -> anyhow::Result<std::path::PathBuf> {
+        match key {
+            BlueprintPersistenceKey::Recording(app_id) => {
+                crate::saving::recording_blueprint_path(app_id)
+            }
+            BlueprintPersistenceKey::Table(key) => crate::saving::table_blueprint_path(key),
+        }
+    }
 
     fn load_blueprint_from_disk(
-        component_reflection: &ComponentReflectionMap,
-        app_id: &ApplicationId,
+        key: &BlueprintPersistenceKey,
     ) -> anyhow::Result<Option<StoreBundle>> {
-        let blueprint_path = crate::saving::default_blueprint_path(app_id)?;
+        let blueprint_path = blueprint_path(key)?;
         if !blueprint_path.exists() {
             return Ok(None);
         }
 
-        re_log::debug!("Trying to load blueprint for {app_id} from {blueprint_path:?}");
+        re_log::debug!("Trying to load blueprint from {blueprint_path:?}");
 
-        if let Some(bundle) = crate::loading::load_blueprint_file(&blueprint_path) {
-            for store in bundle.entity_dbs() {
-                if store.store_kind() == StoreKind::Blueprint
-                    && !crate::blueprint::is_valid_blueprint(store, component_reflection)
-                {
-                    re_log::warn_once!(
-                        "Blueprint for {app_id} at {blueprint_path:?} appears invalid - will ignore. This is expected if you have just upgraded Rerun versions."
-                    );
-                    return Ok(None);
-                }
-            }
-            Ok(Some(bundle))
-        } else {
-            Ok(None)
-        }
+        Ok(crate::loading::load_blueprint_file(&blueprint_path))
     }
 
-    fn save_blueprint_to_disk(app_id: &ApplicationId, blueprint: &EntityDb) -> anyhow::Result<()> {
-        let blueprint_path = crate::saving::default_blueprint_path(app_id)?;
+    fn save_blueprint_to_disk(
+        key: &BlueprintPersistenceKey,
+        blueprint: &EntityDb,
+    ) -> anyhow::Result<()> {
+        let blueprint_path = blueprint_path(key)?;
+        if let Some(parent) = blueprint_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Could not create blueprint directory: {parent:?}"))?;
+        }
 
         let messages = blueprint.to_messages(None);
         let rrd_version = blueprint
@@ -1791,20 +1925,18 @@ fn blueprint_loader(component_reflection: Arc<ComponentReflectionMap>) -> Bluepr
         // be small & fast to save, but maybe not once we start adding big pieces of user data?
         crate::saving::encode_to_file(rrd_version, &blueprint_path, messages)?;
 
-        re_log::debug!("Saved blueprint for {app_id} to {blueprint_path:?}");
+        re_log::debug!("Saved blueprint to {blueprint_path:?}");
 
         Ok(())
     }
 
     BlueprintPersistence {
-        loader: Some(Box::new({
-            let component_reflection = component_reflection.clone();
-            move |app_id| load_blueprint_from_disk(&component_reflection, app_id)
-        })),
+        loader: Some(Box::new(load_blueprint_from_disk)),
         saver: Some(Box::new(save_blueprint_to_disk)),
         validator: Some(Box::new(move |blueprint| {
             crate::blueprint::is_valid_blueprint(blueprint, &component_reflection)
         })),
         deleter: Some(Box::new(crate::saving::delete_blueprint)),
+        table_blueprint_clearer: Some(Box::new(crate::saving::clear_table_blueprints)),
     }
 }

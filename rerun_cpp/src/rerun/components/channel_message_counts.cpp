@@ -3,7 +3,7 @@
 
 #include "channel_message_counts.hpp"
 
-#include "../datatypes/channel_count_pair.hpp"
+#include "../encodings/channel_count_pair.hpp"
 
 #include <arrow/builder.h>
 #include <arrow/type_fwd.h>
@@ -12,10 +12,10 @@ namespace rerun::components {}
 
 namespace rerun {
     const std::shared_ptr<arrow::DataType>&
-        Loggable<components::ChannelMessageCounts>::arrow_datatype() {
+        Loggable<components::ChannelMessageCounts>::arrow_data_type() {
         static const auto datatype = arrow::list(arrow::field(
             "item",
-            Loggable<rerun::datatypes::ChannelCountPair>::arrow_datatype(),
+            Loggable<rerun::encodings::ChannelCountPair>::arrow_data_type(),
             false
         ));
         return datatype;
@@ -26,7 +26,7 @@ namespace rerun {
     ) {
         // TODO(andreas): Allow configuring the memory pool.
         arrow::MemoryPool* pool = arrow::default_memory_pool();
-        auto datatype = arrow_datatype();
+        auto datatype = arrow_data_type();
 
         ARROW_ASSIGN_OR_RAISE(auto builder, arrow::MakeBuilder(datatype, pool))
         if (instances && num_instances > 0) {
@@ -64,7 +64,7 @@ namespace rerun {
             ARROW_RETURN_NOT_OK(builder->Append());
             if (element.counts.data()) {
                 RR_RETURN_NOT_OK(
-                    Loggable<rerun::datatypes::ChannelCountPair>::fill_arrow_array_builder(
+                    Loggable<rerun::encodings::ChannelCountPair>::fill_arrow_array_builder(
                         value_builder,
                         element.counts.data(),
                         element.counts.size()

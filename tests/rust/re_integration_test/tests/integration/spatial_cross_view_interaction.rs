@@ -2,12 +2,13 @@
 //! for both entity-path-derived and named transforms.
 
 use re_integration_test::HarnessExt as _;
+use re_integration_test::ViewerHarnessExt as _;
 use re_sdk::{EntityPathFilter, TimePoint};
 use re_viewer::external::re_sdk_types::{
     archetypes::{CoordinateFrame, Image, Pinhole, Points3D, Transform3D},
     blueprint::archetypes::EyeControls3D,
     components::Position3D,
-    datatypes::ColorModel,
+    encodings::ColorModel,
 };
 use re_viewer::external::re_view_spatial;
 use re_viewer::external::re_viewer_context::{RecommendedView, ViewClass as _};

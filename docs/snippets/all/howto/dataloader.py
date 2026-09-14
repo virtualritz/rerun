@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import torch
@@ -9,6 +10,14 @@ import torch.multiprocessing
 from torch import nn
 
 import rerun as rr
+
+# Suppress warnings when FixedRateSampling samples indices where some entities
+# lack data.
+warnings.filterwarnings(
+    "ignore",
+    message=r"Skipping samples where field .* has no value",
+    category=RuntimeWarning,
+)
 
 # Rerun's tokio runtime is not fork-safe, so DataLoader workers must use
 # `spawn`. Set this before constructing any DataLoader, even with
@@ -71,28 +80,25 @@ ds = RerunIterableDataset(
 
 # region: window
 # Each sample now carries the next 50 action steps instead of a single value.
-# Offsets are in the index timeline's native unit: integer steps for integer
-# indices, or nanoseconds for timestamp indices (use multiples of the
-# FixedRateSampling period).
+# The selected index above is a timestamp timeline, so these offsets are
+# expressed in seconds.
+# An integer index timeline would instead require integral index-unit offsets.
 windowed_action = Field(
     "/action/joint_positions:Scalars:scalars",
     decode=NumericDecoder(),
-    window=(1, 50),
+    window=tuple(step / 15.0 for step in range(1, 51)),
 )
 # endregion: window
 
 
 # region: video_decoder
 # Decode a compressed video stream as part of each sample.
-# `keyframe_interval` must be at least the actual GOP length. For timestamp
-# timelines, `fps_estimate` should also approximate the true frame rate.
+# The stream must include its sibling `VideoStream:is_keyframe` component.
 from rerun.experimental.dataloader import VideoFrameDecoder
 
 image_field = Field(
     "/camera/wrist:VideoStream:sample",
-    decode=VideoFrameDecoder(
-        codec="h264", keyframe_interval=500, fps_estimate=15.0
-    ),
+    decode=VideoFrameDecoder(codec="h264"),
 )
 # endregion: video_decoder
 

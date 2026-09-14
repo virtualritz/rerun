@@ -7,13 +7,16 @@ use re_chunk_store::TimeType;
 use re_format::time::next_grid_tick_magnitude_nanos;
 use re_log_types::external::arrow::datatypes::DataType;
 use re_log_types::{AbsoluteTimeRange, ComponentPath, EntityPath};
-use re_sdk_types::archetypes::{Scalars, SeriesLines, SeriesPoints};
-use re_sdk_types::blueprint::archetypes::{PlotBackground, PlotLegend, ScalarAxis, TimeAxis};
-use re_sdk_types::blueprint::components::{
-    Corner2D, Enabled, LinkAxis, LockRangeDuringZoom, VisualizerInstructionId,
+use re_sdk_types::archetypes::{Measurements, Scalars, SeriesLines, SeriesPoints};
+use re_sdk_types::blueprint::archetypes::{
+    PlotBackground, PlotInteraction, PlotLegend, ScalarAxis, TimeAxis,
 };
-use re_sdk_types::components::{AggregationPolicy, Color, Range1D, Visible};
-use re_sdk_types::datatypes::{TimeRange, TimeRangeBoundary};
+use re_sdk_types::blueprint::components::{
+    Corner2D, Enabled, LinkAxis, LockRangeDuringZoom, PointsDisplay, TooltipMode,
+    VisualizerInstructionId,
+};
+use re_sdk_types::components::{Color, Range1D, Visible};
+use re_sdk_types::encodings::TimeRange;
 use re_sdk_types::{ComponentBatch as _, ComponentIdentifier, View as _, ViewClassIdentifier};
 use re_ui::{Help, IconText, MouseButtonText, UiExt as _, icons, list_item};
 use re_view::controls::{MOVE_TIME_CURSOR_BUTTON, SELECTION_RECT_ZOOM_BUTTON};
@@ -22,16 +25,16 @@ use re_viewer_context::{
     BlueprintContext as _, DataResultInteractionAddress, DatatypeMatch, DragAndDropFeedback,
     IdentifiedViewSystem as _, IndicatedEntities, PerVisualizerType, QueryRange,
     RecommendedMappings, RecommendedView, RecommendedVisualizers, SingleRequiredComponentMatch,
-    SystemExecutionOutput, TimeControlCommand, ViewClass, ViewClassExt as _,
-    ViewClassRegistryError, ViewId, ViewQuery, ViewSpawnHeuristics, ViewState, ViewStateExt as _,
-    ViewSystemExecutionError, ViewSystemIdentifier, ViewerContext, VisualizableReason,
-    VisualizerComponentSource,
+    SystemExecutionOutput, ViewClass, ViewClassExt as _, ViewClassRegistryError, ViewId, ViewQuery,
+    ViewSpawnHeuristics, ViewState, ViewStateExt as _, ViewSystemExecutionError,
+    ViewSystemIdentifier, ViewerContext, VisualizableReason, VisualizerComponentSource,
 };
 use re_viewport_blueprint::ViewProperty;
 use smallvec::SmallVec;
 use vec1::Vec1;
 
 use crate::line_visualizer_system::{SeriesLinesOutput, SeriesLinesSystem};
+use crate::measurements_visualizer_system::{MeasurementsSeriesOutput, MeasurementsSeriesSystem};
 use crate::naming::{SeriesInfo, SeriesNamesContext};
 use crate::point_visualizer_system::{SeriesPointsOutput, SeriesPointsSystem};
 use crate::util::data_result_time_range;
@@ -84,6 +87,9 @@ pub struct TimeSeriesViewState {
     /// This avoids relying on `egui_plot::PlotMemory` keyed by view id, which breaks
     /// when the same blueprint view is shown multiple times.
     pub time_per_pixel: f64,
+
+    /// Whether line-series data point markers are always displayed.
+    pub always_show_line_data_markers: bool,
 }
 
 impl Default for TimeSeriesViewState {
@@ -96,6 +102,7 @@ impl Default for TimeSeriesViewState {
             num_time_series_last_frame_per_instruction: Default::default(),
             plot_transform: None,
             time_per_pixel: 1.0,
+            always_show_line_data_markers: false,
         }
     }
 }
@@ -192,6 +199,7 @@ impl ViewClass for TimeSeriesView {
 
         system_registry.register_visualizer::<SeriesLinesSystem>()?;
         system_registry.register_visualizer::<SeriesPointsSystem>()?;
+        system_registry.register_visualizer::<MeasurementsSeriesSystem>()?;
         Ok(())
     }
 
@@ -229,6 +237,7 @@ impl ViewClass for TimeSeriesView {
             let ctx = self.view_context(viewer_ctx, view_id, state, space_origin);
             view_property_ui::<PlotBackground>(&ctx, ui);
             view_property_ui::<PlotLegend>(&ctx, ui);
+            view_property_ui::<PlotInteraction>(&ctx, ui);
 
             let link_x_axis = ViewProperty::from_archetype::<TimeAxis>(&ctx)
                 .component_or_fallback::<LinkAxis>(&ctx, TimeAxis::descriptor_link().component)?;
@@ -458,14 +467,21 @@ impl ViewClass for TimeSeriesView {
             .visualizer_data_or_default::<SeriesLinesOutput>(SeriesLinesSystem::identifier())?;
         let point_series = system_output
             .visualizer_data_or_default::<SeriesPointsOutput>(SeriesPointsSystem::identifier())?;
+        let measurements_series = system_output
+            .visualizer_data_or_default::<MeasurementsSeriesOutput>(
+                MeasurementsSeriesSystem::identifier(),
+            )?;
 
-        let all_plot_series: Vec<_> =
-            chain!(&line_series.all_series, &point_series.all_series).collect();
+        let all_plot_series: Vec<_> = chain!(
+            &line_series.all_series,
+            &point_series.all_series,
+            &measurements_series.all_series
+        )
+        .collect();
 
         state.num_time_series_last_frame_per_instruction.clear();
 
         let view_query_result = ctx.lookup_query_result(query.view_id);
-        let scalar_component = Scalars::descriptor_scalars().component;
 
         let mut series_names = SeriesNamesContext::default();
 
@@ -483,9 +499,18 @@ impl ViewClass for TimeSeriesView {
                         .iter()
                         .find(|instr| instr.id == instruction_id)
                 {
+                    // Each visualizer maps into its own value component; look up the one this
+                    // instruction actually keys its mapping on.
+                    let value_component =
+                        if instruction.visualizer_type == MeasurementsSeriesSystem::identifier() {
+                            Measurements::descriptor_values().component
+                        } else {
+                            Scalars::descriptor_scalars().component
+                        };
+
                     let (component, selector) = instruction
                         .component_mappings
-                        .get(&scalar_component)
+                        .get(&value_component)
                         .and_then(|mapping| match mapping {
                             re_viewer_context::VisualizerComponentSource::SourceComponent {
                                 source_component,
@@ -493,11 +518,16 @@ impl ViewClass for TimeSeriesView {
                             } => Some((*source_component, selector.clone())),
                             _ => None,
                         })
-                        .unwrap_or((scalar_component, String::new()));
+                        .unwrap_or((value_component, String::new()));
 
                     series_names.insert(
                         instruction_id,
-                        SeriesInfo::new(data_result.entity_path.clone(), component, &selector),
+                        SeriesInfo::new(
+                            data_result.entity_path.clone(),
+                            component,
+                            &selector,
+                            value_component,
+                        ),
                     );
                 }
 
@@ -580,6 +610,25 @@ impl ViewClass for TimeSeriesView {
 
         let view_id = query.view_id;
 
+        let (always_show_line_data_markers, tooltip_mode) = {
+            let view_ctx = self.view_context(ctx, view_id, state, query.space_origin);
+            let plot_interaction = ViewProperty::from_archetype::<PlotInteraction>(&view_ctx);
+
+            let always_show_line_data_markers =
+                plot_interaction.component_or_fallback::<PointsDisplay>(
+                    &view_ctx,
+                    PlotInteraction::descriptor_points_display().component,
+                )? == PointsDisplay::Always;
+
+            let tooltip_mode = plot_interaction.component_or_fallback::<TooltipMode>(
+                &view_ctx,
+                PlotInteraction::descriptor_tooltip_mode().component,
+            )?;
+
+            (always_show_line_data_markers, tooltip_mode)
+        };
+        state.always_show_line_data_markers = always_show_line_data_markers;
+
         let view_ctx = self.view_context(ctx, view_id, state, query.space_origin);
         let background = ViewProperty::from_archetype::<PlotBackground>(&view_ctx);
         let background_color = background.component_or_fallback::<Color>(
@@ -606,35 +655,23 @@ impl ViewClass for TimeSeriesView {
         let link_x_axis = time_axis
             .component_or_fallback::<LinkAxis>(&view_ctx, TimeAxis::descriptor_link().component)?;
 
-        let view_current_time = re_sdk_types::datatypes::TimeInt(
+        let view_current_time = re_sdk_types::encodings::TimeInt(
             current_time
                 .unwrap_or_default()
                 .at_least(timeline_range.min.as_i64()),
         );
 
-        let query_result;
         // If we globally link the x-axis it will ignore this view's time range property and use
         // `GLOBAL_VIEW_ID's` time range property instead.
         let (time_range_property, time_range_ctx) = match link_x_axis {
             LinkAxis::Independent => (&time_axis, &view_ctx),
-            LinkAxis::LinkToGlobal => {
-                query_result = re_viewer_context::DataQueryResult::default();
-
-                (
-                    &ViewProperty::from_archetype_for_view::<TimeAxis>(
-                        ctx,
-                        re_viewer_context::GLOBAL_VIEW_ID,
-                    ),
-                    &re_viewer_context::ViewContext {
-                        viewer_ctx: ctx,
-                        view_id: re_viewer_context::GLOBAL_VIEW_ID,
-                        view_class_identifier: Self::identifier(),
-                        space_origin: query.space_origin,
-                        view_state: state,
-                        query_result: &query_result,
-                    },
-                )
-            }
+            LinkAxis::LinkToGlobal => (
+                &ViewProperty::from_archetype_for_view::<TimeAxis>(
+                    ctx,
+                    re_viewer_context::GLOBAL_VIEW_ID,
+                ),
+                &view_ctx.with_view_id(re_viewer_context::GLOBAL_VIEW_ID),
+            ),
         };
 
         let view_time_range = time_range_property
@@ -645,26 +682,16 @@ impl ViewClass for TimeSeriesView {
 
         let resolve_time_range =
             |view_time_range: &re_sdk_types::blueprint::components::TimeRange| {
+                let range = re_view::resolve_time_axis_range(
+                    view_time_range,
+                    timeline_range,
+                    view_current_time,
+                );
+
+                // Into plot space, where `f64` coordinates still have enough precision.
                 make_range_sane(Range1D::new(
-                    match view_time_range.start {
-                        re_sdk_types::datatypes::TimeRangeBoundary::Infinite => {
-                            timeline_range.min.as_i64()
-                        }
-                        _ => {
-                            view_time_range
-                                .start
-                                .start_boundary_time(view_current_time)
-                                .0
-                        }
-                    }
-                    .saturating_sub(time_offset) as f64,
-                    match view_time_range.end {
-                        re_sdk_types::datatypes::TimeRangeBoundary::Infinite => {
-                            timeline_range.max.as_i64()
-                        }
-                        _ => view_time_range.end.end_boundary_time(view_current_time).0,
-                    }
-                    .saturating_sub(time_offset) as f64,
+                    range.min.as_i64().saturating_sub(time_offset) as f64,
+                    range.max.as_i64().saturating_sub(time_offset) as f64,
                 ))
             };
 
@@ -763,13 +790,8 @@ impl ViewClass for TimeSeriesView {
                 {
                     let time = re_log_types::TimeReal::from(pointer.x as i64 + time_offset);
 
-                    set_time(
-                        ctx,
-                        current_time,
-                        &view_time_range,
-                        &mut new_view_time_range,
-                        time,
-                    );
+                    new_view_time_range =
+                        re_view::set_time_cursor(ctx, current_time, Some(&view_time_range.0), time);
                 }
 
                 plot_double_clicked = plot_ui.response().double_clicked();
@@ -835,12 +857,12 @@ impl ViewClass for TimeSeriesView {
                 &response,
                 query.view_id.render_view_id(),
                 re_renderer_draw_data,
-            );
+            )?;
 
-            // Custom hover detection: find nearest actual data point and show tooltip.
+            // Render the configured tooltip and use its closest series for interaction.
             let hovered_data_result = (!legend_hovered)
                 .then(|| {
-                    find_nearest_data_point_and_show_tooltip(
+                    show_time_series_tooltip(
                         ui,
                         &response,
                         &transform,
@@ -849,6 +871,7 @@ impl ViewClass for TimeSeriesView {
                         time_type,
                         timestamp_format,
                         &plot_item_id_to_data_result_address,
+                        tooltip_mode,
                     )
                 })
                 .flatten();
@@ -896,27 +919,18 @@ impl ViewClass for TimeSeriesView {
                                 return None;
                             }
 
-                            let new_x_range_rounded = Range1D::new(
-                                new_x_range.start().round(),
-                                new_x_range.end().round(),
-                            );
-
-                            let new_view_time_range = TimeRange {
-                                start: re_sdk_types::datatypes::TimeRangeBoundary::Absolute(
-                                    re_sdk_types::datatypes::TimeInt(
-                                        (new_x_range_rounded.start() as i64)
-                                            .saturating_add(time_offset),
-                                    ),
+                            Some(re_view::recover_relative_boundaries_after_zoom_or_pan(
+                                re_view::time_axis_time_from_plot(
+                                    new_x_range.start().into(),
+                                    time_offset,
                                 ),
-                                end: re_sdk_types::datatypes::TimeRangeBoundary::Absolute(
-                                    re_sdk_types::datatypes::TimeInt(
-                                        (new_x_range_rounded.end() as i64)
-                                            .saturating_add(time_offset),
-                                    ),
+                                re_view::time_axis_time_from_plot(
+                                    new_x_range.end().into(),
+                                    time_offset,
                                 ),
-                            };
-
-                            Some(new_view_time_range)
+                                &view_time_range,
+                                view_current_time,
+                            ))
                         })
                         .map(re_sdk_types::blueprint::components::TimeRange)
                         && view_time_range != new_view_time_range
@@ -988,7 +1002,13 @@ impl ViewClass for TimeSeriesView {
                         .filter(|s| !matches!(s.kind, PlotSeriesKind::Clear))
                         .map(|s| re_plot::legend::LegendEntry {
                             id: s.id(),
-                            label: s.label.clone(),
+                            label: match &s.unit {
+                                Some(unit) if !s.label.is_empty() => {
+                                    let label = &s.label;
+                                    format!("{label} [{unit}]")
+                                }
+                                _ => s.label.clone(),
+                            },
                             color: s.color,
                             visible: s.visible,
                             hovered: label_hovered
@@ -1019,42 +1039,6 @@ impl ViewClass for TimeSeriesView {
     }
 }
 
-fn set_time(
-    ctx: &ViewerContext<'_>,
-    current_time: Option<i64>,
-    view_time_range: &re_sdk_types::blueprint::components::TimeRange,
-    new_view_time_range: &mut Option<TimeRange>,
-    time: re_log_types::TimeReal,
-) {
-    if let Some(current_time) = current_time {
-        let current_time = re_log_types::TimeInt::new_temporal(current_time);
-        let time = time.floor();
-
-        let time_diff = current_time.as_i64() - time.as_i64();
-
-        let mut either_relative = false;
-        let mut map_time_range_boundary = |boundary| {
-            if let TimeRangeBoundary::CursorRelative(offset) = boundary {
-                either_relative = true;
-                TimeRangeBoundary::CursorRelative((offset.0 + time_diff).into())
-            } else {
-                boundary
-            }
-        };
-
-        *new_view_time_range = Some(TimeRange {
-            start: map_time_range_boundary(view_time_range.start),
-            end: map_time_range_boundary(view_time_range.end),
-        })
-        .filter(|_| either_relative);
-    }
-
-    ctx.send_time_commands([
-        TimeControlCommand::SetTimeClamped(time),
-        TimeControlCommand::Pause,
-    ]);
-}
-
 fn all_scalar_mappings_for(
     matches: &IntMap<ComponentIdentifier, DatatypeMatch>,
 ) -> Vec<RecommendedMappings> {
@@ -1067,10 +1051,7 @@ fn all_scalar_mappings_for(
             DatatypeMatch::NativeSemantics { .. } => {
                 Either::Left(std::iter::once(RecommendedMappings::new(
                     target,
-                    VisualizerComponentSource::SourceComponent {
-                        source_component: *source_component,
-                        selector: String::new(),
-                    },
+                    VisualizerComponentSource::simple_map(*source_component),
                 )))
             }
 
@@ -1078,10 +1059,7 @@ fn all_scalar_mappings_for(
                 if selectors.is_empty() {
                     Either::Left(std::iter::once(RecommendedMappings::new(
                         target,
-                        VisualizerComponentSource::SourceComponent {
-                            source_component: *source_component,
-                            selector: String::new(),
-                        },
+                        VisualizerComponentSource::simple_map(*source_component),
                     )))
                 } else {
                     Either::Right(selectors.iter().map(|(selector, _datatype)| {
@@ -1187,12 +1165,15 @@ fn all_scalar_mappings(
     };
     let matches = &m.matches;
 
-    let target = Scalars::descriptor_scalars();
+    // Every scalar-valued target shares the rerun-native `Scalar` semantic type, so the type check
+    // below can use `Scalars.scalars` for any visualizer.
+    let target_component = m.target_component;
+    let target_component_type = Scalars::descriptor_scalars().component_type;
 
     // Flatten all (component, selector) pairs into a single comparable list
     // to find the globally best match across all components.
     let candidates = matches.iter().flat_map(|(source_component, match_info)| {
-        let is_rerun_native_type = match_info.component_type() == target.component_type.as_ref();
+        let is_rerun_native_type = match_info.component_type() == target_component_type.as_ref();
 
         // If it's not the exact semantic type that we're looking for,
         // but it is a Rerun-builtin semantic type then we don't consider it at all.
@@ -1206,10 +1187,10 @@ fn all_scalar_mappings(
 
         let primary_match_order = match match_info {
             DatatypeMatch::NativeSemantics { .. } => {
-                i32::from(*source_component != target.component)
+                i32::from(*source_component != target_component)
             }
             DatatypeMatch::PhysicalDatatypeOnly { .. } => {
-                if *source_component == target.component {
+                if *source_component == target_component {
                     0
                 } else {
                     2
@@ -1218,29 +1199,29 @@ fn all_scalar_mappings(
         };
 
         match match_info {
-            DatatypeMatch::NativeSemantics { arrow_datatype, .. } => {
-                Either::Left(Either::Left(std::iter::once((
-                    primary_match_order,
-                    is_rerun_native_type,
-                    scalar_datatype_priority(arrow_datatype),
-                    *source_component,
-                    0usize,
-                    String::new(),
-                ))))
-            }
+            DatatypeMatch::NativeSemantics {
+                arrow_data_type, ..
+            } => Either::Left(Either::Left(std::iter::once((
+                primary_match_order,
+                is_rerun_native_type,
+                scalar_datatype_priority(arrow_data_type),
+                *source_component,
+                0usize,
+                String::new(),
+            )))),
             DatatypeMatch::PhysicalDatatypeOnly {
-                arrow_datatype,
+                arrow_data_type,
                 selectors,
                 ..
             } => {
                 if selectors.is_empty() {
                     if is_rerun_native_type
-                        || RECOMMENDED_DATATYPES.contains(match_info.arrow_datatype())
+                        || RECOMMENDED_DATATYPES.contains(match_info.arrow_data_type())
                     {
                         Either::Left(Either::Left(std::iter::once((
                             primary_match_order,
                             is_rerun_native_type,
-                            scalar_datatype_priority(arrow_datatype),
+                            scalar_datatype_priority(arrow_data_type),
                             *source_component,
                             0usize,
                             String::new(),
@@ -1290,7 +1271,7 @@ fn all_scalar_mappings(
             )
             .map(move |(_, _, _, source_component, _, selector)| {
                 (
-                    target.component,
+                    target_component,
                     VisualizerComponentSource::SourceComponent {
                         source_component,
                         selector,
@@ -1300,11 +1281,48 @@ fn all_scalar_mappings(
     )
 }
 
-/// Find the nearest actual data point to the cursor and show a custom tooltip.
+/// Shows the configured time-series tooltip and returns the closest data result for interaction.
 ///
 /// Returns the hovered data result item for selection/highlighting, or `None` if
 /// no data point is close enough.
-fn find_nearest_data_point_and_show_tooltip(
+#[expect(clippy::too_many_arguments)]
+fn show_time_series_tooltip(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    transform: &egui_plot::PlotTransform,
+    all_plot_series: &[&crate::PlotSeries],
+    time_offset: i64,
+    time_type: TimeType,
+    timestamp_format: re_log_types::TimestampFormat,
+    plot_item_id_to_data_result_address: &ahash::HashMap<egui::Id, DataResultInteractionAddress>,
+    tooltip_mode: TooltipMode,
+) -> Option<re_viewer_context::Item> {
+    match tooltip_mode {
+        TooltipMode::Nearest => nearest_data_point_tooltip(
+            ui,
+            response,
+            transform,
+            all_plot_series,
+            time_offset,
+            time_type,
+            timestamp_format,
+            plot_item_id_to_data_result_address,
+        ),
+        TooltipMode::All => all_series_tooltip(
+            ui,
+            response,
+            transform,
+            all_plot_series,
+            time_offset,
+            time_type,
+            timestamp_format,
+            plot_item_id_to_data_result_address,
+        ),
+    }
+}
+
+#[expect(clippy::too_many_arguments)]
+fn nearest_data_point_tooltip(
     ui: &egui::Ui,
     response: &egui::Response,
     transform: &egui_plot::PlotTransform,
@@ -1333,7 +1351,10 @@ fn find_nearest_data_point_and_show_tooltip(
     let mut closest_value: f64 = 0.0;
 
     for (series_idx, series) in all_plot_series.iter().enumerate() {
-        if !series.visible || series.points.is_empty() {
+        if !series.visible
+            || series.points.is_empty()
+            || matches!(series.kind, PlotSeriesKind::Clear)
+        {
             continue;
         }
 
@@ -1345,7 +1366,9 @@ fn find_nearest_data_point_and_show_tooltip(
         // Check the point at `idx` and the one before it (the two nearest candidates).
         let candidates = [idx.saturating_sub(1), idx.min(series.points.len() - 1)];
         for &candidate_idx in &candidates {
-            if candidate_idx >= series.points.len() {
+            if candidate_idx >= series.points.len()
+                || (candidate_idx == 0 && series.first_point_is_continuity_bridge)
+            {
                 continue;
             }
             let (t, v) = series.points[candidate_idx];
@@ -1384,20 +1407,8 @@ fn find_nearest_data_point_and_show_tooltip(
             tooltip_format,
         )
     };
-    let y_value_text = re_format::format_f64(closest_value);
-    let series_name = if series.label.is_empty() {
-        "y".to_owned()
-    } else {
-        series.label.clone()
-    };
-    // Append aggregation policy to the label when data is aggregated.
-    let is_aggregated =
-        series.aggregator != AggregationPolicy::Off && series.aggregation_factor > 1.0;
-    let display_label = if is_aggregated {
-        format!("{series_name}, {}", series.aggregator)
-    } else {
-        series_name
-    };
+    let y_value_text = tooltip_series_value(series, closest_value);
+    let display_label = tooltip_series_label(series);
 
     re_plot::tooltip::show_plot_tooltip(
         ui,
@@ -1413,6 +1424,275 @@ fn find_nearest_data_point_and_show_tooltip(
     plot_item_id_to_data_result_address
         .get(&series.id())
         .map(|address| re_viewer_context::Item::DataResult(address.clone()))
+}
+
+/// Interpolates a series value at `time` using the rendered line semantics.
+fn interpolated_series_value(
+    kind: PlotSeriesKind,
+    time: i64,
+    time0: i64,
+    value0: f64,
+    time1: i64,
+    value1: f64,
+) -> f64 {
+    match kind {
+        PlotSeriesKind::Continuous => {
+            if time1 == time0 {
+                value0
+            } else {
+                let elapsed = (time as i128 - time0 as i128) as f64;
+                let duration = (time1 as i128 - time0 as i128) as f64;
+                egui::lerp(value0..=value1, elapsed / duration)
+            }
+        }
+        PlotSeriesKind::Stepped(crate::StepMode::After) => value0,
+        PlotSeriesKind::Stepped(crate::StepMode::Before) => value1,
+        PlotSeriesKind::Stepped(crate::StepMode::Mid) => {
+            if 2 * (time as i128) < time0 as i128 + time1 as i128 {
+                value0
+            } else {
+                value1
+            }
+        }
+        PlotSeriesKind::Scatter(_) | PlotSeriesKind::Clear => {
+            if time.abs_diff(time0) <= time.abs_diff(time1) {
+                value0
+            } else {
+                value1
+            }
+        }
+    }
+}
+
+struct TooltipSample {
+    marker_point: egui::Pos2,
+    value: f64,
+    distance_sq: f32,
+}
+
+fn tooltip_value_at_hover(
+    points: &[(i64, f64)],
+    kind: PlotSeriesKind,
+    hover_time: i64,
+) -> Option<f64> {
+    let index = match points.binary_search_by_key(&hover_time, |&(time, _)| time) {
+        Ok(index) => return Some(points[index].1),
+        Err(index) => index,
+    };
+
+    match kind {
+        PlotSeriesKind::Continuous | PlotSeriesKind::Stepped(_) => {
+            if index == 0 {
+                points.first().map(|(_, value)| *value)
+            } else if index == points.len() {
+                points.last().map(|(_, value)| *value)
+            } else {
+                let (time0, value0) = points[index - 1];
+                let (time1, value1) = points[index];
+                Some(interpolated_series_value(
+                    kind, hover_time, time0, value0, time1, value1,
+                ))
+            }
+        }
+        PlotSeriesKind::Scatter(_) | PlotSeriesKind::Clear => None,
+    }
+}
+
+fn tooltip_sample_at_hover(
+    series: &crate::PlotSeries,
+    hover_time: i64,
+    hover_pos: egui::Pos2,
+    transform: &egui_plot::PlotTransform,
+    time_offset: i64,
+) -> Option<TooltipSample> {
+    let index = series
+        .points
+        .binary_search_by_key(&hover_time, |&(time, _)| time)
+        .unwrap_or_else(|index| index);
+
+    let sample = match series.kind {
+        PlotSeriesKind::Continuous | PlotSeriesKind::Stepped(_) => {
+            let value = tooltip_value_at_hover(&series.points, series.kind, hover_time)?;
+            let marker_point = transform.position_from_point(&PlotPoint::new(
+                (hover_time.saturating_sub(time_offset)) as f64,
+                value,
+            ));
+            TooltipSample {
+                marker_point,
+                value,
+                distance_sq: (hover_pos.y - marker_point.y).powi(2),
+            }
+        }
+
+        PlotSeriesKind::Scatter(_) => {
+            struct ScatterCandidate {
+                horizontal_distance: f32,
+                sample: TooltipSample,
+            }
+
+            const SAMPLE_PROXIMITY: f32 = 16.0;
+
+            let candidate_indices = [index.saturating_sub(1), index.min(series.points.len() - 1)];
+            let mut closest_sample = None;
+            for candidate_index in candidate_indices {
+                if candidate_index == 0 && series.first_point_is_continuity_bridge {
+                    continue;
+                }
+                let (time, value) = series.points[candidate_index];
+                if !value.is_finite() {
+                    continue;
+                }
+                let marker_point = transform.position_from_point(&PlotPoint::new(
+                    (time.saturating_sub(time_offset)) as f64,
+                    value,
+                ));
+                let horizontal_distance = (hover_pos.x - marker_point.x).abs();
+                if closest_sample
+                    .as_ref()
+                    .is_none_or(|best: &ScatterCandidate| {
+                        horizontal_distance < best.horizontal_distance
+                    })
+                {
+                    closest_sample = Some(ScatterCandidate {
+                        horizontal_distance,
+                        sample: TooltipSample {
+                            marker_point,
+                            value,
+                            distance_sq: hover_pos.distance_sq(marker_point),
+                        },
+                    });
+                }
+            }
+            let closest_sample = closest_sample?;
+            if closest_sample.horizontal_distance > SAMPLE_PROXIMITY {
+                return None;
+            }
+            closest_sample.sample
+        }
+        PlotSeriesKind::Clear => return None,
+    };
+
+    sample.value.is_finite().then_some(sample)
+}
+
+fn tooltip_series_label(series: &crate::PlotSeries) -> String {
+    let label = if series.label.is_empty() {
+        "y".to_owned()
+    } else {
+        series.label.clone()
+    };
+    if series.is_aggregated() {
+        format!("{label}, {}", series.aggregator)
+    } else {
+        label
+    }
+}
+
+fn tooltip_series_value(series: &crate::PlotSeries, value: f64) -> String {
+    let value = re_format::format_f64(value);
+    series
+        .unit
+        .as_ref()
+        .map_or_else(|| value.clone(), |unit| format!("{value} {unit}"))
+}
+
+#[expect(clippy::too_many_arguments)]
+fn all_series_tooltip(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    transform: &egui_plot::PlotTransform,
+    all_plot_series: &[&crate::PlotSeries],
+    time_offset: i64,
+    time_type: TimeType,
+    timestamp_format: re_log_types::TimestampFormat,
+    plot_item_id_to_data_result_address: &ahash::HashMap<egui::Id, DataResultInteractionAddress>,
+) -> Option<re_viewer_context::Item> {
+    re_tracing::profile_function!();
+
+    let hover_pos = response
+        .hover_pos()
+        .filter(|position| response.rect.contains(*position))?;
+    let hover_time =
+        (transform.value_from_position(hover_pos).x as i64).saturating_add(time_offset);
+
+    const MAX_TOOLTIP_ROWS: usize = 10;
+
+    let mut rows = Vec::new();
+    let mut num_displayed_series = 0_usize;
+    let mut closest_series = None;
+    let mut displayed_series = ahash::HashSet::default();
+    for (series_idx, series) in all_plot_series.iter().enumerate() {
+        let Some(&(first_time, _)) = series.points.first() else {
+            continue;
+        };
+        let Some(&(last_time, _)) = series.points.last() else {
+            continue;
+        };
+        if !series.visible || hover_time < first_time || hover_time > last_time {
+            continue;
+        }
+
+        let Some(sample) =
+            tooltip_sample_at_hover(series, hover_time, hover_pos, transform, time_offset)
+        else {
+            continue;
+        };
+        if !displayed_series.insert(series.id()) {
+            continue;
+        }
+
+        ui.painter()
+            .circle_filled(sample.marker_point, 3.0, series.color);
+
+        if closest_series.is_none_or(|(closest, _)| sample.distance_sq < closest) {
+            closest_series = Some((sample.distance_sq, series_idx));
+        }
+
+        num_displayed_series += 1;
+        if rows.len() < MAX_TOOLTIP_ROWS {
+            rows.push((
+                tooltip_series_label(series),
+                tooltip_series_value(series, sample.value),
+                series.color,
+            ));
+        }
+    }
+
+    if rows.is_empty() {
+        return None;
+    }
+
+    let time_label = format_time_for_tooltip(hover_time, time_type, timestamp_format);
+    let num_omitted_rows = num_displayed_series.saturating_sub(rows.len());
+    re_plot::tooltip::show_plot_tooltip_rows(
+        ui,
+        response,
+        response.id.with("all_series"),
+        &time_label,
+        rows.iter()
+            .map(|(label, value, color)| (label.as_str(), value.as_str(), *color)),
+        num_omitted_rows,
+    );
+
+    const LINE_PROXIMITY_RADIUS_SQ: f32 = 48.0 * 48.0;
+    let (_, series_idx) =
+        closest_series.filter(|(distance_sq, _)| *distance_sq <= LINE_PROXIMITY_RADIUS_SQ)?;
+    plot_item_id_to_data_result_address
+        .get(&all_plot_series[series_idx].id())
+        .map(|address| re_viewer_context::Item::DataResult(address.clone()))
+}
+
+fn format_time_for_tooltip(
+    time: i64,
+    time_type: TimeType,
+    timestamp_format: re_log_types::TimestampFormat,
+) -> String {
+    let tooltip_format = if time_type == TimeType::TimestampNs {
+        timestamp_format.with_date_visibility(re_log_types::DateVisibility::HideDate)
+    } else {
+        timestamp_format
+    };
+    time_type.format(re_log_types::TimeInt::new_temporal(time), tooltip_format)
 }
 
 fn paint_time_range_highlight(
@@ -1508,13 +1788,8 @@ fn paint_time_cursor(
         // Avoid frame-delay:
         time_x = pointer_pos.x;
 
-        set_time(
-            ctx,
-            current_time,
-            view_time_range,
-            new_view_time_range,
-            new_time.into(),
-        );
+        *new_view_time_range =
+            re_view::set_time_cursor(ctx, current_time, Some(&view_time_range.0), new_time.into());
     }
 
     let highlighted = is_near || is_being_dragged;
@@ -1590,26 +1865,23 @@ fn update_series_visibility_from_legend(
             continue;
         };
 
-        let descriptor = match series.kind {
-            PlotSeriesKind::Continuous | PlotSeriesKind::Stepped(_) => {
-                Some(SeriesLines::descriptor_visible_series())
-            }
-            PlotSeriesKind::Scatter(_) => Some(SeriesPoints::descriptor_visible_series()),
-            PlotSeriesKind::Clear => {
-                if cfg!(debug_assertions) {
-                    unreachable!(
-                        "Clear series can't be hidden since it doesn't show in the first place"
-                    );
-                }
-                None
-            }
-        };
-
         if let Some(visualizer_instruction) = result
             .visualizer_instructions
             .iter()
             .find(|instr| instr.id == series.visualizer_instruction_id)
         {
+            let visualizer = visualizer_instruction.visualizer_type;
+            let descriptor = if visualizer == SeriesLinesSystem::identifier() {
+                Some(SeriesLines::descriptor_visible_series())
+            } else if visualizer == SeriesPointsSystem::identifier() {
+                Some(SeriesPoints::descriptor_visible_series())
+            } else if visualizer == MeasurementsSeriesSystem::identifier() {
+                Some(Measurements::descriptor_visible_series())
+            } else {
+                re_log::debug_panic!("Unexpected time series visualizer `{visualizer}`");
+                None
+            };
+
             let override_path = &visualizer_instruction.override_path;
 
             let component_array = visibility_state
@@ -1645,23 +1917,23 @@ pub(crate) fn to_stepped_points(points: &[[f64; 2]], mode: crate::StepMode) -> V
     let mut stepped = Vec::with_capacity(capacity);
     match mode {
         crate::StepMode::After => {
-            for pair in points.windows(2) {
-                stepped.push(pair[0]);
-                stepped.push([pair[1][0], pair[0][1]]);
+            for [a, b] in points.array_windows() {
+                stepped.push(*a);
+                stepped.push([b[0], a[1]]);
             }
         }
         crate::StepMode::Before => {
-            for pair in points.windows(2) {
-                stepped.push(pair[0]);
-                stepped.push([pair[0][0], pair[1][1]]);
+            for [a, b] in points.array_windows() {
+                stepped.push(*a);
+                stepped.push([a[0], b[1]]);
             }
         }
         crate::StepMode::Mid => {
-            for pair in points.windows(2) {
-                let mid_t = fast_midpoint(pair[0][0], pair[1][0]);
-                stepped.push(pair[0]);
-                stepped.push([mid_t, pair[0][1]]);
-                stepped.push([mid_t, pair[1][1]]);
+            for [a, b] in points.array_windows() {
+                let mid_t = fast_midpoint(a[0], b[0]);
+                stepped.push(*a);
+                stepped.push([mid_t, a[1]]);
+                stepped.push([mid_t, b[1]]);
             }
         }
     }
@@ -1782,9 +2054,9 @@ fn render_re_renderer_draw_data(
     response: &egui::Response,
     view_id: re_renderer::ViewBuilderId,
     draw_data: Vec<re_renderer::QueueableDrawData>,
-) {
+) -> Result<(), re_renderer::view_builder::ViewBuilderError> {
     if draw_data.is_empty() {
-        return;
+        return Ok(());
     }
 
     let render_ctx = ctx.render_ctx();
@@ -1798,7 +2070,7 @@ fn render_re_renderer_draw_data(
         re_viewer_context::gpu_bridge::viewport_resolution_in_pixels(plot_rect, pixels_per_point);
 
     if resolution_in_pixel[0] == 0 || resolution_in_pixel[1] == 0 {
-        return;
+        return Ok(());
     }
 
     let height = plot_rect.height();
@@ -1825,13 +2097,10 @@ fn render_re_renderer_draw_data(
         ..Default::default()
     };
 
-    let Ok(mut view_builder) = re_renderer::ViewBuilder::new(render_ctx, target_config, view_id)
-    else {
-        return;
-    };
+    let mut view_builder = re_renderer::ViewBuilder::new(render_ctx, target_config, view_id)?;
 
     for dd in draw_data {
-        view_builder.queue_draw(render_ctx, dd);
+        view_builder.queue_draw(render_ctx, dd)?;
     }
 
     let painter = ui.painter_at(plot_rect);
@@ -1840,12 +2109,133 @@ fn render_re_renderer_draw_data(
         plot_rect,
         re_renderer::Rgba::TRANSPARENT,
     ));
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::StepMode;
     use re_viewer_context::SingleRequiredComponentMatch;
+
+    #[test]
+    fn test_interpolated_series_value_respects_line_modes() {
+        assert_eq!(
+            interpolated_series_value(PlotSeriesKind::Continuous, 5, 0, 0.0, 10, 10.0),
+            5.0
+        );
+        assert_eq!(
+            interpolated_series_value(PlotSeriesKind::Continuous, 5, 5, 1.0, 5, 2.0),
+            1.0
+        );
+        assert_eq!(
+            interpolated_series_value(PlotSeriesKind::Stepped(StepMode::After), 5, 0, 1.0, 10, 2.0),
+            1.0
+        );
+        assert_eq!(
+            interpolated_series_value(
+                PlotSeriesKind::Stepped(StepMode::Before),
+                5,
+                0,
+                1.0,
+                10,
+                2.0
+            ),
+            2.0
+        );
+        assert_eq!(
+            interpolated_series_value(PlotSeriesKind::Stepped(StepMode::Mid), 4, 0, 1.0, 10, 2.0),
+            1.0
+        );
+        assert_eq!(
+            interpolated_series_value(PlotSeriesKind::Stepped(StepMode::Mid), 5, 0, 1.0, 10, 2.0),
+            2.0
+        );
+        assert_eq!(
+            interpolated_series_value(
+                PlotSeriesKind::Scatter(Default::default()),
+                8,
+                0,
+                1.0,
+                10,
+                2.0
+            ),
+            2.0
+        );
+
+        let timestamp = 1_700_000_000_000_000_000;
+        assert_eq!(
+            interpolated_series_value(
+                PlotSeriesKind::Continuous,
+                timestamp + 50,
+                timestamp,
+                0.0,
+                timestamp + 100,
+                10.0,
+            ),
+            5.0
+        );
+        assert_eq!(
+            interpolated_series_value(
+                PlotSeriesKind::Scatter(Default::default()),
+                i64::MAX,
+                i64::MIN,
+                1.0,
+                i64::MAX - 1,
+                2.0,
+            ),
+            2.0
+        );
+        assert_eq!(
+            interpolated_series_value(PlotSeriesKind::Continuous, 0, i64::MIN, 0.0, i64::MAX, 10.0,),
+            5.0
+        );
+        assert_eq!(
+            interpolated_series_value(PlotSeriesKind::Stepped(StepMode::Mid), 1, 0, 1.0, 3, 2.0),
+            1.0
+        );
+        assert_eq!(
+            interpolated_series_value(PlotSeriesKind::Stepped(StepMode::Mid), 2, 0, 1.0, 3, 2.0),
+            2.0
+        );
+        assert_eq!(
+            interpolated_series_value(
+                PlotSeriesKind::Stepped(StepMode::Mid),
+                -1,
+                i64::MIN,
+                1.0,
+                i64::MAX,
+                2.0,
+            ),
+            1.0
+        );
+        assert_eq!(
+            interpolated_series_value(
+                PlotSeriesKind::Stepped(StepMode::Mid),
+                0,
+                i64::MIN,
+                1.0,
+                i64::MAX,
+                2.0,
+            ),
+            2.0
+        );
+    }
+
+    #[test]
+    fn test_tooltip_value_at_hover_uses_exact_finite_sample() {
+        let points = [(0, f64::NAN), (1, 5.0), (2, f64::NAN)];
+
+        for kind in [
+            PlotSeriesKind::Continuous,
+            PlotSeriesKind::Stepped(StepMode::After),
+            PlotSeriesKind::Stepped(StepMode::Before),
+            PlotSeriesKind::Stepped(StepMode::Mid),
+        ] {
+            assert_eq!(tooltip_value_at_hover(&points, kind, 1), Some(5.0));
+        }
+    }
 
     #[test]
     fn test_help_view() {
@@ -1863,7 +2253,7 @@ mod tests {
                 matches: std::iter::once((
                     Scalars::descriptor_scalars().component,
                     DatatypeMatch::PhysicalDatatypeOnly {
-                        arrow_datatype: DataType::Int32,
+                        arrow_data_type: DataType::Int32,
                         component_type: None,
                         selectors: vec![],
                     },
@@ -1891,7 +2281,7 @@ mod tests {
                 matches: std::iter::once((
                     Scalars::descriptor_scalars().component,
                     DatatypeMatch::NativeSemantics {
-                        arrow_datatype: DataType::Float64,
+                        arrow_data_type: DataType::Float64,
                         component_type: None,
                     },
                 ))

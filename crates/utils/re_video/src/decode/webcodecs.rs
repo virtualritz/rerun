@@ -229,7 +229,7 @@ impl AsyncDecoder for WebVideoDecoder {
                 frame_info: FrameInfo {
                     frame_nr: Some(video_chunk.frame_nr),
                     is_sync: Some(video_chunk.is_sync),
-                    sample_idx: Some(video_chunk.sample_idx),
+                    source: Some(video_chunk.source),
                     presentation_timestamp: video_chunk.presentation_timestamp,
                     duration: video_chunk.duration,
                     latest_decode_timestamp: Some(video_chunk.decode_timestamp),
@@ -376,7 +376,7 @@ impl AsyncDecoder for WebVideoDecoder {
 
     fn min_num_samples_to_enqueue_ahead(&self) -> usize {
         // TODO(#8848): For some h264 videos we need to enqueue more samples. For example videos in
-        // `s3://rerun-redap-datasets-pdx/larger-than-ram-demo/very-large.rrd`. (requires rerun login)
+        // `s3://rerun-datasets-curated-446437544659-us-west-2-an/larger-than-ram-demo/very-large.rrd`. (requires rerun login)
         //
         // This fixes it for Safari and Chrome on mac, while firefox still has issues.
         //

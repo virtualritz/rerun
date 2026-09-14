@@ -24,7 +24,7 @@ This page lists all built-in archetypes.
 ## Image & tensor
 
 * [`DepthImage`](archetypes/depth_image.md): A depth image, i.e. as captured by a depth camera.
-* [`EncodedDepthImage`](archetypes/encoded_depth_image.md): A depth image encoded with a codec (e.g. RVL or PNG).
+* [`EncodedDepthImage`](archetypes/encoded_depth_image.md): A depth image encoded with a codec (e.g. RVL, PNG, or TIFF).
 * [`EncodedImage`](archetypes/encoded_image.md): An image encoded as e.g. a JPEG or PNG.
 * [`Image`](archetypes/image.md): A monochrome or color image.
 * [`SegmentationImage`](archetypes/segmentation_image.md): An image made up of integer [`components.ClassId`](https://rerun.io/docs/reference/types/components/class_id)s.
@@ -40,6 +40,7 @@ This page lists all built-in archetypes.
 ## Plotting
 
 * [`BarChart`](archetypes/bar_chart.md): A bar chart.
+* [`Measurements`](archetypes/measurements.md): One or more scalar measurements, each with a variance and a unit.
 * [`Scalars`](archetypes/scalars.md): One or more double-precision scalar values, e.g. for use for time-series plots.
 * [`SeriesLines`](archetypes/series_lines.md): Define the style properties for one or more line series in a chart.
 * [`SeriesPoints`](archetypes/series_points.md): Define the style properties for one or more point series (scatter plot) in a chart.
@@ -68,6 +69,7 @@ This page lists all built-in archetypes.
 * [`LineStrips3D`](archetypes/line_strips3d.md): 3D line strips with positions and optional colors, radii, labels, etc.
 * [`Mesh3D`](archetypes/mesh3d.md): A 3D triangle mesh as specified by its per-mesh and per-vertex properties.
 * [`Points3D`](archetypes/points3d.md): A 3D point cloud with positions and optional colors, radii, labels, etc.
+* [`Volume3D`](archetypes/volume3d.md): A dense 3D scalar field, rendered by ray marching.
 * [`VoxelGridMap`](archetypes/voxel_grid_map.md): A sparse 3D voxel grid map with grid indices and voxel dimensions.
 
 ## Text

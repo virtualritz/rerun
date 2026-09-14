@@ -1,15 +1,15 @@
-"""Tests for rerun.experimental.McapReader and StreamingReader protocol."""
+"""Tests for rerun.chunk.McapReader and StreamingReader protocol."""
 
 from __future__ import annotations
 
 import re
 from collections import Counter
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import pyarrow as pa
 import pytest
-from rerun.experimental import Chunk, McapInfo, McapReader, StreamingReader
+from rerun.chunk import Chunk, McapInfo, McapReader, StreamingReader
 
 if TYPE_CHECKING:
     from syrupy import SnapshotAssertion
@@ -100,9 +100,10 @@ def test_file_not_found(tmp_path: Path) -> None:
         McapReader(tmp_path / "nonexistent.mcap")
 
 
-def test_invalid_timeline_type() -> None:
+@pytest.mark.parametrize("invalid", ["sequence", "unknown"])
+def test_invalid_timeline_type(invalid: str) -> None:
     with pytest.raises(ValueError, match="Invalid timeline_type"):
-        McapReader(POINT_CLOUD_MCAP, timeline_type="sequence")  # type: ignore[arg-type]
+        McapReader(POINT_CLOUD_MCAP, timeline_type=invalid)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -288,14 +289,24 @@ def test_recover_truncated_matches_healthy(tmp_path: Path) -> None:
 
 
 def test_truncated_without_recover_raises(tmp_path: Path) -> None:
-    """Without `recover`, a missing summary is a hard error on both `stream` and `time_bounds`."""
+    """Without `recover`, a missing summary is a hard error on `stream`, `info`, and `time_bounds`."""
     truncated = tmp_path / "truncated.mcap"
     _truncate_before_summary(POINT_CLOUD_MCAP, truncated)
 
-    with pytest.raises(ValueError):
-        McapReader(truncated).stream().to_chunks()
-    with pytest.raises(ValueError):
-        McapReader(truncated).time_bounds()
+    reader = McapReader(truncated)
+    for read_summary in (reader.stream, reader.info, reader.time_bounds):
+        with pytest.raises(ValueError, match="try reopening it with recovery enabled"):
+            read_summary()
+
+
+def test_invalid_start_magic_does_not_suggest_recovery(tmp_path: Path) -> None:
+    """A file without MCAP start magic should not suggest recovery in its error message."""
+    invalid = tmp_path / "invalid.mcap"
+    invalid.write_bytes(b"not an mcap file at all")
+
+    with pytest.raises(ValueError, match="missing start magic") as exc_info:
+        McapReader(invalid).info()
+    assert "try reopening it with recovery enabled" not in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
@@ -305,3 +316,32 @@ def test_truncated_without_recover_raises(tmp_path: Path) -> None:
 
 def test_streaming_reader_protocol() -> None:
     assert isinstance(McapReader(POINT_CLOUD_MCAP), StreamingReader)
+
+
+@pytest.mark.parametrize("kind", ["duration", "timestamp"])
+def test_timeline_aliases(kind: Literal["duration", "timestamp"]) -> None:
+    canonical: Literal["duration_ns", "timestamp_ns"] = "duration_ns" if kind == "duration" else "timestamp_ns"
+    short_chunks = McapReader(LOG_MCAP, timestamp_offset_ns=123, timeline_type=kind).stream().to_chunks()
+    canonical_chunks = McapReader(LOG_MCAP, timestamp_offset_ns=123, timeline_type=canonical).stream().to_chunks()
+    _assert_same_timelines(short_chunks, canonical_chunks)
+
+
+def test_default_timeline_type() -> None:
+    default_chunks = McapReader(LOG_MCAP).stream().to_chunks()
+    explicit_chunks = McapReader(LOG_MCAP, timeline_type="timestamp_ns").stream().to_chunks()
+    _assert_same_timelines(default_chunks, explicit_chunks)
+
+
+def _assert_same_timelines(left: list[Chunk], right: list[Chunk]) -> None:
+    assert left
+    assert len(left) == len(right)
+    compared = 0
+    for a, b in zip(left, right, strict=True):
+        assert a.entity_path == b.entity_path
+        assert a.timeline_names == b.timeline_names
+        a_batch, b_batch = a.to_record_batch(), b.to_record_batch()
+        for name in a.timeline_names:
+            assert a_batch.schema.field(name).equals(b_batch.schema.field(name), check_metadata=True)
+            assert a_batch.column(name).equals(b_batch.column(name))
+            compared += 1
+    assert compared > 0

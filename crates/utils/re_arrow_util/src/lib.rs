@@ -11,7 +11,7 @@ mod test_extensions;
 // ----------------------------------------------------------------
 use std::sync::Arc;
 
-use arrow::array::{Array as _, AsArray as _, ListArray};
+use arrow::array::{AsArray as _, ListArray};
 use arrow::datatypes::{DataType, Field};
 
 pub use self::arrays::*;
@@ -27,10 +27,7 @@ pub use self::test_extensions::*;
 
 /// Convert any `BinaryArray` to `LargeBinaryArray`, because we treat them logically the same
 pub fn widen_binary_arrays(list_array: &ListArray) -> ListArray {
-    let list_data_type = list_array.data_type();
-    if let DataType::List(field) = list_data_type
-        && field.data_type() == &DataType::Binary
-    {
+    if list_array.field().data_type() == &DataType::Binary {
         re_tracing::profile_function!();
         let large_binary_field = Field::new("item", DataType::LargeBinary, true);
         let target_type = DataType::List(Arc::new(large_binary_field));
@@ -47,7 +44,7 @@ pub fn widen_binary_arrays(list_array: &ListArray) -> ListArray {
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{BinaryBuilder, ListBuilder};
+    use arrow::array::{Array as _, BinaryBuilder, ListBuilder};
 
     use super::*;
 
@@ -80,12 +77,7 @@ mod tests {
         assert!(!widened_list.is_null(1));
         assert!(widened_list.is_null(2));
 
-        // Check data type
-        if let DataType::List(field) = widened_list.data_type() {
-            assert_eq!(field.data_type(), &DataType::LargeBinary);
-        } else {
-            panic!("Expected List data type");
-        }
+        assert_eq!(widened_list.field().data_type(), &DataType::LargeBinary);
     }
 }
 
@@ -131,7 +123,7 @@ pub fn reject_unsupported_widenings(dt: &DataType) -> Result<(), arrow::error::A
 // ----------------------------------------------------------------
 
 /// Error used when a column is missing from a record batch
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Clone, thiserror::Error)]
 pub struct MissingColumnError {
     pub missing: String,
     pub available: Vec<String>,
@@ -141,6 +133,46 @@ impl std::fmt::Display for MissingColumnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self { missing, available } = self;
         write!(f, "Missing column: {missing:?}. Available: {available:?}")
+    }
+}
+
+/// Defers to [`std::fmt::Display`], so that `.unwrap()` panics with the readable message.
+impl std::fmt::Debug for MissingColumnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self}")
+    }
+}
+
+/// Error used when a column is missing from a record batch, or has the wrong type.
+#[derive(Clone, thiserror::Error)]
+pub enum GetColumnError {
+    #[error(transparent)]
+    Missing(#[from] MissingColumnError),
+
+    #[error("Column {column:?}: {err}")]
+    Downcast {
+        column: String,
+
+        #[source]
+        err: DowncastError,
+    },
+}
+
+/// Defers to [`std::fmt::Display`], so that `.unwrap()` panics with the readable message.
+impl std::fmt::Debug for GetColumnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self}")
+    }
+}
+
+impl From<GetColumnError> for arrow::error::ArrowError {
+    fn from(err: GetColumnError) -> Self {
+        let message = err.to_string();
+        match err {
+            // Same mapping as the errors these wrap:
+            GetColumnError::Missing(_) => Self::SchemaError(message),
+            GetColumnError::Downcast { .. } => Self::CastError(message),
+        }
     }
 }
 

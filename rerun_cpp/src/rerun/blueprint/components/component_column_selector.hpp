@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "../../blueprint/datatypes/component_column_selector.hpp"
+#include "../../blueprint/encodings/component_column_selector.hpp"
 #include "../../result.hpp"
 
 #include <cstdint>
@@ -16,23 +16,23 @@ namespace rerun::blueprint::components {
     /// ⚠ **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**
     ///
     struct ComponentColumnSelector {
-        rerun::blueprint::datatypes::ComponentColumnSelector selector;
+        rerun::blueprint::encodings::ComponentColumnSelector selector;
 
       public:
         ComponentColumnSelector() = default;
 
-        ComponentColumnSelector(rerun::blueprint::datatypes::ComponentColumnSelector selector_)
+        ComponentColumnSelector(rerun::blueprint::encodings::ComponentColumnSelector selector_)
             : selector(std::move(selector_)) {}
 
         ComponentColumnSelector& operator=(
-            rerun::blueprint::datatypes::ComponentColumnSelector selector_
+            rerun::blueprint::encodings::ComponentColumnSelector selector_
         ) {
             selector = std::move(selector_);
             return *this;
         }
 
-        /// Cast to the underlying ComponentColumnSelector datatype
-        operator rerun::blueprint::datatypes::ComponentColumnSelector() const {
+        /// Cast to the underlying ComponentColumnSelector encoding
+        operator rerun::blueprint::encodings::ComponentColumnSelector() const {
             return selector;
         }
     };
@@ -40,7 +40,7 @@ namespace rerun::blueprint::components {
 
 namespace rerun {
     static_assert(
-        sizeof(rerun::blueprint::datatypes::ComponentColumnSelector) ==
+        sizeof(rerun::blueprint::encodings::ComponentColumnSelector) ==
         sizeof(blueprint::components::ComponentColumnSelector)
     );
 
@@ -51,8 +51,9 @@ namespace rerun {
             "rerun.blueprint.components.ComponentColumnSelector";
 
         /// Returns the arrow data type this type corresponds to.
-        static const std::shared_ptr<arrow::DataType>& arrow_datatype() {
-            return Loggable<rerun::blueprint::datatypes::ComponentColumnSelector>::arrow_datatype();
+        static const std::shared_ptr<arrow::DataType>& arrow_data_type() {
+            return Loggable<rerun::blueprint::encodings::ComponentColumnSelector>::arrow_data_type(
+            );
         }
 
         /// Serializes an array of `rerun::blueprint:: components::ComponentColumnSelector` into an arrow array.
@@ -60,7 +61,7 @@ namespace rerun {
             const blueprint::components::ComponentColumnSelector* instances, size_t num_instances
         ) {
             if (num_instances == 0) {
-                return Loggable<rerun::blueprint::datatypes::ComponentColumnSelector>::to_arrow(
+                return Loggable<rerun::blueprint::encodings::ComponentColumnSelector>::to_arrow(
                     nullptr,
                     0
                 );
@@ -70,7 +71,7 @@ namespace rerun {
                     "Passed array instances is null when num_elements> 0."
                 );
             } else {
-                return Loggable<rerun::blueprint::datatypes::ComponentColumnSelector>::to_arrow(
+                return Loggable<rerun::blueprint::encodings::ComponentColumnSelector>::to_arrow(
                     &instances->selector,
                     num_instances
                 );

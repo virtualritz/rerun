@@ -17,9 +17,10 @@ use re_viewer_context::open_url::{self, ViewerOpenUrl};
 use re_viewer_context::{
     ActiveStoreContext, AppBlueprintCtx, AppContext, AppOptions, ApplicationSelectionState,
     AuthContext, BlueprintContext, BlueprintUndoState, CommandSender, ComponentUiRegistry,
-    DragAndDropManager, FallbackProviderRegistry, FocusTarget, Item, ItemCollection, Route,
-    SelectionChange, StorageContext, StoreHub, SystemCommand, SystemCommandSender as _, TableStore,
-    TimeControl, TimeControlCommand, ViewClassRegistry, ViewStates, ViewerContext,
+    DragAndDropManager, EntryKind, FallbackProviderRegistry, FocusTarget, Item, ItemCollection,
+    Route, SelectionChange, StorageContext, StoreHub, SystemCommand, SystemCommandSender as _,
+    TableReference, TableStore, TimeControl, TimeControlCommand, ViewClassRegistry, ViewStates,
+    ViewerContext,
 };
 use re_viewport::ViewportUi;
 use re_viewport_blueprint::ViewportBlueprint;
@@ -47,6 +48,17 @@ pub struct AppState {
     /// Global options for the whole viewer.
     pub(crate) app_options: AppOptions,
 
+    /// Settings shared by all conversations in the agent panel.
+    ///
+    /// This stays in `re_viewer` so `re_viewer_context` does not depend on the native-only
+    /// agent UI.
+    #[cfg(agent_panel)]
+    pub(crate) agent_settings: re_agent_ui::AgentSettings,
+
+    /// Whether the agent panel is open. Persisted, so it comes back on the next run.
+    #[cfg(agent_panel)]
+    pub(crate) agent_panel_open: bool,
+
     /// The time control for each recording (found in [`EntityDb`]).
     ///
     /// Created lazily on first use with a given store.
@@ -65,6 +77,13 @@ pub struct AppState {
     /// Maps blueprint id to the current undo state for it.
     #[serde(skip)]
     pub blueprint_undo_state: HashMap<StoreId, BlueprintUndoState>,
+
+    /// The selection panel's back/forward history for each recording.
+    ///
+    /// Kept per recording so that stepping back never jumps you to a different recording.
+    /// Created lazily on first use with a given store.
+    #[serde(skip)]
+    pub selection_histories: HashMap<StoreId, re_selection_panel::SelectionHistory>,
 
     selection_panel: re_selection_panel::SelectionPanel,
     time_panel: re_time_panel::TimePanel,
@@ -103,6 +122,10 @@ pub struct AppState {
     /// A stack of [`Route`]s that represents tab-like navigation of the user.
     #[serde(skip)]
     pub(crate) navigation: Navigation,
+
+    /// The latest terminal loading error for each data source.
+    #[serde(skip)]
+    pub(crate) last_loading_error: HashMap<LogSource, String>,
 
     /// A history of urls the viewer has visited.
     ///
@@ -144,9 +167,14 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             app_options: Default::default(),
+            #[cfg(agent_panel)]
+            agent_settings: Default::default(),
+            #[cfg(agent_panel)]
+            agent_panel_open: false,
             time_controls: Default::default(),
             app_caches: Default::default(),
             blueprint_undo_state: Default::default(),
+            selection_histories: Default::default(),
             blueprint_time_control: Default::default(),
             selection_panel: Default::default(),
             time_panel: Default::default(),
@@ -159,6 +187,7 @@ impl Default for AppState {
             open_url_modal: Default::default(),
             share_modal: Default::default(),
             navigation: Default::default(),
+            last_loading_error: Default::default(),
             history: Default::default(),
             view_states: Default::default(),
             selection_state: Default::default(),
@@ -181,7 +210,27 @@ pub(crate) struct WelcomeScreenState {
     pub opacity: f32,
 }
 
+/// The entry kind a route should carry, given what it has and what the catalog says.
+fn resolve_entry_kind(
+    route_kind: Option<EntryKind>,
+    catalog_kind: Option<EntryKind>,
+) -> Option<EntryKind> {
+    match (catalog_kind, route_kind) {
+        (Some(EntryKind::Dataset(_)), Some(dataset @ EntryKind::Dataset(_))) => Some(dataset),
+        (Some(catalog_kind), _) => Some(catalog_kind),
+        (None, route_kind) => route_kind,
+    }
+}
+
 impl AppState {
+    /// Returns the latest terminal loading error for `source`.
+    pub fn last_loading_error_for(&self, source: &LogSource) -> Option<&str> {
+        self.last_loading_error
+            .iter()
+            .find(|(candidate, _)| candidate.is_same_ignoring_uri_fragments(source))
+            .map(|(_, error)| error.as_str())
+    }
+
     /// The active recording [`StoreId`], if any, derived from the current [`Route`].
     pub fn active_recording_id(&self) -> Option<&StoreId> {
         self.navigation.current().recording_id()
@@ -190,6 +239,48 @@ impl AppState {
     /// The current time cursor for a recording, if any.
     pub fn time_cursor_for(&self, store_id: &StoreId) -> Option<re_entity_db::PrefetchTimeCursor> {
         self.time_controls.get(store_id)?.time_cursor()
+    }
+
+    /// Makes the entry kind of the current route agree with the catalog, once the catalog knows.
+    pub(crate) fn resolve_route(&mut self) {
+        let Route::RedapEntry {
+            origin,
+            entry_id,
+            kind,
+        } = self.navigation.current()
+        else {
+            return;
+        };
+
+        let (origin, entry_id, kind) = (origin.clone(), *entry_id, *kind);
+
+        let resolved_kind =
+            resolve_entry_kind(kind, self.redap_servers.entry_kind(&origin, entry_id));
+
+        if resolved_kind != kind {
+            self.navigation.replace(Route::RedapEntry {
+                origin,
+                entry_id,
+                kind: resolved_kind,
+            });
+        }
+    }
+
+    /// Whether the current route may still change as data or metadata loads.
+    pub(crate) fn is_resolving_route(&self) -> bool {
+        match self.navigation.current() {
+            Route::Loading(_) => true,
+            Route::RedapEntry {
+                origin,
+                entry_id,
+                kind,
+            } => {
+                self.redap_servers.is_entry_kind_pending(origin, *entry_id)
+                    || resolve_entry_kind(*kind, self.redap_servers.entry_kind(origin, *entry_id))
+                        != *kind
+            }
+            _ => false,
+        }
     }
 
     pub fn set_examples_manifest_url(&mut self, egui_ctx: &egui::Context, url: String) {
@@ -204,7 +295,6 @@ impl AppState {
         &mut self.app_options
     }
 
-    // TODO(andreas): Large route-dispatch match, one arm per `Route`.
     pub fn show(
         &mut self,
         app_env: &crate::AppEnvironment,
@@ -214,6 +304,7 @@ impl AppState {
         render_ctx: &re_renderer::RenderContext,
         active_store_context: Option<&ActiveStoreContext<'_>>,
         storage_context: &StorageContext<'_>,
+        table_blueprints: &re_dataframe_ui::TableBlueprints,
         reflection: &re_types_core::reflection::Reflection,
         component_ui_registry: &ComponentUiRegistry,
         component_fallback_registry: &FallbackProviderRegistry,
@@ -248,13 +339,17 @@ impl AppState {
 
         let active_route = self.navigation.current().clone();
 
-        self.selection_on_frame_start(
-            storage_context,
-            event_dispatcher,
-            active_store_context,
-            &active_route,
-            viewport_ui.as_ref(),
-        );
+        // Don't mess with the selection state while we're on the loading screen,
+        // this way we can go back.
+        if !matches!(active_route, Route::Loading(_)) {
+            self.selection_on_frame_start(
+                storage_context,
+                event_dispatcher,
+                active_store_context,
+                &active_route,
+                viewport_ui.as_ref(),
+            );
+        }
 
         // App-level context, available for all routes (also those without an active recording).
         let app_ctx = AppContext {
@@ -268,6 +363,7 @@ impl AppState {
             command_sender,
 
             connection_registry,
+            last_loading_error: &self.last_loading_error,
             storage_context,
             active_store_context,
             app_caches: &self.app_caches,
@@ -293,6 +389,13 @@ impl AppState {
 
         let viewport_frame = egui::Frame {
             fill: ui.style().visuals.panel_fill,
+            ..Default::default()
+        };
+
+        // The catalog, dataset and table pages get their own background, so they don't look like
+        // more panel. The viewport keeps the panel fill.
+        let page_frame = egui::Frame {
+            fill: ui.tokens().page_bg_color,
             ..Default::default()
         };
 
@@ -327,7 +430,7 @@ impl AppState {
                 );
             }
 
-            Route::LocalRecording { recording_id: _ } => {
+            Route::LocalRecording { recording_id } => {
                 // `viewport_ui` is `Some` iff `active_store_context` is `Some`.
                 let (Some(store_context), Some(viewport_ui)) = (active_store_context, viewport_ui)
                 else {
@@ -339,6 +442,7 @@ impl AppState {
 
                 let Self {
                     blueprint_undo_state,
+                    selection_histories,
                     blueprint_time_control,
                     selection_panel,
                     time_panel,
@@ -546,6 +650,7 @@ impl AppState {
                     view_states,
                     ui,
                     &mut selection_expanded,
+                    selection_histories.entry(recording_id.clone()).or_default(),
                 );
                 if selection_expanded != selection_was_expanded {
                     // The user dragged the resize handle past the panel's limits to collapse/expand it:
@@ -618,21 +723,16 @@ impl AppState {
                 egui::CentralPanel::default()
                     .frame(viewport_frame)
                     .show(ui, |ui| {
-                        if let Some(re_uri::RedapUri::DatasetData(uri)) = log_source.redap_uri()
-                            && let Some(err) = app_ctx.connection_registry.error_for_uri(uri)
-                        {
-                            ui.center("loading error", |ui| {
-                                ui.set_max_width(ui.available_width() * 0.75);
-                                ui.vertical_centered(|ui| {
-                                    ui.error_label(format!("Failed to load {source_name}: {err}"));
-
-                                    if ui.button("Go Back").clicked() {
-                                        command_sender.send_system(SystemCommand::ResetRoute);
-                                    }
-                                })
-                            });
-                        } else {
-                            ui.loading_screen("Loading data source:", &*source_name);
+                        let error = self
+                            .last_loading_error_for(log_source)
+                            .map(|error| format!("Failed to load {source_name}: {error}"));
+                        if ui.loading_screen(
+                            "Loading data source:",
+                            &*source_name,
+                            error.as_deref(),
+                            Some("Go Back"),
+                        ) {
+                            command_sender.send_system(SystemCommand::ReturnFromLoading);
                         }
                     });
             }
@@ -651,19 +751,20 @@ impl AppState {
                 );
 
                 egui::CentralPanel::default()
-                    .frame(viewport_frame)
+                    .frame(page_frame)
                     .show(ui, |ui| {
                         if let Some(store) = app_ctx.table_stores().get(table_id) {
                             re_dataframe_ui::DataFusionTableWidget::new(
                                 store.session_context(),
                                 TableStore::TABLE_NAME,
+                                TableReference::local(table_id.clone()),
                             )
-                            .table_id(table_id.clone())
                             .title(table_id.as_str())
                             .show(
                                 &app_ctx,
                                 runtime,
                                 ui,
+                                table_blueprints,
                                 &mut self.view_states,
                             );
                         } else {
@@ -689,7 +790,7 @@ impl AppState {
                 );
 
                 egui::CentralPanel::default()
-                    .frame(viewport_frame)
+                    .frame(page_frame)
                     .show(ui, |ui| {
                         if origin == &*re_redap_browser::EXAMPLES_ORIGIN {
                             let origin = self
@@ -727,16 +828,14 @@ impl AppState {
                                 &app_ctx,
                                 ui,
                                 origin,
+                                table_blueprints,
                                 &mut self.view_states,
                             );
                         }
                     });
             }
 
-            Route::RedapEntry {
-                kind: re_viewer_context::RedapEntryKind::Entry(entry_id),
-                ..
-            } => {
+            Route::RedapEntry { entry_id, kind, .. } => {
                 Self::left_panel_ui(
                     &mut self.recording_panel,
                     &mut self.blueprint_tree,
@@ -750,16 +849,22 @@ impl AppState {
                 );
 
                 egui::CentralPanel::default()
-                    .frame(viewport_frame)
+                    .frame(page_frame)
                     .show(ui, |ui| {
-                        self.redap_servers
-                            .entry_ui(&app_ctx, ui, *entry_id, &mut self.view_states);
+                        self.redap_servers.entry_ui(
+                            &app_ctx,
+                            ui,
+                            *entry_id,
+                            *kind,
+                            table_blueprints,
+                            &mut self.view_states,
+                        );
                     });
             }
 
-            Route::RedapEntry {
+            Route::RedapFolder {
                 origin,
-                kind: re_viewer_context::RedapEntryKind::Folder(path_prefix),
+                path: path_prefix,
             } => {
                 Self::left_panel_ui(
                     &mut self.recording_panel,
@@ -774,7 +879,7 @@ impl AppState {
                 );
 
                 egui::CentralPanel::default()
-                    .frame(viewport_frame)
+                    .frame(page_frame)
                     .show(ui, |ui| {
                         self.redap_servers.folder_central_panel_ui(
                             &app_ctx,
@@ -939,6 +1044,7 @@ impl AppState {
                     Route::LocalRecording { .. }
                     | Route::LocalTable(..)
                     | Route::RedapEntry { .. }
+                    | Route::RedapFolder { .. }
                     | Route::RedapServer(..)
                     | Route::Loading(..) => {
                         let resizable = viewport.is_some();
@@ -1034,6 +1140,9 @@ impl AppState {
             .retain(|store_id, _| store_hub.store_bundle().contains(store_id));
 
         self.blueprint_undo_state
+            .retain(|store_id, _| store_hub.store_bundle().contains(store_id));
+
+        self.selection_histories
             .retain(|store_id, _| store_hub.store_bundle().contains(store_id));
 
         if let Some(preview_state) = &mut self.view_states.preview_state {
@@ -1170,10 +1279,9 @@ fn check_for_clicked_hyperlinks(egui_ctx: &egui::Context, command_sender: &Comma
 
                     // We handled the URL, therefore egui shouldn't do anything anymore with it.
                     return false;
-                } else {
-                    // Open all links in a new tab (https://github.com/rerun-io/rerun/issues/4105)
-                    open_url.new_tab = true;
                 }
+                // Open all links in a new tab (https://github.com/rerun-io/rerun/issues/4105)
+                open_url.new_tab = true;
             }
             true
         });
@@ -1198,5 +1306,102 @@ impl re_byte_size::MemUsageTreeCapture for AppState {
             re_byte_size::MemUsageTreeCapture::capture_mem_usage_tree(&self.view_states),
         );
         tree.into_tree()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use re_log_types::EntryId;
+
+    use super::*;
+
+    #[test]
+    fn loading_error_lookup_ignores_redap_open_behavior() {
+        let entry_id = EntryId::new();
+        let uri: re_uri::DatasetUri =
+            format!("rerun://127.0.0.1:1234/dataset/{entry_id}?segment_id=pid")
+                .parse()
+                .expect("valid dataset URI");
+        let failed_source = LogSource::RedapGrpcStream {
+            uri: uri.clone(),
+            open_behavior: RecordingOpenBehavior::Open,
+        };
+        let loading_source = LogSource::RedapGrpcStream {
+            uri,
+            open_behavior: RecordingOpenBehavior::Background,
+        };
+        let mut state = AppState::default();
+        state
+            .last_loading_error
+            .insert(failed_source, "server error".to_owned());
+
+        assert_eq!(
+            state.last_loading_error_for(&loading_source),
+            Some("server error")
+        );
+    }
+
+    /// A url can call an entry a dataset when the catalog knows it to be a table. The route then
+    /// shows a table, and the url it shares is an entry url.
+    #[test]
+    fn a_table_behind_a_dataset_url_shares_an_entry_url() {
+        let origin: re_uri::Origin = "rerun://localhost:51234".parse().expect("valid origin");
+        let entry_id = EntryId::new();
+
+        let kind = resolve_entry_kind(
+            Some(EntryKind::Dataset(re_uri::DatasetResource::default())),
+            Some(EntryKind::Table),
+        );
+        assert_eq!(kind, Some(EntryKind::Table));
+
+        let url = ViewerOpenUrl::from_route(
+            &StoreHub::test_hub(),
+            &Route::RedapEntry {
+                origin: origin.clone(),
+                entry_id,
+                kind,
+            },
+        )
+        .expect("a redap entry route has a url");
+
+        assert_eq!(
+            url,
+            ViewerOpenUrl::RedapEntry(re_uri::EntryUri::new(origin, entry_id))
+        );
+    }
+
+    /// The catalog says nothing about which resource of a dataset is on display, so a route that
+    /// already shows one keeps it. A route that shows a table instead falls back to the default
+    /// resource.
+    #[test]
+    fn a_dataset_route_keeps_its_resource() {
+        let catalog_kind = Some(EntryKind::Dataset(re_uri::DatasetResource::default()));
+
+        assert_eq!(
+            resolve_entry_kind(
+                Some(EntryKind::Dataset(re_uri::DatasetResource::Assets)),
+                catalog_kind
+            ),
+            Some(EntryKind::Dataset(re_uri::DatasetResource::Assets))
+        );
+        assert_eq!(
+            resolve_entry_kind(Some(EntryKind::Table), catalog_kind),
+            catalog_kind
+        );
+    }
+
+    /// A route that names no kind takes the one from the catalog, and a catalog that knows nothing
+    /// leaves the route as it is.
+    #[test]
+    fn an_unknown_kind_follows_the_catalog() {
+        assert_eq!(
+            resolve_entry_kind(None, Some(EntryKind::Table)),
+            Some(EntryKind::Table)
+        );
+        assert_eq!(resolve_entry_kind(None, None), None);
+        assert_eq!(
+            resolve_entry_kind(Some(EntryKind::Table), None),
+            Some(EntryKind::Table)
+        );
     }
 }

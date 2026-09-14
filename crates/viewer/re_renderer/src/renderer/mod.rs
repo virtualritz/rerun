@@ -30,7 +30,9 @@ pub use rectangles::{
     TextureAlpha, TextureFilterMag, TextureFilterMin, TexturedRect,
 };
 pub use test_triangle::TestTriangleDrawData;
-pub use voxel_grid::{VoxelGridDrawData, VoxelGridInstance, VoxelGridOptions};
+pub use voxel_grid::{
+    VoxelGridDrawData, VoxelGridDrawDataError, VoxelGridInstance, VoxelGridOptions,
+};
 pub use world_grid::{WorldGridConfiguration, WorldGridDrawData, WorldGridRenderer};
 
 pub use self::depth_cloud::{DepthCloud, DepthCloudDrawData, DepthCloudRenderer, DepthClouds};
@@ -47,6 +49,8 @@ pub(crate) use compositor::CompositorDrawData;
 pub(crate) use mesh_renderer::MeshRenderer;
 
 // ------------
+use std::any::Any;
+
 use crate::{
     Drawable, DrawableCollector, QueueableDrawData,
     context::RenderContext,
@@ -87,15 +91,6 @@ pub struct DrawDataDrawable {
 }
 
 impl DrawDataDrawable {
-    #[inline]
-    pub fn from_affine(
-        view_info: &DrawableCollectionViewInfo,
-        world_from_rdf: &glam::Affine3A,
-        draw_data_payload: DrawDataDrawablePayload,
-    ) -> Self {
-        Self::from_world_position(view_info, world_from_rdf.translation, draw_data_payload)
-    }
-
     #[inline]
     pub fn from_world_position(
         view_info: &DrawableCollectionViewInfo,
@@ -155,6 +150,9 @@ pub trait DrawData {
 pub enum DrawError {
     #[error(transparent)]
     Pool(#[from] PoolError),
+
+    #[error(transparent)]
+    Renderer(#[from] crate::RendererRegistrationError),
 }
 
 /// A draw instruction specifies which drawables of a given [`DrawData`] should be rendered.
@@ -191,8 +189,7 @@ pub trait Renderer {
     ) -> Result<(), DrawError>;
 }
 
-/// Extension trait for [`Renderer`] that allows running draw instructions with type erased draw data.
-pub(crate) trait RendererExt: wgpu::WasmNotSendSync {
+pub trait RendererExt: Any + Send + Sync {
     fn run_draw_instructions(
         &self,
         gpu_resources: &GpuRenderPipelinePoolAccessor<'_>,
@@ -200,12 +197,9 @@ pub(crate) trait RendererExt: wgpu::WasmNotSendSync {
         pass: &mut wgpu::RenderPass<'_>,
         type_erased_draw_instructions: &[DrawInstruction<'_, QueueableDrawData>],
     ) -> Result<(), DrawError>;
-
-    /// Name of the renderer, used for debugging & error reporting.
-    fn name(&self) -> &'static str;
 }
 
-impl<R: Renderer + wgpu::WasmNotSendSync> RendererExt for R {
+impl<R: Renderer + Send + Sync + 'static> RendererExt for R {
     fn run_draw_instructions(
         &self,
         gpu_resources: &GpuRenderPipelinePoolAccessor<'_>,
@@ -224,10 +218,6 @@ impl<R: Renderer + wgpu::WasmNotSendSync> RendererExt for R {
 
         self.draw(gpu_resources, phase, pass, &draw_instructions)
     }
-
-    fn name(&self) -> &'static str {
-        std::any::type_name::<R>()
-    }
 }
 
 /// Gets or creates a vertex shader module for drawing a screen filling triangle.
@@ -240,4 +230,26 @@ pub fn screen_triangle_vertex_shader(
         ctx,
         &include_shader_module!("../../shader/screen_triangle.wgsl"),
     )
+}
+
+pub fn register_renderers(renderers: &mut crate::Renderers) {
+    renderers.register::<compositor::Compositor>();
+    renderers.register::<debug_overlay::DebugOverlayRenderer>();
+    renderers.register::<depth_cloud::DepthCloudRenderer>();
+    renderers.register::<gaussian_splat::GaussianSplatRenderer>();
+    renderers.register::<generic_skybox::GenericSkybox>();
+    renderers.register::<lines::LineRenderer>();
+    // FORK DIVERGENCE: akatela's resident mesh-element pass, which draws cage
+    // edges and vertices straight from the mesh already on the GPU. Upstream
+    // moved to explicit registration, and an unregistered `Renderer` does not
+    // fail to compile -- `queue_draw` returns `NotRegistered` the first time
+    // the pass runs. Omitting this line breaks element display at RUNTIME
+    // only.
+    renderers.register::<mesh_element_renderer::MeshElementRenderer>();
+    renderers.register::<mesh_renderer::MeshRenderer>();
+    renderers.register::<point_cloud::PointCloudRenderer>();
+    renderers.register::<rectangles::RectangleRenderer>();
+    renderers.register::<test_triangle::TestTriangle>();
+    renderers.register::<voxel_grid::VoxelGridRenderer>();
+    renderers.register::<world_grid::WorldGridRenderer>();
 }

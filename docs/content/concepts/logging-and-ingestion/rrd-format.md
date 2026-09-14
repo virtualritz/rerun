@@ -41,7 +41,7 @@ The body of an RRD is a sequence of `LogMsg`s. There are three variants:
 
 Every `ArrowMsg` carries a single **chunk** — an Apache Arrow `RecordBatch` with Rerun-specific schema metadata. A chunk belongs to one entity path and holds a contiguous run of rows for that entity, with one column per timeline and one column per component. See [Chunks](chunks.md) for the conceptual deep-dive (how chunks are built, batched, sorted, compacted); this section just shows what a chunk looks like when you crack one open.
 
-The schema is laid out per **Sorbet**, Rerun's object-model spec — it defines how chunks, archetypes, components, and timelines map onto Arrow column names, types, and metadata. The easiest way to see it concretely is to save a recording and reopen it with [`RrdReader`](https://ref.rerun.io/docs/python/stable/experimental/#rerun.experimental.RrdReader).
+The schema is laid out per **Sorbet**, Rerun's object-model spec — it defines how chunks, archetypes, components, and timelines map onto Arrow column names, types, and metadata. The easiest way to see it concretely is to save a recording and reopen it with [`RrdReader`](https://ref.rerun.io/docs/python/stable/chunk?speculative-link#rerun.chunk.RrdReader).
 
 First, let's create an RRD file with some content:
 
@@ -101,7 +101,6 @@ Every store in an RRD is identified by a `StoreId` and described by a `StoreInfo
     - **`application_id`** — a user-chosen identifier for the application that produced the recording (see [Recordings](recordings.md) for the conventions, including the relationship with segment and dataset IDs in the remote/catalog context).
     - **`recording_id`** — a UUID or user-chosen string that distinguishes runs of the same application (catalog servers use this as the segment ID — see the [catalog object model](../query-and-transform/catalog-object-model.md)).
 - **`StoreInfo`** wraps the `StoreId` and adds:
-    - **`cloned_from`** — for stores that originated as a clone of another (typically the active blueprint is derived from a default blueprint).
     - **`store_source`** — where the store came from (`PythonSdk`, `RustSdk`, `CppSdk`, or a file source such as CLI / drag-drop).
     - **`store_version`** — the Rerun version that produced the data.
 
@@ -145,7 +144,6 @@ StoreInfo {
         "rerun_example_rrd_format",
         "example",
     ),
-    cloned_from: None,
     store_source: PythonSdk(
         3.11.13,
     ),
@@ -169,7 +167,6 @@ StoreInfo {
         "rerun_example_rrd_format",
         "example",
     ),
-    cloned_from: None,
     store_source: PythonSdk(
         3.11.13,
     ),
@@ -376,4 +373,3 @@ This includes the chunk and footer schemas, as well as the high-level data model
 Sorbet is versioned and **subject to change**, but `re_sorbet` performs in-memory migration to the current Sorbet version as chunks (and the footer manifest) are loaded.
 Any CLI tool that rewrites an RRD (`rerun rrd merge`, `rerun rrd optimize`, `rerun rrd migrate`, …) emits chunks in the current Sorbet version, so a round-trip through any of these is also a migration.
 Future changes to Sorbet will be auto-migrated in the same way.
-

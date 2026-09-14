@@ -4,23 +4,25 @@
 
 pub mod controls;
 
+mod annotation_context_resolver;
 mod annotation_context_utils;
 mod annotation_map_cache;
 mod blueprint_resolved_results;
 mod chunks_with_component;
 mod clears;
 mod component_drop;
+mod component_mapping_error;
+mod component_mapping_query_plan;
 mod instance_hash_conversions;
 mod outlines;
 mod query;
+mod time_axis;
 mod view_property_ui;
 mod visualizer_query;
 
-use std::{borrow::Cow, sync::Arc};
+use std::borrow::Cow;
 
-pub use annotation_context_utils::{
-    process_annotation_and_keypoint_slices, process_annotation_slices, process_color_slice,
-};
+pub use annotation_context_utils::{process_color_slice, process_keypoint_slices};
 pub use annotation_map_cache::AnnotationMapCache;
 pub use blueprint_resolved_results::{
     BlueprintResolvedLatestAtResults, BlueprintResolvedRangeResults, BlueprintResolvedResults,
@@ -31,6 +33,7 @@ pub use chunks_with_component::{
 };
 pub use clears::collect_recursive_clears;
 pub use component_drop::{ComponentDropResult, handle_component_drop};
+pub use component_mapping_error::ComponentMappingError;
 pub use instance_hash_conversions::{
     instance_path_hash_from_picking_layer_id, picking_layer_id_from_instance_path_hash,
 };
@@ -40,9 +43,13 @@ pub use outlines::{
 pub use query::{
     ComponentCastRule, DataResultQuery, latest_at_with_blueprint_resolved_data,
     latest_at_with_blueprint_resolved_data_polymorphic, range_with_blueprint_resolved_data,
-    range_with_blueprint_resolved_data_polymorphic,
+    range_with_blueprint_resolved_data_polymorphic, resolve_visible_time_range,
 };
-use re_log_types::external::arrow;
+pub use time_axis::{
+    cursor_centered_default_range, recover_relative_boundaries_after_zoom_or_pan,
+    resolve_time_axis_range, set_time_cursor, time_axis_range_after_cursor_move,
+    time_axis_time_from_plot,
+};
 pub use view_property_ui::{
     view_property_component_ui, view_property_component_ui_custom, view_property_ui,
     view_property_ui_with_hidden_components, view_property_ui_with_redirect,
@@ -51,67 +58,6 @@ pub use visualizer_query::VisualizerInstructionQueryResults;
 
 pub mod external {
     pub use re_entity_db::external::*;
-}
-
-/// Error that can occur when mapping components.
-#[derive(thiserror::Error, Debug, Clone)]
-pub enum ComponentMappingError {
-    /// Failed to parse a selector.
-    #[error("Failed to parse selector: {0}")]
-    SelectorParseFailed(re_lenses_core::SelectorError),
-
-    /// Failed to execute a selector.
-    #[error("Failed to select data: {0}")]
-    SelectorExecutionFailed(re_lenses_core::SelectorError),
-
-    /// Failed to cast component data to target datatype.
-    #[error("Failed to cast from {source_datatype} to {target_datatype}: {err}")]
-    CastFailed {
-        source_datatype: arrow::datatypes::DataType,
-        target_datatype: arrow::datatypes::DataType,
-        err: Arc<arrow::error::ArrowError>,
-    },
-
-    #[error("Component '{0}' does not exist on the entity.")]
-    ComponentNotPresentOnEntity(re_types_core::ComponentIdentifier),
-
-    #[error("Component '{0}' exists on the entity but no data is available at the given time.")]
-    NoComponentDataForQuery(re_types_core::ComponentIdentifier),
-
-    // Note that we don't know whether we're actively fetching data for it.
-    #[error("Component '{0}' exists on the entity but data for it hasn't been loaded yet.")]
-    NoComponentDataForQueryButIsFetchable(re_types_core::ComponentIdentifier),
-}
-
-impl ComponentMappingError {
-    pub fn summary(&self) -> String {
-        match self {
-            Self::SelectorParseFailed(_) => "Failed to parse selector.".to_owned(),
-            Self::SelectorExecutionFailed(_) => "Failed to select data.".to_owned(),
-            Self::CastFailed {
-                source_datatype,
-                target_datatype,
-                ..
-            } => {
-                format!("Failed to cast from {source_datatype} to {target_datatype}.")
-            }
-            Self::ComponentNotPresentOnEntity(_)
-            | Self::NoComponentDataForQuery(_)
-            | Self::NoComponentDataForQueryButIsFetchable(_) => self.to_string(),
-        }
-    }
-
-    pub fn details(&self) -> Option<String> {
-        match self {
-            Self::SelectorParseFailed(err) | Self::SelectorExecutionFailed(err) => {
-                Some(err.to_string())
-            }
-            Self::CastFailed { err, .. } => Some(err.to_string()),
-            Self::ComponentNotPresentOnEntity(_)
-            | Self::NoComponentDataForQuery(_)
-            | Self::NoComponentDataForQueryButIsFetchable(_) => None,
-        }
-    }
 }
 
 /// Clamp the last value in `values` in order to reach a length of `clamped_len`.

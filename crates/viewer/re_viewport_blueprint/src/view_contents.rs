@@ -15,7 +15,7 @@ use re_sdk_types::blueprint::components::{QueryExpression, VisualizerInstruction
 use re_sdk_types::blueprint::{
     archetypes as blueprint_archetypes, components as blueprint_components,
 };
-use re_sdk_types::{Loggable as _, ViewClassIdentifier};
+use re_sdk_types::{FromArrow as _, ViewClassIdentifier};
 use re_viewer_context::{
     DataQueryResult, DataResult, DataResultHandle, DataResultNode, DataResultTree,
     IndicatedEntities, PerVisualizerType, QueryRange, ViewId, ViewSystemIdentifier, ViewerContext,
@@ -56,32 +56,6 @@ pub struct ViewContents {
     ///
     /// Mutations go to this value and should be saved to the blueprint store when they occur.
     new_entity_path_filter: Arc<Mutex<ResolvedEntityPathFilter>>,
-}
-
-impl ViewContents {
-    pub fn is_equivalent(&self, other: &Self) -> bool {
-        self.view_class_identifier.eq(&other.view_class_identifier)
-            && self.entity_path_filter.eq(&other.entity_path_filter)
-    }
-
-    /// Checks whether the results of this query "fully contains" the results of another query.
-    ///
-    /// If this returns `true` then the [`DataQueryResult`] returned by this query should always
-    /// contain any [`EntityPath`] that would be included in the results of the other query.
-    ///
-    /// This is a conservative estimate, and may return `false` in situations where the
-    /// query does in fact cover the other query. However, it should never return `true`
-    /// in a case where the other query would not be fully covered.
-    pub fn entity_path_filter_is_superset_of(&self, other: &Self) -> bool {
-        // A query can't fully contain another if their view classes don't match
-        if self.view_class_identifier != other.view_class_identifier {
-            return false;
-        }
-
-        // Anything included by the other query is also included by this query
-        self.entity_path_filter
-            .is_superset_of(&other.entity_path_filter)
-    }
 }
 
 impl ViewContents {
@@ -574,7 +548,7 @@ impl DataQueryPropertyResolver<'_> {
 
                         let (_high, low) = uuid.as_u64_pair();
                         let id = VisualizerInstructionId::from(
-                            re_sdk_types::datatypes::Uuid::from(uuid),
+                            re_sdk_types::encodings::Uuid::from(uuid),
                         );
                         known_ids.insert(low, id);
                     }

@@ -9,8 +9,8 @@ Note: although the x,y,z,w components of the quaternion will be passed through t
 datastore as provided, when used in the Viewer, quaternions will always be normalized.
 If normalization fails the rotation is treated as an invalid transform.
 
-## Rerun datatype
-[`Quaternion`](../datatypes/quaternion.md)
+## Rerun encoding
+[`Quaternion`](../encodings/quaternion.md)
 
 
 ## Arrow datatype
@@ -30,8 +30,9 @@ FixedSizeList(4 x non-null Float32)
 * [`Capsules3D`](../archetypes/capsules3d.md)
 * [`Cylinders3D`](../archetypes/cylinders3d.md)
 * [`Ellipsoids3D`](../archetypes/ellipsoids3d.md)
-* [`GaussianSplats3D`](../archetypes/gaussian_splats3d.md?speculative-link)
+* [`GaussianSplats3D`](../archetypes/gaussian_splats3d.md)
 * [`GridMap`](../archetypes/grid_map.md)
 * [`InstancePoses3D`](../archetypes/instance_poses3d.md)
 * [`Transform3D`](../archetypes/transform3d.md)
+* [`Volume3D`](../archetypes/volume3d.md?speculative-link)
 * [`VoxelGridMap`](../archetypes/voxel_grid_map.md)

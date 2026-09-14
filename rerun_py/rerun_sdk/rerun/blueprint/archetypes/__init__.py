@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .active_visualizers import ActiveVisualizers
 from .background import Background
+from .card_layout import CardLayout
 from .container_blueprint import ContainerBlueprint
 from .dataframe_query import DataframeQuery
 from .entity_behavior import EntityBehavior
@@ -20,10 +21,15 @@ from .map_zoom import MapZoom
 from .near_clip_plane import NearClipPlane
 from .panel_blueprint import PanelBlueprint
 from .plot_background import PlotBackground
+from .plot_interaction import PlotInteraction
 from .plot_legend import PlotLegend
+from .previews_config import PreviewsConfig
 from .scalar_axis import ScalarAxis
 from .spatial_information import SpatialInformation
 from .table_blueprint import TableBlueprint
+from .table_column import TableColumn
+from .table_column_preview import TableColumnPreview
+from .table_layout import TableLayout
 from .tensor_scalar_mapping import TensorScalarMapping
 from .tensor_slice_selection import TensorSliceSelection
 from .tensor_view_fit import TensorViewFit
@@ -43,6 +49,7 @@ from .visualizer_instruction import VisualizerInstruction
 __all__ = [
     "ActiveVisualizers",
     "Background",
+    "CardLayout",
     "ContainerBlueprint",
     "DataframeQuery",
     "EntityBehavior",
@@ -59,10 +66,15 @@ __all__ = [
     "NearClipPlane",
     "PanelBlueprint",
     "PlotBackground",
+    "PlotInteraction",
     "PlotLegend",
+    "PreviewsConfig",
     "ScalarAxis",
     "SpatialInformation",
     "TableBlueprint",
+    "TableColumn",
+    "TableColumnPreview",
+    "TableLayout",
     "TensorScalarMapping",
     "TensorSliceSelection",
     "TensorViewFit",

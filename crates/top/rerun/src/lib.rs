@@ -109,6 +109,9 @@
 #[cfg(feature = "run")]
 mod commands;
 
+#[cfg(feature = "rrd")]
+pub mod rrd;
+
 #[cfg(feature = "sdk")]
 mod sdk;
 
@@ -118,6 +121,12 @@ pub mod clap;
 /// Methods for spawning the native viewer and streaming the SDK log stream to it.
 #[cfg(all(feature = "sdk", feature = "native_viewer"))]
 pub mod native_viewer;
+
+/// Runtime reflection types used when extending the viewer.
+#[cfg(feature = "native_viewer")]
+pub mod reflection {
+    pub use re_viewer::{ViewApplicability, ViewReflection};
+}
 
 #[cfg(feature = "demo")]
 pub mod demo_util;

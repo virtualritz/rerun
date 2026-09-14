@@ -11,7 +11,7 @@ import numpy as np
 import pyarrow as pa
 from attrs import define, field
 
-from .. import components, datatypes
+from .. import components, encodings
 from .._baseclasses import (
     Archetype,
     ComponentColumnList,
@@ -21,7 +21,7 @@ from ..blueprint import VisualizableArchetype, Visualizer
 from ..error_utils import catch_and_log_exceptions
 
 if TYPE_CHECKING:
-    from ..blueprint.datatypes import VisualizerComponentMappingLike
+    from ..blueprint.encodings import VisualizerComponentMappingLike
 
 __all__ = ["EncodedDepthImage"]
 
@@ -29,7 +29,7 @@ __all__ = ["EncodedDepthImage"]
 @define(str=False, repr=False, init=False)
 class EncodedDepthImage(Archetype, VisualizableArchetype):
     """
-    **Archetype**: A depth image encoded with a codec (e.g. RVL or PNG).
+    **Archetype**: A depth image encoded with a codec (e.g. RVL, PNG, or TIFF).
 
     Rerun also supports uncompressed depth images with the [`archetypes.DepthImage`](https://rerun.io/docs/reference/types/archetypes/depth_image).
 
@@ -85,14 +85,14 @@ class EncodedDepthImage(Archetype, VisualizableArchetype):
 
     def __init__(
         self: Any,
-        blob: datatypes.BlobLike,
+        blob: encodings.BlobLike,
         *,
-        media_type: datatypes.Utf8Like | None = None,
-        meter: datatypes.Float32Like | None = None,
+        media_type: encodings.Utf8Like | None = None,
+        meter: encodings.Float32Like | None = None,
         colormap: components.ColormapLike | None = None,
-        depth_range: datatypes.Range1DLike | None = None,
-        point_fill_ratio: datatypes.Float32Like | None = None,
-        draw_order: datatypes.Float32Like | None = None,
+        depth_range: encodings.Range1DLike | None = None,
+        point_fill_ratio: encodings.Float32Like | None = None,
+        draw_order: encodings.Float32Like | None = None,
         magnification_filter: components.MagnificationFilterLike | None = None,
     ) -> None:
         """
@@ -105,12 +105,14 @@ class EncodedDepthImage(Archetype, VisualizableArchetype):
 
             Supported are:
             * single channel PNG
+            * single channel TIFF with `U8`, `U16`, or `F32` samples
             * RVL with ROS2 metadata (for details see <https://github.com/ros-perception/image_transport_plugins/tree/jazzy>)
         media_type:
             Media type of the blob, e.g.:
 
              * `application/rvl` (RVL-compressed 16-bit)
              * `image/png`
+             * `image/tiff`
         meter:
             Conversion from native units to meters (e.g. `0.001` for millimeters).
 
@@ -172,13 +174,13 @@ class EncodedDepthImage(Archetype, VisualizableArchetype):
         cls,
         *,
         clear_unset: bool = False,
-        blob: datatypes.BlobLike | None = None,
-        media_type: datatypes.Utf8Like | None = None,
-        meter: datatypes.Float32Like | None = None,
+        blob: encodings.BlobLike | None = None,
+        media_type: encodings.Utf8Like | None = None,
+        meter: encodings.Float32Like | None = None,
         colormap: components.ColormapLike | None = None,
-        depth_range: datatypes.Range1DLike | None = None,
-        point_fill_ratio: datatypes.Float32Like | None = None,
-        draw_order: datatypes.Float32Like | None = None,
+        depth_range: encodings.Range1DLike | None = None,
+        point_fill_ratio: encodings.Float32Like | None = None,
+        draw_order: encodings.Float32Like | None = None,
         magnification_filter: components.MagnificationFilterLike | None = None,
     ) -> EncodedDepthImage:
         """
@@ -193,12 +195,14 @@ class EncodedDepthImage(Archetype, VisualizableArchetype):
 
             Supported are:
             * single channel PNG
+            * single channel TIFF with `U8`, `U16`, or `F32` samples
             * RVL with ROS2 metadata (for details see <https://github.com/ros-perception/image_transport_plugins/tree/jazzy>)
         media_type:
             Media type of the blob, e.g.:
 
              * `application/rvl` (RVL-compressed 16-bit)
              * `image/png`
+             * `image/tiff`
         meter:
             Conversion from native units to meters (e.g. `0.001` for millimeters).
 
@@ -315,13 +319,13 @@ class EncodedDepthImage(Archetype, VisualizableArchetype):
     def columns(
         cls,
         *,
-        blob: datatypes.BlobArrayLike | None = None,
-        media_type: datatypes.Utf8ArrayLike | None = None,
-        meter: datatypes.Float32ArrayLike | None = None,
+        blob: encodings.BlobArrayLike | None = None,
+        media_type: encodings.Utf8ArrayLike | None = None,
+        meter: encodings.Float32ArrayLike | None = None,
         colormap: components.ColormapArrayLike | None = None,
-        depth_range: datatypes.Range1DArrayLike | None = None,
-        point_fill_ratio: datatypes.Float32ArrayLike | None = None,
-        draw_order: datatypes.Float32ArrayLike | None = None,
+        depth_range: encodings.Range1DArrayLike | None = None,
+        point_fill_ratio: encodings.Float32ArrayLike | None = None,
+        draw_order: encodings.Float32ArrayLike | None = None,
         magnification_filter: components.MagnificationFilterArrayLike | None = None,
     ) -> ComponentColumnList:
         """
@@ -339,12 +343,14 @@ class EncodedDepthImage(Archetype, VisualizableArchetype):
 
             Supported are:
             * single channel PNG
+            * single channel TIFF with `U8`, `U16`, or `F32` samples
             * RVL with ROS2 metadata (for details see <https://github.com/ros-perception/image_transport_plugins/tree/jazzy>)
         media_type:
             Media type of the blob, e.g.:
 
              * `application/rvl` (RVL-compressed 16-bit)
              * `image/png`
+             * `image/tiff`
         meter:
             Conversion from native units to meters (e.g. `0.001` for millimeters).
 
@@ -435,6 +441,7 @@ class EncodedDepthImage(Archetype, VisualizableArchetype):
     #
     # Supported are:
     # * single channel PNG
+    # * single channel TIFF with `U8`, `U16`, or `F32` samples
     # * RVL with ROS2 metadata (for details see <https://github.com/ros-perception/image_transport_plugins/tree/jazzy>)
     #
     # (Docstring intentionally commented out to hide this field from the docs)
@@ -448,6 +455,7 @@ class EncodedDepthImage(Archetype, VisualizableArchetype):
     #
     #  * `application/rvl` (RVL-compressed 16-bit)
     #  * `image/png`
+    #  * `image/tiff`
     #
     # (Docstring intentionally commented out to hide this field from the docs)
 

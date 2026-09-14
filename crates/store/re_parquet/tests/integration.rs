@@ -14,6 +14,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use itertools::Itertools as _;
 
+use re_arrow_util::ArrowArrayDowncastRef as _;
 use re_chunk::{Chunk, EntityPath};
 use re_log_types::TimeType;
 use re_parquet::{ColumnGrouping, IndexColumn, IndexType, ParquetConfig, TimeUnit};
@@ -179,6 +180,7 @@ fn prefix_grouping() {
         index_columns: vec![IndexColumn {
             name: "frame_index".into(),
             index_type: IndexType::Sequence,
+            output_name: None,
         }],
         ..Default::default()
     };
@@ -205,9 +207,8 @@ fn prefix_grouping() {
     let camera_list = camera.components().get_array("data".into()).unwrap();
     let camera_struct = camera_list
         .values()
-        .as_any()
-        .downcast_ref::<arrow::array::StructArray>()
-        .expect("should be a StructArray");
+        .try_downcast_array_ref::<arrow::array::StructArray>()
+        .unwrap();
     assert_eq!(camera_struct.num_columns(), 2);
     assert_eq!(camera_struct.column_by_name("rgb").unwrap().len(), 3);
     assert_eq!(camera_struct.column_by_name("depth").unwrap().len(), 3);
@@ -226,9 +227,8 @@ fn prefix_grouping() {
     let joint_list = joint.components().get_array("data".into()).unwrap();
     let joint_struct = joint_list
         .values()
-        .as_any()
-        .downcast_ref::<arrow::array::StructArray>()
-        .expect("should be a StructArray");
+        .try_downcast_array_ref::<arrow::array::StructArray>()
+        .unwrap();
     assert_eq!(joint_struct.num_columns(), 2);
     assert!(joint_struct.column_by_name("position").is_some());
     assert!(joint_struct.column_by_name("velocity").is_some());
@@ -262,6 +262,7 @@ fn explicit_timestamp_index() {
         index_columns: vec![IndexColumn {
             name: "ts".into(),
             index_type: IndexType::Timestamp(TimeUnit::Nanoseconds),
+            output_name: None,
         }],
         ..Default::default()
     };
@@ -295,6 +296,7 @@ fn explicit_sequence_index() {
         index_columns: vec![IndexColumn {
             name: "frame_id".into(),
             index_type: IndexType::Sequence,
+            output_name: None,
         }],
         ..Default::default()
     };
@@ -328,6 +330,7 @@ fn explicit_duration_index() {
         index_columns: vec![IndexColumn {
             name: "elapsed_us".into(),
             index_type: IndexType::Duration(TimeUnit::Microseconds),
+            output_name: None,
         }],
         ..Default::default()
     };
@@ -361,6 +364,7 @@ fn time_unit_scaling() {
         index_columns: vec![IndexColumn {
             name: "ts_ms".into(),
             index_type: IndexType::Timestamp(TimeUnit::Milliseconds),
+            output_name: None,
         }],
         ..Default::default()
     };
@@ -387,6 +391,7 @@ fn missing_index_column_is_error() {
         index_columns: vec![IndexColumn {
             name: "nonexistent".into(),
             index_type: IndexType::Sequence,
+            output_name: None,
         }],
         ..Default::default()
     };
@@ -413,6 +418,7 @@ fn validate_config_checks_schema() {
         index_columns: vec![IndexColumn {
             name: "frame_index".into(),
             index_type: IndexType::Sequence,
+            output_name: None,
         }],
         static_columns: vec!["x".into()],
         ..Default::default()
@@ -423,6 +429,7 @@ fn validate_config_checks_schema() {
         index_columns: vec![IndexColumn {
             name: "nonexistent".into(),
             index_type: IndexType::Sequence,
+            output_name: None,
         }],
         ..Default::default()
     };
@@ -435,6 +442,21 @@ fn validate_config_checks_schema() {
     };
     let err = re_parquet::validate_config(&path, &missing_static).unwrap_err();
     assert!(err.to_string().contains("Static column"), "{err}");
+
+    // A row window is validated eagerly too: the whole point of `validate_config` is
+    // failing when a stream is configured, not when it is first polled.
+    let in_bounds = ParquetConfig {
+        row_window: Some(re_span::Span::from_start_end(0, 2)),
+        ..Default::default()
+    };
+    assert!(re_parquet::validate_config(&path, &in_bounds).is_ok());
+
+    let out_of_bounds = ParquetConfig {
+        row_window: Some(re_span::Span::from_start_end(1, 3)),
+        ..Default::default()
+    };
+    let err = re_parquet::validate_config(&path, &out_of_bounds).unwrap_err();
+    assert!(err.to_string().contains("Row window"), "{err}");
 }
 
 #[test]
@@ -462,8 +484,10 @@ fn static_columns() {
         index_columns: vec![IndexColumn {
             name: "frame_index".into(),
             index_type: IndexType::Sequence,
+            output_name: None,
         }],
         static_columns: vec!["suite".into(), "agg".into()],
+        ..Default::default()
     };
     let chunks = load_chunks(&path, &config);
     let all = data_chunks(&chunks);
@@ -576,6 +600,7 @@ fn prefix_grouping_flat() {
         index_columns: vec![IndexColumn {
             name: "frame_index".into(),
             index_type: IndexType::Sequence,
+            output_name: None,
         }],
         ..Default::default()
     };
@@ -659,6 +684,7 @@ fn explicit_prefixes_basic() {
         index_columns: vec![IndexColumn {
             name: "frame_index".into(),
             index_type: IndexType::Sequence,
+            output_name: None,
         }],
         ..Default::default()
     };
@@ -677,9 +703,8 @@ fn explicit_prefixes_basic() {
     let foo_list = foo.components().get_array("data".into()).unwrap();
     let foo_struct = foo_list
         .values()
-        .as_any()
-        .downcast_ref::<arrow::array::StructArray>()
-        .expect("should be a StructArray");
+        .try_downcast_array_ref::<arrow::array::StructArray>()
+        .unwrap();
     assert_eq!(foo_struct.num_columns(), 3);
     assert!(foo_struct.column_by_name("a").is_some());
     assert!(foo_struct.column_by_name("b").is_some());
@@ -693,9 +718,8 @@ fn explicit_prefixes_basic() {
     let cat_list = cat.components().get_array("data".into()).unwrap();
     let cat_struct = cat_list
         .values()
-        .as_any()
-        .downcast_ref::<arrow::array::StructArray>()
-        .expect("should be a StructArray");
+        .try_downcast_array_ref::<arrow::array::StructArray>()
+        .unwrap();
     assert_eq!(cat_struct.num_columns(), 3);
 
     let other = data
@@ -778,9 +802,8 @@ fn explicit_prefixes_underscore_stripping() {
     let cat_list = cat.components().get_array("data".into()).unwrap();
     let cat_struct = cat_list
         .values()
-        .as_any()
-        .downcast_ref::<arrow::array::StructArray>()
-        .expect("should be a StructArray");
+        .try_downcast_array_ref::<arrow::array::StructArray>()
+        .unwrap();
     // Comp names should be "foo" and "bar", not "_foo" and "_bar"
     assert!(
         cat_struct.column_by_name("foo").is_some(),
@@ -838,6 +861,7 @@ fn transform3d_from_struct_via_lens() {
         index_columns: vec![IndexColumn {
             name: "frame_index".into(),
             index_type: IndexType::Sequence,
+            output_name: None,
         }],
         ..Default::default()
     };
@@ -890,15 +914,13 @@ fn transform3d_from_struct_via_lens() {
         .unwrap();
     let translation = translation
         .values()
-        .as_any()
-        .downcast_ref::<FixedSizeListArray>()
+        .try_downcast_array_ref::<FixedSizeListArray>()
         .expect("translation should be a FixedSizeList");
     assert_eq!(translation.value_length(), 3);
     assert_eq!(translation.values().data_type(), &DataType::Float32);
     let translation = translation
         .values()
-        .as_any()
-        .downcast_ref::<Float32Array>()
+        .try_downcast_array_ref::<Float32Array>()
         .unwrap();
     assert_eq!(
         translation.values().to_vec(),
@@ -912,18 +934,173 @@ fn transform3d_from_struct_via_lens() {
         .unwrap();
     let quaternion = quaternion
         .values()
-        .as_any()
-        .downcast_ref::<FixedSizeListArray>()
+        .try_downcast_array_ref::<FixedSizeListArray>()
         .expect("quaternion should be a FixedSizeList");
     assert_eq!(quaternion.value_length(), 4);
     assert_eq!(quaternion.values().data_type(), &DataType::Float32);
     let quaternion = quaternion
         .values()
-        .as_any()
-        .downcast_ref::<Float32Array>()
+        .try_downcast_array_ref::<Float32Array>()
         .unwrap();
     assert_eq!(
         quaternion.values().to_vec(),
         vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Column projection and row windows
+// ---------------------------------------------------------------------------
+
+fn projection_test_batch() -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("frame_index", DataType::Int64, false),
+            Field::new("state", DataType::Float64, false),
+            Field::new("heavy", DataType::Float64, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![0, 1, 2, 3, 4])),
+            Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0, 5.0])),
+            Arc::new(Float64Array::from(vec![9.0, 9.0, 9.0, 9.0, 9.0])),
+        ],
+    )
+    .unwrap()
+}
+
+fn frame_index_config() -> ParquetConfig {
+    ParquetConfig {
+        column_grouping: ColumnGrouping::Individual,
+        index_columns: vec![IndexColumn {
+            name: "frame_index".into(),
+            index_type: IndexType::Sequence,
+            output_name: None,
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn columns_and_row_window_limit_the_read() {
+    let path = write_parquet_tmp_with_metadata(
+        &projection_test_batch(),
+        vec![parquet::file::metadata::KeyValue::new(
+            "creator".to_owned(),
+            "test".to_owned(),
+        )],
+    );
+
+    let config = ParquetConfig {
+        columns: Some(vec!["state".into()]),
+        row_window: Some(re_span::Span::from_start_end(1, 4)),
+        ..frame_index_config()
+    };
+    let chunks = load_chunks(&path, &config);
+
+    // The file-metadata chunk is still emitted by default.
+    assert!(
+        chunks
+            .iter()
+            .any(|c| c.entity_path() == &EntityPath::properties())
+    );
+
+    // Only the listed data column produces a chunk, with only the windowed rows; the
+    // index column is read without being listed.
+    let data = data_chunks(&chunks);
+    assert_eq!(data.len(), 1);
+    let chunk = data[0];
+    assert_eq!(chunk.entity_path(), &EntityPath::from("/state"));
+    assert_eq!(chunk.num_rows(), 3);
+    let tl = chunk.timelines().get(&"frame_index".into()).unwrap();
+    assert_eq!(tl.times_raw().to_vec(), vec![1, 2, 3]);
+}
+
+#[test]
+fn row_window_keeps_file_absolute_row_index() {
+    let path = write_parquet_tmp(&projection_test_batch());
+
+    // No index columns → the synthetic `row_index` timeline, based at the window start.
+    let config = ParquetConfig {
+        column_grouping: ColumnGrouping::Individual,
+        columns: Some(vec!["state".into()]),
+        row_window: Some(re_span::Span::from_start_end(2, 5)),
+        ..Default::default()
+    };
+    let chunks = load_chunks(&path, &config);
+    let data = data_chunks(&chunks);
+
+    assert_eq!(data.len(), 1);
+    let tl = data[0].timelines().get(&"row_index".into()).unwrap();
+    assert_eq!(tl.times_raw().to_vec(), vec![2, 3, 4]);
+}
+
+#[test]
+fn out_of_bounds_row_window_is_an_error() {
+    let path = write_parquet_tmp(&projection_test_batch());
+
+    let config = ParquetConfig {
+        row_window: Some(re_span::Span::from_start_end(3, 9)),
+        ..frame_index_config()
+    };
+    let prefix = EntityPath::from("/");
+    let err = re_parquet::load_parquet(&path, &config, &prefix)
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("Row window"), "{err}");
+}
+
+#[test]
+fn output_name_renames_the_timeline() {
+    let path = write_parquet_tmp(&projection_test_batch());
+
+    let config = ParquetConfig {
+        column_grouping: ColumnGrouping::Individual,
+        index_columns: vec![IndexColumn {
+            name: "frame_index".into(),
+            index_type: IndexType::Sequence,
+            output_name: Some("frame".into()),
+        }],
+        ..Default::default()
+    };
+    let chunks = load_chunks(&path, &config);
+    let data = data_chunks(&chunks);
+
+    let tl = data[0].timelines().get(&"frame".into()).unwrap();
+    assert_eq!(*tl.timeline().name(), re_chunk::TimelineName::from("frame"));
+    assert!(!data[0].timelines().contains_key(&"frame_index".into()));
+}
+
+#[test]
+fn fractional_seconds_index_scales_before_rounding() {
+    // A fractional-seconds timestamp column (the LeRobot layout). Truncating to
+    // integers before scaling would collapse every value to 0.
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Float64, false),
+            Field::new("value", DataType::Float64, false),
+        ])),
+        vec![
+            Arc::new(Float64Array::from(vec![0.0, 0.0333, 0.0666])),
+            Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0])),
+        ],
+    )
+    .unwrap();
+
+    let path = write_parquet_tmp(&batch);
+    let config = ParquetConfig {
+        column_grouping: ColumnGrouping::Individual,
+        index_columns: vec![IndexColumn {
+            name: "timestamp".into(),
+            index_type: IndexType::Duration(TimeUnit::Seconds),
+            output_name: None,
+        }],
+        ..Default::default()
+    };
+    let chunks = load_chunks(&path, &config);
+    let data = data_chunks(&chunks);
+
+    assert_eq!(data.len(), 1);
+    let tl = data[0].timelines().get(&"timestamp".into()).unwrap();
+    assert_eq!(tl.timeline().typ(), TimeType::DurationNs);
+    assert_eq!(tl.times_raw().to_vec(), vec![0, 33_300_000, 66_600_000]);
 }

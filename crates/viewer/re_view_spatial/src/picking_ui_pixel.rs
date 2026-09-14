@@ -2,7 +2,7 @@ use re_data_ui::item_ui;
 use re_renderer::external::wgpu;
 use re_renderer::renderer::ColormappedTexture;
 use re_renderer::resource_managers::GpuTexture2D;
-use re_sdk_types::datatypes::ColorModel;
+use re_sdk_types::encodings::ColorModel;
 use re_sdk_types::image::ImageKind;
 use re_sdk_types::tensor_data::TensorElement;
 use re_ui::UiExt as _;
@@ -80,7 +80,10 @@ pub fn textured_rect_hover_ui(
             ui,
             texture,
             image,
-            &annotations,
+            match annotations {
+                Some(annotations) => annotations,
+                None => re_viewer_context::Annotations::missing_ref(),
+            },
             depth_meter,
             &TextureInteractionId {
                 entity_path: &instance_path.entity_path,

@@ -5,7 +5,7 @@
 
 mod color;
 pub mod color_swatch;
-mod datatype_uis;
+mod encoding_uis;
 mod entity_path;
 mod geo_line_string;
 mod image_format;
@@ -30,7 +30,10 @@ mod visible_dnd;
 mod visual_bounds2d;
 mod zoom_level;
 
-use datatype_uis::{
+/// Variant used to render editable and read-only table flags.
+pub const TABLE_FLAG_VARIANT: &str = "table_flag";
+
+use encoding_uis::{
     edit_bool, edit_f32_min_to_max_float, edit_f32_zero_to_max, edit_f32_zero_to_one,
     edit_f64_min_to_max_float, edit_f64_zero_to_max, edit_multiline_string, edit_or_view_vec2d,
     edit_or_view_vec3d, edit_or_view_vec3d_positive, edit_singleline_string, edit_u32_range,
@@ -41,15 +44,15 @@ use re_sdk_types::ColormapSelection;
 use re_sdk_types::blueprint::components::{
     AngularSpeed, BackgroundKind, Corner2D, Enabled, Eye3DKind, ForceDistance, ForceIterations,
     ForceStrength, GridSpacing, LinkAxis, LockRangeDuringZoom, MapProvider, NearClipPlane,
-    RootContainer, ViewFit, ViewMaximized,
+    PointsDisplay, RootContainer, TooltipMode, ViewFit, ViewMaximized,
 };
 use re_sdk_types::components::{
-    AggregationPolicy, AlbedoFactor, AxisLength, Color, DepthMeter, DrawOrder, FillMode, FillRatio,
-    GammaCorrection, GraphType, HalfSize3D, ImagePlaneDistance, InterpolationMode, IsKeyframe,
-    Length, LinearSpeed, MagnificationFilter, MarkerSize, MeshFaceRendering, Name, Opacity,
-    PointShading, Position2D, Position3D, Range1D, Scale3D, ShowLabels, SphericalHarmonicsDegree,
-    StrokeWidth, Text, Timestamp, TransformRelation, Translation3D, ValueRange, Vector3D,
-    VideoCodec, Visible,
+    AggregationPolicy, AlbedoFactor, AxisLength, CellSize, Color, DepthMeter, DrawOrder, FillMode,
+    FillRatio, GammaCorrection, GraphType, HalfSize3D, ImagePlaneDistance, InterpolationMode,
+    IsKeyframe, Length, LinearSpeed, MagnificationFilter, MarkerSize, MeshFaceRendering, Name,
+    Opacity, PointShading, Position2D, Position3D, Range1D, Scale3D, ShowLabels,
+    SphericalHarmonicsDegree, StrokeWidth, Text, Timestamp, TransformRelation, Translation3D,
+    ValueRange, Vector3D, VideoCodec, Visible,
 };
 use re_sdk_types::{archetypes, components};
 use re_viewer_context::gpu_bridge::colormap_edit_or_view_ui_with_selection;
@@ -74,7 +77,7 @@ pub const REDAP_THUMBNAIL_VARIANT: &str = "redap_thumbnail";
 pub fn create_component_ui_registry() -> re_viewer_context::ComponentUiRegistry {
     re_tracing::profile_function!();
 
-    let mut registry = re_viewer_context::ComponentUiRegistry::new();
+    let mut registry = re_viewer_context::ComponentUiRegistry::new(re_arrow_ui::arrow_ui);
 
     // Color components:
     registry.add_singleline_edit_or_view::<Color>(color::edit_rgba32);
@@ -84,6 +87,7 @@ pub fn create_component_ui_registry() -> re_viewer_context::ComponentUiRegistry 
     // 0-inf float components:
     registry.add_singleline_edit_or_view::<AngularSpeed>(edit_f64_min_to_max_float);
     registry.add_singleline_edit_or_view::<AxisLength>(edit_f32_zero_to_max);
+    registry.add_singleline_edit_or_view::<CellSize>(edit_f32_zero_to_max);
     registry.add_singleline_edit_or_view::<DepthMeter>(edit_f32_zero_to_max);
     registry.add_singleline_edit_or_view::<FillRatio>(edit_f32_zero_to_max);
     registry.add_singleline_edit_or_view::<ForceDistance>(edit_f64_zero_to_max);
@@ -149,6 +153,8 @@ pub fn create_component_ui_registry() -> re_viewer_context::ComponentUiRegistry 
     registry.add_singleline_edit_or_view::<InterpolationMode>(edit_view_enum);
     registry.add_singleline_edit_or_view::<LinkAxis>(edit_view_enum);
     registry.add_singleline_edit_or_view::<PointShading>(edit_view_enum);
+    registry.add_singleline_edit_or_view::<PointsDisplay>(edit_view_enum);
+    registry.add_singleline_edit_or_view::<TooltipMode>(edit_view_enum);
     registry.add_singleline_edit_or_view::<MapProvider>(
         edit_view_enum_with_variant_available::<
             MapProvider,
@@ -254,6 +260,7 @@ pub fn create_component_ui_registry() -> re_viewer_context::ComponentUiRegistry 
     registry.add_variant_ui(REDAP_URI_BUTTON_VARIANT, variant_uis::redap_uri_button);
     registry.add_variant_ui(REDAP_ENTRY_KIND_VARIANT, variant_uis::redap_entry_kind);
     registry.add_variant_ui(REDAP_THUMBNAIL_VARIANT, variant_uis::redap_thumbnail);
+    registry.add_edit_or_view_variant_ui(TABLE_FLAG_VARIANT, variant_uis::table_flag);
 
     registry
 }

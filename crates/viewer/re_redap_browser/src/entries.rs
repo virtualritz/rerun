@@ -9,24 +9,27 @@ use datafusion::prelude::SessionContext;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt as _, StreamExt as _, TryFutureExt as _};
 use re_async::AsyncRuntimeHandle;
-use re_dataframe_ui::{RequestedObject, StreamingCacheTableProvider};
+use re_dataframe_ui::StreamingCacheTableProvider;
 use re_datafusion::{SegmentTableProvider, TableEntryTableProvider, TableKind, TableQueryCaller};
-use re_log_types::{EntryId, EntryName, TableId};
+use re_log_types::{EntryId, EntryName};
 use re_protos::TypeConversionError;
 use re_protos::cloud::v1alpha1::ext::{DatasetEntry, EntryDetails, ProviderDetails, TableEntry};
 use re_protos::cloud::v1alpha1::{EntryFilter, EntryKind};
 use re_protos::external::prost;
-use re_redap_client::{
-    ApiError, ConnectionAnalyticsExporter, ConnectionClient, ConnectionRegistryHandle,
-};
-use re_ui::{Icon, icons};
+use re_redap_client::{ApiError, ConnectionAnalyticsExporter, ConnectionClient, ConnectionHandle};
+use re_ui::{Icon, RequestedObject, ServerValue, icons};
 use re_viewer_context::{CommandSender, SystemCommand, SystemCommandSender as _};
+
+use crate::entry_meta::{DatasetRequests, EntryMetaQuery};
 
 pub type EntryResult<T = ()> = Result<T, ApiError>;
 
 pub struct Dataset {
     pub dataset_entry: DatasetEntry,
     pub origin: re_uri::Origin,
+
+    /// What the server told us about this dataset beyond its entry, fetched on demand.
+    requests: Box<DatasetRequests>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -42,6 +45,14 @@ impl Dataset {
 
     pub fn name(&self) -> &EntryName {
         &self.dataset_entry.details.name
+    }
+
+    pub fn asset_dataset(&self) -> Option<EntryId> {
+        self.dataset_entry.dataset_details.asset_dataset
+    }
+
+    pub fn requests(&self) -> &DatasetRequests {
+        &self.requests
     }
 }
 
@@ -108,6 +119,11 @@ impl Entry {
         }
     }
 
+    /// What the viewer shows for this entry, using a dataset's default resource.
+    pub fn route_kind(&self) -> Option<re_viewer_context::EntryKind> {
+        route_entry_kind(self.details.kind)
+    }
+
     /// Which icon this entry should use.
     pub fn link_kind(&self) -> re_viewer_context::LinkKind {
         match &self.details.kind {
@@ -125,96 +141,138 @@ impl Entry {
     }
 }
 
+/// Maps what the server says an entry is onto what the viewer shows for it.
+pub fn route_entry_kind(kind: EntryKind) -> Option<re_viewer_context::EntryKind> {
+    match kind {
+        EntryKind::Table | EntryKind::TableView => Some(re_viewer_context::EntryKind::Table),
+
+        EntryKind::Dataset
+        | EntryKind::DatasetView
+        | EntryKind::BlueprintDataset
+        | EntryKind::AssetDataset => Some(re_viewer_context::EntryKind::Dataset(
+            re_uri::DatasetResource::default(),
+        )),
+
+        EntryKind::Unspecified => None,
+    }
+}
+
 /// All the entries of a server.
 // TODO(ab): we currently load the ENTIRE list of datasets. We will need to be more granular
 // about this in the future.
+#[derive(Default)]
 pub struct Entries {
-    entries: RequestedObject<EntryResult<HashMap<EntryId, Entry>>>,
+    entries: RequestedObject<HashMap<EntryId, Entry>, ApiError>,
 }
 
 impl Entries {
-    pub(crate) fn new(
-        connection_registry: ConnectionRegistryHandle,
+    /// Fetch the entries again, keeping the ones we have until the new ones arrive.
+    pub(crate) fn refresh(&mut self) {
+        self.entries.refresh();
+    }
+
+    /// Ask the server for the entries if nothing has yet, and take in whatever has arrived.
+    pub(crate) fn on_frame_start(
+        &mut self,
+        connection: &ConnectionHandle,
+        session_ctx: &Arc<SessionContext>,
         runtime: &AsyncRuntimeHandle,
         egui_ctx: &egui::Context,
-        origin: re_uri::Origin,
-        session_context: Arc<SessionContext>,
-        command_sender: CommandSender,
-    ) -> Self {
-        let entries_fut = fetch_entries_and_register_tables(
-            connection_registry,
-            origin,
-            session_context,
-            runtime.clone(),
-            command_sender,
-        );
+        command_sender: &CommandSender,
+    ) {
+        self.entries.request(runtime, egui_ctx, || {
+            fetch_entries_and_register_tables(
+                connection.clone(),
+                session_ctx.clone(),
+                runtime.clone(),
+                command_sender.clone(),
+            )
+        });
 
-        Self {
-            entries: RequestedObject::new_with_repaint(runtime, egui_ctx.clone(), entries_fut),
+        self.entries.poll();
+    }
+
+    /// Clear an entry's assets, so the next access refetches them.
+    pub(crate) fn clear_entry_assets(&self, entry_id: EntryId) {
+        if let Some(dataset) = self.find_dataset(entry_id) {
+            dataset.requests.clear_assets();
         }
     }
 
-    pub(crate) fn refresh(
-        self,
-        connection_registry: ConnectionRegistryHandle,
-        runtime: &AsyncRuntimeHandle,
-        egui_ctx: &egui::Context,
-        origin: re_uri::Origin,
-        session_context: Arc<SessionContext>,
-        command_sender: CommandSender,
-    ) -> Self {
-        let entries_fut = fetch_entries_and_register_tables(
-            connection_registry,
-            origin,
-            session_context,
-            runtime.clone(),
-            command_sender,
-        );
-
-        Self {
-            entries: self.entries.refresh_with_previous_and_repaint(
-                runtime,
-                egui_ctx.clone(),
-                entries_fut,
-            ),
+    /// Ask the server for an entry's assets if nothing has yet.
+    ///
+    /// The assets are only shown on a dataset's assets tab, so this is how the list is kept up to
+    /// date while that tab is off screen.
+    pub(crate) fn request_entry_assets(&self, query: EntryMetaQuery<'_>) {
+        if let Some(dataset) = self.find_dataset(query.dataset_id) {
+            // The value is read where the assets are shown. Here we only keep the fetch going.
+            dataset.requests.assets(query, dataset.asset_dataset());
         }
     }
 
-    pub(crate) fn on_frame_start(&mut self) {
-        self.entries.on_frame_start();
+    /// The dataset an entry's assets are registered with, as the entry list has it.
+    ///
+    /// This is `None` until the entry's first asset is registered and the new entry list arrives.
+    pub(crate) fn entry_asset_dataset(&self, entry_id: EntryId) -> Option<EntryId> {
+        self.find_dataset(entry_id)?.asset_dataset()
+    }
+
+    /// Whether we are waiting for an entry's assets.
+    ///
+    /// An entry we don't have counts as waiting, since we know nothing about its assets. So does
+    /// one whose assets nothing has asked for yet, until [`Self::request_entry_assets`] starts the
+    /// fetch.
+    pub(crate) fn entry_assets_pending(&self, entry_id: EntryId) -> bool {
+        self.find_dataset(entry_id)
+            .is_none_or(|dataset| dataset.requests.assets_pending())
+    }
+
+    fn find_dataset(&self, entry_id: EntryId) -> Option<&Dataset> {
+        match self.find_entry(entry_id)?.inner() {
+            Ok(EntryInner::Dataset(dataset)) => Some(dataset),
+            Ok(EntryInner::Table(_)) | Err(_) => None,
+        }
     }
 
     pub fn find_entry(&self, entry_id: EntryId) -> Option<&Entry> {
-        self.entries.try_as_ref()?.as_ref().ok()?.get(&entry_id)
+        self.entries.get()?.get(&entry_id)
+    }
+
+    /// Whether the request for the entries might still tell us what `entry_id` is.
+    ///
+    /// Once it has settled this is `false`, even if the entries we got back don't hold `entry_id`.
+    pub fn is_kind_pending(&self, entry_id: EntryId) -> bool {
+        self.find_entry(entry_id).is_none()
+            && matches!(self.entries.value(), ServerValue::Pending { .. })
     }
 
     /// Iterate over all loaded entries (empty while still loading or on error).
     pub fn iter_loaded(&self) -> impl Iterator<Item = &Entry> {
         self.entries
-            .try_as_ref()
-            .and_then(|result| result.as_ref().ok())
+            .get()
             .into_iter()
             .flat_map(|entries| entries.values())
     }
 
     pub fn state(&self) -> Poll<Result<&HashMap<EntryId, Entry>, &ApiError>> {
-        self.entries
-            .try_as_ref()
-            .map_or(Poll::Pending, |r| match r {
-                Ok(entries) => Poll::Ready(Ok(entries)),
-                Err(err) => Poll::Ready(Err(err)),
-            })
+        match self.entries.value() {
+            ServerValue::Pending { previous } => {
+                previous.map_or(Poll::Pending, |entries| Poll::Ready(Ok(entries)))
+            }
+            ServerValue::Completed(entries) => Poll::Ready(Ok(entries)),
+            ServerValue::Unavailable { err, .. } => Poll::Ready(Err(err)),
+        }
     }
 }
 
 async fn fetch_entries_and_register_tables(
-    connection_registry: ConnectionRegistryHandle,
-    origin: re_uri::Origin,
+    connection: ConnectionHandle,
     session_ctx: Arc<SessionContext>,
     runtime: AsyncRuntimeHandle,
     command_sender: CommandSender,
 ) -> EntryResult<HashMap<EntryId, Entry>> {
-    let connection = connection_registry.connection(origin.clone()).await?;
+    let origin = connection.origin().clone();
+    let connection = connection.connection().await?;
     let mut client = connection.client;
     let analytics = connection.analytics;
 
@@ -320,6 +378,7 @@ fn fetch_entry_details(
             Some(Right(future::ready((
                 entry,
                 Err(ApiError::deserialization_with_source(
+                    origin,
                     None,
                     err,
                     "unknown entry kind",
@@ -349,13 +408,19 @@ async fn fetch_dataset_details(
     let result = Dataset {
         dataset_entry,
         origin: origin.clone(),
+        requests: Box::default(),
     };
 
     let table_provider = SegmentTableProvider::new(client, id)
         .into_provider()
         .await
         .map_err(|err| {
-            ApiError::internal_with_source(None, err, "failed creating segment table provider")
+            ApiError::internal_with_source(
+                origin,
+                None,
+                err,
+                "failed creating segment table provider",
+            )
         })?;
 
     Ok((result, table_provider))
@@ -381,13 +446,15 @@ fn start_streaming_segment_table_blueprint(
     let application_id = re_log_types::ApplicationId::from_entry_id(dataset_id);
     let blueprint_store_id =
         re_log_types::StoreId::random(re_log_types::StoreKind::Blueprint, application_id);
+    let table_ref = re_uri::TableReference::RedapEntry {
+        origin: origin.clone(),
+        entry_id: dataset_id,
+    };
 
     let (tx, rx) = re_redap_client::table_blueprint_log_channel(
         origin.clone(),
         blueprint_dataset,
         &blueprint_segment,
-        TableId::new(dataset_id.to_string()),
-        blueprint_store_id.clone(),
     );
 
     command_sender.send_system(SystemCommand::AddReceiver(rx));
@@ -397,6 +464,7 @@ fn start_streaming_segment_table_blueprint(
             client,
             tx,
             blueprint_store_id,
+            table_ref,
             blueprint_dataset,
             blueprint_segment,
         )
@@ -414,7 +482,7 @@ fn start_registered_table_blueprint_stream(
     runtime: &AsyncRuntimeHandle,
     command_sender: &CommandSender,
 ) {
-    let table_id = table_entry.details.id;
+    let table_entry_id = table_entry.details.id;
     let Some((blueprint_dataset, blueprint_segment)) =
         table_entry.table_details.default_blueprint()
     else {
@@ -422,16 +490,18 @@ fn start_registered_table_blueprint_stream(
     };
 
     #[expect(deprecated)]
-    let application_id = re_log_types::ApplicationId::from_entry_id(table_id);
+    let application_id = re_log_types::ApplicationId::from_entry_id(table_entry_id);
     let blueprint_store_id =
         re_log_types::StoreId::random(re_log_types::StoreKind::Blueprint, application_id);
+    let table_ref = re_uri::TableReference::RedapEntry {
+        origin: origin.clone(),
+        entry_id: table_entry_id,
+    };
 
     let (tx, rx) = re_redap_client::table_blueprint_log_channel(
         origin.clone(),
         blueprint_dataset,
         &blueprint_segment,
-        TableId::new(table_id.to_string()),
-        blueprint_store_id.clone(),
     );
 
     command_sender.send_system(SystemCommand::AddReceiver(rx));
@@ -441,6 +511,7 @@ fn start_registered_table_blueprint_stream(
             client,
             tx,
             blueprint_store_id,
+            table_ref,
             blueprint_dataset,
             blueprint_segment,
         )
@@ -490,8 +561,33 @@ async fn fetch_table_details(
         table_provider = table_provider.with_analytics(exporter, runtime.clone());
     }
     let table_provider = table_provider.into_provider().await.map_err(|err| {
-        ApiError::internal_with_source(None, err, "failed creating table-entry table provider")
+        ApiError::internal_with_source(
+            origin,
+            None,
+            err,
+            "failed creating table-entry table provider",
+        )
     })?;
 
     Ok((result, table_provider))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An entry we haven't heard about is only pending while the request for the entries is in
+    /// flight. Once the entries have arrived without it, we know as much about it as we ever will.
+    #[test]
+    fn unknown_entry_is_pending_until_the_entries_arrive() {
+        let entry_id = EntryId::new();
+
+        let in_flight = Entries::default();
+        assert!(in_flight.is_kind_pending(entry_id));
+
+        let arrived = Entries {
+            entries: RequestedObject::Completed(HashMap::default()),
+        };
+        assert!(!arrived.is_kind_pending(entry_id));
+    }
 }

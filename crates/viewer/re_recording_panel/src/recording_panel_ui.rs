@@ -12,7 +12,7 @@ use re_ui::{ContextExt as _, OnResponseExt as _, UiExt as _, UiLayout, icons, li
 use re_uri::dataset_hierarchy_leaf_name;
 use re_viewer_context::open_url::ViewerOpenUrl;
 use re_viewer_context::{
-    AppContext, Item, RecordingOrTable, RedapEntryKind, Route, SystemCommand,
+    AppContext, Item, RecordingOrLocalTable, RedapEntryKind, Route, SystemCommand,
     SystemCommandSender as _,
 };
 
@@ -193,47 +193,70 @@ fn all_sections_ui(
     }
 
     //
-    // Local recordings and tables
+    // Live and imported recordings
     //
 
-    if !recording_panel_data.local_apps.is_empty() || !recording_panel_data.local_tables.is_empty()
-    {
-        let id = egui::Id::new("local items");
-        if ui
-            .list_item()
-            .header()
-            .show_hierarchical_with_children(
-                ui,
-                id,
-                true,
-                list_item::LabelContent::header("Local"),
-                |ui| {
-                    for app_id_data in &recording_panel_data.local_apps {
-                        app_id_section_ui(ctx, ui, app_id_data);
-                    }
-
-                    for table_id in &recording_panel_data.local_tables {
-                        table_item_ui(ctx, ui, table_id);
-                    }
-                },
-            )
-            .item_response
-            .clicked()
-        {
-            let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, true);
-            state.toggle(ui);
-            state.store(ui.ctx());
-        }
-    }
-
-    //
-    // Loading receivers
-    //
-
-    loading_receivers_ui(ctx, ui, &recording_panel_data.loading_receivers);
+    recording_section_ui(
+        ctx,
+        ui,
+        "Live",
+        &recording_panel_data.live_recordings,
+        &[],
+        &[],
+    );
+    recording_section_ui(
+        ctx,
+        ui,
+        "Imported",
+        &recording_panel_data.imported_recordings,
+        &recording_panel_data.local_tables,
+        &recording_panel_data.loading_receivers,
+    );
 
     // Add space at the end of the recordings panel
     ui.add_space(8.0);
+}
+
+fn recording_section_ui(
+    ctx: &AppContext<'_>,
+    ui: &mut egui::Ui,
+    title: &'static str,
+    apps: &[AppIdData<'_>],
+    tables: &[TableId],
+    loading_receivers: &[Arc<LogSource>],
+) {
+    if apps.is_empty() && tables.is_empty() && loading_receivers.is_empty() {
+        return;
+    }
+
+    let id = egui::Id::new(title);
+    if ui
+        .list_item()
+        .header()
+        .show_hierarchical_with_children(
+            ui,
+            id,
+            true,
+            list_item::LabelContent::header(title),
+            |ui| {
+                for app_id_data in apps {
+                    app_id_section_ui(ctx, ui, app_id_data);
+                }
+
+                for table_id in tables {
+                    table_item_ui(ctx, ui, table_id);
+                }
+
+                loading_receivers_ui(ctx, ui, loading_receivers);
+            },
+        )
+        .item_response
+        .clicked()
+    {
+        let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, true);
+        state.toggle(ui);
+        state.store(ui.ctx());
+    }
 }
 
 fn welcome_item_ui(
@@ -252,7 +275,9 @@ fn welcome_item_ui(
 
     let list_item = ui.list_item().header().selected(selected).active(active);
 
-    let response = if recording_panel_data.example_apps.is_empty() {
+    let response = if recording_panel_data.example_apps.is_empty()
+        && recording_panel_data.loading_examples.is_empty()
+    {
         list_item.show_flat(ui, title)
     } else {
         list_item
@@ -265,6 +290,7 @@ fn welcome_item_ui(
                     for app_id_data in &recording_panel_data.example_apps {
                         app_id_section_ui(ctx, ui, app_id_data);
                     }
+                    loading_receivers_ui(ctx, ui, &recording_panel_data.loading_examples);
                 },
             )
             .item_response
@@ -305,8 +331,8 @@ fn server_section_ui(ctx: &AppContext<'_>, ui: &mut egui::Ui, server_data: &Serv
     } = server_data;
 
     // We hide the section for the internal catalog, until we actually have data.
-    // This mirrors the behavior of "Local" in the recording panel.
-    if *is_internal && entries_data.iter_datasets().is_empty() {
+    // This mirrors the behavior of the local sections in the recording panel.
+    if !server_data.is_visible() {
         return;
     }
 
@@ -471,7 +497,7 @@ fn dataset_entry_ui(ctx: &AppContext<'_>, ui: &mut egui::Ui, dataset_entry_data:
                 for db in displayed_segments.iter().filter_map(SegmentData::entity_db) {
                     ctx.command_sender()
                         .send_system(SystemCommand::CloseRecordingOrTable(
-                            RecordingOrTable::Recording {
+                            RecordingOrLocalTable::Recording {
                                 store_id: db.store_id().clone(),
                             },
                         ));
@@ -480,7 +506,9 @@ fn dataset_entry_ui(ctx: &AppContext<'_>, ui: &mut egui::Ui, dataset_entry_data:
         });
     }
 
-    let item_response = if !displayed_segments.is_empty() {
+    let item_response = if displayed_segments.is_empty() {
+        list_item.show_hierarchical(ui, list_item_content)
+    } else {
         list_item
             .show_hierarchical_with_children(ui, id, true, list_item_content, |ui| {
                 for segment in displayed_segments {
@@ -505,15 +533,19 @@ fn dataset_entry_ui(ctx: &AppContext<'_>, ui: &mut egui::Ui, dataset_entry_data:
                 }
             })
             .item_response
-    } else {
-        list_item.show_hierarchical(ui, list_item_content)
     };
 
     let item_response = item_response.on_hover_ui(|ui| {
         ui.label(format!("Dataset: {name}"));
     });
 
-    let new_route = Route::from(re_uri::EntryUri::new(origin.clone(), *entry_id));
+    let new_route = Route::RedapEntry {
+        origin: origin.clone(),
+        entry_id: *entry_id,
+        kind: Some(re_viewer_context::EntryKind::Dataset(
+            re_uri::DatasetResource::default(),
+        )),
+    };
 
     item_response.context_menu(|ui| {
         let url = ViewerOpenUrl::from_route(ctx.store_hub(), &new_route)
@@ -559,8 +591,8 @@ fn remote_table_entry_ui(
     let RemoteTableData {
         entry_data:
             EntryData {
-                origin: _,
-                entry_id: _,
+                origin,
+                entry_id,
                 name,
                 icon,
                 is_selected,
@@ -579,10 +611,12 @@ fn remote_table_entry_ui(
     ctx.handle_select_focus_sync(&item_response, item.clone());
 
     if item_response.clicked() {
-        if let Some(route) = Route::from_item(&item) {
-            ctx.command_sender()
-                .send_system(SystemCommand::SetRoute(route));
-        }
+        ctx.command_sender()
+            .send_system(SystemCommand::SetRoute(Route::RedapEntry {
+                origin: origin.clone(),
+                entry_id: *entry_id,
+                kind: Some(re_viewer_context::EntryKind::Table),
+            }));
         ctx.command_sender()
             .send_system(SystemCommand::set_selection(item));
     }
@@ -652,7 +686,9 @@ fn app_id_section_ui(ctx: &AppContext<'_>, ui: &mut egui::Ui, local_app_id: &App
         });
     }
 
-    let mut item_response = if !loaded_recordings.is_empty() {
+    let mut item_response = if loaded_recordings.is_empty() {
+        list_item.show_hierarchical(ui, list_item_content)
+    } else {
         list_item
             .show_hierarchical_with_children(ui, id, true, list_item_content, |ui| {
                 for recording_data in loaded_recordings {
@@ -671,8 +707,6 @@ fn app_id_section_ui(ctx: &AppContext<'_>, ui: &mut egui::Ui, local_app_id: &App
                 }
             })
             .item_response
-    } else {
-        list_item.show_hierarchical(ui, list_item_content)
     };
 
     item_response = item_response.on_hover_ui(|ui| {
@@ -700,7 +734,7 @@ fn table_item_ui(ctx: &AppContext<'_>, ui: &mut egui::Ui, table_id: &TableId) {
 fn loading_receivers_ui(
     ctx: &AppContext<'_>,
     ui: &mut egui::Ui,
-    loading_receivers: &Vec<Arc<LogSource>>,
+    loading_receivers: &[Arc<LogSource>],
 ) {
     for receiver in loading_receivers {
         receiver_ui(ctx, ui, receiver, false);

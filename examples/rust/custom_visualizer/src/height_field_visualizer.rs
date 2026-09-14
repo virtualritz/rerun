@@ -46,7 +46,7 @@ impl VisualizerSystem for HeightFieldVisualizer {
 
         let mut output = VisualizerExecutionOutput::default();
         let transforms = context_systems.get::<re_view_spatial::TransformTreeContext>(&output)?;
-        let mut draw_data = HeightFieldDrawData::new(render_ctx);
+        let mut draw_data = HeightFieldDrawData::new(render_ctx)?;
 
         for (data_result, instruction) in query.iter_visualizer_instruction_for(Self::identifier())
         {
@@ -56,8 +56,12 @@ impl VisualizerSystem for HeightFieldVisualizer {
                 continue;
             };
 
-            let results =
-                data_result.query_archetype_with_history::<HeightField>(ctx, query, instruction);
+            let results = data_result.query_archetype_with_history::<HeightField>(
+                ctx,
+                query,
+                instruction,
+                None,
+            );
             let results = VisualizerInstructionQueryResults::new(instruction, &results, &output);
 
             let transform =
@@ -129,7 +133,7 @@ impl VisualizerSystem for HeightFieldVisualizer {
                         picking_instance_id: re_renderer::PickingLayerInstanceId(0),
                         outline_mask,
                     },
-                );
+                )?;
             }
         }
 

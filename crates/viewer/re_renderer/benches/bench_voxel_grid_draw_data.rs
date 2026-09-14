@@ -165,9 +165,6 @@ fn mesh_instances(
                 .into(),
                 outline_mask_ids: OutlineMaskPreference::NONE,
                 picking_layer_id: PickingLayerId::default(),
-                // Nothing is hovered or selected, so the tint is never read.
-                hover_element_id: 0,
-                selection_tint: [0.0; 3],
                 cull_mode: None,
             }
         })

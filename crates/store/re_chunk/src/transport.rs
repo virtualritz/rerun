@@ -215,11 +215,10 @@ impl Chunk {
 
             for (schema, column) in batch.component_columns() {
                 let column = column
-                    .downcast_array_ref::<ArrowListArray>()
-                    .ok_or_else(|| ChunkError::Malformed {
+                    .try_downcast_array_ref::<ArrowListArray>()
+                    .map_err(|err| ChunkError::Malformed {
                         reason: format!(
-                            "The outer array in a chunked component batch must be a sparse list, got {:?}",
-                            column.data_type(),
+                            "The outer array in a chunked component batch must be a sparse list: {err}"
                         ),
                     })?;
 
@@ -295,6 +294,7 @@ impl Chunk {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
     use std::sync::Arc;
 
     use arrow::array::{Float32Array, Int64Array, TimestampMicrosecondArray};
@@ -304,7 +304,7 @@ mod tests {
 
     use re_log_types::example_components::{MyColor, MyPoint, MyPoints};
     use re_log_types::{EntityPath, Timeline};
-    use re_types_core::{ChunkId, Loggable as _, RowId, TimelineName};
+    use re_types_core::{ChunkId, RowId, TimelineName, ToArrow as _};
 
     use super::*;
 
@@ -451,13 +451,12 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(matches!(
-            err,
-            ChunkError::DataframeToChunks(ref e)
-                if matches!(**e, re_sorbet::DataframeToChunksError::Sorbet(
-                    re_sorbet::SorbetError::IndexColumn(_)
-                ))
-        ));
+        assert_matches!(
+        err,
+        ChunkError::DataframeToChunks(ref e)
+            if matches!(**e, re_sorbet::DataframeToChunksError::Sorbet(
+                re_sorbet::SorbetError::IndexColumn(_)
+            )));
     }
 
     #[test]

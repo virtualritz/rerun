@@ -5,8 +5,8 @@
 
 use std::io;
 use std::path::{Component, Path};
-use std::sync::Arc;
 
+use re_span::Span;
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{
     DomException, FileSystemDirectoryHandle, FileSystemFileHandle, FileSystemWritableFileStream,
@@ -114,9 +114,11 @@ impl File {
 
 #[async_trait::async_trait]
 impl re_async::AsyncReadAt for File {
-    async fn read_exact_at(&self, offset: u64, len: usize) -> io::Result<bytes::Bytes> {
+    async fn read_exact_at(&self, span: Span<u64>) -> io::Result<bytes::Bytes> {
         let file = self.file.clone();
         re_async::spawn_local_with_result(async move {
+            let offset = span.start;
+            let len = re_async::span_len_usize(span)?;
             let end = offset.checked_add(len as u64).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "read range overflows u64")
             })?;
@@ -152,30 +154,6 @@ impl re_async::AsyncReadAt for File {
     }
 }
 
-/// Write `contents` to `path`, creating any missing parent directories.
-///
-/// Takes `contents` by value so callers that already own the bytes avoid a copy; the whole
-/// buffer would otherwise be duplicated on the Wasm heap for large uploads.
-pub async fn write(path: impl AsRef<Path>, contents: Arc<[u8]>) -> io::Result<()> {
-    let path = path.as_ref().to_owned();
-    re_async::spawn_local_with_result(async move {
-        let file_handle = create_file(&path).await?;
-        let writer: FileSystemWritableFileStream = await_js(file_handle.create_writable()).await?;
-
-        if let Err(err) = write_all(&writer, &contents).await {
-            // `createWritable` commits atomically on close. Aborting preserves any previous file
-            // and prevents a partial write from becoming visible.
-            let writable_stream: &web_sys::WritableStream = writer.as_ref();
-            writable_stream.abort().await.ok();
-            return Err(err);
-        }
-
-        Ok(())
-    })
-    .await
-    .map_err(io::Error::other)?
-}
-
 /// Copy a browser file into OPFS without moving its payload through Wasm linear memory.
 pub async fn write_file(path: impl AsRef<Path>, file: web_sys::File) -> io::Result<()> {
     let path = path.as_ref().to_owned();
@@ -197,19 +175,6 @@ pub async fn write_file(path: impl AsRef<Path>, file: web_sys::File) -> io::Resu
     })
     .await
     .map_err(io::Error::other)?
-}
-
-async fn write_all(writer: &FileSystemWritableFileStream, contents: &[u8]) -> io::Result<()> {
-    let _: JsValue = await_js(
-        writer
-            .write_with_u8_array(contents)
-            .map_err(|err| js_to_io_error(&err))?,
-    )
-    .await?;
-
-    let writable_stream: &web_sys::WritableStream = writer.as_ref();
-    let _: JsValue = await_js(writable_stream.close()).await?;
-    Ok(())
 }
 
 /// Recursively remove the directory at `path` and everything under it.
@@ -363,7 +328,7 @@ mod test {
         let test_dir = unique_opfs_test_dir();
         let file_path = format!("/{test_dir}/./nested/file.bin");
 
-        write(&file_path, Vec::from(b"first write").into())
+        write_file(&file_path, file(b"first write"))
             .await
             .expect("initial write should succeed");
 
@@ -379,7 +344,7 @@ mod test {
             b"first write",
         );
 
-        write(&file_path, Vec::from(b"second").into())
+        write_file(&file_path, file(b"second"))
             .await
             .expect("overwriting an OPFS file should succeed");
         assert_eq!(
@@ -448,10 +413,10 @@ mod test {
         let first_file = format!("{test_dir}/a.bin");
         let second_file = format!("{test_dir}/nested/b.bin");
 
-        write(&first_file, Vec::from(b"a").into())
+        write_file(&first_file, file(b"a"))
             .await
             .expect("writing first OPFS file should succeed");
-        write(&second_file, Vec::from(b"b").into())
+        write_file(&second_file, file(b"b"))
             .await
             .expect("writing nested OPFS file should succeed");
 
@@ -478,7 +443,7 @@ mod test {
 
     #[wasm_bindgen_test]
     async fn rejects_parent_directory_paths() {
-        let err = write("opfs-test/../escape.bin", Vec::from(b"x").into())
+        let err = write_file("opfs-test/../escape.bin", file(b"x"))
             .await
             .expect_err("OPFS paths must not allow parent-directory traversal");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
@@ -500,7 +465,7 @@ mod test {
         let file_path = format!("/{test_dir}/data.bin");
         let contents = b"0123456789";
 
-        write(&file_path, Vec::from(contents).into())
+        write_file(&file_path, file(contents))
             .await
             .expect("write should succeed");
 
@@ -512,7 +477,7 @@ mod test {
         );
 
         assert_eq!(
-            file.read_exact_at(3, 4)
+            file.read_exact_at(Span::from_start_len(3, 4))
                 .await
                 .expect("mid-file read should succeed"),
             b"3456".as_slice(),
@@ -520,14 +485,14 @@ mod test {
 
         // A read ending exactly at EOF returns all requested bytes.
         assert_eq!(
-            file.read_exact_at(6, 4)
+            file.read_exact_at(Span::from_start_len(6, 4))
                 .await
                 .expect("tail read should succeed"),
             b"6789".as_slice(),
         );
 
         let err = file
-            .read_exact_at(8, 4)
+            .read_exact_at(Span::from_start_len(8, 4))
             .await
             .expect_err("reading past the end should fail");
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);

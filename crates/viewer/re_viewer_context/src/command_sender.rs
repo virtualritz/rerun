@@ -9,7 +9,7 @@ use re_log_types::StoreId;
 use re_ui::{RecordingCommand, RecordingCommandSender, UICommand, UICommandSender};
 
 use crate::time_control::TimeControlCommand;
-use crate::{AuthContext, RecordingOrTable, Route, ScreenshotTarget, ViewId};
+use crate::{AuthContext, RecordingOrLocalTable, Route, ScreenshotTarget, ViewId};
 
 // ----------------------------------------------------------------------------
 
@@ -46,6 +46,15 @@ pub enum SystemCommand {
     /// Remove a server from the redap browser and clean up associated blueprints.
     RemoveRedapServer(re_uri::Origin),
 
+    /// Stream every segment of a dataset that the viewer already has again.
+    ///
+    /// Use this when something streamed with a segment changed, such as the dataset's assets.
+    ReloadDatasetSegments {
+        origin: re_uri::Origin,
+        dataset_id: re_log_types::EntryId,
+        unregistered_asset: Option<re_types_core::SegmentId>,
+    },
+
     /// Open a modal to edit this redap server.
     EditRedapServerModal(EditRedapServerModalCommand),
 
@@ -71,6 +80,11 @@ pub enum SystemCommand {
     /// Sets the route to what it is at startup.
     ResetRoute,
 
+    /// Restores the route hidden by the current loading screen.
+    ///
+    /// Does nothing if there is no loading screen active.
+    ReturnFromLoading,
+
     /// Reset the `Viewer` to the default state
     ResetViewer,
 
@@ -92,8 +106,8 @@ pub enum SystemCommand {
     /// does not affect the default blueprint if any was set.
     ClearActiveBlueprintAndEnableHeuristics,
 
-    /// Close an [`RecordingOrTable`] and free its memory.
-    CloseRecordingOrTable(RecordingOrTable),
+    /// Close a [`RecordingOrLocalTable`] and free its memory.
+    CloseRecordingOrTable(RecordingOrLocalTable),
 
     /// Close all stores and show the welcome screen again.
     CloseAllEntries,

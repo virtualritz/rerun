@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::array::{BinaryArray, BooleanArray, StringArray};
+use arrow::array::BooleanArray;
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
 use futures::StreamExt as _;
@@ -15,7 +15,7 @@ use re_arrow_util::RecordBatchExt as _;
 use re_chunk_store::{
     Chunk, ChunkId, ChunkStore, ChunkStoreHandle, ChunkTrackingMode, LatestAtQuery, RangeQuery,
 };
-use re_log_encoding::ToTransport as _;
+use re_log_encoding::{ChunkProvider as _, ToTransport as _};
 use re_log_types::{AbsoluteTimeRange, EntityPath, EntryId, StoreId, StoreKind, TimelineName};
 #[cfg(not(target_arch = "wasm32"))]
 use re_protos::cloud::v1alpha1::ext::{CreateTableEntryResponse, ProviderDetails};
@@ -35,7 +35,7 @@ use re_protos::cloud::v1alpha1::{
     WatchEventsResponse, segment_id_filter, watch_events_response,
 };
 use re_protos::common::v1alpha1::ext::{DatasetKind, IfDuplicateBehavior, SegmentId};
-use re_protos::headers::RerunHeadersExtractorExt as _;
+use re_protos::headers::{RerunHeadersExtractorExt as _, resolve_entry_id};
 use re_protos::missing_field;
 use re_protos::{
     EntryName,
@@ -101,15 +101,12 @@ fn apply_segment_id_filter(
     };
     let ids = ids.iter().map(String::as_str).collect::<HashSet<_>>();
 
-    let segment_ids = batch
-        .column_by_name(ScanSegmentTableDataframe::COLUMN_RERUN_SEGMENT_ID_NAME)
-        .ok_or_else(|| Status::internal("segment ID column is missing"))?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| Status::internal("segment ID column is not UTF-8"))?;
+    let segment_ids = ScanSegmentTableDataframe::COLUMN_RERUN_SEGMENT_ID
+        .extract(&batch)
+        .map_err(|err| Status::internal(err.to_string()))?;
     let mask = segment_ids
         .iter()
-        .map(|segment_id| segment_id.map(|segment_id| ids.contains(segment_id) == scan_only))
+        .map(|segment_id| ids.contains(segment_id) == scan_only)
         .collect::<BooleanArray>();
 
     arrow::compute::filter_record_batch(&batch, &mask)
@@ -269,97 +266,98 @@ impl RerunCloudHandler {
     async fn resolve_data_sources(data_sources: &[DataSource]) -> tonic::Result<Vec<DataSource>> {
         let mut resolved = Vec::<DataSource>::with_capacity(data_sources.len());
         for source in data_sources {
-            if source.is_prefix {
-                cfg_select! {
-                    target_arch = "wasm32" => {
-                        // TODO(RR-5155): Support enumerating OPFS directories for prefix registration.
+            if !source.is_prefix {
+                resolved.push(source.clone());
+                continue;
+            }
+
+            cfg_select! {
+                target_arch = "wasm32" => {
+                    // TODO(RR-5155): Support enumerating OPFS directories for prefix registration.
+                    return Err(tonic::Status::invalid_argument(
+                        "prefix data sources are not supported on wasm",
+                    ));
+                }
+                _ => {
+                    if source.storage_url.scheme() == "memory" {
                         return Err(tonic::Status::invalid_argument(
-                            "prefix data sources are not supported on wasm",
+                            "memory:// URLs cannot be used as prefix data sources",
                         ));
                     }
-                    _ => {
-                        if source.storage_url.scheme() == "memory" {
-                            return Err(tonic::Status::invalid_argument(
-                                "memory:// URLs cannot be used as prefix data sources",
-                            ));
-                        }
-                        let path = source.storage_url.to_file_path().map_err(|_err| {
-                            tonic::Status::invalid_argument(format!(
-                                "getting file path from {:?}",
-                                source.storage_url
-                            ))
-                        })?;
-                        let meta =
-                            tokio::fs::metadata(&path)
-                                .await
-                                .map_err(|err| match err.kind() {
-                                    std::io::ErrorKind::NotFound => tonic::Status::invalid_argument(
-                                        format!("Directory not found: {path:?}"),
-                                    ),
-                                    _ => tonic::Status::invalid_argument(format!(
-                                        "Failed to read directory metadata {path:?}: {err:#}"
-                                    )),
-                                })?;
-                        if !meta.is_dir() {
-                            return Err(tonic::Status::invalid_argument(format!(
-                                "expected prefix / directory but got an object ({path:?})"
-                            )));
-                        }
+                    let path = source.storage_url.to_file_path().map_err(|_err| {
+                        tonic::Status::invalid_argument(format!(
+                            "getting file path from {:?}",
+                            source.storage_url
+                        ))
+                    })?;
+                    let meta =
+                        tokio::fs::metadata(&path)
+                            .await
+                            .map_err(|err| match err.kind() {
+                                std::io::ErrorKind::NotFound => tonic::Status::invalid_argument(
+                                    format!("Directory not found: {path:?}"),
+                                ),
+                                _ => tonic::Status::invalid_argument(format!(
+                                    "Failed to read directory metadata {path:?}: {err:#}"
+                                )),
+                            })?;
+                    if !meta.is_dir() {
+                        return Err(tonic::Status::invalid_argument(format!(
+                            "expected prefix / directory but got an object ({path:?})"
+                        )));
+                    }
 
-                        // Recursively walk the directory and grab all '.rrd' files
-                        let mut dirs_to_visit = vec![path];
-                        let mut files = Vec::new();
+                    // Recursively walk the directory and grab all '.rrd' files
+                    let mut dirs_to_visit = vec![path];
+                    let mut files = Vec::new();
 
-                        while let Some(current_dir) = dirs_to_visit.pop() {
-                            let mut entries =
-                                tokio::fs::read_dir(&current_dir).await.map_err(|err| {
-                                    tonic::Status::internal(format!(
-                                        "Failed to read directory {current_dir:?}: {err:#}"
-                                    ))
-                                })?;
-
-                            while let Some(entry) = entries.next_entry().await.map_err(|err| {
+                    while let Some(current_dir) = dirs_to_visit.pop() {
+                        let mut entries =
+                            tokio::fs::read_dir(&current_dir).await.map_err(|err| {
                                 tonic::Status::internal(format!(
-                                    "Failed to read directory entry: {err:#}"
+                                    "Failed to read directory {current_dir:?}: {err:#}"
                                 ))
-                            })? {
-                                let entry_path = entry.path();
-                                let file_type = entry.file_type().await.map_err(|err| {
-                                    tonic::Status::internal(format!(
-                                        "Failed to read directory entry metadata: {err:#}"
-                                    ))
-                                })?;
+                            })?;
 
-                                if file_type.is_dir() {
-                                    dirs_to_visit.push(entry_path);
-                                } else if let Some(extension) = entry_path.extension()
-                                    && extension == "rrd"
-                                {
-                                    files.push(entry_path);
-                                }
+                        while let Some(entry) = entries.next_entry().await.map_err(|err| {
+                            tonic::Status::internal(format!(
+                                "Failed to read directory entry: {err:#}"
+                            ))
+                        })? {
+                            let entry_path = entry.path();
+                            let file_type = entry.file_type().await.map_err(|err| {
+                                tonic::Status::internal(format!(
+                                    "Failed to read directory entry metadata: {err:#}"
+                                ))
+                            })?;
+
+                            if file_type.is_dir() {
+                                dirs_to_visit.push(entry_path);
+                            } else if let Some(extension) = entry_path.extension()
+                                && extension == "rrd"
+                            {
+                                files.push(entry_path);
                             }
                         }
+                    }
 
-                        if files.is_empty() {
-                            return Err(tonic::Status::invalid_argument(format!(
-                                "no rrd files found in {:?}",
-                                source.storage_url
-                            )));
-                        }
+                    if files.is_empty() {
+                        return Err(tonic::Status::invalid_argument(format!(
+                            "no rrd files found in {:?}",
+                            source.storage_url
+                        )));
+                    }
 
-                        for file_path in files {
-                            let mut file_url = source.storage_url.clone();
-                            file_url.set_path(&file_path.to_string_lossy());
-                            resolved.push(DataSource {
-                                storage_url: file_url,
-                                is_prefix: false,
-                                ..source.clone()
-                            });
-                        }
+                    for file_path in files {
+                        let mut file_url = source.storage_url.clone();
+                        file_url.set_path(&file_path.to_string_lossy());
+                        resolved.push(DataSource {
+                            storage_url: file_url,
+                            is_prefix: false,
+                            ..source.clone()
+                        });
                     }
                 }
-            } else {
-                resolved.push(source.clone());
             }
         }
 
@@ -592,6 +590,9 @@ impl RerunCloudService for RerunCloudHandler {
                 user_id: None,
                 can_read: true,
                 can_write: true,
+                capabilities: Some(re_protos::cloud::v1alpha1::ServerCapabilities {
+                    capabilities: crate::capability_names(),
+                }),
             },
         ))
     }
@@ -803,7 +804,8 @@ impl RerunCloudService for RerunCloudHandler {
         request: tonic::Request<re_protos::cloud::v1alpha1::UpdateDatasetEntryRequest>,
     ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::UpdateDatasetEntryResponse>>
     {
-        let request: UpdateDatasetEntryRequest = request.into_inner().try_into()?;
+        let entry_id = resolve_entry_id(&request, request.get_ref().id.as_ref())?;
+        let request = UpdateDatasetEntryRequest::from_resolved(entry_id, request.into_inner())?;
 
         request
             .dataset_details
@@ -852,11 +854,7 @@ impl RerunCloudService for RerunCloudHandler {
     ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::ReadTableEntryResponse>> {
         let store = self.store.read().await;
 
-        let id = request
-            .into_inner()
-            .id
-            .ok_or_else(|| Status::invalid_argument("No table entry ID provided"))?
-            .try_into()?;
+        let id = resolve_entry_id(&request, request.get_ref().id.as_ref())?;
 
         let table = store.table(id).ok_or_else(|| {
             tonic::Status::not_found(format!("table with entry ID '{id}' not found"))
@@ -874,7 +872,8 @@ impl RerunCloudService for RerunCloudHandler {
         &self,
         request: tonic::Request<re_protos::cloud::v1alpha1::UpdateTableEntryRequest>,
     ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::UpdateTableEntryResponse>> {
-        let request: UpdateTableEntryRequest = request.into_inner().try_into()?;
+        let entry_id = resolve_entry_id(&request, request.get_ref().id.as_ref())?;
+        let request = UpdateTableEntryRequest::from_resolved(entry_id, request.into_inner())?;
 
         let mut store = self.store.write().await;
         store.table(request.id).ok_or_else(|| {
@@ -921,7 +920,7 @@ impl RerunCloudService for RerunCloudHandler {
         &self,
         request: tonic::Request<re_protos::cloud::v1alpha1::DeleteEntryRequest>,
     ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::DeleteEntryResponse>> {
-        let entry_id = request.into_inner().try_into()?;
+        let entry_id = resolve_entry_id(&request, request.get_ref().id.as_ref())?;
 
         self.store.write().await.delete_entry(entry_id)?;
 
@@ -938,10 +937,11 @@ impl RerunCloudService for RerunCloudHandler {
         &self,
         request: tonic::Request<re_protos::cloud::v1alpha1::UpdateEntryRequest>,
     ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::UpdateEntryResponse>> {
+        let resolved_id = resolve_entry_id(&request, request.get_ref().id.as_ref())?;
         let UpdateEntryRequest {
             id: entry_id,
             entry_details_update: EntryDetailsUpdate { name },
-        } = request.into_inner().try_into()?;
+        } = UpdateEntryRequest::from_resolved(resolved_id, request.into_inner())?;
 
         let mut store = self.store.write().await;
 
@@ -957,7 +957,20 @@ impl RerunCloudService for RerunCloudHandler {
         ))
     }
 
+    // --- Grants ---
+
+    async fn get_write_access_grant(
+        &self,
+        _request: tonic::Request<re_protos::cloud::v1alpha1::GetWriteAccessGrantRequest>,
+    ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::GetWriteAccessGrantResponse>>
+    {
+        Err(tonic::Status::unimplemented(
+            "write access grants are not implemented",
+        ))
+    }
+
     // --- Manifest Registry ---
+
     async fn register_with_dataset(
         &self,
         request: tonic::Request<re_protos::cloud::v1alpha1::RegisterWithDatasetRequest>,
@@ -987,13 +1000,13 @@ impl RerunCloudService for RerunCloudHandler {
             task_ids,
         } = do_register_with_dataset(&mut store, dataset_id, data_sources, on_duplicate).await?;
 
-        let record_batch = RegisterWithDatasetDataframe {
-            rerun_segment_id: segment_ids.into(),
-            rerun_segment_layer: segment_layers.into(),
-            rerun_segment_type: segment_types.into(),
-            rerun_storage_url: storage_urls.into(),
-            rerun_task_id: task_ids.into(),
-        }
+        let record_batch = RegisterWithDatasetDataframe::new(
+            segment_ids,
+            segment_layers,
+            segment_types,
+            storage_urls,
+            task_ids,
+        )
         .into_record_batch()
         .map_err(|err| tonic::Status::internal(format!("Failed to create dataframe: {err:#}")))?;
         Ok(tonic::Response::new(
@@ -1124,6 +1137,12 @@ impl RerunCloudService for RerunCloudHandler {
         let dataset = store.dataset_mut(entry_id)?;
 
         for (entity_path, store_slot_id, resolved) in handles {
+            // These chunks have no file behind them, so the store slot is the layer's only address.
+            let storage_url = url::Url::parse(&format!("memory:///store/{store_slot_id}"))
+                .map_err(|err| {
+                    tonic::Status::internal(format!("failed to build memory URL: {err}"))
+                })?;
+
             dataset
                 .add_source(
                     entity_path,
@@ -1132,6 +1151,7 @@ impl RerunCloudService for RerunCloudHandler {
                     }),
                     store_slot_id,
                     resolved,
+                    storage_url,
                     IfDuplicateBehavior::Error,
                 )
                 .await?;
@@ -1228,6 +1248,7 @@ impl RerunCloudService for RerunCloudHandler {
                         ))
                     })?,
             ),
+            meta: None,
         }))
     }
 
@@ -1261,6 +1282,7 @@ impl RerunCloudService for RerunCloudHandler {
         let stream = futures::stream::once(async move {
             Ok(ScanSegmentTableResponse {
                 data: Some(record_batch.into()),
+                meta: None,
             })
         });
 
@@ -1291,6 +1313,7 @@ impl RerunCloudService for RerunCloudHandler {
                         ))
                     })?,
             ),
+            meta: None,
         }))
     }
 
@@ -1322,6 +1345,7 @@ impl RerunCloudService for RerunCloudHandler {
         let stream = futures::stream::once(async move {
             Ok(ScanDatasetManifestResponse {
                 data: Some(record_batch.into()),
+                meta: None,
             })
         });
 
@@ -1346,6 +1370,7 @@ impl RerunCloudService for RerunCloudHandler {
             schema: Some((&schema).try_into().map_err(|err| {
                 tonic::Status::internal(format!("Unable to serialize Arrow schema: {err:#}"))
             })?),
+            meta: None,
         }))
     }
 
@@ -1378,6 +1403,7 @@ impl RerunCloudService for RerunCloudHandler {
                     tonic::Status::internal(format!("Unable to compute RRD manifest: {err:#}"))
                 })?),
                 manifest_key: None,
+                meta: None,
             }));
 
         Ok(tonic::Response::new(
@@ -1512,7 +1538,7 @@ impl RerunCloudService for RerunCloudHandler {
             let stream = futures::stream::iter([{
                 let batch = QueryDatasetDataframe::empty_record_batch();
                 let data = Some(batch.into());
-                Ok(QueryDatasetResponse { data })
+                Ok(QueryDatasetResponse { data, meta: None })
             }]);
 
             return Ok(tonic::Response::new(
@@ -1747,7 +1773,7 @@ impl RerunCloudService for RerunCloudHandler {
 
                 let data = Some(batch.into());
 
-                Ok(QueryDatasetResponse { data })
+                Ok(QueryDatasetResponse { data, meta: None })
             },
         ));
 
@@ -1774,39 +1800,13 @@ impl RerunCloudService for RerunCloudHandler {
                 tonic::Status::internal(format!("Failed to decode chunk_info: {err:#}"))
             })?;
 
-            let schema = chunk_info_batch.schema();
+            // Checks that the column is present, is `Binary`, and has no nulls:
+            let chunk_key_col = FetchChunksRequest::COLUMN_CHUNK_KEY
+                .extract(&chunk_info_batch)
+                .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
 
-            let chunk_key_col_idx = schema
-                .column_with_name(FetchChunksRequest::FIELD_CHUNK_KEY)
-                .ok_or_else(|| {
-                    tonic::Status::invalid_argument(format!(
-                        "Missing {} column",
-                        FetchChunksRequest::FIELD_CHUNK_KEY
-                    ))
-                })?
-                .0;
-
-            let chunk_keys_arr = chunk_info_batch
-                .column(chunk_key_col_idx)
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| {
-                    tonic::Status::invalid_argument(format!(
-                        "{} must be binary array",
-                        FetchChunksRequest::FIELD_CHUNK_KEY
-                    ))
-                })?;
-
-            for chunk_key in chunk_keys_arr {
-                let chunk_key = chunk_key.ok_or_else(|| {
-                    tonic::Status::invalid_argument(format!(
-                        "{} must not be null",
-                        FetchChunksRequest::FIELD_CHUNK_KEY
-                    ))
-                })?;
-
-                let chunk_key = ChunkKey::decode(chunk_key)?;
-                chunk_keys.push(chunk_key);
+            for chunk_key in &chunk_key_col {
+                chunk_keys.push(ChunkKey::decode(chunk_key)?);
             }
         }
 
@@ -1916,10 +1916,7 @@ impl RerunCloudService for RerunCloudHandler {
         request: tonic::Request<re_protos::cloud::v1alpha1::GetTableSchemaRequest>,
     ) -> tonic::Result<tonic::Response<re_protos::cloud::v1alpha1::GetTableSchemaResponse>> {
         let store = self.store.read().await;
-        let Some(entry_id) = request.into_inner().table_id else {
-            return Err(Status::not_found("Table ID not specified in request"));
-        };
-        let entry_id = entry_id.try_into()?;
+        let entry_id = resolve_entry_id(&request, request.get_ref().table_id.as_ref())?;
 
         let table = store
             .table(entry_id)
@@ -1942,10 +1939,7 @@ impl RerunCloudService for RerunCloudHandler {
         &self,
         request: tonic::Request<re_protos::cloud::v1alpha1::ScanTableRequest>,
     ) -> tonic::Result<tonic::Response<Self::ScanTableStream>> {
-        let Some(entry_id) = request.into_inner().table_id else {
-            return Err(Status::not_found("Table ID not specified in request"));
-        };
-        let entry_id = entry_id.try_into()?;
+        let entry_id = resolve_entry_id(&request, request.get_ref().table_id.as_ref())?;
 
         let provider = {
             let store = self.store.read().await;
@@ -2008,18 +2002,21 @@ impl RerunCloudService for RerunCloudHandler {
         }
 
         let num_tasks = ids.len();
-        let rb = QueryTasksDataframe {
-            task_id: ids.into(),
-            kind: vec![None::<String>; num_tasks].into(),
-            data: vec![None::<String>; num_tasks].into(),
-            exec_status: exec_statuses.into(),
-            msgs: msgs.into(),
-            blob_len: vec![None::<u64>; num_tasks].into(),
-            lease_owner: vec![None::<String>; num_tasks].into(),
-            lease_expiration: vec![None::<i64>; num_tasks].into(),
-            attempts: vec![1_u8; num_tasks].into(),
-            creation_time: vec![None::<i64>; num_tasks].into(),
-            last_update_time: vec![None::<i64>; num_tasks].into(),
+        type Df = QueryTasksDataframe;
+        // The OSS server runs every task to completion synchronously, so it has nothing to say
+        // about kind, payload, leases, or timing: those columns are all-null.
+        let rb = Df {
+            task_id: Df::COLUMN_TASK_ID.new_from_values(ids),
+            kind: Df::COLUMN_KIND.new_null(num_tasks),
+            data: Df::COLUMN_DATA.new_null(num_tasks),
+            exec_status: Df::COLUMN_EXEC_STATUS.new_from_values(exec_statuses),
+            msgs: Df::COLUMN_MSGS.new_from_values(msgs),
+            blob: Df::COLUMN_BLOB.new_null(num_tasks),
+            lease_owner: Df::COLUMN_LEASE_OWNER.new_null(num_tasks),
+            lease_expiration: Df::COLUMN_LEASE_EXPIRATION.new_null(num_tasks),
+            attempts: Df::COLUMN_ATTEMPTS.new_from_values(std::iter::repeat_n(1_u8, num_tasks)),
+            creation_time: Df::COLUMN_CREATION_TIME.new_null(num_tasks),
+            last_update_time: Df::COLUMN_LAST_UPDATE_TIME.new_null(num_tasks),
         }
         .into_record_batch()
         .map_err(|err| tonic::Status::internal(format!("Failed to create dataframe: {err:#}")))?;
@@ -2219,8 +2216,8 @@ impl ChunkMetadata {
     ) -> Self {
         Self {
             chunk_id,
-            entity_path: EntityPath::from(manifest.col_chunk_entity_path_raw().value(row_idx)),
-            is_static: manifest.col_chunk_is_static_raw().value(row_idx),
+            entity_path: EntityPath::from(manifest.col_chunk_entity_path().value(row_idx)),
+            is_static: manifest.col_chunk_is_static().value(row_idx),
             byte_size: manifest.col_chunk_byte_size_uncompressed()[row_idx],
             timelines: chunk_timelines.cloned().unwrap_or_default(),
         }

@@ -45,7 +45,7 @@ pub fn is_valid_blueprint(
     } else {
         mismatches.sort();
         re_log::warn_once!(
-            "Blueprint has {} component(s) with unexpected datatypes:\n{}",
+            "Blueprint has {} component(s) with unexpected encodings:\n{}",
             mismatches.len(),
             mismatches.join("\n"),
         );
@@ -62,15 +62,9 @@ mod tests {
     use re_chunk::{Chunk, RowId};
     use re_entity_db::EntityDb;
     use re_log_types::{StoreId, TimePoint};
-    use re_sdk_types::{Loggable as _, archetypes::Points3D, components::Radius};
+    use re_sdk_types::{ArrowDataType as _, archetypes::Points3D, components::Radius};
 
     use super::is_valid_blueprint;
-
-    fn reflection() -> re_types_core::reflection::ComponentReflectionMap {
-        re_sdk_types::reflection::generate_reflection()
-            .expect("failed to generate reflection")
-            .components
-    }
 
     /// One `Radius` column per given array, each on its own entity,
     /// as if logged as overrides in a blueprint.
@@ -106,56 +100,56 @@ mod tests {
 
     #[test]
     fn empty_blueprint_is_valid() {
-        let component_reflection = reflection();
+        let component_reflection = &re_sdk_types::reflection::reflection().components;
         let blueprint = EntityDb::new(StoreId::random(
             re_log_types::StoreKind::Blueprint,
             "test_app",
         ));
-        assert!(is_valid_blueprint(&blueprint, &component_reflection));
+        assert!(is_valid_blueprint(&blueprint, component_reflection));
     }
 
     #[test]
     fn matching_datatype_is_valid() {
-        let component_reflection = reflection();
+        let component_reflection = &re_sdk_types::reflection::reflection().components;
         assert_eq!(
-            Radius::arrow_datatype(),
+            Radius::arrow_data_type(),
             arrow::datatypes::DataType::Float32
         );
 
         let blueprint = blueprint_with_radius_column(Arc::new(Float32Array::from(vec![1.0])));
-        assert!(is_valid_blueprint(&blueprint, &component_reflection));
+        assert!(is_valid_blueprint(&blueprint, component_reflection));
     }
 
     /// A blueprint written before a component changed its datatype must be rejected,
     /// even for non-blueprint components (which are used for overrides and defaults).
     #[test]
     fn mismatched_datatype_is_invalid() {
-        let component_reflection = reflection();
+        let component_reflection = &re_sdk_types::reflection::reflection().components;
 
         let blueprint = blueprint_with_radius_column(Arc::new(Float64Array::from(vec![1.0])));
-        assert!(!is_valid_blueprint(&blueprint, &component_reflection));
+        assert!(!is_valid_blueprint(&blueprint, component_reflection));
     }
 
     /// A mismatch on any column invalidates the blueprint, not just the first one visited.
     #[test]
     fn mismatch_after_valid_column_is_invalid() {
-        let component_reflection = reflection();
+        let component_reflection = &re_sdk_types::reflection::reflection().components;
 
         let blueprint = blueprint_with_radius_columns([
             Arc::new(Float32Array::from(vec![1.0])) as arrow::array::ArrayRef,
             Arc::new(Float64Array::from(vec![1.0])),
         ]);
-        assert!(!is_valid_blueprint(&blueprint, &component_reflection));
+        assert!(!is_valid_blueprint(&blueprint, component_reflection));
     }
 
     #[test]
     fn multiple_mismatches_are_invalid() {
-        let component_reflection = reflection();
+        let component_reflection = &re_sdk_types::reflection::reflection().components;
 
         let blueprint = blueprint_with_radius_columns([
             Arc::new(Float64Array::from(vec![1.0])) as arrow::array::ArrayRef,
             Arc::new(Float64Array::from(vec![2.0])),
         ]);
-        assert!(!is_valid_blueprint(&blueprint, &component_reflection));
+        assert!(!is_valid_blueprint(&blueprint, component_reflection));
     }
 }

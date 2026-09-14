@@ -8,7 +8,7 @@ use re_integration_test::HarnessExt as _;
 use re_sdk::external::arrow::array::Float64Array;
 use re_sdk::{Component as _, Timeline};
 use re_view_time_series::TimeSeriesView;
-use re_viewer::external::re_sdk_types::{self, components, datatypes};
+use re_viewer::external::re_sdk_types::{self, components, encodings};
 use re_viewer::external::re_viewer_context::ViewClass as _;
 use re_viewer::viewer_test_utils;
 
@@ -75,7 +75,7 @@ pub async fn test_time_series_max_views_spawned() {
     assert_eq!(
         time_series_view_descriptions.len(),
         6,
-        "Expected exactly 6 TimeSeriesViews to be spawned (respecting DEFAULT_MAX_VIEWS_SPAWNED)"
+        "Expected exactly 6 TimeSeriesViews to be spawned (respecting MAX_VIEWS_SPAWNED)"
     );
     insta::assert_snapshot!(time_series_view_descriptions.join("\n"), @r#"
     origin: /native_0, filter: ResolvedEntityPathFilter("+ $origin\n- /__properties/**")
@@ -99,7 +99,7 @@ pub async fn test_time_series_does_not_spawn_for_non_scalar_physical_type() {
             builder.with_archetype_auto_row(
                 [(timeline, frame)],
                 &re_sdk_types::DynamicArchetype::new("custom")
-                    .with_component_override::<datatypes::Utf8>(
+                    .with_component_override::<encodings::Utf8>(
                         "text_field",
                         components::Scalar::name(), // We attach a semantic value.
                         ["hello"],

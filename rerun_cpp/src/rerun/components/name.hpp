@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "../datatypes/utf8.hpp"
+#include "../encodings/utf8.hpp"
 #include "../result.hpp"
 
 #include <cstdint>
@@ -13,8 +13,11 @@
 
 namespace rerun::components {
     /// **Component**: A display name, typically for an entity or a item like a plot series.
+    ///
+    /// This name is only a display label, never an identifier: it is not used to look anything
+    /// up, and two items may share the same name.
     struct Name {
-        rerun::datatypes::Utf8 value;
+        rerun::encodings::Utf8 value;
 
       public: // START of extensions from name_ext.cpp:
         /// Construct `Name` from a null-terminated UTF8 string.
@@ -29,9 +32,9 @@ namespace rerun::components {
       public:
         Name() = default;
 
-        Name(rerun::datatypes::Utf8 value_) : value(std::move(value_)) {}
+        Name(rerun::encodings::Utf8 value_) : value(std::move(value_)) {}
 
-        Name& operator=(rerun::datatypes::Utf8 value_) {
+        Name& operator=(rerun::encodings::Utf8 value_) {
             value = std::move(value_);
             return *this;
         }
@@ -43,15 +46,15 @@ namespace rerun::components {
             return *this;
         }
 
-        /// Cast to the underlying Utf8 datatype
-        operator rerun::datatypes::Utf8() const {
+        /// Cast to the underlying Utf8 encoding
+        operator rerun::encodings::Utf8() const {
             return value;
         }
     };
 } // namespace rerun::components
 
 namespace rerun {
-    static_assert(sizeof(rerun::datatypes::Utf8) == sizeof(components::Name));
+    static_assert(sizeof(rerun::encodings::Utf8) == sizeof(components::Name));
 
     /// \private
     template <>
@@ -59,8 +62,8 @@ namespace rerun {
         static constexpr std::string_view ComponentType = "rerun.components.Name";
 
         /// Returns the arrow data type this type corresponds to.
-        static const std::shared_ptr<arrow::DataType>& arrow_datatype() {
-            return Loggable<rerun::datatypes::Utf8>::arrow_datatype();
+        static const std::shared_ptr<arrow::DataType>& arrow_data_type() {
+            return Loggable<rerun::encodings::Utf8>::arrow_data_type();
         }
 
         /// Serializes an array of `rerun::components::Name` into an arrow array.
@@ -68,14 +71,14 @@ namespace rerun {
             const components::Name* instances, size_t num_instances
         ) {
             if (num_instances == 0) {
-                return Loggable<rerun::datatypes::Utf8>::to_arrow(nullptr, 0);
+                return Loggable<rerun::encodings::Utf8>::to_arrow(nullptr, 0);
             } else if (instances == nullptr) {
                 return rerun::Error(
                     ErrorCode::UnexpectedNullArgument,
                     "Passed array instances is null when num_elements> 0."
                 );
             } else {
-                return Loggable<rerun::datatypes::Utf8>::to_arrow(&instances->value, num_instances);
+                return Loggable<rerun::encodings::Utf8>::to_arrow(&instances->value, num_instances);
             }
         }
     };

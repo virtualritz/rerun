@@ -282,6 +282,8 @@ namespace rerun::archetypes {
 
         /// The parent frame this transform transforms into.
         ///
+        /// Any child frame has exactly one parent frame at any point in time, so logging a different `parent_frame` for a known `child_frame` replaces the previous relationship.
+        ///
         /// If not specified, this is set to the implicit transform frame of the current entity path's parent.
         /// This means that if a `archetypes::Transform3D` is set on an entity called `/my/entity/path` then this will default to `tf#/my/entity`.
         ///
@@ -355,7 +357,7 @@ namespace rerun::archetypes {
         /// _Implementation note:_ This overload is necessary, otherwise the array may be
         /// interpreted as bool and call the wrong overload.
         Transform3D(
-            const components::Translation3D& translation_, const datatypes::Vec3D (&columns)[3],
+            const components::Translation3D& translation_, const encodings::Vec3D (&columns)[3],
             bool from_parent = false
         )
             : Transform3D(translation_, components::TransformMat3x3(columns), from_parent) {}
@@ -394,7 +396,7 @@ namespace rerun::archetypes {
         /// \param translation \çopydoc Transform3D::translation
         /// \param columns Column vectors of 3x3 matrix.
         static Transform3D from_translation_mat3x3(
-            const components::Translation3D& translation, const datatypes::Vec3D (&columns)[3]
+            const components::Translation3D& translation, const encodings::Vec3D (&columns)[3]
         ) {
             return Transform3D::from_translation_mat3x3(
                 translation,
@@ -449,14 +451,14 @@ namespace rerun::archetypes {
         ///
         /// \param columns Column vectors of 3x3 matrix.
         /// \param from_parent If true, the transform relation to `TransformRelation::ChildFromParent`.
-        Transform3D(const datatypes::Vec3D (&columns)[3], bool from_parent = false)
+        Transform3D(const encodings::Vec3D (&columns)[3], bool from_parent = false)
             : Transform3D(components::TransformMat3x3(columns), from_parent) {}
 
         /// From 3x3 matrix provided as 3 columns only.
         /// Clears out all other components like `Transform3D::clear_fields`.
         ///
         /// \param columns Column vectors of 3x3 matrix.
-        static Transform3D from_mat3x3(const datatypes::Vec3D (&columns)[3]) {
+        static Transform3D from_mat3x3(const encodings::Vec3D (&columns)[3]) {
             return Transform3D(components::TransformMat3x3(columns), false);
         }
 
@@ -875,6 +877,8 @@ namespace rerun::archetypes {
         }
 
         /// The parent frame this transform transforms into.
+        ///
+        /// Any child frame has exactly one parent frame at any point in time, so logging a different `parent_frame` for a known `child_frame` replaces the previous relationship.
         ///
         /// If not specified, this is set to the implicit transform frame of the current entity path's parent.
         /// This means that if a `archetypes::Transform3D` is set on an entity called `/my/entity/path` then this will default to `tf#/my/entity`.

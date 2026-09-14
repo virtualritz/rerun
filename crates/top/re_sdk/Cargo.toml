@@ -28,7 +28,7 @@ default = []
 ##
 ## See our `log_file` example and <https://www.rerun.io/docs/concepts/logging-and-ingestion/importers/overview>
 ## for more information.
-importers = ["dep:re_importer", "dep:re_log_channel"]
+importers = ["dep:re_importer", "dep:re_log_channel", "re_importer?/all"]
 
 ## Support serving a web viewer over HTTP.
 ##
@@ -94,6 +94,7 @@ insta.workspace = true
 similar-asserts.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 

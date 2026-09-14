@@ -2,12 +2,15 @@ use std::error::Error;
 use std::str::FromStr as _;
 
 use egui::{Align2, AtomKind, Id, IntoAtoms as _, Ui};
+use re_arrow_util::ArrowArrayDowncastRef as _;
 use re_types_core::{ComponentIdentifier, RowId};
 use re_ui::loading_indicator::paint_loading_indicator_inside;
 use re_ui::{ReButton, Size, UiExt as _, Variant, icons};
 use re_uri::RedapUri;
 use re_viewer_context::open_url::ViewerOpenUrl;
-use re_viewer_context::{AppContext, RecordingOrTable, SystemCommand, SystemCommandSender as _};
+use re_viewer_context::{
+    AppContext, RecordingOrLocalTable, SystemCommand, SystemCommandSender as _,
+};
 
 /// Display an URL as an `Open` button (instead of spelling the full URL).
 ///
@@ -24,9 +27,7 @@ pub fn redap_uri_button(
     }
 
     let url_str = array
-        .as_any()
-        .downcast_ref::<arrow::array::StringArray>()
-        .ok_or_else(|| format!("unsupported arrow datatype: {}", array.data_type()))?
+        .try_downcast_array_ref::<arrow::array::StringArray>()?
         .value(0);
 
     let uri = RedapUri::from_str(url_str)?;
@@ -67,17 +68,23 @@ pub fn redap_uri_button(
             (false, false, None, None)
         };
 
-    let mut atoms = match &uri {
-        RedapUri::DatasetData(dataset)
+    let segment_in_active_dataset = match &uri {
+        RedapUri::Dataset(dataset)
             if ctx.active_redap_entry() == Some(dataset.dataset_id.into()) =>
         {
-            // A segment is a recording within the active dataset; show just the segment button.
-            re_viewer_context::segment_button_atoms(dataset.segment_id.as_str(), ui.ctx().theme())
+            dataset.segment_id.as_ref()
         }
-        _ => re_ui::UrlDecorator::get(ui.ctx())
+        _ => None,
+    };
+
+    let mut atoms = if let Some(segment_id) = segment_in_active_dataset {
+        // A segment is a recording within the active dataset, so show just the segment button.
+        re_viewer_context::segment_button_atoms(segment_id.as_str(), ui.ctx().theme())
+    } else {
+        re_ui::UrlDecorator::get(ui.ctx())
             .and_then(|decorator| decorator(url_str))
             .map(|link| link.into_atoms())
-            .unwrap_or_else(|| url_str.into_atoms()),
+            .unwrap_or_else(|| url_str.into_atoms())
     };
 
     let spinner_id = Id::new("loading_spinner");
@@ -167,7 +174,7 @@ pub fn redap_uri_button(
                 // The recording is already loaded — close it and free its memory.
                 ctx.command_sender
                     .send_system(SystemCommand::CloseRecordingOrTable(
-                        RecordingOrTable::Recording { store_id },
+                        RecordingOrLocalTable::Recording { store_id },
                     ));
             } else {
                 // Still loading — cancel the connected receiver.

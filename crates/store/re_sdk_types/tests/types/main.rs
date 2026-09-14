@@ -1,6 +1,6 @@
 //! Tests mainly, but not exclusively, of [`re_sdk_types::archetypes`].
 
-// Tests of archetypes and their related components and datatypes
+// Tests of archetypes and their related components and encodings
 
 mod annotation_context;
 mod arrows3d;
@@ -18,10 +18,13 @@ mod line_strips3d;
 mod mesh3d;
 mod points2d;
 mod points3d;
+mod reflection;
 mod segmentation_image;
 mod tensor;
 mod text_document;
 mod transform3d;
+#[cfg(feature = "testing")]
+mod transparent_optional;
 mod union_tags;
 mod view_coordinates;
 mod voxel_grid_map;

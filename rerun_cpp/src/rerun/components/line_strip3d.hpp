@@ -4,7 +4,7 @@
 #pragma once
 
 #include "../collection.hpp"
-#include "../datatypes/vec3d.hpp"
+#include "../encodings/vec3d.hpp"
 #include "../result.hpp"
 
 #include <cstdint>
@@ -31,15 +31,15 @@ namespace rerun::components {
     ///                  4
     /// ```
     struct LineStrip3D {
-        rerun::Collection<rerun::datatypes::Vec3D> points;
+        rerun::Collection<rerun::encodings::Vec3D> points;
 
       public:
         LineStrip3D() = default;
 
-        LineStrip3D(rerun::Collection<rerun::datatypes::Vec3D> points_)
+        LineStrip3D(rerun::Collection<rerun::encodings::Vec3D> points_)
             : points(std::move(points_)) {}
 
-        LineStrip3D& operator=(rerun::Collection<rerun::datatypes::Vec3D> points_) {
+        LineStrip3D& operator=(rerun::Collection<rerun::encodings::Vec3D> points_) {
             points = std::move(points_);
             return *this;
         }
@@ -56,7 +56,7 @@ namespace rerun {
         static constexpr std::string_view ComponentType = "rerun.components.LineStrip3D";
 
         /// Returns the arrow data type this type corresponds to.
-        static const std::shared_ptr<arrow::DataType>& arrow_datatype();
+        static const std::shared_ptr<arrow::DataType>& arrow_data_type();
 
         /// Serializes an array of `rerun::components::LineStrip3D` into an arrow array.
         static Result<std::shared_ptr<arrow::Array>> to_arrow(

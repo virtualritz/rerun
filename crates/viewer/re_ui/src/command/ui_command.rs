@@ -46,11 +46,15 @@ pub enum UICommand {
 
     TogglePanelStateOverrides,
     ToggleDevPanel,
+    ToggleChunkStoreBrowser,
     ToggleTopPanel,
     ToggleBlueprintPanel,
     ExpandBlueprintPanel,
     ToggleSelectionPanel,
     ExpandSelectionPanel,
+
+    ToggleAgentPanel,
+
     Settings,
 
     #[cfg(debug_assertions)]
@@ -162,6 +166,10 @@ impl UICommand {
                 "Toggle dev panel",
                 "View developer stats like RAM usage inside Rerun Viewer",
             ),
+            Self::ToggleChunkStoreBrowser => (
+                "Toggle chunk store browser",
+                "Toggle the chunk store browser",
+            ),
 
             Self::TogglePanelStateOverrides => (
                 "Toggle panel state overrides",
@@ -172,6 +180,12 @@ impl UICommand {
             Self::ExpandBlueprintPanel => ("Expand blueprint panel", "Expand the left panel"),
             Self::ToggleSelectionPanel => ("Toggle selection panel", "Toggle the right panel"),
             Self::ExpandSelectionPanel => ("Expand selection panel", "Expand the right panel"),
+
+            Self::ToggleAgentPanel => (
+                "Toggle agent panel",
+                "Toggle the chat panel with a coding agent that can drive the viewer (experimental)",
+            ),
+
             Self::Settings => ("Settings…", "Show the settings screen"),
 
             #[cfg(debug_assertions)]
@@ -309,12 +323,16 @@ impl UICommand {
             #[cfg(not(target_arch = "wasm32"))]
             Self::CaptureProfileTrace => smallvec![],
             Self::ToggleDevPanel => smallvec![ctrl_shift(Key::M)],
+            Self::ToggleChunkStoreBrowser => smallvec![ctrl_shift(Key::D)],
             Self::TogglePanelStateOverrides => smallvec![],
             Self::ToggleTopPanel => smallvec![],
             Self::ToggleBlueprintPanel => smallvec![ctrl_shift(Key::B)],
             Self::ExpandBlueprintPanel => smallvec![],
             Self::ToggleSelectionPanel => smallvec![ctrl_shift(Key::S)],
             Self::ExpandSelectionPanel => smallvec![],
+
+            Self::ToggleAgentPanel => smallvec![ctrl_shift(Key::A)],
+
             Self::Settings => smallvec![cmd(Key::Comma)],
 
             #[cfg(debug_assertions)]
@@ -338,7 +356,7 @@ impl UICommand {
             Self::ToggleCommandPalette => smallvec![cmd(Key::K), cmd(Key::P)],
 
             #[cfg(not(target_arch = "wasm32"))]
-            Self::ScreenshotWholeApp => smallvec![],
+            Self::ScreenshotWholeApp => smallvec![ctrl_shift(Key::F)],
 
             #[cfg(debug_assertions)]
             Self::ResetEguiMemory => smallvec![],
@@ -362,6 +380,14 @@ impl UICommand {
     /// Primary keyboard shortcut
     pub fn primary_kb_shortcut(self, os: OperatingSystem) -> Option<KeyboardShortcut> {
         self.kb_shortcuts(os).first().copied()
+    }
+
+    /// Whether this command is supported on the current platform.
+    pub fn is_supported(self) -> bool {
+        match self {
+            Self::ToggleAgentPanel => !cfg!(target_arch = "wasm32"),
+            _ => true,
+        }
     }
 
     /// Return the keyboard shortcut for this command, nicely formatted
@@ -401,6 +427,7 @@ impl UICommand {
         use strum::IntoEnumIterator as _;
 
         let commands = Self::iter()
+            .filter(|cmd| cmd.is_supported())
             .flat_map(|cmd| {
                 cmd.kb_shortcuts(egui_ctx.os())
                     .into_iter()

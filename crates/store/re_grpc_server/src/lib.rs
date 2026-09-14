@@ -14,6 +14,7 @@ use re_protos::common::v1alpha1::{
     DataframePart as DataframePartProto, StoreKind as StoreKindProto, TableId as TableIdProto,
 };
 use re_protos::log_msg::v1alpha1::LogMsg as LogMsgProto;
+use re_protos::sdk_comms::v1alpha1::message_proxy_service_server::MessageProxyServiceServer;
 use re_protos::sdk_comms::v1alpha1::{
     ReadMessagesRequest, ReadMessagesResponse, ReadTablesRequest, ReadTablesResponse,
     WriteMessagesRequest, WriteMessagesResponse, WriteTableRequest, WriteTableResponse,
@@ -24,6 +25,7 @@ use std::task::{Context, Poll};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_stream::{Stream, StreamExt as _};
+use tonic::server::NamedService as _;
 use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -125,25 +127,25 @@ impl std::fmt::Display for TonicStatusError {
 }
 
 fn fmt_tonic_status(f: &mut std::fmt::Formatter<'_>, status: &tonic::Status) -> std::fmt::Result {
-    if status.message().is_empty() {
-        write!(f, "gRPC error")?;
-    } else {
-        write!(f, "{}", status.message())?;
+    // The server message may come with details of its own, which must stay details:
+    // the status code belongs on the summary.
+    let mut error = re_error::StructuredError::parse(status.message());
+
+    if error.summary.is_empty() {
+        error.summary = "gRPC error".to_owned();
     }
 
-    if status.code() != tonic::Code::Unknown {
-        write!(f, " ({})", status.code())?;
+    let code = status.code();
+    if code != tonic::Code::Unknown {
+        // The `Debug` name ("NotFound"), not tonic's long `Display` prose.
+        error.summary = format!("{} ({code:?})", error.summary);
     }
 
     if !status.metadata().is_empty() {
-        write!(
-            f,
-            "{} metadata: {:?}",
-            re_error::DETAILS_SEPARATOR,
-            status.metadata().as_ref()
-        )?;
+        error.add_detail(format!("metadata: {:?}", status.metadata().as_ref()));
     }
-    Ok(())
+
+    write!(f, "{error}")
 }
 
 impl From<tonic::Status> for TonicStatusError {
@@ -213,6 +215,7 @@ impl tonic::service::Interceptor for LoopbackOnly {
 #[derive(Default)]
 pub struct LoopbackServices {
     builder: tonic::service::RoutesBuilder,
+    service_names: Vec<&'static str>,
 }
 
 impl LoopbackServices {
@@ -235,11 +238,8 @@ impl LoopbackServices {
                 svc,
                 LoopbackOnly,
             ));
+        self.service_names.push(S::NAME);
         self
-    }
-
-    fn into_routes(self) -> tonic::service::Routes {
-        self.builder.routes()
     }
 }
 
@@ -272,7 +272,7 @@ pub async fn serve(
         options,
         message_proxy,
         shutdown,
-        tonic::service::Routes::default(),
+        LoopbackServices::default(),
     )
     .await
 }
@@ -282,7 +282,7 @@ async fn serve_impl(
     options: ServerOptions,
     message_proxy: MessageProxy,
     shutdown: shutdown::Shutdown,
-    extra_services: tonic::service::Routes,
+    extra_services: LoopbackServices,
 ) -> anyhow::Result<()> {
     // TODO(rust-lang/rust#130668): When listening on `::` we want to listen to both ipv6 `::` and ipv4 `0.0.0.0`
     // On Mac & Linux this happens automatically since all sockets are dual-stack by default.
@@ -336,13 +336,17 @@ async fn serve_impl(
     let cors = cors_layer(&options.cors_allowed_origins);
     let grpc_web = tonic_web::GrpcWebLayer::new();
 
-    let routes = extra_services.add_service(
-        re_protos::sdk_comms::v1alpha1::message_proxy_service_server::MessageProxyServiceServer::new(
-            message_proxy,
-        )
-        .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE)
-        .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE),
+    let LoopbackServices {
+        mut builder,
+        mut service_names,
+    } = extra_services;
+    builder.add_service(
+        MessageProxyServiceServer::new(message_proxy)
+            .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE)
+            .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE),
     );
+    service_names.push(MessageProxyServiceServer::<MessageProxy>::NAME);
+    let routes = re_protos::reflection::with_reflection(builder.routes(), service_names)?;
 
     Server::builder()
         .accept_http1(true) // Support `grpc-web` clients
@@ -436,7 +440,7 @@ pub async fn serve_from_channel(
         options,
         message_proxy,
         shutdown,
-        tonic::service::Routes::default(),
+        LoopbackServices::default(),
     )
     .await
     {
@@ -468,7 +472,7 @@ pub fn spawn_from_rx_set(
             options,
             message_proxy,
             shutdown,
-            tonic::service::Routes::default(),
+            LoopbackServices::default(),
         )
         .await
         {
@@ -590,14 +594,8 @@ pub fn spawn_with_recv_and_services(
     );
 
     tokio::spawn(async move {
-        if let Err(err) = serve_impl(
-            addr,
-            options,
-            message_proxy,
-            shutdown,
-            loopback_services.into_routes(),
-        )
-        .await
+        if let Err(err) =
+            serve_impl(addr, options, message_proxy, shutdown, loopback_services).await
         {
             re_log::error!("message proxy server crashed: {err}");
         }
@@ -1266,11 +1264,20 @@ impl message_proxy_service_server::MessageProxyService for MessageProxy {
                 Ok(Some(WriteMessagesRequest {
                     log_msg: Some(log_msg),
                 })) => {
-                    self.push_message(log_msg).await;
+                    if log_msg.msg.is_some() {
+                        self.push_message(log_msg).await;
+                    } else {
+                        // Reject at ingress, so that live and replayed streams see the same messages.
+                        return Err(tonic::Status::invalid_argument(
+                            "missing `msg` in `log_msg` in `WriteMessagesRequest`",
+                        ));
+                    }
                 }
 
                 Ok(Some(WriteMessagesRequest { log_msg: None })) => {
-                    re_log::warn!("missing log_msg in WriteMessagesRequest");
+                    return Err(tonic::Status::invalid_argument(
+                        "missing `log_msg` in `WriteMessagesRequest`",
+                    ));
                 }
 
                 Ok(None) => {
@@ -1279,8 +1286,9 @@ impl message_proxy_service_server::MessageProxyService for MessageProxy {
                 }
 
                 Err(err) => {
-                    re_log::error!("Error while receiving messages: {}", TonicStatusError(err));
-                    break;
+                    let err = TonicStatusError(err);
+                    re_log::error!("Error while receiving messages: {err}");
+                    return Err(err.0);
                 }
             }
         }
@@ -1303,15 +1311,20 @@ impl message_proxy_service_server::MessageProxyService for MessageProxy {
         &self,
         request: tonic::Request<WriteTableRequest>,
     ) -> tonic::Result<tonic::Response<WriteTableResponse>> {
-        if let WriteTableRequest {
-            id: Some(id),
-            data: Some(data),
-        } = request.into_inner()
-        {
-            self.push_message(TableMsgProto { id, data }).await;
-        } else {
-            re_log::warn!("malformed `WriteTableRequest`");
-        }
+        let WriteTableRequest { id, data } = request.into_inner();
+
+        let Some(id) = id else {
+            return Err(tonic::Status::invalid_argument(
+                "missing `id` in `WriteTableRequest`",
+            ));
+        };
+        let Some(data) = data else {
+            return Err(tonic::Status::invalid_argument(
+                "missing `data` in `WriteTableRequest`",
+            ));
+        };
+
+        self.push_message(TableMsgProto { id, data }).await;
 
         Ok(tonic::Response::new(WriteTableResponse {}))
     }
@@ -1326,6 +1339,7 @@ impl message_proxy_service_server::MessageProxyService for MessageProxy {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1335,7 +1349,6 @@ mod tests {
     use re_log_encoding::rrd::Compression;
     use re_log_types::{LogMsg, SetStoreInfo, StoreId, StoreInfo, StoreKind, StoreSource};
     use re_protos::sdk_comms::v1alpha1::message_proxy_service_client::MessageProxyServiceClient;
-    use re_protos::sdk_comms::v1alpha1::message_proxy_service_server::MessageProxyServiceServer;
     use similar_asserts::assert_eq;
     use tokio::net::TcpListener;
     use tokio_util::sync::CancellationToken;
@@ -1630,8 +1643,8 @@ mod tests {
         // While `SetStoreInfo` is sent first in `fake_log_stream`,
         // we can observe that it's also received first,
         // even though it is actually stored out of order in `persistent_message_queue`.
-        assert!(matches!(messages[0], LogMsg::SetStoreInfo(..)));
-        assert!(matches!(actual[0], LogMsg::SetStoreInfo(..)));
+        assert_matches!(messages[0], LogMsg::SetStoreInfo(..));
+        assert_matches!(actual[0], LogMsg::SetStoreInfo(..));
 
         completion.finish();
     }
@@ -1896,6 +1909,95 @@ mod tests {
         let actual = read_log_stream(&mut log_stream, expected.len()).await;
 
         assert_eq!(actual, expected);
+
+        completion.finish();
+    }
+
+    #[tokio::test]
+    async fn write_messages_half_close_returns_ok() {
+        let (completion, addr) = setup().await;
+        let mut client = make_client(addr).await;
+
+        let blueprint_id = StoreId::random(StoreKind::Blueprint, "test_app");
+        let messages = fake_log_stream_blueprint(&blueprint_id, 1);
+
+        let requests = messages
+            .into_iter()
+            .map(|msg| WriteMessagesRequest {
+                log_msg: Some(msg.to_transport(Compression::Off).unwrap().into()),
+            })
+            .collect_vec();
+
+        // The client half-closing the stream after sending is the normal end of a write:
+        let response = client.write_messages(tokio_stream::iter(requests)).await;
+        assert!(response.is_ok());
+
+        completion.finish();
+    }
+
+    #[tokio::test]
+    async fn write_table_missing_fields_are_invalid_argument() {
+        let (completion, addr) = setup().await;
+        let mut client = make_client(addr).await;
+
+        let status = client
+            .write_table(WriteTableRequest {
+                id: None,
+                data: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("`id`"));
+
+        let status = client
+            .write_table(WriteTableRequest {
+                id: Some(TableIdProto {
+                    id: "some_table".to_owned(),
+                }),
+                data: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("`data`"));
+
+        completion.finish();
+    }
+
+    #[tokio::test]
+    async fn write_messages_rejects_log_msg_with_unset_oneof() {
+        let (completion, addr) = setup().await;
+        let mut client = make_client(addr).await;
+
+        let blueprint_id = StoreId::random(StoreKind::Blueprint, "test_app");
+        let messages = fake_log_stream_blueprint(&blueprint_id, 1);
+
+        // Start reading before writing, so the malformed message would reach us if it were broadcast:
+        let mut log_stream = client.read_messages(ReadMessagesRequest {}).await.unwrap();
+
+        let valid = messages
+            .clone()
+            .into_iter()
+            .map(|msg| WriteMessagesRequest {
+                log_msg: Some(msg.to_transport(Compression::Off).unwrap().into()),
+            });
+        let malformed = WriteMessagesRequest {
+            log_msg: Some(LogMsgProto { msg: None }),
+        };
+        let requests = chain!(valid, [malformed]).collect_vec();
+
+        // A `log_msg` with an unset `msg` oneof is rejected at ingress:
+        let status = client
+            .write_messages(tokio_stream::iter(requests))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("`msg`"));
+
+        // The valid messages preceding it should still be broadcast:
+        let actual = read_log_stream(&mut log_stream, messages.len()).await;
+        assert_eq!(messages, actual);
 
         completion.finish();
     }

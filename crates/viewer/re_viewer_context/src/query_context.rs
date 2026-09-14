@@ -42,6 +42,9 @@ pub struct QueryContext<'a> {
 
     /// Query which didn't yield a result for the component at the target entity path.
     pub query: re_chunk_store::LatestAtQuery,
+
+    /// Annotation data available while resolving fallbacks.
+    pub annotation_context: Option<&'a crate::Annotations>,
 }
 
 impl QueryContext<'_> {
@@ -197,46 +200,6 @@ impl DataResultTree {
         if let Some(root_handle) = self.root_handle {
             self.visit_recursive(root_handle, visitor);
         }
-    }
-
-    /// Depth-first traversal of the tree, calling `visitor` on each result, starting from a
-    /// specific node.
-    ///
-    /// Stops traversing a branch if `visitor` returns `false`.
-    pub fn visit_from_node<'a>(
-        &'a self,
-        node: &DataResultNode,
-        visitor: &mut impl FnMut(&'a DataResultNode) -> bool,
-    ) {
-        if let Some(handle) = self
-            .data_results_by_path
-            .get(&node.data_result.entity_path.hash())
-        {
-            self.visit_recursive(*handle, visitor);
-        }
-    }
-
-    /// Depth-first search of a node based on the provided predicate.
-    ///
-    /// If a `staring_node` is provided, the search starts at that node. Otherwise, it starts at the
-    /// root node.
-    pub fn find_node_by(
-        &self,
-        starting_node: Option<&DataResultNode>,
-        predicate: impl Fn(&DataResultNode) -> bool,
-    ) -> Option<&DataResultNode> {
-        let mut result = None;
-
-        let node = starting_node.or_else(|| self.root_node())?;
-        self.visit_from_node(node, &mut |node| {
-            if predicate(node) {
-                result = Some(node);
-            }
-
-            // keep recursing until we find something
-            result.is_none()
-        });
-        result
     }
 
     /// Look up a [`DataResult`] in the tree based on its handle.

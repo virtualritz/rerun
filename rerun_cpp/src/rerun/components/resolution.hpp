@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "../datatypes/vec2d.hpp"
+#include "../encodings/vec2d.hpp"
 #include "../rerun_sdk_export.hpp"
 #include "../result.hpp"
 
@@ -16,7 +16,7 @@ namespace rerun::components {
     ///
     /// Typically in integer units, but for some use cases floating point may be used.
     struct Resolution {
-        rerun::datatypes::Vec2D resolution;
+        rerun::encodings::Vec2D resolution;
 
       public: // START of extensions from resolution_ext.cpp:
         /// Construct resolution from width and height floats.
@@ -31,9 +31,9 @@ namespace rerun::components {
       public:
         Resolution() = default;
 
-        Resolution(rerun::datatypes::Vec2D resolution_) : resolution(resolution_) {}
+        Resolution(rerun::encodings::Vec2D resolution_) : resolution(resolution_) {}
 
-        Resolution& operator=(rerun::datatypes::Vec2D resolution_) {
+        Resolution& operator=(rerun::encodings::Vec2D resolution_) {
             resolution = resolution_;
             return *this;
         }
@@ -45,15 +45,15 @@ namespace rerun::components {
             return *this;
         }
 
-        /// Cast to the underlying Vec2D datatype
-        operator rerun::datatypes::Vec2D() const {
+        /// Cast to the underlying Vec2D encoding
+        operator rerun::encodings::Vec2D() const {
             return resolution;
         }
     };
 } // namespace rerun::components
 
 namespace rerun {
-    static_assert(sizeof(rerun::datatypes::Vec2D) == sizeof(components::Resolution));
+    static_assert(sizeof(rerun::encodings::Vec2D) == sizeof(components::Resolution));
 
     /// \private
     template <>
@@ -61,8 +61,8 @@ namespace rerun {
         static constexpr std::string_view ComponentType = "rerun.components.Resolution";
 
         /// Returns the arrow data type this type corresponds to.
-        static const std::shared_ptr<arrow::DataType>& arrow_datatype() {
-            return Loggable<rerun::datatypes::Vec2D>::arrow_datatype();
+        static const std::shared_ptr<arrow::DataType>& arrow_data_type() {
+            return Loggable<rerun::encodings::Vec2D>::arrow_data_type();
         }
 
         /// Serializes an array of `rerun::components::Resolution` into an arrow array.
@@ -70,14 +70,14 @@ namespace rerun {
             const components::Resolution* instances, size_t num_instances
         ) {
             if (num_instances == 0) {
-                return Loggable<rerun::datatypes::Vec2D>::to_arrow(nullptr, 0);
+                return Loggable<rerun::encodings::Vec2D>::to_arrow(nullptr, 0);
             } else if (instances == nullptr) {
                 return rerun::Error(
                     ErrorCode::UnexpectedNullArgument,
                     "Passed array instances is null when num_elements> 0."
                 );
             } else {
-                return Loggable<rerun::datatypes::Vec2D>::to_arrow(
+                return Loggable<rerun::encodings::Vec2D>::to_arrow(
                     &instances->resolution,
                     num_instances
                 );

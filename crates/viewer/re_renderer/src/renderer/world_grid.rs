@@ -90,8 +90,11 @@ impl DrawData for WorldGridDrawData {
 }
 
 impl WorldGridDrawData {
-    pub fn new(ctx: &RenderContext, config: &WorldGridConfiguration) -> Self {
-        let world_grid_renderer = ctx.renderer::<WorldGridRenderer>();
+    pub fn new(
+        ctx: &RenderContext,
+        config: &WorldGridConfiguration,
+    ) -> Result<Self, crate::RendererRegistrationError> {
+        let world_grid_renderer = ctx.renderer::<WorldGridRenderer>()?;
 
         let uniform_buffer_binding = create_and_fill_uniform_buffer(
             ctx,
@@ -107,7 +110,7 @@ impl WorldGridDrawData {
             },
         );
 
-        Self {
+        Ok(Self {
             bind_group: ctx.gpu_resources.bind_groups.alloc(
                 &ctx.device,
                 &ctx.gpu_resources,
@@ -117,7 +120,7 @@ impl WorldGridDrawData {
                     layout: world_grid_renderer.bind_group_layout,
                 },
             ),
-        }
+        })
     }
 }
 

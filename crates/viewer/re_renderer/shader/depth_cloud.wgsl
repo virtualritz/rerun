@@ -199,8 +199,9 @@ fn coverage(
 ) -> f32 {
     if is_camera_orthographic() {
         return circle_quad_coverage(quad_offset_from_center, point_radius);
+    } else {
+        return sphere_quad_coverage(pos_in_world, point_radius, point_pos_in_world);
     }
-    return sphere_quad_coverage(pos_in_world, point_radius, point_pos_in_world);
 }
 
 @fragment

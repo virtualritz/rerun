@@ -45,9 +45,9 @@ pub use self::arrow_msg::{ArrowMsg, ArrowRecordBatchReleaseCallback};
 pub use self::entry_id::{EntryId, EntryIdOrName};
 pub use self::entry_name::{EntryName, InvalidEntryNameError};
 pub use self::index::{
-    AbsoluteTimeRange, AbsoluteTimeRangeF, DateVisibility, Duration, NonMinI64, TimeCell, TimeInt,
-    TimePoint, TimeReal, TimeType, Timeline, TimelinePoint, Timestamp, TimestampFormat,
-    TimestampFormatKind, TryFromIntError,
+    AbsoluteTimeRange, AbsoluteTimeRangeF, DateVisibility, Duration, IndexWindow, NonMinI64,
+    TimeCell, TimeInt, TimePoint, TimeReal, TimeType, Timeline, TimelinePoint, Timestamp,
+    TimestampFormat, TimestampFormatKind, TryFromIntError,
 };
 pub use self::instance::Instance;
 pub use self::path::*;
@@ -242,6 +242,11 @@ impl StoreId {
     #[inline]
     pub fn empty_recording() -> Self {
         Self::new(StoreKind::Recording, "-EMPTY-", "<EMPTY>")
+    }
+
+    #[inline]
+    pub fn empty_blueprint() -> Self {
+        Self::new(StoreKind::Blueprint, "-EMPTY-", "<EMPTY>")
     }
 
     #[inline]
@@ -575,23 +580,13 @@ pub struct StoreInfo {
     /// segment id).
     pub store_id: StoreId,
 
-    /// If this store is the result of a clone, which store was it cloned from?
-    ///
-    /// A cloned store always gets a new unique ID.
-    ///
-    /// We currently only clone stores for blueprints:
-    /// when we receive a _default_ blueprints on the wire (e.g. from a recording),
-    /// we clone it and make the clone the _active_ blueprint.
-    /// This means all active blueprints are clones.
-    pub cloned_from: Option<StoreId>,
-
     pub store_source: StoreSource,
 
     /// The Rerun version used to encoded the RRD data.
     ///
     // NOTE: The version comes directly from the decoded RRD stream's header, duplicating it here
     // would probably only lead to more issues down the line.
-    pub store_version: Option<CrateVersion>,
+    pub store_version: Option<CrateVersion<'static>>,
 }
 
 impl StoreInfo {
@@ -599,7 +594,6 @@ impl StoreInfo {
     pub fn new(store_id: StoreId, store_source: StoreSource) -> Self {
         Self {
             store_id,
-            cloned_from: None,
             store_source,
             store_version: Some(CrateVersion::LOCAL),
         }
@@ -609,7 +603,6 @@ impl StoreInfo {
     pub fn new_unversioned(store_id: StoreId, store_source: StoreSource) -> Self {
         Self {
             store_id,
-            cloned_from: None,
             store_source,
             store_version: None,
         }

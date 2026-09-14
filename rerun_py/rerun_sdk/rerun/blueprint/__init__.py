@@ -4,7 +4,7 @@ from __future__ import annotations
 # API RE-EXPORTS
 # Important: always use the `import _ as _` format to make it explicit to type-checkers that these are public APIs.
 #
-from ..datatypes import (  # Re-export time range types for better discoverability.
+from ..encodings import (  # Re-export time range types for better discoverability.
     TimeRange as TimeRange,
     TimeRangeBoundary as TimeRangeBoundary,
     VisibleTimeRange as VisibleTimeRange,
@@ -34,6 +34,7 @@ from .archetypes import (
     EntityBehavior as EntityBehavior,
     EyeControls3D as EyeControls3D,
     LineGrid3D as LineGrid3D,
+    PlotInteraction as PlotInteraction,
     PlotLegend as PlotLegend,
     ScalarAxis as ScalarAxis,
     SpatialInformation as SpatialInformation,

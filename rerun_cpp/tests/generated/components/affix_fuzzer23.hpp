@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "../datatypes/multi_enum.hpp"
+#include "../encodings/multi_enum.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -18,21 +18,21 @@ namespace arrow {
 
 namespace rerun::components {
     struct AffixFuzzer23 {
-        std::optional<rerun::datatypes::MultiEnum> multi_enum;
+        std::optional<rerun::encodings::MultiEnum> multi_enum;
 
       public:
         AffixFuzzer23() = default;
 
-        AffixFuzzer23(std::optional<rerun::datatypes::MultiEnum> multi_enum_)
+        AffixFuzzer23(std::optional<rerun::encodings::MultiEnum> multi_enum_)
             : multi_enum(multi_enum_) {}
 
-        AffixFuzzer23& operator=(std::optional<rerun::datatypes::MultiEnum> multi_enum_) {
+        AffixFuzzer23& operator=(std::optional<rerun::encodings::MultiEnum> multi_enum_) {
             multi_enum = multi_enum_;
             return *this;
         }
 
-        /// Cast to the underlying MultiEnum datatype
-        operator std::optional<rerun::datatypes::MultiEnum>() const {
+        /// Cast to the underlying MultiEnum encoding
+        operator std::optional<rerun::encodings::MultiEnum>() const {
             return multi_enum;
         }
     };
@@ -48,7 +48,7 @@ namespace rerun {
         static constexpr std::string_view ComponentType = "rerun.testing.components.AffixFuzzer23";
 
         /// Returns the arrow data type this type corresponds to.
-        static const std::shared_ptr<arrow::DataType>& arrow_datatype();
+        static const std::shared_ptr<arrow::DataType>& arrow_data_type();
 
         /// Serializes an array of `rerun::components::AffixFuzzer23` into an arrow array.
         static Result<std::shared_ptr<arrow::Array>> to_arrow(

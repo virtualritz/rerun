@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "../datatypes/fixed_size_bytes.hpp"
+#include "../encodings/fixed_size_bytes.hpp"
 
 #include <array>
 #include <cstdint>
@@ -19,16 +19,16 @@ namespace arrow {
 
 namespace rerun::components {
     struct AffixFuzzer22 {
-        std::optional<rerun::datatypes::FixedSizeBytes> nullable_nested_array;
+        std::optional<rerun::encodings::FixedSizeBytes> nullable_nested_array;
 
       public:
         AffixFuzzer22() = default;
 
-        AffixFuzzer22(std::optional<rerun::datatypes::FixedSizeBytes> nullable_nested_array_)
+        AffixFuzzer22(std::optional<rerun::encodings::FixedSizeBytes> nullable_nested_array_)
             : nullable_nested_array(nullable_nested_array_) {}
 
         AffixFuzzer22& operator=(
-            std::optional<rerun::datatypes::FixedSizeBytes> nullable_nested_array_
+            std::optional<rerun::encodings::FixedSizeBytes> nullable_nested_array_
         ) {
             nullable_nested_array = nullable_nested_array_;
             return *this;
@@ -42,8 +42,8 @@ namespace rerun::components {
             return *this;
         }
 
-        /// Cast to the underlying FixedSizeBytes datatype
-        operator std::optional<rerun::datatypes::FixedSizeBytes>() const {
+        /// Cast to the underlying FixedSizeBytes encoding
+        operator std::optional<rerun::encodings::FixedSizeBytes>() const {
             return nullable_nested_array;
         }
     };
@@ -59,7 +59,7 @@ namespace rerun {
         static constexpr std::string_view ComponentType = "rerun.testing.components.AffixFuzzer22";
 
         /// Returns the arrow data type this type corresponds to.
-        static const std::shared_ptr<arrow::DataType>& arrow_datatype();
+        static const std::shared_ptr<arrow::DataType>& arrow_data_type();
 
         /// Serializes an array of `rerun::components::AffixFuzzer22` into an arrow array.
         static Result<std::shared_ptr<arrow::Array>> to_arrow(

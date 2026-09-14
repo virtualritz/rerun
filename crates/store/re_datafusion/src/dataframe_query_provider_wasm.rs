@@ -6,10 +6,10 @@ use std::task::{Context, Poll};
 
 use crate::DataframeClientAPI;
 use crate::dataframe_query_common::{
-    IndexValuesMap, PlanSummary, group_chunk_infos_by_segment_id, segment_partition_hash,
+    IndexValuesMap, PlanSummary, group_chunk_infos_by_segment_id, schema_with_array_datatypes,
+    segment_belongs_to_partition,
 };
 use arrow::array::{Array, RecordBatch, RecordBatchOptions, StringArray};
-use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::plan_err;
 use datafusion::config::ConfigOptions;
@@ -18,11 +18,7 @@ use re_redap_client::{ApiError, ApiResult};
 
 use crate::IntoDfError as _;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{
-    EquivalenceProperties, LexOrdering, Partitioning, PhysicalExpr, PhysicalSortExpr,
-};
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_expr::Partitioning;
 use datafusion::physical_plan::metrics::MetricsSet;
 
 use crate::analytics::build_metrics_set_for_explain;
@@ -88,10 +84,16 @@ pub struct DataframeSegmentStream<T: DataframeClientAPI> {
 }
 
 impl<T: DataframeClientAPI> DataframeSegmentStream<T> {
+    /// The server this stream is querying.
+    fn origin(&self) -> &re_uri::Origin {
+        self.client.origin()
+    }
+
     async fn get_chunk_store_for_single_rerun_segment(
         &mut self,
         segment_id: &str,
     ) -> ApiResult<ChunkStoreHandle> {
+        let origin = self.origin().clone();
         let chunk_infos = self.chunk_infos.iter().map(Into::into).collect::<Vec<_>>();
         let fetch_chunks_request = FetchChunksRequest { chunk_infos };
 
@@ -101,15 +103,21 @@ impl<T: DataframeClientAPI> DataframeSegmentStream<T> {
             .client
             .fetch_chunks(req)
             .await
-            .map_err(|err| ApiError::tonic(err, "fetch_chunks"))?;
+            .map_err(|err| ApiError::tonic(&origin, err, "fetch_chunks"))?;
 
-        let response_stream =
-            re_redap_client::ApiResponseStream::from_tonic_response(response, "/FetchChunks");
+        let response_stream = re_redap_client::ApiResponseStream::from_tonic_response(
+            origin.clone(),
+            response,
+            "/FetchChunks",
+        );
 
         // Then we need to fully decode these chunks, i.e. both the transport layer (Protobuf)
         // and the app layer (Arrow).
-        let mut chunk_stream =
-            re_redap_client::fetch_chunks_response_to_chunk_and_segment_id(response_stream);
+        let decode_us = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut chunk_stream = re_redap_client::fetch_chunks_response_to_chunk_and_segment_id(
+            response_stream,
+            Some(Arc::clone(&decode_us)),
+        );
 
         // Note: using segment id as the store id, shouldn't really
         // matter since this is just a temporary store.
@@ -131,12 +139,14 @@ impl<T: DataframeClientAPI> DataframeSegmentStream<T> {
 
                 let received_segment_id = received_segment_id.ok_or_else(|| {
                     ApiError::deserialization(
+                        &origin,
                         None,
                         "server returned chunk without a segment id in fetch_chunks response",
                     )
                 })?;
                 if received_segment_id.as_ref() != segment_id {
                     return Err(ApiError::deserialization(
+                        &origin,
                         None,
                         format!(
                             "server returned chunk for unexpected segment id `{received_segment_id}` \
@@ -150,6 +160,7 @@ impl<T: DataframeClientAPI> DataframeSegmentStream<T> {
                     .insert_chunk(&Arc::new(chunk))
                     .map_err(|err| {
                         ApiError::internal_with_source(
+                            &origin,
                             None,
                             err,
                             "inserting chunk into in-memory store",
@@ -157,6 +168,11 @@ impl<T: DataframeClientAPI> DataframeSegmentStream<T> {
                     })?;
             }
         }
+
+        self.pending_analytics.metrics().decode_time_us.fetch_add(
+            decode_us.load(std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         Ok(store)
     }
@@ -206,6 +222,7 @@ impl<T: DataframeClientAPI> Stream for DataframeSegmentStream<T> {
     #[tracing::instrument(level = "info", skip_all)]
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        let origin = this.origin().clone();
 
         loop {
             if this.remaining_segment_ids.is_empty() && this.current_query.is_none() {
@@ -239,10 +256,22 @@ impl<T: DataframeClientAPI> Stream for DataframeSegmentStream<T> {
                 .expect("current_query should be Some");
 
             // If the following returns none, we have exhausted that rerun segment id
-            match create_next_row(query, segment_id, &this.projected_schema)
+            match create_next_row(&origin, query, segment_id, &this.projected_schema)
                 .map_err(|err| err.into_df_error())?
             {
-                Some(rb) => return Poll::Ready(Some(Ok(rb))),
+                Some(rb) => {
+                    // Payload delivered to the consumer — post-query,
+                    // post-client-filter. Mirrors the native path.
+                    let metrics = this.pending_analytics.metrics();
+                    metrics
+                        .delivered_rows
+                        .fetch_add(rb.num_rows() as u64, std::sync::atomic::Ordering::Relaxed);
+                    metrics.delivered_bytes.fetch_add(
+                        rb.get_array_memory_size() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    return Poll::Ready(Some(Ok(rb)));
+                }
                 None => this.current_query = None,
             }
         }
@@ -282,60 +311,13 @@ impl<T: DataframeClientAPI> SegmentStreamExec<T> {
             None => Arc::clone(table_schema),
         };
 
-        let partition_col = Arc::new(Column::new(
-            ScanSegmentTableDataframe::COLUMN_RERUN_SEGMENT_ID_NAME,
-            0,
-        )) as Arc<dyn PhysicalExpr>;
-        let order_col = sort_index
-            .and_then(|index| {
-                let index_name = index.as_str();
-                projected_schema
-                    .fields()
-                    .iter()
-                    .enumerate()
-                    .find(|(_idx, field)| field.name() == index_name)
-                    .map(|(index_col, _)| Column::new(index_name, index_col))
-            })
-            .map(|expr| Arc::new(expr) as Arc<dyn PhysicalExpr>);
-
-        let mut physical_ordering = vec![PhysicalSortExpr::new(
-            partition_col,
-            SortOptions::new(false, true),
-        )];
-        if let Some(col_expr) = order_col {
-            physical_ordering.push(PhysicalSortExpr::new(
-                col_expr,
-                SortOptions::new(false, true),
-            ));
-        }
-
-        let orderings = vec![
-            LexOrdering::new(physical_ordering)
-                .expect("LexOrdering should return Some when non-empty vec is passed"),
-        ];
-
-        let eq_properties =
-            EquivalenceProperties::new_with_orderings(Arc::clone(&projected_schema), orderings);
-
-        let partition_in_output_schema = projection.map(|p| p.contains(&0)).unwrap_or(false);
-
-        let output_partitioning = if partition_in_output_schema {
-            Partitioning::Hash(
-                vec![Arc::new(Column::new(
-                    ScanSegmentTableDataframe::COLUMN_RERUN_SEGMENT_ID_NAME,
-                    0,
-                ))],
-                num_partitions,
-            )
-        } else {
-            Partitioning::UnknownPartitioning(num_partitions)
-        };
-
-        let props = PlanProperties::new(
-            eq_properties,
-            output_partitioning,
-            EmissionType::Incremental,
-            Boundedness::Bounded,
+        // Same claims as the native provider, including the projection guard:
+        // claiming an ordering the output can't honor is silently wrong for
+        // downstream sorted-mode operators.
+        let props = crate::dataframe_query_common::segment_stream_plan_properties(
+            &projected_schema,
+            sort_index,
+            num_partitions,
         )
         .into();
 
@@ -363,6 +345,7 @@ impl<T: DataframeClientAPI> SegmentStreamExec<T> {
 
 #[tracing::instrument(level = "trace", skip_all)]
 fn create_next_row(
+    origin: &re_uri::Origin,
     query_handle: &mut QueryHandle<StorageEngine>,
     segment_id: &SegmentId,
     target_schema: &Arc<Schema>,
@@ -380,6 +363,7 @@ fn create_next_row(
     }
     if num_fields != next_row.len() {
         return Err(ApiError::internal(
+            origin,
             "Unexpected number of columns returned from query",
         ));
     }
@@ -392,9 +376,12 @@ fn create_next_row(
     arrays.push(sid_array);
     arrays.extend(next_row);
 
-    let batch_schema = Arc::new(prepend_string_column_schema(
-        &query_schema,
-        ScanSegmentTableDataframe::COLUMN_RERUN_SEGMENT_ID_NAME,
+    let batch_schema = Arc::new(schema_with_array_datatypes(
+        &prepend_string_column_schema(
+            &query_schema,
+            ScanSegmentTableDataframe::COLUMN_RERUN_SEGMENT_ID_NAME,
+        ),
+        &arrays,
     ));
 
     let batch = RecordBatch::try_new_with_options(
@@ -404,6 +391,7 @@ fn create_next_row(
     )
     .map_err(|err| {
         ApiError::deserialization_with_source(
+            origin,
             None,
             err,
             "building output record batch from chunk-store rows",
@@ -411,7 +399,7 @@ fn create_next_row(
     })?;
 
     let output_batch = align_record_batch_to_schema(&batch, target_schema).map_err(|err| {
-        ApiError::deserialization_with_source(None, err, "DataFusion schema mismatch error")
+        ApiError::deserialization_with_source(origin, None, err, "DataFusion schema mismatch error")
     })?;
 
     Ok(Some(output_batch))
@@ -490,8 +478,7 @@ impl<T: DataframeClientAPI> ExecutionPlan for SegmentStreamExec<T> {
             .chunk_info
             .keys()
             .filter(|segment_id| {
-                let hash_value = segment_partition_hash(segment_id) as usize;
-                hash_value % self.target_partitions == partition
+                segment_belongs_to_partition(segment_id, partition, self.target_partitions)
             })
             .cloned()
             .collect::<Vec<_>>();

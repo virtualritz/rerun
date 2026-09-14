@@ -528,7 +528,7 @@ impl MessageParser for PointCloud2MessageParser {
         for (i, points_3d) in points_3ds.iter().flatten().enumerate() {
             let timelines = timelines
                 .iter()
-                .map(|(timeline, time_col)| (*timeline, time_col.row_sliced(i, 1).clone()))
+                .map(|(timeline, time_col)| (*timeline, time_col.row_sliced_unit(i)))
                 .collect::<HashMap<_, _, _>>();
 
             let components = points_3d
@@ -628,6 +628,7 @@ impl MessageParser for PointCloud2MessageParser {
 
 #[cfg(test)]
 mod tests {
+    use re_arrow_util::ArrowArrayDowncastRef as _;
     use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 
     use arrow::array::{Array as _, Float32Array};
@@ -825,8 +826,7 @@ mod tests {
             .unwrap();
         let values = intensity
             .values()
-            .as_any()
-            .downcast_ref::<Float32Array>()
+            .try_downcast_array_ref::<Float32Array>()
             .unwrap();
 
         assert_eq!(intensity.len(), 1);

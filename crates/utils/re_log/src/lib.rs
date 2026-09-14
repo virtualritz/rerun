@@ -56,7 +56,7 @@ pub use tracing::{debug, error, event, info, trace, warn};
 #[macro_export]
 macro_rules! debug_warn {
     ($($arg:tt)+) => {
-        $crate::_with_panic_on_warn_suppressed(|| $crate::warn!("DEBUG: {}", format_args!($($arg)+)))
+        $crate::with_panic_on_warn_suppressed(|| $crate::warn!("DEBUG: {}", format_args!($($arg)+)))
     };
 }
 
@@ -90,7 +90,7 @@ macro_rules! debug_warn {
 #[macro_export]
 macro_rules! debug_warn_once {
     ($($arg:tt)+) => {
-        $crate::_with_panic_on_warn_suppressed(|| $crate::warn_once!("DEBUG: {}", format_args!($($arg)+)))
+        $crate::with_panic_on_warn_suppressed(|| $crate::warn_once!("DEBUG: {}", format_args!($($arg)+)))
     };
 }
 
@@ -139,6 +139,7 @@ const CRATES_AT_WARN_LEVEL: &[&str] = &[
 /// These creates are quite spammy on debug, drowning out what we care about:
 #[cfg(any(feature = "setup", not(target_arch = "wasm32")))]
 const CRATES_AT_INFO_LEVEL: &[&str] = &[
+    "agent_client_protocol", // Logs every JSON-RPC message at debug level
     "datafusion_optimizer",
     "datafusion",
     "h2",
@@ -356,7 +357,7 @@ thread_local! {
 ///
 /// This relies on `tracing` dispatching events synchronously on the emitting thread.
 #[doc(hidden)] // implementation detail of the `debug_warn!` family
-pub fn _with_panic_on_warn_suppressed<R>(f: impl FnOnce() -> R) -> R {
+pub fn with_panic_on_warn_suppressed<R>(f: impl FnOnce() -> R) -> R {
     // RAII-restore, so a panic during `f` (e.g. while formatting) doesn't leak the flag.
     struct Guard(bool);
 
@@ -370,7 +371,7 @@ pub fn _with_panic_on_warn_suppressed<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// Is panic-on-warn currently suppressed on this thread (see [`_with_panic_on_warn_suppressed`])?
+/// Is panic-on-warn currently suppressed on this thread (see [`with_panic_on_warn_suppressed`])?
 #[cfg(all(feature = "setup", not(target_arch = "wasm32")))] // only used by the `PanicOnWarn` layer
 pub(crate) fn is_panic_on_warn_suppressed() -> bool {
     SUPPRESS_PANIC_ON_WARN.with(|suppress| suppress.get())

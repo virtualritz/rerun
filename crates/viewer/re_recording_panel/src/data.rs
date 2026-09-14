@@ -23,14 +23,20 @@ pub struct RecordingPanelData<'a> {
     /// All the configured servers.
     pub servers: Vec<ServerData<'a>>,
 
-    /// All the locally loaded application IDs and the corresponding recordings.
-    pub local_apps: Vec<AppIdData<'a>>,
+    /// Application IDs and recordings streaming from an SDK or message proxy.
+    pub live_recordings: Vec<AppIdData<'a>>,
+
+    /// Application IDs and recordings loaded from other local sources.
+    pub imported_recordings: Vec<AppIdData<'a>>,
 
     /// All the locally loaded tables.
     pub local_tables: Vec<TableId>,
 
-    /// All the loaded examples
+    /// All the loaded examples.
     pub example_apps: Vec<AppIdData<'a>>,
+
+    /// Examples that are currently loading.
+    pub loading_examples: Vec<Arc<LogSource>>,
 
     /// Should the example section be displayed at all?
     pub show_example_section: bool,
@@ -49,6 +55,7 @@ impl<'a> RecordingPanelData<'a> {
         //
 
         let mut loading_receivers = vec![];
+        let mut loading_examples = vec![];
         let mut loading_segments: HashMap<re_uri::Origin, HashMap<EntryId, Vec<Arc<LogSource>>>> =
             HashMap::default();
 
@@ -64,12 +71,23 @@ impl<'a> RecordingPanelData<'a> {
             }
 
             match source.as_ref() {
-                LogSource::File { .. } | LogSource::HttpStream { .. } => {
+                LogSource::File { .. } => {
                     loading_receivers.push(source);
                 }
 
+                LogSource::HttpStream { .. } => {
+                    if EntityDbClass::for_recording(Some(source.as_ref())).is_example() {
+                        loading_examples.push(source);
+                    } else {
+                        loading_receivers.push(source);
+                    }
+                }
+
                 LogSource::RedapGrpcStream { uri, .. } => {
-                    if ctx.store_hub().is_opened(&uri.store_id()) {
+                    if uri
+                        .store_id()
+                        .is_some_and(|store_id| ctx.store_hub().is_opened(&store_id))
+                    {
                         loading_segments
                             .entry(uri.origin.clone())
                             .or_default()
@@ -97,16 +115,24 @@ impl<'a> RecordingPanelData<'a> {
             .map(|server| ServerData::new(ctx, server, loading_segments.get(server.origin())))
             .collect();
 
-        let mut local_apps: BTreeMap<ApplicationId, Vec<&EntityDb>> = Default::default();
+        let mut live_recordings: BTreeMap<ApplicationId, Vec<&EntityDb>> = Default::default();
+        let mut imported_recordings: BTreeMap<ApplicationId, Vec<&EntityDb>> = Default::default();
         let mut examples_apps: BTreeMap<ApplicationId, Vec<&EntityDb>> = Default::default();
 
         for entity_db in ctx.store_bundle().entity_dbs() {
             let app_id = entity_db.application_id();
             match entity_db.store_class() {
-                EntityDbClass::LocalRecording => local_apps
-                    .entry(app_id.clone())
-                    .or_default()
-                    .push(entity_db),
+                EntityDbClass::LocalRecording => {
+                    let apps = if matches!(
+                        entity_db.data_source.as_ref(),
+                        Some(LogSource::Sdk | LogSource::MessageProxy(_))
+                    ) {
+                        &mut live_recordings
+                    } else {
+                        &mut imported_recordings
+                    };
+                    apps.entry(app_id.clone()).or_default().push(entity_db);
+                }
 
                 EntityDbClass::ExampleRecording => examples_apps
                     .entry(app_id.clone())
@@ -118,12 +144,13 @@ impl<'a> RecordingPanelData<'a> {
             }
         }
 
-        let local_apps = local_apps
-            .into_iter()
-            .map(|(app_id_or_examples, entity_dbs)| {
-                AppIdData::new(ctx, app_id_or_examples, entity_dbs)
-            })
-            .collect();
+        let to_app_data = |apps: BTreeMap<_, _>| {
+            apps.into_iter()
+                .map(|(app_id, entity_dbs)| AppIdData::new(ctx, app_id, entity_dbs))
+                .collect()
+        };
+        let live_recordings = to_app_data(live_recordings);
+        let imported_recordings = to_app_data(imported_recordings);
 
         let example_apps: Vec<_> = examples_apps
             .into_iter()
@@ -132,29 +159,35 @@ impl<'a> RecordingPanelData<'a> {
             })
             .collect();
 
-        let show_example_section = ctx
+        let show_example_section = (ctx
             .app_options
             .include_rerun_examples_button_in_recordings_panel
-            && !hide_examples
-            || !example_apps.is_empty();
+            && !hide_examples)
+            || !example_apps.is_empty()
+            || !loading_examples.is_empty();
 
         let local_tables = ctx.table_stores().keys().sorted().cloned().collect();
 
         Self {
             servers,
-            local_apps,
+            live_recordings,
+            imported_recordings,
             local_tables,
             example_apps,
+            loading_examples,
             show_example_section,
             loading_receivers,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.local_apps.is_empty()
+        self.live_recordings.is_empty()
+            && self.imported_recordings.is_empty()
             && self.local_tables.is_empty()
             && self.example_apps.is_empty()
-            && self.servers.is_empty()
+            && self.loading_examples.is_empty()
+            && self.loading_receivers.is_empty()
+            && self.servers.iter().all(|server| !server.is_visible())
     }
 
     /// Search for the relevant store id and, if found, return its sibling entity dbs and its index
@@ -173,7 +206,11 @@ impl<'a> RecordingPanelData<'a> {
             }
         }
 
-        for local_app in std::iter::chain(&self.local_apps, &self.example_apps) {
+        for local_app in itertools::chain!(
+            &self.live_recordings,
+            &self.imported_recordings,
+            &self.example_apps
+        ) {
             let store_iter = local_app.iter_loaded_stores();
 
             if let Some(pos) = store_iter.clone().position(|db| db.store_id() == store_id) {
@@ -307,6 +344,10 @@ impl<'a> ServerData<'a> {
     pub fn item(&self) -> Item {
         Item::RedapServer(self.origin.clone())
     }
+
+    pub fn is_visible(&self) -> bool {
+        !self.is_internal || !self.entries_data.iter_datasets().is_empty()
+    }
 }
 
 // ---
@@ -351,21 +392,19 @@ impl<'a> ServerEntriesData<'a> {
 
                     match entry.inner() {
                         Ok(EntryInner::Dataset(_dataset)) => {
+                            // Assets live in a separate, hidden dataset, but their urls name the
+                            // dataset that owns them, so they are displayed under it.
                             let mut displayed_segments: Vec<SegmentData<'_>> = ctx
                                 .store_bundle()
                                 .entity_dbs()
                                 .filter_map(|entity_db| {
                                     if let EntityDbClass::DatasetSegment(uri) =
                                         entity_db.store_class()
+                                        && &uri.origin == origin
+                                        && ctx.store_hub().is_opened(entity_db.store_id())
+                                        && EntryId::from(uri.dataset_id) == entry.id()
                                     {
-                                        if &uri.origin == origin
-                                            && EntryId::from(uri.dataset_id) == entry.id()
-                                            && ctx.store_hub().is_opened(entity_db.store_id())
-                                        {
-                                            Some(SegmentData::Loaded { entity_db })
-                                        } else {
-                                            None
-                                        }
+                                        Some(SegmentData::Loaded { entity_db })
                                     } else {
                                         None
                                     }
@@ -386,7 +425,7 @@ impl<'a> ServerEntriesData<'a> {
                                 SegmentData::Loading { receiver } => {
                                     ctx.store_hub().data_source_order(receiver)
                                 }
-                                SegmentData::Loaded { entity_db } => {
+                                SegmentData::Loaded { entity_db, .. } => {
                                     if let Some(data_source) = &entity_db.data_source {
                                         ctx.store_hub().data_source_order(data_source)
                                     } else {
@@ -456,7 +495,7 @@ impl<'a> DatasetData<'a> {
         self.displayed_segments
             .iter()
             .filter_map(|segment| match segment {
-                SegmentData::Loaded { entity_db } => Some(*entity_db),
+                SegmentData::Loaded { entity_db, .. } => Some(*entity_db),
                 SegmentData::Loading { .. } => None,
             })
     }

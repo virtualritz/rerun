@@ -10,7 +10,7 @@ use re_redap_client::ConnectionRegistryHandle;
 use crate::stream_rrd_from_http::stream_from_http_to_channel;
 
 pub type AuthErrorHandler =
-    Arc<dyn Fn(re_uri::DatasetSegmentUri, &re_redap_client::ClientCredentialsError) + Send + Sync>;
+    Arc<dyn Fn(re_uri::DatasetUri, &re_redap_client::ClientCredentialsError) + Send + Sync>;
 
 /// Somewhere we can get Rerun logging data from.
 // TODO(emilk): there is a lot of overlap between this and `ViewerOpenUrl`
@@ -35,6 +35,14 @@ pub enum LogDataSource {
         /// The file's path or, on web, its display name.
         path: std::path::PathBuf,
 
+        /// Recordings holding shared assets.
+        ///
+        /// They are registered with the file's dataset before the file is opened, and only when
+        /// the file goes to the internal catalog with the "Load files via Viewer catalog" setting
+        /// on.
+        #[cfg(not(target_arch = "wasm32"))]
+        assets: Vec<std::path::PathBuf>,
+
         /// The browser file selected through the file dialog or drag-and-drop.
         #[cfg(target_arch = "wasm32")]
         file: web_sys::File,
@@ -46,7 +54,7 @@ pub enum LogDataSource {
 
     /// A `rerun://` URI pointing to a recording.
     RedapDatasetSegment {
-        uri: re_uri::DatasetSegmentUri,
+        uri: re_uri::DatasetUri,
 
         open_behavior: RecordingOpenBehavior,
     },
@@ -84,10 +92,12 @@ impl LogDataSource {
         {
             use itertools::Itertools as _;
 
+            // See https://learn.microsoft.com/en-us/dotnet/standard/io/file-path-formats
             fn looks_like_windows_abs_path(path: &str) -> bool {
                 let path = path.as_bytes();
-                // "C:/" etc
-                path.get(1).copied() == Some(b':') && path.get(2).copied() == Some(b'/')
+                path.starts_with(b"\\\\")
+                    || (path.get(1).copied() == Some(b':')
+                        && matches!(path.get(2).copied(), Some(b'/' | b'\\')))
             }
 
             fn looks_like_a_file_path(uri: &str) -> bool {
@@ -106,7 +116,9 @@ impl LogDataSource {
                     true // Unix relative path
                 } else if looks_like_windows_abs_path(uri) {
                     true
-                } else if uri.starts_with("http:") || uri.starts_with("https:") {
+                } else if url::Url::parse(uri).is_ok() {
+                    // An explicit URI scheme cannot name a local path. Windows paths are handled
+                    // above because the URL parser interprets their drive letter as a scheme.
                     false
                 } else {
                     // We use a simple heuristic here: if there are multiple dots, it is likely an url,
@@ -146,6 +158,7 @@ impl LogDataSource {
                 return Some(Self::File {
                     file_source: _file_source,
                     path,
+                    assets: Vec::new(),
                 });
             }
 
@@ -153,11 +166,15 @@ impl LogDataSource {
                 return Some(Self::File {
                     file_source: _file_source,
                     path,
+                    assets: Vec::new(),
                 });
             }
         }
 
-        if let Ok(uri) = url.parse::<re_uri::DatasetSegmentUri>() {
+        // A dataset url without a segment names no data to load.
+        if let Ok(uri) = url.parse::<re_uri::DatasetUri>()
+            && uri.segment_id.is_some()
+        {
             Some(Self::RedapDatasetSegment {
                 uri,
                 open_behavior: RecordingOpenBehavior::OpenAndSelect,
@@ -209,7 +226,9 @@ impl LogDataSource {
                 // This is a web viewer URL with a `?url=` parameter.
                 // Extract the URL parameter and try to parse it as a redap URI.
                 let (_, value) = url.query_pairs().find(|(key, _)| key == "url")?;
-                if let Ok(uri) = value.parse::<re_uri::DatasetSegmentUri>() {
+                if let Ok(uri) = value.parse::<re_uri::DatasetUri>()
+                    && uri.segment_id.is_some()
+                {
                     Some(Self::RedapDatasetSegment {
                         uri,
                         open_behavior: RecordingOpenBehavior::OpenAndSelect,
@@ -264,8 +283,12 @@ impl LogDataSource {
 
         match self {
             Self::HttpUrl { url } => {
-                let path = url.path();
-                let is_rrd = path.ends_with(".rrd") || path.ends_with(".rbl");
+                let extension = std::path::Path::new(url.path())
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .unwrap_or_default()
+                    .to_lowercase();
+                let is_rrd = matches!(extension.as_str(), "rrd" | "rbl");
                 if is_rrd {
                     Ok(stream_from_http_to_channel(url.to_string()))
                 } else {
@@ -276,6 +299,8 @@ impl LogDataSource {
             Self::File {
                 file_source,
                 path,
+                #[cfg(not(target_arch = "wasm32"))]
+                    assets: _,
                 #[cfg(target_arch = "wasm32")]
                 file,
             } => {
@@ -339,14 +364,13 @@ impl LogDataSource {
                     re_log_channel::log_channel(re_log_channel::LogSource::RedapGrpcStream {
                         uri: uri.clone(),
                         open_behavior,
-                        table_blueprint: None,
                     });
 
-                let connection_registry = connection_registry.clone();
+                let connection = connection_registry.connection_handle(uri.origin.clone());
                 let uri_clone = uri.clone();
                 let tx_err = tx.clone();
                 let stream_segment = async move {
-                    let client = connection_registry.client(uri_clone.origin.clone()).await?;
+                    let client = connection.client().await?;
                     re_redap_client::stream_blueprint_and_segment_from_server(
                         client,
                         tx,
@@ -484,6 +508,10 @@ mod tests {
             "foo.png",
             "/foo/bar/baz.rbl",
             "D:/file.jpg",
+            "D:\\file.jpg",
+            "D:\\directory.with.dots\\file.jpg",
+            "\\\\server.example\\share\\file.jpg", // https://learn.microsoft.com/en-us/dotnet/standard/io/file-path-formats#unc-paths
+            "//server.example/share/file.jpg",
         ];
         let http = [
             "http://example.com/foo.rrd",
@@ -536,6 +564,10 @@ mod tests {
             "data:application/octet-stream;base64,UlJEMAo=",
             "data:,inline-text",
             "blob:https://example.com/550e8400-e29b-41d4-a716-446655440000",
+            "s3://example-bucket/recording.rrd",
+            "gs://bucket/file.rrd",
+            "ftp://host/file.rrd",
+            "custom://host/file.rrd",
         ];
 
         let file_source = FileSource::DragAndDrop {
@@ -630,10 +662,11 @@ mod tests {
         assert_eq!(
             data_source,
             Some(LogDataSource::RedapDatasetSegment {
-                uri: re_uri::DatasetSegmentUri {
+                uri: re_uri::DatasetUri {
                     origin: "api.customer.cloud.rerun.io:443".parse().unwrap(),
                     dataset_id: "18A23D2FAC59F8572563b312ef21f53b".parse().unwrap(),
-                    segment_id: "the_segment_name".into(),
+                    resource: re_uri::DatasetResource::Segments,
+                    segment_id: Some("the_segment_name".into()),
                     fragment: Default::default(),
                 },
                 open_behavior: RecordingOpenBehavior::OpenAndSelect,

@@ -16,11 +16,13 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::wildcard_imports)]
 
+use ::arrow::array::ArrayRef;
 use ::re_types_core::SerializationResult;
+use ::re_types_core::SerializedComponentBatch;
 use ::re_types_core::try_serialize_field;
-use ::re_types_core::{ComponentBatch as _, SerializedComponentBatch};
 use ::re_types_core::{ComponentDescriptor, ComponentType};
 use ::re_types_core::{DeserializationError, DeserializationResult};
+use ::std::borrow::Cow;
 
 /// **Component**: View-dependent color, expressed as spherical harmonics coefficients of degrees 1 through 3.
 ///
@@ -31,10 +33,10 @@ use ::re_types_core::{DeserializationError, DeserializationResult};
     Clone, Debug, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable, ::re_byte_size::SizeBytes,
 )]
 #[repr(transparent)]
-pub struct SphericalHarmonics3Rgb(pub crate::datatypes::SphericalHarmonics3Rgb);
+pub struct SphericalHarmonics3Rgb(pub crate::encodings::SphericalHarmonics3Rgb);
 
 impl ::re_types_core::WrapperComponent for SphericalHarmonics3Rgb {
-    type Datatype = crate::datatypes::SphericalHarmonics3Rgb;
+    type Encoding = crate::encodings::SphericalHarmonics3Rgb;
 
     #[inline]
     fn name() -> ComponentType {
@@ -42,38 +44,38 @@ impl ::re_types_core::WrapperComponent for SphericalHarmonics3Rgb {
     }
 
     #[inline]
-    fn into_inner(self) -> Self::Datatype {
+    fn into_inner(self) -> Self::Encoding {
         self.0
     }
 }
 
 ::re_types_core::macros::impl_into_cow!(SphericalHarmonics3Rgb);
 
-impl<T: Into<crate::datatypes::SphericalHarmonics3Rgb>> From<T> for SphericalHarmonics3Rgb {
+impl<T: Into<crate::encodings::SphericalHarmonics3Rgb>> From<T> for SphericalHarmonics3Rgb {
     fn from(v: T) -> Self {
         Self(v.into())
     }
 }
 
-impl std::borrow::Borrow<crate::datatypes::SphericalHarmonics3Rgb> for SphericalHarmonics3Rgb {
+impl std::borrow::Borrow<crate::encodings::SphericalHarmonics3Rgb> for SphericalHarmonics3Rgb {
     #[inline]
-    fn borrow(&self) -> &crate::datatypes::SphericalHarmonics3Rgb {
+    fn borrow(&self) -> &crate::encodings::SphericalHarmonics3Rgb {
         &self.0
     }
 }
 
 impl std::ops::Deref for SphericalHarmonics3Rgb {
-    type Target = crate::datatypes::SphericalHarmonics3Rgb;
+    type Target = crate::encodings::SphericalHarmonics3Rgb;
 
     #[inline]
-    fn deref(&self) -> &crate::datatypes::SphericalHarmonics3Rgb {
+    fn deref(&self) -> &crate::encodings::SphericalHarmonics3Rgb {
         &self.0
     }
 }
 
 impl std::ops::DerefMut for SphericalHarmonics3Rgb {
     #[inline]
-    fn deref_mut(&mut self) -> &mut crate::datatypes::SphericalHarmonics3Rgb {
+    fn deref_mut(&mut self) -> &mut crate::encodings::SphericalHarmonics3Rgb {
         &mut self.0
     }
 }

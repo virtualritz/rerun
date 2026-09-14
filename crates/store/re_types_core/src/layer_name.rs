@@ -2,6 +2,13 @@
 ///
 /// Layers partition a segment's chunks into named groups that can be
 /// registered, queried, and deleted independently.
+///
+/// This name is used both as an identifier and as a display label: there is no separate layer
+/// id, so the name is what a layer is keyed on (e.g. `Segment::sources`) and what the API
+/// refers to it by, and it is also what the user reads.
+///
+/// Being the key has consequences: two layers with the same name in the same segment are the
+/// same layer.
 //
 // NOTE: Intentionally does not implement `Default` — a blank layer name is
 // almost always a bug. It cannot be constructed empty at all: use the fallible
@@ -118,7 +125,7 @@ impl std::str::FromStr for LayerName {
 // Make `quiver::Column<LayerName>` work (backed by a `Utf8` column).
 // `try_*` because reading validates non-emptiness (via `TryFrom<String>`) at
 // column construction, so an empty layer name can't sneak in from storage either.
-quiver::try_newtype_datatype!(LayerName, quiver::Utf8);
+quiver::try_newtype_data_type!(LayerName, quiver::Utf8);
 
 impl AsRef<str> for LayerName {
     #[inline]
@@ -228,15 +235,15 @@ mod tests {
     }
 
     #[test]
-    fn quiver_column_rejects_empty() {
+    fn quiver_rejects_empty() {
         use arrow::array::StringArray;
 
-        // A non-empty column round-trips.
-        let column = quiver::Column::<LayerName>::from_values([LayerName::base()]);
-        assert_eq!(column.to_vec(), [LayerName::base()]);
+        // Non-empty values round-trip.
+        let values = quiver::TypedArray::<LayerName>::from_values([LayerName::base()]);
+        assert_eq!(values.to_vec(), [LayerName::base()]);
 
-        // A column containing an empty string is rejected at construction.
+        // An empty string is rejected at construction.
         let array = std::sync::Arc::new(StringArray::from(vec!["base", ""]));
-        assert!(quiver::Column::<LayerName>::try_new(array).is_err());
+        assert!(quiver::TypedArray::<LayerName>::try_new(array).is_err());
     }
 }

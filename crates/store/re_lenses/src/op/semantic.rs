@@ -9,9 +9,10 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Float64Type, Int32Type, Int64Type};
 use arrow::error::ArrowError;
+use re_arrow_util::ArrowArrayDowncastRef as _;
 use re_sdk_types::components::VideoCodec;
 
-use re_lenses_core::combinators::{DowncastRef, Error, GetField, Transform};
+use re_lenses_core::combinators::{DowncastRef, Error, GetField, Transform, try_downcast};
 
 /// Converts binary arrays to list arrays where each binary element becomes a list of `u8`.
 ///
@@ -221,20 +222,33 @@ impl Transform for RgbaStructToUInt32 {
 }
 
 /// Converts binary data (i32 offsets) to a list of `u8` values.
+///
+/// If the binary data is already a list of `u8` values, it is passed through unchanged.
 pub fn binary_to_list_uint8()
 -> impl Fn(&arrow::array::ArrayRef) -> Result<Option<arrow::array::ArrayRef>, Error> + Send + Sync {
     move |source: &arrow::array::ArrayRef| {
-        let binary = source
-            .as_any()
-            .downcast_ref::<arrow::array::BinaryArray>()
-            .ok_or_else(|| Error::TypeMismatch {
-                expected: "BinaryArray".to_owned(),
-                actual: source.data_type().clone(),
-                context: "binary_to_list_uint8 input".to_owned(),
-            })?;
-        Ok(BinaryToListUInt8::<i32, i32>::new()
-            .transform(binary)?
-            .map(|arr| Arc::new(arr) as arrow::array::ArrayRef))
+        if let Some(binary) = source.downcast_array_ref::<arrow::array::BinaryArray>() {
+            return Ok(BinaryToListUInt8::<i32, i32>::new()
+                .transform(binary)?
+                .map(|arr| Arc::new(arr) as arrow::array::ArrayRef));
+        }
+
+        if source
+            .downcast_array_ref::<arrow::array::ListArray>()
+            .is_some_and(|list| {
+                list.values()
+                    .downcast_array_ref::<arrow::array::UInt8Array>()
+                    .is_some()
+            })
+        {
+            return Ok(Some(source.clone()));
+        }
+
+        Err(Error::TypeMismatch {
+            expected: "BinaryArray or ListArray<UInt8>".to_owned(),
+            actual: source.data_type().clone(),
+            context: "binary_to_list_uint8 input".to_owned(),
+        })
     }
 }
 
@@ -242,14 +256,7 @@ pub fn binary_to_list_uint8()
 pub fn timespec_to_nanos()
 -> impl Fn(&arrow::array::ArrayRef) -> Result<Option<arrow::array::ArrayRef>, Error> + Send + Sync {
     move |source: &arrow::array::ArrayRef| {
-        let struct_array = source
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .ok_or_else(|| Error::TypeMismatch {
-                expected: "StructArray".to_owned(),
-                actual: source.data_type().clone(),
-                context: "timespec_to_nanos input".to_owned(),
-            })?;
+        let struct_array = try_downcast::<StructArray>(source, "timespec_to_nanos input")?;
         Ok(TimeSpecToNanos::default()
             .transform(struct_array)?
             .map(|arr| Arc::new(arr) as arrow::array::ArrayRef))
@@ -260,14 +267,7 @@ pub fn timespec_to_nanos()
 pub fn string_to_video_codec()
 -> impl Fn(&arrow::array::ArrayRef) -> Result<Option<arrow::array::ArrayRef>, Error> + Send + Sync {
     move |source: &arrow::array::ArrayRef| {
-        let string_array = source
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| Error::TypeMismatch {
-                expected: "StringArray".to_owned(),
-                actual: source.data_type().clone(),
-                context: "string_to_video_codec input".to_owned(),
-            })?;
+        let string_array = try_downcast::<StringArray>(source, "string_to_video_codec input")?;
         Ok(StringToVideoCodecUInt32::default()
             .transform(string_array)?
             .map(|arr| Arc::new(arr) as arrow::array::ArrayRef))
@@ -280,14 +280,7 @@ pub fn string_to_video_codec()
 pub fn rgba_struct_to_uint32()
 -> impl Fn(&arrow::array::ArrayRef) -> Result<Option<arrow::array::ArrayRef>, Error> + Send + Sync {
     move |source: &arrow::array::ArrayRef| {
-        let struct_array = source
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .ok_or_else(|| Error::TypeMismatch {
-                expected: "StructArray".to_owned(),
-                actual: source.data_type().clone(),
-                context: "rgba_struct_to_uint32 input".to_owned(),
-            })?;
+        let struct_array = try_downcast::<StructArray>(source, "rgba_struct_to_uint32 input")?;
         Ok(RgbaStructToUInt32::default()
             .transform(struct_array)?
             .map(|arr| Arc::new(arr) as arrow::array::ArrayRef))
@@ -299,8 +292,8 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{
-        Array as _, Float32Array, Float64Array, GenericByteBuilder, Int32Array, Int64Array,
-        StringArray, StructArray, UInt32Array,
+        Array as _, ArrayRef, BinaryArray, Float32Array, Float64Array, GenericByteBuilder,
+        Int32Array, Int64Array, ListBuilder, StringArray, StructArray, UInt8Builder, UInt32Array,
     };
     use arrow::datatypes::{DataType, Field, GenericBinaryType};
     use re_lenses_core::combinators::{Error, Transform as _};
@@ -334,8 +327,7 @@ mod tests {
         {
             let list = result.value(0);
             let uint8 = list
-                .as_any()
-                .downcast_ref::<arrow::array::UInt8Array>()
+                .try_downcast_array_ref::<arrow::array::UInt8Array>()
                 .unwrap();
             assert_eq!(uint8.len(), 5);
             assert_eq!(uint8.value(0) as char, 'h');
@@ -348,8 +340,7 @@ mod tests {
         {
             let list = result.value(1);
             let uint8 = list
-                .as_any()
-                .downcast_ref::<arrow::array::UInt8Array>()
+                .try_downcast_array_ref::<arrow::array::UInt8Array>()
                 .unwrap();
             assert_eq!(list.len(), 5);
             assert_eq!(uint8.value(0) as char, 'w');
@@ -364,8 +355,7 @@ mod tests {
         {
             let list = result.value(3);
             let uint8 = list
-                .as_any()
-                .downcast_ref::<arrow::array::UInt8Array>()
+                .try_downcast_array_ref::<arrow::array::UInt8Array>()
                 .unwrap();
             assert_eq!(uint8.len(), 0);
         }
@@ -373,8 +363,7 @@ mod tests {
         {
             let list = result.value(4);
             let uint8 = list
-                .as_any()
-                .downcast_ref::<arrow::array::UInt8Array>()
+                .try_downcast_array_ref::<arrow::array::UInt8Array>()
                 .unwrap();
             assert_eq!(uint8.len(), 3);
             assert_eq!(uint8.value(0), 0x00);
@@ -392,6 +381,27 @@ mod tests {
         impl_binary_test::<i64, i32>()?;
         impl_binary_test::<i32, i64>()?;
         impl_binary_test::<i64, i64>()?;
+
+        Ok(())
+    }
+
+    /// Checks that the pipe helper accepts both binary data and an existing list of `u8` values.
+    #[test]
+    fn binary_to_list_uint8_accepts_both_representations() -> Result<(), Error> {
+        let binary: ArrayRef = Arc::new(BinaryArray::from_iter_values([&b"bytes"[..]]));
+        let converted = binary_to_list_uint8()(&binary)?.unwrap();
+        assert_eq!(
+            converted.data_type(),
+            &DataType::new_list(DataType::UInt8, false)
+        );
+
+        let mut builder = ListBuilder::new(UInt8Builder::new())
+            .with_field(Arc::new(Field::new_list_field(DataType::UInt8, false)));
+        builder.values().append_slice(b"bytes");
+        builder.append(true);
+        let list: ArrayRef = Arc::new(builder.finish());
+        let passed_through = binary_to_list_uint8()(&list)?.unwrap();
+        assert!(Arc::ptr_eq(&list, &passed_through));
 
         Ok(())
     }

@@ -76,8 +76,8 @@ fn playable_stream(cache: &mut VideoStreamCache, store: &EntityDb) -> SharablePl
             &re_chunk::EntityPath::from(STREAM_ENTITY),
             TIMELINE_NAME.into(),
             re_video::DecodeSettings {
-                hw_acceleration: Default::default(),
                 ffmpeg_path: Some(std::path::PathBuf::from("/not/used")),
+                ..Default::default()
             },
             blob_component,
             re_video::VideoCodec::ImageSequence(media_type),
@@ -212,6 +212,71 @@ fn png_decoding() {
     assert_eq!(encoding_details.bit_depth, Some(16));
 }
 
+/// A gray F32 TIFF logged as `EncodedDepthImage` should be recognized with the
+/// correct dimensions and bit depth, and its samples should decode.
+#[test]
+fn tiff_decoding() {
+    let mut cache = VideoStreamCache::default();
+    let mut store = EntityDb::new(StoreId::recording("test", "test"));
+
+    let width = 2u32;
+    let height = 2u32;
+    let depth_values: [f32; 4] = [0.0, 0.5, 1.5, 2.0];
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut encoder = tiff::encoder::TiffEncoder::new(&mut buf).unwrap();
+        encoder
+            .write_image::<tiff::encoder::colortype::Gray32Float>(width, height, &depth_values)
+            .unwrap();
+    }
+    let encoded_tiff = buf.into_inner();
+
+    let codec = Chunk::builder(STREAM_ENTITY)
+        .with_archetype(
+            RowId::new(),
+            [(
+                Timeline::new_duration(TIMELINE_NAME),
+                TimeInt::from_secs(0.0),
+            )],
+            &EncodedDepthImage::new(encoded_tiff).with_media_type("image/tiff"),
+        )
+        .build()
+        .unwrap();
+
+    load_chunks(&mut store, &mut cache, &[Arc::new(codec)]);
+
+    let video_stream = playable_stream(&mut cache, &store);
+    let descr = video_stream.read_arc().video_descr().clone();
+
+    assert_eq!(
+        descr.samples.next_index(),
+        1,
+        "should have exactly 1 sample"
+    );
+
+    let encoding_details = descr
+        .encoding_details
+        .as_ref()
+        .expect("should have encoding details");
+    assert_eq!(
+        encoding_details.coded_dimensions,
+        [width as u16, height as u16]
+    );
+    assert_eq!(encoding_details.bit_depth, Some(32));
+
+    let mut player = TestVideoPlayer::from_stream(video_stream);
+    player
+        .play_store_with_component(
+            0.0..1.0,
+            1.0,
+            &store,
+            EncodedDepthImage::descriptor_blob().component,
+        )
+        .unwrap();
+    player.expect_decoded_samples(0..1);
+}
+
 /// An `EncodedDepthImage` without an explicit media type should still be
 /// loadable when the format can be guessed from the blob data.
 #[test]
@@ -256,6 +321,7 @@ fn guesses_png_media_type() {
         TIMELINE_NAME.into(),
         re_video::DecodeSettings {
             hw_acceleration: Default::default(),
+            allow_slow_av1_decoding: false,
             ffmpeg_path: Some(std::path::PathBuf::from("/not/used")),
         },
         blob_component,

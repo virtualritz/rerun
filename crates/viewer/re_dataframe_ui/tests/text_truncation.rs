@@ -2,12 +2,13 @@ mod common;
 
 use std::sync::Arc;
 
-use arrow::array::{Int32Array, RecordBatch, StringArray, StructArray};
+use arrow::array::{Int32Array, StringArray, StructArray};
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use datafusion::prelude::SessionContext;
 use re_async::AsyncRuntimeHandle;
-use re_dataframe_ui::DataFusionTableWidget;
+use re_dataframe_ui::{DataFusionTableWidget, TableBlueprints};
 use re_test_context::TestContext;
+use re_viewer_context::TableReference;
 
 use common::run_async_harness;
 
@@ -21,18 +22,23 @@ async fn test_text_truncation() {
         .setup_kittest_for_rendering_ui([2500.0, 200.0])
         .build_ui(|ui| {
             test_context.run_recording(&ui.ctx().clone(), |ctx| {
-                DataFusionTableWidget::new(Arc::clone(&session_context), table_ref)
-                    .title("Text truncation")
-                    .show(
-                        ctx.app_ctx,
-                        &runtime_handle,
-                        ui,
-                        &mut test_context.view_states.lock(),
-                    );
+                DataFusionTableWidget::new(
+                    Arc::clone(&session_context),
+                    table_ref,
+                    TableReference::local("test_table"),
+                )
+                .title("Text truncation")
+                .show(
+                    ctx.app_ctx,
+                    &runtime_handle,
+                    ui,
+                    &TableBlueprints::default(),
+                    &mut test_context.view_states.lock(),
+                );
             });
         });
 
-    run_async_harness(&mut harness).await;
+    run_async_harness(&test_context, &mut harness).await;
     // TODO(rerun-io/egui_table#50): We should add a `max_default_width` field to egui_table
     // to truncate the root-level arrow strings
     harness.snapshot("test_text_truncation");
@@ -60,22 +66,13 @@ fn prepare_session_context() -> (Arc<SessionContext>, &'static str) {
         None,
     );
 
-    let batch = RecordBatch::try_new_with_options(
-        schema.clone(),
+    common::register_test_table(
+        "test_table",
+        schema,
         vec![
             Arc::new(StringArray::from(vec![lorem])),
             Arc::new(Int32Array::from(vec![42])),
             Arc::new(struct_array),
         ],
-        &Default::default(),
     )
-    .expect("Failed to create a record batch");
-
-    let session_context = Arc::new(SessionContext::new());
-    let table_ref = "test_table";
-    session_context
-        .register_batch(table_ref, batch)
-        .expect("Failed to register the table");
-
-    (session_context, table_ref)
 }

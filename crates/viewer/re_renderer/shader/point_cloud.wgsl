@@ -154,6 +154,8 @@ fn vs_main(@builtin(vertex_index) vertex_idx: u32) -> VertexOut {
 fn coverage(world_position: vec3f, radius: f32, point_center: vec3f, quad_offset_from_center: vec3f) -> f32 {
     if is_camera_orthographic() || has_any_flag(batch.flags, FLAG_DRAW_AS_CIRCLES) {
         return circle_quad_coverage(quad_offset_from_center, radius);
+    } else {
+        return sphere_quad_coverage(world_position, radius, point_center);
     }
     return sphere_quad_coverage(world_position, radius, point_center);
 }

@@ -78,9 +78,11 @@ fn settings_screen_ui_impl(ui: &mut egui::Ui, app_options: &mut AppOptions, keep
 
     let AppOptions {
         experimental,
+        use_viewer_catalog,
         warn_e2e_latency: _, // not yet exposed
         show_metrics,
         show_notification_toasts,
+        check_for_updates_on_startup,
         custom_window_decorations,
         include_rerun_examples_button_in_recordings_panel,
         show_picking_debug_overlay: _, // not yet exposed
@@ -133,9 +135,9 @@ fn settings_screen_ui_impl(ui: &mut egui::Ui, app_options: &mut AppOptions, keep
     )
     .on_hover_text(
         "Caps the number of elements individual visualizers process \
-             (e.g. instance caps for 3D shapes, line limits for time series). \
-             Disabling this may cause the viewer to become unresponsive \
-             with very large data sets.",
+        (e.g. instance caps for 3D shapes, line limits for time series). \
+        Disabling this may cause the viewer to become unresponsive \
+        with very large data sets.",
     );
 
     ui.collapsing_header("Timestamp format", false, |ui| {
@@ -149,7 +151,7 @@ fn settings_screen_ui_impl(ui: &mut egui::Ui, app_options: &mut AppOptions, keep
         ui.re_checkbox(custom_window_decorations, "Use custom window decorations")
             .on_hover_text(
                 "Hide the native title bar and draw Rerun's top bar as the window frame.\n\n\
-             Opt out of this if you experience any issues with the window's behavior.",
+            Opt out of this if you experience any issues with the window's behavior.",
             );
     }
 
@@ -159,6 +161,8 @@ fn settings_screen_ui_impl(ui: &mut egui::Ui, app_options: &mut AppOptions, keep
     ui.re_checkbox(show_notification_toasts, "Show notification toasts")
         .on_hover_text("Show toasts for log messages and other notifications");
 
+    ui.re_checkbox(check_for_updates_on_startup, "Check for updates on startup");
+
     separator_with_some_space(ui);
     ui.strong("Map view");
     map_view_section_ui(ui, mapbox_access_token);
@@ -167,8 +171,16 @@ fn settings_screen_ui_impl(ui: &mut egui::Ui, app_options: &mut AppOptions, keep
     ui.strong("Video");
     video_section_ui(ui, video);
 
+    separator_with_some_space(ui);
+    ui.strong("Viewer catalog");
+    ui.re_checkbox(use_viewer_catalog, "Load files via Viewer catalog")
+        .on_hover_text(
+            "Load .rrd files through the Viewer catalog instead of importing them as a live \
+             recording. Takes effect for files opened after enabling.",
+        );
+
     #[cfg(target_arch = "wasm32")]
-    if experimental.use_internal_catalog {
+    if *use_viewer_catalog {
         separator_with_some_space(ui);
         ui.strong("Origin private filesystem");
         origin_private_filesystem_section_ui(ui);
@@ -176,33 +188,25 @@ fn settings_screen_ui_impl(ui: &mut egui::Ui, app_options: &mut AppOptions, keep
 
     {
         let ExperimentalAppOptions {
-            table_cards_and_blueprints,
+            agent_panel,
             gamepad_navigation,
             point_cloud_transparency,
-            use_internal_catalog,
         } = experimental;
         separator_with_some_space(ui);
         ui.strong("Experimental");
-        ui.re_checkbox(table_cards_and_blueprints, "Table cards and blueprints")
-            .on_hover_text(
-                "Enable registered table blueprints and the card layout for server-supplied tables.\n\n\
-                 When enabled, tables can use registered view definitions for segment previews, and a list/grid toggle appears in the table title bar.",
-            );
         ui.re_checkbox(point_cloud_transparency, "Point cloud transparency")
             .on_hover_text(
                 "Alpha-blend semi-transparent point clouds, sorting them back-to-front.\n\n\
                  Sorting happens on the CPU every frame, so this is very slow for large point clouds.",
             );
-        ui.re_checkbox(use_internal_catalog, "Load files via Viewer catalog")
-            .on_hover_text(
-                "Load .rrd files through the Viewer catalog instead of importing them as a live \
-                 recording. Takes effect for files opened after enabling.",
-            );
         cfg_select! {
             target_arch = "wasm32" => {
-                let _ = gamepad_navigation;
+                let _ = (agent_panel, gamepad_navigation);
             }
             _ => {
+                ui.re_checkbox(agent_panel, "Agent panel").on_hover_text(
+                    "Experimental: chat with your own coding agent in a panel on the right.",
+                );
                 let gamepad_navigation_response = ui
                     .re_checkbox(gamepad_navigation, "Gamepad navigation")
                     .on_hover_text("Enable gamepad navigation in 3D spatial views.");

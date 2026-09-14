@@ -27,7 +27,7 @@ pub use highlights::{
     OptionalViewEntityHighlight, ViewEntityHighlight, ViewHighlights, ViewOutlineMasks,
 };
 pub use named_system::{IdentifiedViewSystem, PerSystemEntities, ViewSystemIdentifier};
-pub use spawn_heuristics::{RecommendedView, ViewSpawnHeuristics};
+pub use spawn_heuristics::{MAX_VIEWS_SPAWNED, RecommendedView, ViewSpawnHeuristics};
 pub use system_execution_output::{
     SystemExecutionOutput, VisualizerTypeReport, VisualizerViewReport,
 };
@@ -91,6 +91,9 @@ pub enum ViewSystemExecutionError {
 
     #[error(transparent)]
     ViewBuilderError(#[from] re_renderer::view_builder::ViewBuilderError),
+
+    #[error(transparent)]
+    RendererRegistrationError(#[from] re_renderer::RendererRegistrationError),
 }
 
 const _: () = assert!(

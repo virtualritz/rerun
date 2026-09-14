@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use re_log_types::{TimeType, TimelineName};
 use re_mcap::decoders::{DecoderRegistry, TopicFilter};
 
-use super::info::print_table;
+use crate::commands::table_util::print_table;
 
 #[derive(Debug, Clone, clap::Parser)]
 pub struct CheckCommand {
@@ -56,9 +56,7 @@ impl CheckCommand {
             )
         })?;
         let mcap_file = re_mcap::McapFile::new(mmap, *recover);
-        let summary = mcap_file.summary().with_context(|| {
-            format!("Failed to inspect MCAP file\nFile path: {}", path.display())
-        })?;
+        let summary = mcap_file.summary()?;
         let by_topic = if *full {
             collect_by_topic_full(mcap_file.bytes(), &summary)?
         } else {
@@ -196,7 +194,7 @@ impl TimeColumns {
         let perm = self.sorted_permutation();
         self.columns
             .values()
-            .all(|col| perm.windows(2).all(|w| col[w[0]] <= col[w[1]]))
+            .all(|col| perm.array_windows().all(|&[i, j]| col[i] <= col[j]))
     }
 }
 

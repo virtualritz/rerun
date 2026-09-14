@@ -16,11 +16,13 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::wildcard_imports)]
 
+use ::arrow::array::ArrayRef;
 use ::re_types_core::SerializationResult;
+use ::re_types_core::SerializedComponentBatch;
 use ::re_types_core::try_serialize_field;
-use ::re_types_core::{ComponentBatch as _, SerializedComponentBatch};
 use ::re_types_core::{ComponentDescriptor, ComponentType};
 use ::re_types_core::{DeserializationError, DeserializationResult};
+use ::std::borrow::Cow;
 
 /// **Archetype**: Video stream consisting of raw video chunks.
 ///
@@ -29,8 +31,7 @@ use ::re_types_core::{DeserializationError, DeserializationResult};
 ///
 /// All components except `sample` are typically logged statically once per entity.
 /// `sample` is then logged repeatedly for each frame on the timeline.
-///
-/// TODO(#10422): [`archetypes::VideoFrameReference`][crate::archetypes::VideoFrameReference] does not yet work with [`archetypes::VideoStream`][crate::archetypes::VideoStream].
+/// Individual frames can be displayed with [`archetypes::VideoFrameReference`][crate::archetypes::VideoFrameReference], which uses the active Viewer timeline.
 ///
 /// ⚠️ **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**
 #[derive(Clone, Debug, Default, ::re_byte_size::SizeBytes)]
@@ -206,31 +207,33 @@ impl ::re_types_core::Archetype for VideoStream {
     }
 
     #[inline]
-    fn required_components() -> ::std::borrow::Cow<'static, [ComponentDescriptor]> {
+    fn required_components() -> Cow<'static, [ComponentDescriptor]> {
         REQUIRED_COMPONENTS.as_slice().into()
     }
 
     #[inline]
-    fn recommended_components() -> ::std::borrow::Cow<'static, [ComponentDescriptor]> {
+    fn recommended_components() -> Cow<'static, [ComponentDescriptor]> {
         RECOMMENDED_COMPONENTS.as_slice().into()
     }
 
     #[inline]
-    fn optional_components() -> ::std::borrow::Cow<'static, [ComponentDescriptor]> {
+    fn optional_components() -> Cow<'static, [ComponentDescriptor]> {
         OPTIONAL_COMPONENTS.as_slice().into()
     }
 
     #[inline]
-    fn all_components() -> ::std::borrow::Cow<'static, [ComponentDescriptor]> {
+    fn all_components() -> Cow<'static, [ComponentDescriptor]> {
         ALL_COMPONENTS.as_slice().into()
     }
 
     #[inline]
     fn from_arrow_components(
-        arrow_data: impl IntoIterator<Item = (ComponentDescriptor, arrow::array::ArrayRef)>,
+        arrow_data: impl IntoIterator<Item = (ComponentDescriptor, ArrayRef)>,
     ) -> DeserializationResult<Self> {
         re_tracing::profile_function!();
-        use ::re_types_core::{Loggable as _, ResultExt as _};
+        use ::re_types_core::{
+            ArrowDataType as _, FromArrow as _, FromArrowOpt as _, ResultExt as _,
+        };
         let arrays_by_descr: ::nohash_hasher::IntMap<_, _> = arrow_data.into_iter().collect();
         let codec = arrays_by_descr
             .get(&Self::descriptor_codec())
@@ -309,7 +312,7 @@ impl VideoStream {
     /// Clear all the fields of a `VideoStream`.
     #[inline]
     pub fn clear_fields() -> Self {
-        use ::re_types_core::Loggable as _;
+        use ::re_types_core::ArrowDataType as _;
         Self {
             codec: Some(SerializedComponentBatch::new(
                 crate::components::VideoCodec::arrow_empty(),

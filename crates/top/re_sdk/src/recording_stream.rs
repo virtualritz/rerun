@@ -283,12 +283,12 @@ impl RecordingStreamBuilder {
     ///
     /// The default is to use a random `RecordingId`.
     ///
-    /// When explicitly setting a `RecordingId`, the initial chunk that contains the recording
-    /// properties will not be sent.
+    /// Processes that share a `RecordingId` each send their own recording properties, and the most
+    /// recent one is selected if combined. Use [`Self::send_properties`] to opt out of that.
     #[inline]
     pub fn recording_id(mut self, recording_id: impl Into<RecordingId>) -> Self {
         self.recording_id = Some(recording_id.into());
-        self.send_properties(false)
+        self
     }
 
     /// Sets an optional name for the recording.
@@ -694,6 +694,9 @@ impl RecordingStreamBuilder {
         });
 
         let store_info = StoreInfo::new(store_id, store_source);
+
+        // `RecordingInfo` describes a recording, so blueprint stores never carry it.
+        let should_send_properties = should_send_properties && store_info.store_id.is_recording();
 
         (
             enabled,
@@ -1698,7 +1701,7 @@ fn forwarding_thread(
                     continue;
                 }
             };
-            msg.on_release = on_release.clone();
+            msg.on_release.clone_from(&on_release);
             sink.send(LogMsg::ArrowMsg(store_info.store_id.clone(), msg));
         }
 
@@ -2935,7 +2938,7 @@ mod tests {
     #[test]
     fn default_timeline_injection_toggles() {
         use re_log_types::example_components::{MyPoint, MyPoints};
-        use re_sdk_types::Loggable;
+        use re_sdk_types::ToArrow;
 
         // Logs a single row (with a user timeline) and returns the set of timeline names
         // that ended up on the resulting data chunk.
@@ -2962,7 +2965,7 @@ mod tests {
                 components: std::iter::once((
                     MyPoints::descriptor_points().component,
                     SerializedComponentBatch::new(
-                        <MyPoint as Loggable>::to_arrow([MyPoint::new(1.0, 2.0)]).unwrap(),
+                        <MyPoint as ToArrow>::to_arrow([MyPoint::new(1.0, 2.0)]).unwrap(),
                         MyPoints::descriptor_points(),
                     ),
                 ))
@@ -3266,7 +3269,7 @@ mod tests {
 
     fn example_rows(static_: bool) -> Vec<PendingRow> {
         use re_log_types::example_components::{MyColor, MyLabel, MyPoint};
-        use re_sdk_types::Loggable;
+        use re_sdk_types::ToArrow;
 
         let mut tick = 0i64;
         let mut timepoint = |frame_nr: i64| {
@@ -3288,7 +3291,7 @@ mod tests {
                     (
                         MyPoints::descriptor_points().component,
                         SerializedComponentBatch::new(
-                            <MyPoint as Loggable>::to_arrow([
+                            <MyPoint as ToArrow>::to_arrow([
                                 MyPoint::new(10.0, 10.0),
                                 MyPoint::new(20.0, 20.0),
                             ])
@@ -3299,14 +3302,14 @@ mod tests {
                     (
                         MyPoints::descriptor_colors().component,
                         SerializedComponentBatch::new(
-                            <MyColor as Loggable>::to_arrow([MyColor(0x8080_80FF)]).unwrap(),
+                            <MyColor as ToArrow>::to_arrow([MyColor(0x8080_80FF)]).unwrap(),
                             MyPoints::descriptor_colors(),
                         ),
                     ), //
                     (
                         MyPoints::descriptor_labels().component,
                         SerializedComponentBatch::new(
-                            <MyLabel as Loggable>::to_arrow([] as [MyLabel; 0]).unwrap(),
+                            <MyLabel as ToArrow>::to_arrow([] as [MyLabel; 0]).unwrap(),
                             MyPoints::descriptor_labels(),
                         ),
                     ), //
@@ -3324,21 +3327,21 @@ mod tests {
                     (
                         MyPoints::descriptor_points().component,
                         SerializedComponentBatch::new(
-                            <MyPoint as Loggable>::to_arrow([] as [MyPoint; 0]).unwrap(),
+                            <MyPoint as ToArrow>::to_arrow([] as [MyPoint; 0]).unwrap(),
                             MyPoints::descriptor_points(),
                         ),
                     ), //
                     (
                         MyPoints::descriptor_colors().component,
                         SerializedComponentBatch::new(
-                            <MyColor as Loggable>::to_arrow([] as [MyColor; 0]).unwrap(),
+                            <MyColor as ToArrow>::to_arrow([] as [MyColor; 0]).unwrap(),
                             MyPoints::descriptor_colors(),
                         ),
                     ), //
                     (
                         MyPoints::descriptor_labels().component,
                         SerializedComponentBatch::new(
-                            <MyLabel as Loggable>::to_arrow([] as [MyLabel; 0]).unwrap(),
+                            <MyLabel as ToArrow>::to_arrow([] as [MyLabel; 0]).unwrap(),
                             MyPoints::descriptor_labels(),
                         ),
                     ), //
@@ -3356,21 +3359,21 @@ mod tests {
                     (
                         MyPoints::descriptor_points().component,
                         SerializedComponentBatch::new(
-                            <MyPoint as Loggable>::to_arrow([] as [MyPoint; 0]).unwrap(),
+                            <MyPoint as ToArrow>::to_arrow([] as [MyPoint; 0]).unwrap(),
                             MyPoints::descriptor_points(),
                         ),
                     ), //
                     (
                         MyPoints::descriptor_colors().component,
                         SerializedComponentBatch::new(
-                            <MyColor as Loggable>::to_arrow([MyColor(0xFFFF_FFFF)]).unwrap(),
+                            <MyColor as ToArrow>::to_arrow([MyColor(0xFFFF_FFFF)]).unwrap(),
                             MyPoints::descriptor_colors(),
                         ),
                     ), //
                     (
                         MyPoints::descriptor_labels().component,
                         SerializedComponentBatch::new(
-                            <MyLabel as Loggable>::to_arrow([MyLabel("hey".into())]).unwrap(),
+                            <MyLabel as ToArrow>::to_arrow([MyLabel("hey".into())]).unwrap(),
                             MyPoints::descriptor_labels(),
                         ),
                     ), //

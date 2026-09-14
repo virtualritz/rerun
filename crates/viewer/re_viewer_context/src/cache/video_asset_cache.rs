@@ -47,7 +47,7 @@ impl VideoAssetCache {
         debug_name: String,
         blob_row_id: RowId,
         blob_component: ComponentIdentifier,
-        video_buffer: &re_sdk_types::datatypes::Blob,
+        video_buffer: &re_sdk_types::encodings::Blob,
         media_type: Option<&MediaType>,
         decode_settings: DecodeSettings,
     ) -> Arc<Result<Video, VideoLoadError>> {
@@ -67,7 +67,7 @@ impl VideoAssetCache {
             return Arc::new(Err(VideoLoadError::UnrecognizedMimeType));
         };
 
-        let inner_key = Hash64::hash((media_type.as_str(), decode_settings.hw_acceleration));
+        let inner_key = Hash64::hash((media_type.as_str(), &decode_settings));
 
         let entry = self
             .0

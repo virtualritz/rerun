@@ -2,6 +2,7 @@
 
 use arrow::array::{AsArray as _, Int64Array, ListArray, UInt32Array};
 use arrow::compute::take;
+use re_arrow_util::ArrowArrayDowncastRef as _;
 use re_chunk::{ArrowArray as _, Chunk, ChunkComponents, ChunkId};
 use re_log_types::TimeType;
 use re_sdk_types::{ComponentDescriptor, SerializedComponentColumn};
@@ -31,7 +32,7 @@ fn output_components_iter<'a>(
                 .map(|list_array| (output.component_descr.clone(), list_array)),
             ),
             Ok(None) => {
-                re_log::debug_once!(
+                re_log::trace_once!(
                     "Lens suppressed for `{target_entity}` component `{}`",
                     output.component_descr.component
                 );
@@ -58,7 +59,7 @@ fn output_timelines_iter<'a>(
         match runtime.execute_per_row(&time.selector, &input.list_array) {
             Ok(Some(list_array)) => Some(Ok((time.timeline_name, time.timeline_type, list_array))),
             Ok(None) => {
-                re_log::debug_once!(
+                re_log::trace_once!(
                     "Lens suppressed for `{target_entity}` timeline `{}`",
                     time.timeline_name,
                 );
@@ -80,7 +81,7 @@ fn try_convert_time_column(
     timeline_type: TimeType,
     list_array: &ListArray,
 ) -> Result<(re_chunk::TimelineName, re_chunk::TimeColumn), LensRuntimeError> {
-    if let Some(time_vals) = list_array.values().as_any().downcast_ref::<Int64Array>() {
+    if let Some(time_vals) = list_array.values().downcast_array_ref::<Int64Array>() {
         let time_column = re_chunk::TimeColumn::new(
             None,
             re_chunk::Timeline::new(timeline_name, timeline_type),
@@ -169,8 +170,8 @@ fn compute_scatter_indices(reference: &ListArray) -> UInt32Array {
     let offsets = reference.value_offsets();
     let mut indices = Vec::new();
 
-    for (row_idx, window) in offsets.windows(2).enumerate() {
-        let count = window[1] - window[0];
+    for (row_idx, [start, end]) in offsets.array_windows().enumerate() {
+        let count = end - start;
         if reference.is_null(row_idx) || count == 0 {
             indices.push(row_idx as u32);
         } else {
@@ -291,16 +292,16 @@ fn apply_one_to_many(work: &DeriveWork<'_>, runtime: &Runtime) -> Result<Chunk, 
         match result {
             Ok((component_descr, list_array)) => match Explode.transform(&list_array) {
                 Ok(Some(exploded)) => {
-                    if exploded.len() != expected_rows {
+                    if exploded.len() == expected_rows {
+                        chunk_components
+                            .insert(SerializedComponentColumn::new(exploded, component_descr));
+                    } else {
                         errors.push(LensRuntimeError::InconsistentOutputRows {
                             target_entity: work.target_entity.clone(),
                             component: component_descr.component,
                             expected: expected_rows,
                             actual: exploded.len(),
                         });
-                    } else {
-                        chunk_components
-                            .insert(SerializedComponentColumn::new(exploded, component_descr));
                     }
                 }
                 Ok(None) => {}
@@ -343,30 +344,7 @@ pub fn execute<'a>(
 
     let has_modifications = !mutate_work.is_empty() || !merge_work.is_empty();
 
-    let prefix: Option<Result<Chunk, LensError>> = if !has_modifications {
-        let p: Option<Chunk> = if forward_columns.len() == chunk.components().len() {
-            Some(chunk.clone())
-        } else if forward_columns.is_empty() {
-            None
-        } else {
-            let to_drop: Vec<_> = chunk
-                .components()
-                .keys()
-                .copied()
-                .filter(|id| !forward_columns.contains(id))
-                .collect();
-            let dropped = chunk.components_dropped(&to_drop);
-            (!dropped.components().is_empty()).then_some(dropped)
-        };
-        if plan_errors.is_empty() {
-            p.map(Ok)
-        } else {
-            Some(match p {
-                Some(chunk) => Err(LensError::with_partial_chunk(chunk, plan_errors)),
-                None => Err(LensError::new(None, plan_errors)),
-            })
-        }
-    } else {
+    let prefix: Option<Result<Chunk, LensError>> = if has_modifications {
         let entity_path = chunk.entity_path();
         let timelines = chunk.timelines();
         let mut components = chunk.components().clone();
@@ -388,7 +366,7 @@ pub fn execute<'a>(
                     ));
                 }
                 Ok(None) => {
-                    re_log::debug_once!(
+                    re_log::trace_once!(
                         "Mutate lens suppressed for `{entity_path}` component `{id}`",
                     );
                     components.remove(id);
@@ -439,6 +417,29 @@ pub fn execute<'a>(
                         Err(LensError::new(None, errors))
                     }
                 }
+            })
+        }
+    } else {
+        let p: Option<Chunk> = if forward_columns.len() == chunk.components().len() {
+            Some(chunk.clone())
+        } else if forward_columns.is_empty() {
+            None
+        } else {
+            let to_drop: Vec<_> = chunk
+                .components()
+                .keys()
+                .copied()
+                .filter(|id| !forward_columns.contains(id))
+                .collect();
+            let dropped = chunk.components_dropped(&to_drop);
+            (!dropped.components().is_empty()).then_some(dropped)
+        };
+        if plan_errors.is_empty() {
+            p.map(Ok)
+        } else {
+            Some(match p {
+                Some(chunk) => Err(LensError::with_partial_chunk(chunk, plan_errors)),
+                None => Err(LensError::new(None, plan_errors)),
             })
         }
     };

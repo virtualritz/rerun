@@ -1,4 +1,4 @@
-use arrow::datatypes::{DataType as ArrowDatatype, Field as ArrowField};
+use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 use re_log_types::{ComponentPath, EntityPath};
 use re_types_core::{
     ArchetypeName, ComponentDescriptor, ComponentIdentifier, ComponentType,
@@ -15,7 +15,7 @@ pub struct ComponentColumnDescriptor {
     /// This is the log-time datatype corresponding to how this data is encoded
     /// in a chunk. Currently this will always be an [`arrow::array::ListArray`], but as
     /// we introduce mono-type optimization, this might be a native type instead.
-    pub store_datatype: ArrowDatatype,
+    pub store_datatype: ArrowDataType,
 
     /// Optional semantic name associated with this data.
     ///
@@ -240,7 +240,10 @@ impl ComponentColumnDescriptor {
         }
 
         if *is_static {
-            metadata.insert("rerun:is_static".to_owned(), "true".to_owned());
+            metadata.insert(
+                crate::metadata::SORBET_IS_STATIC.to_owned(),
+                "true".to_owned(),
+            );
         }
         if *is_tombstone {
             metadata.insert("rerun:is_tombstone".to_owned(), "true".to_owned());
@@ -253,14 +256,14 @@ impl ComponentColumnDescriptor {
     }
 
     #[inline]
-    pub fn returned_datatype(&self) -> ArrowDatatype {
+    pub fn returned_datatype(&self) -> ArrowDataType {
         self.store_datatype.clone()
     }
 
     /// Returns the child's datatype of the outer list-array.
     ///
     /// Logs a warning if the outer type is not a list-array, which should never happen in current Sorbet versions.
-    pub fn inner_datatype(&self) -> ArrowDatatype {
+    pub fn inner_datatype(&self) -> ArrowDataType {
         match self.returned_datatype() {
             arrow::datatypes::DataType::List(field) => field.data_type().clone(),
 
@@ -354,7 +357,7 @@ impl ComponentColumnDescriptor {
             component_type: field
                 .get_opt(re_types_core::FIELD_METADATA_KEY_COMPONENT_TYPE)
                 .and_then(|s| ComponentType::try_new(s).ok()),
-            is_static: field.get_bool("rerun:is_static"),
+            is_static: field.get_bool(crate::metadata::SORBET_IS_STATIC),
             is_tombstone: field.get_bool("rerun:is_tombstone"),
             is_semantically_empty: field.get_bool("rerun:is_semantically_empty"),
         };

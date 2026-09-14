@@ -8,7 +8,7 @@ use re_viewer_context::{
 
 use crate::{
     BlueprintResolvedResults, BlueprintResolvedResultsExt as _, ChunksWithComponent,
-    ComponentMappingError, HybridResultsChunkIter,
+    HybridResultsChunkIter,
 };
 
 /// Utility for processing queries while executing a visualizer instruction and reporting errors/warnings as they arise.
@@ -72,13 +72,10 @@ impl<'a> VisualizerInstructionQueryResults<'a> {
             Ok(chunks) => chunks,
             Err(err) => {
                 // Don't report an error when the component is just still loading or simply not in our range.
-                if !matches!(
-                    err,
-                    ComponentMappingError::NoComponentDataForQuery(_)
-                        | ComponentMappingError::NoComponentDataForQueryButIsFetchable(_)
-                ) {
+                if !err.is_data_unavailable_for_query() {
                     let report = VisualizerInstructionReport {
                         diagnostic: ViewerDiagnostic {
+                            // Missing a **required** component is always a full error.
                             severity: ViewerReportSeverity::Error,
                             summary: err.summary(),
                             details: err.details(),

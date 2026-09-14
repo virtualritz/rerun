@@ -1,6 +1,6 @@
 ---
 name: rerun-chunk-processing
-description: "Core mechanics of the Rerun Chunk Processing API (rerun.experimental) — LazyChunkStream pipelines, Chunk, lenses (MutateLens/DeriveLens/Selector), RrdReader, writing optimized RRDs. Read BEFORE writing any ingestion/conversion/preprocessing code (convert an MCAP, build a recording from a dataset, preprocess an .rrd, port an old converter): it mandates reader+lens pipelines and steers away from hand-built chunks — no Chunk.from_columns for data a reader/lens can produce, no per-message rr.log, no manual pa.array assembly. Source-specific knowledge lives in the importer skills (rerun-mcap, rerun-urdf, rerun-parquet, rerun-lerobot); read rerun-data-model first to decide what the data should become."
+description: "Core mechanics of the Rerun Chunk Processing API (rerun.experimental) — LazyChunkStream pipelines, Chunk, lenses (MutateLens/DeriveLens/Selector), RrdReader, writing optimized RRDs. Read BEFORE writing any ingestion/conversion/preprocessing code (convert an MCAP, build a recording from a dataset, preprocess an .rrd, port an old converter): it mandates reader+lens pipelines and steers away from hand-built chunks — no Chunk.from_columns for data a reader/lens can produce, no per-message rr.log, no manual pa.array assembly. Source-specific knowledge lives in the importer skills (rerun-mcap, rerun-urdf, rerun-parquet, rerun-mp4, rerun-lerobot); read rerun-data-model first to decide what the data should become."
 user_invocable: true
 allowed-tools: Read, Grep, Bash, WebFetch
 ---
@@ -17,13 +17,14 @@ importer skill for each source:
 | MCAP file (ROS2, protobuf, Foxglove)      | `McapReader(path).stream()`             | `rerun-mcap`    |
 | URDF robot model (+ joint states → FK)    | `UrdfTree.from_file_path(...).stream()` | `rerun-urdf`    |
 | Parquet table (trajectories, sensor logs) | `ParquetReader(path).stream()`          | `rerun-parquet` |
+| mp4 camera video                          | `Mp4Reader(path).stream()`              | `rerun-mp4`     |
 | LeRobot dataset directory                 | built-in importer, then `RrdReader`     | `rerun-lerobot` |
 | Existing RRD                              | `RrdReader(path)`                       | here, below     |
 | Sidecar files (JSON calib, metadata)      | `Chunk.from_columns` + `from_iter`      | here, below     |
 
 The API is `rerun.experimental`; when
 behavior matters, check the installed surface:
-`python -c "from rerun.experimental import LazyChunkStream; help(LazyChunkStream)"`.
+`python -c "from rerun.chunk import LazyChunkStream; help(LazyChunkStream)"`.
 
 ## Decision rule: where does each component come from?
 
@@ -32,7 +33,7 @@ writing any conversion code — most "build it by hand" instincts are wrong here
 
 1. **Source a reader supports?** Use the reader's `.stream()`; never hand-parse
    and re-log. MCAP→`McapReader`, URDF→`UrdfTree`, parquet→`ParquetReader`,
-   RRD→`RrdReader`, LeRobot dir→`log_file_from_path`.
+   mp4→`Mp4Reader`, RRD→`RrdReader`, LeRobot dir→`log_file_from_path`.
 2. **A decoder already emits the archetype?** Foxglove gives `Transform3D`,
    `Pinhole`, `VideoStream` (real sample bytes) ready-made — **pass it through**,
    do not re-derive. Only custom-protobuf topics arrive as `<Name>:message` and
@@ -105,7 +106,7 @@ check every `Chunk.from_columns` / for-loop against this list before copying.
 ## Stream composition
 
 ```python
-from rerun.experimental import Chunk, LazyChunkStream, OptimizationProfile
+from rerun.chunk import Chunk, LazyChunkStream, OptimizationProfile
 ```
 
 - `stream.filter(content=, has_timeline=, is_static=, components=)` keeps the
@@ -249,7 +250,7 @@ Rerun catalog or Hub, unless explicitly asked otherwise.
   `RrdReader(path)` lists `recordings()` / `blueprints()` (each a `StoreEntry`
   with `kind`, `application_id`, `recording_id`); `.stream(store=entry)` for
   sequential passes, `.store(store=entry)` for indexed access.
-- Chunks → logging: `rerun.experimental.send_chunks(chunks, recording=...)`
+- Chunks → logging: `rerun.send_chunks(chunks, recording=...)`
   accepts a `Chunk`, `LazyChunkStream`, `LazyStore`, `ChunkStore`, or any
   iterable of chunks. The source store's `application_id`/`recording_id` are
   **not** preserved; the active recording's identity wins.

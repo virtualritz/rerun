@@ -12,7 +12,7 @@ use re_test_context::TestContext;
 use re_test_context::external::egui_kittest::SnapshotResults;
 use re_test_viewport::TestContextExt as _;
 use re_view_time_series::TimeSeriesView;
-use re_viewer_context::{BlueprintContext as _, TimeControlCommand, ViewClass as _, ViewId};
+use re_viewer_context::{BlueprintContext as _, ViewClass as _, ViewId};
 use re_viewport_blueprint::{ViewBlueprint, ViewContents, ViewProperty};
 
 fn color_gradient0(step: i64) -> re_sdk_types::components::Color {
@@ -545,6 +545,63 @@ fn test_non_finite_islands() {
 }
 
 #[test]
+fn test_line_series_always_show_markers() {
+    let mut test_context = TestContext::new_with_view_class::<TimeSeriesView>();
+    let timeline = Timeline::log_tick();
+
+    test_context.log_entity("plots/line", |builder| {
+        builder.with_archetype_auto_row(
+            TimePoint::default(),
+            &re_sdk_types::archetypes::SeriesLines::new(),
+        )
+    });
+    test_context.log_entity("plots/measurement", |builder| {
+        builder.with_archetype_auto_row(
+            TimePoint::default(),
+            &re_sdk_types::archetypes::Measurements::update_fields().with_widths([8.0]),
+        )
+    });
+
+    for (time, value) in [(0, 0.0), (5, 0.4), (10, 1.0), (15, 0.6), (20, 0.0)] {
+        test_context.log_entity("plots/line", |builder| {
+            builder.with_archetype_auto_row(
+                [(timeline, time)],
+                &re_sdk_types::archetypes::Scalars::single(value),
+            )
+        });
+        test_context.log_entity("plots/measurement", |builder| {
+            builder.with_archetype_auto_row(
+                [(timeline, time)],
+                &re_sdk_types::archetypes::Measurements::new([value - 1.5]),
+            )
+        });
+    }
+
+    test_context.set_active_timeline(*timeline.name());
+
+    let view_id = test_context.setup_viewport_blueprint(|ctx, blueprint| {
+        let view = ViewBlueprint::new_with_root_wildcard(TimeSeriesView::identifier());
+        ViewProperty::from_archetype_for_view::<
+            re_sdk_types::blueprint::archetypes::PlotInteraction,
+        >(ctx, view.id)
+        .save_blueprint_component(
+            ctx,
+            &re_sdk_types::blueprint::archetypes::PlotInteraction::descriptor_points_display(),
+            &[re_sdk_types::blueprint::components::PointsDisplay::Always],
+        );
+        blueprint.add_view_at_root(view)
+    });
+
+    let mut snapshot_results = SnapshotResults::new();
+    snapshot_results.add(test_context.run_view_ui_and_save_snapshot(
+        view_id,
+        "series_lines_always_show_markers",
+        egui::vec2(300.0, 300.0),
+        None,
+    ));
+}
+
+#[test]
 fn test_series_lines_single_logged_point() {
     let mut test_context = TestContext::new_with_view_class::<TimeSeriesView>();
     let timeline = Timeline::log_tick();
@@ -573,9 +630,9 @@ fn test_series_lines_single_logged_point() {
         .save_blueprint_component(
             ctx,
             &re_sdk_types::blueprint::archetypes::TimeAxis::descriptor_view_range(),
-            &re_sdk_types::datatypes::TimeRange {
-                start: re_sdk_types::datatypes::TimeRangeBoundary::Absolute(0.into()),
-                end: re_sdk_types::datatypes::TimeRangeBoundary::Absolute(20.into()),
+            &re_sdk_types::encodings::TimeRange {
+                start: re_sdk_types::encodings::TimeRangeBoundary::Absolute(0.into()),
+                end: re_sdk_types::encodings::TimeRangeBoundary::Absolute(20.into()),
             },
         );
 
@@ -713,13 +770,13 @@ fn test_bootstrapped_secondaries_impl(partial_range: bool, snapshot_results: &mu
                 override_path.clone(),
                 &re_sdk_types::blueprint::archetypes::VisibleTimeRanges::new([
                     re_sdk_types::blueprint::components::VisibleTimeRange(
-                        re_sdk_types::datatypes::VisibleTimeRange {
+                        re_sdk_types::encodings::VisibleTimeRange {
                             timeline: "log_tick".into(),
-                            range: re_sdk_types::datatypes::TimeRange {
-                                start: re_sdk_types::datatypes::TimeRangeBoundary::Absolute(
+                            range: re_sdk_types::encodings::TimeRange {
+                                start: re_sdk_types::encodings::TimeRangeBoundary::Absolute(
                                     70.into(),
                                 ),
-                                end: re_sdk_types::datatypes::TimeRangeBoundary::Infinite,
+                                end: re_sdk_types::encodings::TimeRangeBoundary::Infinite,
                             },
                         },
                     ),
@@ -760,13 +817,7 @@ fn temporal_anchor_between_sequence_steps() {
     test_context.set_active_timeline(*timeline.name());
 
     // Pin the cursor at 100 — like a `#when` URL anchor would.
-    test_context.send_time_commands(
-        test_context.active_store_id(),
-        [TimeControlCommand::SetTime(
-            TimeInt::new_temporal(100).into(),
-        )],
-    );
-    test_context.handle_system_commands(&egui::Context::default());
+    test_context.set_time(TimeInt::new_temporal(100));
 
     let view_id = setup_blueprint(&mut test_context);
     snapshot_results.add(test_context.run_view_ui_and_save_snapshot(

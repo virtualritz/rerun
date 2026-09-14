@@ -8,11 +8,25 @@ fn test_ros2msg_import() {
     // This makes it easier to add/remove individual tests.
     McapTestHarness::new()
         .add("ros_camera_info.mcap", "/camera/camera_info")
+        .add("ros_fluid_pressure.mcap", "/env/pressure")
+        .add("ros_illuminance.mcap", "/env/illuminance")
+        .add("ros_compressed_image.mcap", "/camera/compressed_image")
+        .add(
+            "ros_compressed_image.mcap",
+            "/camera/compressed_depth_image",
+        )
+        .add("ros_compressed_image.mcap", "/camera/h264")
+        .add("ros_image.mcap", "/camera/image")
+        .add("ros_image.mcap", "/camera/depth_image")
         .add("ros_log.mcap", "/rosout")
         .add("ros_magnetic_field.mcap", "/imu/mag")
+        .add("ros_nav_sat_fix.mcap", "/gps/fix")
         .add("ros_nav2_voxel_grid.mcap", "/voxel_grid")
         .add("ros_occupancy_grid.mcap", "/map")
         .add("ros_pose_stamped.mcap", "/pose_stamped")
+        .add("ros_relative_humidity.mcap", "/env/humidity")
         .add("ros_string.mcap", "/chatter")
+        .add("ros_temperature.mcap", "/env/temperature")
+        .add("ros_tfmessage.mcap", "/tf_static")
         .run();
 }

@@ -352,10 +352,11 @@ impl PyDatasetEntryInternal {
             })
             .transpose()?;
 
-        Ok(re_uri::DatasetSegmentUri {
+        Ok(re_uri::DatasetUri {
             origin: connection.origin().clone(),
             dataset_id: self_.entry_details.id.id,
-            segment_id: SegmentId::from(segment_id),
+            resource: re_uri::DatasetResource::Segments,
+            segment_id: Some(SegmentId::from(segment_id)),
             fragment: re_uri::Fragment {
                 selection: None,
                 when: timeline.map(|timeline| {
@@ -415,7 +416,7 @@ impl PyDatasetEntryInternal {
             .map(LayerName::try_new)
             .collect::<Result<Vec<_>, _>>()
             .map_err(to_py_err)?;
-        let (request_trace_id, results) = connection.register_with_dataset(
+        let registration = connection.register_with_dataset(
             py,
             self_.entry_details.id,
             recording_uris,
@@ -423,11 +424,7 @@ impl PyDatasetEntryInternal {
             on_duplicate,
         )?;
 
-        Ok(PyRegistrationHandleInternal::new(
-            self_.client.clone_ref(py),
-            results,
-            request_trace_id,
-        ))
+        Ok(PyRegistrationHandleInternal::new(registration))
     }
 
     /// Unregisters segments and layers from the dataset.
@@ -523,7 +520,7 @@ impl PyDatasetEntryInternal {
         let connection = self_.client.borrow(py).connection().clone();
         let on_duplicate = parse_on_duplicate(on_duplicate)?;
 
-        let (request_trace_id, results) = connection.register_with_dataset_prefix(
+        let registration = connection.register_with_dataset_prefix(
             py,
             self_.entry_details.id,
             recordings_prefix,
@@ -531,18 +528,19 @@ impl PyDatasetEntryInternal {
             on_duplicate,
         )?;
 
-        Ok(PyRegistrationHandleInternal::new(
-            self_.client.clone_ref(py),
-            results,
-            request_trace_id,
-        ))
+        Ok(PyRegistrationHandleInternal::new(registration))
     }
 
-    /// Open a remote segment as a [`LazyStore`][rerun.experimental.LazyStore].
+    /// Open a remote segment as a [`LazyStore`][rerun.chunk.LazyStore].
     ///
-    /// One round-trip on construction (the manifest); chunks are fetched on
-    /// demand.
-    fn segment_store(self_: PyRef<'_, Self>, segment_id: String) -> PyResult<PyLazyStoreInternal> {
+    /// One round-trip on construction for the manifest. With `include_assets`, one more to list
+    /// the assets and one for each of their manifests. Chunks are fetched on demand.
+    #[pyo3(signature = (segment_id, *, include_assets = true))]
+    fn segment_store(
+        self_: PyRef<'_, Self>,
+        segment_id: String,
+        include_assets: bool,
+    ) -> PyResult<PyLazyStoreInternal> {
         let py = self_.py();
         let _span = read_trace_context_from_python(py, "DatasetEntry.segment_store").entered();
         let connection = self_.client.borrow(py).connection().clone();
@@ -551,17 +549,16 @@ impl PyDatasetEntryInternal {
 
         let provider = wait_for_future(py, async {
             SegmentChunkProvider::try_new(
-                connection.connection_registry().clone(),
-                connection.origin().clone(),
+                connection.inner().clone(),
                 dataset_id,
                 segment_id,
+                include_assets,
             )
             .await
             .map_err(to_py_err)
         })?;
 
-        let lazy = LazyStore::new(Arc::new(provider));
-        Ok(PyLazyStoreInternal::new(lazy))
+        Ok(PyLazyStoreInternal::new(LazyStore::new(Arc::new(provider))))
     }
 
     /// Perform maintenance tasks on the datasets.

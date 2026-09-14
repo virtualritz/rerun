@@ -1,10 +1,8 @@
-use anyhow::Context as _;
 use itertools::Itertools as _;
-use re_build_info::CrateVersion;
 use re_chunk::TimelineName;
 use re_entity_db::{EntityDb, LogSource};
-use re_log_channel::RecordingOpenBehavior;
-use re_log_types::{ApplicationId, LogMsg, RecordingId, StoreId, StoreKind};
+use re_log_channel::{RecordingOpenBehavior, SaveScreenshotError};
+use re_log_types::{ApplicationId, RecordingId, StoreId, StoreKind};
 use re_sdk_types::blueprint::components::PlayState;
 use re_ui::{RecordingCommand, UICommand, UICommandSender as _};
 use re_viewer_context::open_url::{OpenUrlOptions, ViewerOpenUrl};
@@ -13,11 +11,12 @@ use re_viewer_context::{
     SystemCommand, open_url::combine_with_base_url,
 };
 use re_viewer_context::{
-    RecordingOrTable, SystemCommandSender as _, TimeControlCommand, sanitize_file_name,
+    RecordingOrLocalTable, SystemCommandSender as _, TimeControlCommand, sanitize_file_name,
 };
 use std::sync::Arc;
 
 use super::App;
+use crate::saving::RrdSnapshot;
 use crate::{app_blueprint::AppBlueprint, event::ViewerEventDispatcher};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -25,7 +24,7 @@ const MIN_ZOOM_FACTOR: f32 = 0.2;
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_ZOOM_FACTOR: f32 = 5.0;
 
-/// How [`App::close_recording`] should treat a recording that's still rendered as a preview.
+/// How [`App::close_recording_or_table`] should treat a recording that's still rendered as a preview.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CloseRecording {
     /// A recording still rendered as a preview stays loaded and streaming, just no longer in the
@@ -218,7 +217,7 @@ impl App {
                 // The active recording we're closing, if that's what this is. When set, we move off
                 // it after closing.
                 let active_being_closed = match &entry {
-                    RecordingOrTable::Recording { store_id }
+                    RecordingOrLocalTable::Recording { store_id }
                         if self.state.active_recording_id() == Some(store_id) =>
                     {
                         Some(store_id.clone())
@@ -245,7 +244,7 @@ impl App {
                     })
                 });
 
-                self.close_recording(store_hub, &entry, CloseRecording::KeepPreview);
+                self.close_recording_or_table(store_hub, &entry, CloseRecording::KeepPreview);
 
                 if let Some(new_navigation) = new_navigation {
                     self.navigate_to(egui_ctx, &new_navigation);
@@ -256,6 +255,7 @@ impl App {
 
             SystemCommand::CloseAllEntries => {
                 self.state.navigation.reset();
+                self.table_blueprints.close_all_tables(store_hub);
                 store_hub.clear_entries();
 
                 // Stop receiving into the old recordings.
@@ -289,11 +289,12 @@ impl App {
 
                 // Suppress loading screen if we're loading a recording that's already loaded, even if only partially.
                 if let Route::Loading(source) = &new_route
-                    && let Some(re_uri::RedapUri::DatasetData(dataset_uri)) = source.redap_uri()
+                    && let Some(re_uri::RedapUri::Dataset(dataset_uri)) = source.redap_uri()
+                    && let Some(dataset_store_id) = dataset_uri.store_id()
                     && store_hub
                         .store_bundle()
                         .entity_dbs()
-                        .any(|db| db.store_id() == &dataset_uri.store_id())
+                        .any(|db| db.store_id() == &dataset_store_id)
                 {
                     return;
                 }
@@ -304,12 +305,6 @@ impl App {
                     // If we're navigating to a recording that was only ever a preview, fetch the
                     // blueprint we skipped while previewing it.
                     self.fetch_pending_blueprint(store_hub, recording_id);
-                }
-
-                if matches!(new_route, Route::Loading(_)) {
-                    self.state
-                        .selection_state
-                        .set_selection(re_viewer_context::ItemCollection::default());
                 }
 
                 self.state.navigation.replace(new_route);
@@ -345,7 +340,7 @@ impl App {
                 }
                 current => {
                     self.state.navigation.replace(Route::ChunkStoreBrowser {
-                        store_id: store_id.or_else(|| current.recording_id().cloned()),
+                        store_id,
                         selected_chunk,
                         return_route: Box::new(current.clone()),
                     });
@@ -354,6 +349,12 @@ impl App {
 
             SystemCommand::ResetRoute => {
                 self.state.navigation.reset();
+
+                egui_ctx.request_repaint(); // Make sure we actually see the new mode.
+            }
+
+            SystemCommand::ReturnFromLoading => {
+                self.state.navigation.return_from_loading();
 
                 egui_ctx.request_repaint(); // Make sure we actually see the new mode.
             }
@@ -415,7 +416,11 @@ impl App {
                 // `Force` because a recording rendered as a preview last frame would otherwise stay
                 // loaded and streaming even though its server is being removed.
                 for store_id in recordings_to_close {
-                    self.close_recording(store_hub, &store_id.into(), CloseRecording::Force);
+                    self.close_recording_or_table(
+                        store_hub,
+                        &store_id.into(),
+                        CloseRecording::Force,
+                    );
                 }
 
                 self.state
@@ -444,6 +449,19 @@ impl App {
                         self.state.navigation.reset();
                     }
                 }
+            }
+
+            SystemCommand::ReloadDatasetSegments {
+                origin,
+                dataset_id,
+                unregistered_asset,
+            } => {
+                self.reload_dataset_segments(
+                    store_hub,
+                    &origin,
+                    dataset_id,
+                    unregistered_asset.as_ref(),
+                );
             }
 
             SystemCommand::EditRedapServerModal(command) => {
@@ -504,7 +522,15 @@ impl App {
                 // By clearing the blueprint the default blueprint will be restored
                 // at the beginning of the next frame.
                 re_log::debug!("Reset blueprint to default");
-                store_hub.clear_active_blueprint(self.state.navigation.current());
+
+                if let Some(table_ref) = self.state.navigation.current().table_reference() {
+                    if let Err(err) = self.table_blueprints.reset(&table_ref, store_hub) {
+                        re_log::warn!("Failed to reset table blueprint: {err}");
+                    }
+                } else {
+                    store_hub.clear_active_blueprint(self.state.navigation.current());
+                }
+
                 egui_ctx.request_repaint(); // Many changes take a frame delay to show up.
             }
 
@@ -630,7 +656,7 @@ impl App {
             SystemCommand::SetSelection(set) => {
                 if let Some(item) = set.selection.single_item() {
                     // If the selected item has its own page, switch to it.
-                    if let Some(route) = Route::from_item(item) {
+                    if let Some(route) = self.route_for_item(item) {
                         if let Route::LocalRecording { recording_id } = &route {
                             store_hub
                                 .load_blueprint_and_caches(recording_id, &self.view_class_registry);
@@ -733,57 +759,95 @@ impl App {
                 view_id,
                 notify,
             } => {
-                if let Some(view_id) = view_id {
-                    // Screenshot a specific view
-                    if let Some(view_info) = self.egui_ctx.memory_mut(|mem| {
-                        mem.caches
-                            .cache::<re_viewer_context::ViewRectPublisher>()
-                            .get(&view_id)
-                            .cloned()
-                    }) {
-                        let re_viewer_context::PublishedViewInfo { name, rect } = view_info;
-                        let rect = rect.shrink(2.5); // Hacky: Shrink so we don't accidentally include the border of the view.
-                        if !rect.is_positive() {
-                            re_log::warn!("View too small for a screenshot");
-                            return;
-                        }
+                self.save_screenshot(target, view_id, notify);
+            }
+        }
+    }
 
-                        self.egui_ctx
-                            .send_viewport_cmd(egui::ViewportCommand::Screenshot(
-                                egui::UserData::new(re_viewer_context::ScreenshotInfo {
-                                    ui_rect: Some(rect),
-                                    pixels_per_point: self.egui_ctx.pixels_per_point(),
-                                    name,
-                                    target,
-                                    notify,
-                                }),
-                            ));
-                    } else {
-                        re_log::warn!("View {view_id} not found for screenshot");
-                    }
-                } else {
-                    // Screenshot the entire viewer
-                    self.egui_ctx
-                        .send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(
-                            re_viewer_context::ScreenshotInfo {
-                                ui_rect: None,
-                                pixels_per_point: self.egui_ctx.pixels_per_point(),
-                                name: "screenshot".to_owned(),
-                                target,
-                                notify,
-                            },
-                        )));
+    fn save_screenshot(
+        &mut self,
+        target: re_viewer_context::ScreenshotTarget,
+        view_id: Option<re_viewer_context::ViewId>,
+        notify: bool,
+    ) {
+        if let Some(view_id) = view_id {
+            // Screenshot a specific view
+            if let Some(view_info) = self.egui_ctx.memory_mut(|mem| {
+                mem.caches
+                    .cache::<re_viewer_context::ViewRectPublisher>()
+                    .get(&view_id)
+                    .cloned()
+            }) {
+                let re_viewer_context::PublishedViewInfo { name, rect } = view_info;
+                let rect = rect.shrink(2.5); // Hacky: Shrink so we don't accidentally include the border of the view.
+                if !rect.is_positive() {
+                    re_log::warn!("View too small for a screenshot");
+                    self.notify_screenshot_failed(
+                        &target,
+                        SaveScreenshotError::ViewTooSmall {
+                            view_id: view_id.to_string(),
+                        },
+                    );
+                    return;
                 }
 
-                // Screenshot commands may be triggered from receiving messages over the network, so we may not actually do any painting right now.
-                // Make sure we do at least once, so the screenshot gets saved out.
-                self.egui_ctx.request_repaint();
-
-                // TODO(#12481): Depending on the platform we a request repaint alone isn't enough to wake up the viewer.
-                // For now we do a focus switch but this isn't ideal since it breaks the flow of programmatic screenshot taking.
                 self.egui_ctx
-                    .send_viewport_cmd(egui::ViewportCommand::Focus);
+                    .send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(
+                        re_viewer_context::ScreenshotInfo {
+                            ui_rect: Some(rect),
+                            pixels_per_point: self.egui_ctx.pixels_per_point(),
+                            name,
+                            target,
+                            notify,
+                        },
+                    )));
+            } else {
+                re_log::warn!("View {view_id} not found for screenshot");
+                self.notify_screenshot_failed(
+                    &target,
+                    SaveScreenshotError::ViewNotFound {
+                        view_id: view_id.to_string(),
+                    },
+                );
+                return;
             }
+        } else {
+            // Screenshot the entire viewer
+            self.egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(
+                    re_viewer_context::ScreenshotInfo {
+                        ui_rect: None,
+                        pixels_per_point: self.egui_ctx.pixels_per_point(),
+                        name: "screenshot".to_owned(),
+                        target,
+                        notify,
+                    },
+                )));
+        }
+
+        // Screenshot commands may be triggered from receiving messages over the network, so we may not actually do any painting right now.
+        // Make sure we do at least once, so the screenshot gets saved out.
+        self.egui_ctx.request_repaint();
+
+        // TODO(#12481): Depending on the platform we a request repaint alone isn't enough to wake up the viewer.
+        // For now we do a focus switch but this isn't ideal since it breaks the flow of programmatic screenshot taking.
+        self.egui_ctx
+            .send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    /// Tell any RPC caller waiting for a screenshot at this file path that it failed.
+    ///
+    /// Without this, `ViewerControlService::SaveScreenshot` would hang forever,
+    /// and the notifier map entry would leak.
+    fn notify_screenshot_failed(
+        &mut self,
+        target: &re_viewer_context::ScreenshotTarget,
+        err: SaveScreenshotError,
+    ) {
+        if let re_viewer_context::ScreenshotTarget::SaveToPath(file_path) = target
+            && let Some(notifier) = self.pending_screenshot_notifiers.remove(file_path)
+        {
+            notifier.call(Err(err));
         }
     }
 
@@ -830,6 +894,7 @@ impl App {
                                 force_store_info,
                             },
                             path: file_path,
+                            assets: Vec::new(),
                         }));
                 }
             }
@@ -862,6 +927,7 @@ impl App {
                                 force_store_info,
                             },
                             path: file_path,
+                            assets: Vec::new(),
                         }));
                 }
             }
@@ -968,6 +1034,22 @@ impl App {
             UICommand::ToggleDevPanel => {
                 self.dev_panel_open ^= true;
             }
+            UICommand::ToggleChunkStoreBrowser => match route {
+                Route::ChunkStoreBrowser { return_route, .. } => {
+                    self.state.navigation.replace((**return_route).clone());
+                }
+                current => {
+                    let store_id = current.recording_id().cloned().or_else(|| {
+                        let table_ref = current.table_reference()?;
+                        self.table_blueprints.active_id(&table_ref).cloned()
+                    });
+                    self.command_sender
+                        .send_system(SystemCommand::OpenChunkStoreBrowser {
+                            store_id,
+                            selected_chunk: None,
+                        });
+                }
+            },
             UICommand::TogglePanelStateOverrides => {
                 self.panel_state_overrides_active ^= true;
             }
@@ -989,6 +1071,10 @@ impl App {
                 if !app_blueprint.selection_panel_state().is_expanded() {
                     app_blueprint.toggle_selection_panel(&self.command_sender);
                 }
+            }
+            UICommand::ToggleAgentPanel => {
+                #[cfg(agent_panel)]
+                self.toggle_agent_panel();
             }
             #[cfg(debug_assertions)]
             UICommand::ToggleEguiDebugPanel => {
@@ -1282,22 +1368,6 @@ impl App {
                 app_blueprint.toggle_time_panel(&self.command_sender);
             }
 
-            RecordingCommandKind::ToggleChunkStoreBrowser => {
-                match self.state.navigation.current() {
-                    Route::ChunkStoreBrowser { return_route, .. } => {
-                        self.state.navigation.replace((**return_route).clone());
-                    }
-
-                    current => {
-                        self.state.navigation.replace(Route::ChunkStoreBrowser {
-                            store_id: current.recording_id().cloned(),
-                            selected_chunk: None,
-                            return_route: Box::new(current.clone()),
-                        });
-                    }
-                }
-            }
-
             #[cfg(debug_assertions)]
             RecordingCommandKind::ToggleBlueprintInspectionPanel => {
                 self.app_options_mut().inspect_blueprint_timeline ^= true;
@@ -1472,6 +1542,7 @@ impl App {
         self.state = Default::default();
 
         store_hub.clear_all_cloned_blueprints();
+        self.table_blueprints.clear_all_cloned_blueprints(store_hub);
 
         // Reset egui:
         egui_ctx.memory_mut(|mem| *mem = Default::default());
@@ -1585,10 +1656,14 @@ impl App {
 
             // Resolves to a recording: it must still be loaded, and not be the one we're closing.
             // We don't re-stream a closed recording, that would land us on a blank, unloaded one.
-            ViewerOpenUrl::RedapDatasetSegment(uri) => {
-                let store_id = uri.store_id();
-                closing.is_none_or(|closing| &store_id != closing) && store_hub.is_opened(&store_id)
-            }
+            // Without a segment it resolves to the dataset, which stays reachable with its server.
+            ViewerOpenUrl::RedapDataset(uri) => match uri.store_id() {
+                Some(store_id) => {
+                    closing.is_none_or(|closing| &store_id != closing)
+                        && store_hub.is_opened(&store_id)
+                }
+                None => origin_reachable(&uri.origin),
+            },
 
             // Redap destinations are reachable while their server is still registered.
             ViewerOpenUrl::RedapProxy(uri) => origin_reachable(&uri.origin),
@@ -1620,9 +1695,10 @@ impl App {
             .and_then(|source| source.redap_uri());
 
         match redap_uri {
-            Some(re_uri::RedapUri::DatasetData(uri)) => Route::RedapEntry {
+            Some(re_uri::RedapUri::Dataset(uri)) => Route::RedapEntry {
                 origin: uri.origin,
-                kind: re_viewer_context::RedapEntryKind::Entry(uri.dataset_id.into()),
+                entry_id: uri.dataset_id.into(),
+                kind: Some(re_viewer_context::EntryKind::Dataset(uri.resource)),
             },
 
             Some(uri) if !matches!(uri, re_uri::RedapUri::Proxy(_)) => {
@@ -1633,53 +1709,56 @@ impl App {
         }
     }
 
-    fn close_recording(
-        &self,
+    fn close_recording_or_table(
+        &mut self,
         store_hub: &mut StoreHub,
-        entry: &RecordingOrTable,
+        entry: &RecordingOrLocalTable,
         mode: CloseRecording,
     ) {
-        if let RecordingOrTable::Recording { store_id } = entry {
-            store_hub.set_opened(store_id, false);
+        match entry {
+            RecordingOrLocalTable::Recording { store_id } => {
+                store_hub.set_opened(store_id, false);
 
-            // A recording that's still rendered as a preview should stay loaded and streaming, just
-            // no longer in the recording list. Removing it would make the preview re-download it.
-            // `Force` overrides this and removes it regardless.
-            if mode != CloseRecording::Force && store_hub.was_preview(store_id) {
-                return;
+                // A recording that's still rendered as a preview should stay loaded and streaming, just
+                // no longer in the recording list. Removing it would make the preview re-download it.
+                // `Force` overrides this and removes it regardless.
+                if mode != CloseRecording::Force && store_hub.was_preview(store_id) {
+                    return;
+                }
+
+                let data_source = store_hub.entity_db_entry(store_id).data_source.as_ref();
+
+                if let Some(data_source) = data_source {
+                    // Only certain sources should be closed.
+                    #[expect(clippy::match_same_arms)]
+                    let should_close = match &data_source {
+                        // Specific files should stop streaming when closing them.
+                        LogSource::File { .. } => true,
+
+                        // Specific HTTP streams should stop streaming when closing them.
+                        LogSource::HttpStream { .. } => true,
+
+                        // Specific GRPC streams should stop streaming when closing them.
+                        // TODO(#10967): We still stream in some data after that.
+                        LogSource::RedapGrpcStream { .. } => true,
+
+                        // Don't close generic connections (like to an SDK) that may feed in different recordings over time.
+                        LogSource::RrdWebEvent
+                        | LogSource::JsChannel { .. }
+                        | LogSource::Sdk
+                        | LogSource::Stdin
+                        | LogSource::MessageProxy(_) => false,
+                    };
+
+                    if should_close {
+                        self.rx_log.retain(|r| r.source() != data_source);
+                    }
+                }
             }
-        }
-
-        let data_source = match entry {
-            RecordingOrTable::Recording { store_id } => {
-                store_hub.entity_db_entry(store_id).data_source.clone()
-            }
-            RecordingOrTable::Table { .. } => None,
-        };
-        if let Some(data_source) = data_source {
-            // Only certain sources should be closed.
-            #[expect(clippy::match_same_arms)]
-            let should_close = match &data_source {
-                // Specific files should stop streaming when closing them.
-                LogSource::File { .. } => true,
-
-                // Specific HTTP streams should stop streaming when closing them.
-                LogSource::HttpStream { .. } => true,
-
-                // Specific GRPC streams should stop streaming when closing them.
-                // TODO(#10967): We still stream in some data after that.
-                LogSource::RedapGrpcStream { .. } => true,
-
-                // Don't close generic connections (like to an SDK) that may feed in different recordings over time.
-                LogSource::RrdWebEvent
-                | LogSource::JsChannel { .. }
-                | LogSource::Sdk
-                | LogSource::Stdin
-                | LogSource::MessageProxy(_) => false,
-            };
-
-            if should_close {
-                self.rx_log.retain(|r| r.source() != &data_source);
+            RecordingOrLocalTable::LocalTable { table_id } => {
+                // Remove any existing table blueprints associated with this table.
+                self.table_blueprints
+                    .close_table(&table_id.clone().into(), store_hub);
             }
         }
 
@@ -1762,11 +1841,6 @@ fn save_recording(
     entity_db: &EntityDb,
     loop_selection: Option<(TimelineName, re_log_types::AbsoluteTimeRangeF)>,
 ) -> anyhow::Result<()> {
-    let rrd_version = entity_db
-        .store_info()
-        .and_then(|info| info.store_version)
-        .unwrap_or(re_build_info::CrateVersion::LOCAL);
-
     let file_name = if let Some(recording_name) = entity_db
         .recording_info_property::<re_sdk_types::components::Name>(
             re_sdk_types::archetypes::RecordingInfo::descriptor_name().component,
@@ -1775,19 +1849,16 @@ fn save_recording(
     } else {
         "data.rrd".to_owned()
     };
-
     let title = if loop_selection.is_some() {
         "Save loop selection"
     } else {
         "Save recording"
     };
-
     save_entity_db(
         app,
-        rrd_version,
+        RrdSnapshot::recording(entity_db, loop_selection),
         file_name,
         title.to_owned(),
-        entity_db.to_messages(loop_selection),
     )
 }
 
@@ -1799,49 +1870,18 @@ fn save_blueprint(
         anyhow::bail!("No blueprint to save");
     };
 
-    re_tracing::profile_function!();
-
-    let rrd_version = store_context
-        .blueprint
-        .store_info()
-        .and_then(|info| info.store_version)
-        .unwrap_or(re_build_info::CrateVersion::LOCAL);
-
-    // We change the recording id to a new random one,
-    // otherwise when saving and loading a blueprint file, we can end up
-    // in a situation where the store_id we're loading is the same as the currently active one,
-    // which mean they will merge in a strange way.
-    // This is also related to https://github.com/rerun-io/rerun/issues/5295
-    let new_store_id = store_context
-        .blueprint
-        .store_id()
-        .clone()
-        .with_recording_id(RecordingId::random());
-
-    let mut saved_blueprint = store_context
-        .blueprint
-        .clone_with_new_id(new_store_id)
-        .context("Cloning current blueprint")?;
-
-    if let Some(undo_state) = app
-        .state
-        .blueprint_undo_state
-        .get(store_context.blueprint.store_id())
-    {
-        // We don't actually want to edit the undo state when saving,
-        // just clear the redo-buffer section of what we save.
-        undo_state.clone().clear_redo_buffer(&mut saved_blueprint);
-    }
-
-    let messages = saved_blueprint.to_messages(None);
-
+    let snapshot = RrdSnapshot::blueprint(
+        store_context.blueprint,
+        app.state
+            .blueprint_undo_state
+            .get(store_context.blueprint.store_id()),
+    )?;
     let file_name = format!(
         "{}.rbl",
         crate::saving::sanitize_app_id(store_context.application_id())
     );
-    let title = "Save blueprint";
 
-    save_entity_db(app, rrd_version, file_name, title.to_owned(), messages)
+    save_entity_db(app, snapshot, file_name, "Save blueprint".to_owned())
 }
 
 // TODO(emilk): unify this with `ViewerContext::save_file_dialog`
@@ -1849,28 +1889,20 @@ fn save_blueprint(
 #[allow(clippy::unnecessary_wraps)] // cannot return error on web
 fn save_entity_db(
     #[allow(clippy::allow_attributes, unused_variables)] app: &mut App, // only used on native
-    rrd_version: CrateVersion,
+    snapshot: crate::saving::RrdSnapshot,
     file_name: String,
     title: String,
-    messages: impl Iterator<Item = re_chunk::ChunkResult<LogMsg>>,
 ) -> anyhow::Result<()> {
     re_tracing::profile_function!();
 
-    // TODO(#6984): Ideally we wouldn't collect at all and just stream straight to the
-    // encoder from the store.
-    //
-    // From a memory usage perspective this isn't too bad though: the data within is still
-    // refcounted straight from the store in any case.
-    //
-    // It just sucks latency-wise.
-    let messages = messages.collect::<Vec<_>>();
+    let RrdSnapshot { version, messages } = snapshot;
 
     cfg_select! {
         target_arch = "wasm32" => {
             // Web
             re_async::spawn_local(async move {
                 if let Err(err) =
-                    async_save_dialog(rrd_version, &file_name, &title, messages.into_iter()).await
+                    async_save_dialog(version, &file_name, &title, messages.into_iter()).await
                 {
                     re_log::error!("File saving failed: {err}");
                 }
@@ -1887,7 +1919,7 @@ fn save_entity_db(
             };
             if let Some(path) = path {
                 app.background_tasks.spawn_file_saver(move || {
-                    crate::saving::encode_to_file(rrd_version, &path, messages.into_iter())?;
+                    crate::saving::encode_to_file(version, &path, messages.into_iter())?;
                     Ok(path)
                 })?;
             }
@@ -1899,10 +1931,10 @@ fn save_entity_db(
 
 #[cfg(target_arch = "wasm32")]
 async fn async_save_dialog(
-    rrd_version: CrateVersion,
+    rrd_version: re_build_info::CrateVersion<'static>,
     file_name: &str,
     title: &str,
-    messages: impl Iterator<Item = re_chunk::ChunkResult<LogMsg>>,
+    messages: impl Iterator<Item = re_chunk::ChunkResult<re_log_types::LogMsg>>,
 ) -> anyhow::Result<()> {
     use anyhow::Context as _;
 

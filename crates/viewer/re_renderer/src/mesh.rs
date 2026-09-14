@@ -1,5 +1,5 @@
+use re_span::Span;
 use std::mem::size_of;
-use std::ops::Range;
 
 use ecolor::Rgba;
 use smallvec::{SmallVec, smallvec};
@@ -215,6 +215,9 @@ pub enum MeshError {
 
     #[error(transparent)]
     CpuWriteGpuReadError(#[from] crate::allocator::CpuWriteGpuReadError),
+
+    #[error(transparent)]
+    Renderer(#[from] crate::RendererRegistrationError),
 }
 
 const _: () = assert!(
@@ -227,7 +230,7 @@ pub struct Material {
     pub label: Label,
 
     /// Index range within the owning [`CpuMesh`] that should be rendered with this material.
-    pub index_range: Range<u32>,
+    pub index_range: Span<u32>,
 
     /// Base color texture, also known as albedo.
     /// When `use_matcap` is true, this should be a matcap texture.
@@ -269,17 +272,17 @@ pub struct GpuMesh {
     /// Buffer for all vertex data, subdivided in several sections for different vertex buffer bindings.
     /// See [`mesh_vertices`]
     pub vertex_buffer_combined: GpuBuffer,
-    pub vertex_buffer_positions_range: Range<u64>,
-    pub vertex_buffer_colors_range: Range<u64>,
-    pub vertex_buffer_normals_range: Range<u64>,
-    pub vertex_buffer_texcoord_range: Range<u64>,
-    pub vertex_buffer_element_ids_range: Range<u64>,
+    pub vertex_buffer_positions_range: Span<u64>,
+    pub vertex_buffer_colors_range: Span<u64>,
+    pub vertex_buffer_normals_range: Span<u64>,
+    pub vertex_buffer_texcoord_range: Span<u64>,
+    pub vertex_buffer_element_ids_range: Span<u64>,
     /// Range of the per-vertex topology-vertex ID channel.
-    pub vertex_buffer_topology_ids_range: Range<u64>,
+    pub vertex_buffer_topology_ids_range: Span<u64>,
     /// Range of the per-vertex edge ID channel.
-    pub vertex_buffer_edge_ids_range: Range<u64>,
+    pub vertex_buffer_edge_ids_range: Span<u64>,
 
-    pub index_buffer_range: Range<u64>,
+    pub index_buffer_range: Span<u64>,
 
     /// Every mesh has at least one material.
     pub materials: SmallVec<[GpuMaterial; 1]>,
@@ -300,7 +303,7 @@ impl GpuMesh {
 #[derive(Clone)]
 pub struct GpuMaterial {
     /// Index range within the owning [`CpuMesh`] that should be rendered with this material.
-    pub index_range: Range<u32>,
+    pub index_range: Span<u32>,
 
     pub bind_group: GpuBindGroup,
 
@@ -587,7 +590,7 @@ impl GpuMesh {
             let mut materials = SmallVec::with_capacity(data.materials.len());
 
             // The bind group layout must be in sync with the mesh renderer.
-            let mesh_bind_group_layout = ctx.renderer::<MeshRenderer>().bind_group_layout;
+            let mesh_bind_group_layout = ctx.renderer::<MeshRenderer>()?.bind_group_layout;
 
             for (material, uniform_buffer_binding) in
                 std::iter::zip(&data.materials, uniform_buffer_bindings)
@@ -610,7 +613,7 @@ impl GpuMesh {
                 let is_transparent = material.albedo_factor.a() < 1.0;
 
                 materials.push(GpuMaterial {
-                    index_range: material.index_range.clone(),
+                    index_range: material.index_range,
                     bind_group,
                     has_transparency: is_transparent,
                 });
@@ -628,14 +631,14 @@ impl GpuMesh {
         Ok(Self {
             index_buffer,
             vertex_buffer_combined,
-            vertex_buffer_positions_range: 0..vb_positions_size,
-            vertex_buffer_colors_range: vb_colors_start..vb_normals_start,
-            vertex_buffer_normals_range: vb_normals_start..vb_texcoord_start,
-            vertex_buffer_texcoord_range: vb_texcoord_start..vb_element_ids_start,
-            vertex_buffer_element_ids_range: vb_element_ids_start..vb_topology_ids_start,
-            vertex_buffer_topology_ids_range: vb_topology_ids_start..vb_edge_ids_start,
-            vertex_buffer_edge_ids_range: vb_edge_ids_start..vb_combined_size,
-            index_buffer_range: 0..index_buffer_size,
+            vertex_buffer_positions_range: Span::from_start_end(0, vb_positions_size),
+            vertex_buffer_colors_range: Span::from_start_end(vb_colors_start, vb_normals_start),
+            vertex_buffer_normals_range: Span::from_start_end(vb_normals_start, vb_texcoord_start),
+            vertex_buffer_texcoord_range: Span::from_start_end(vb_texcoord_start, vb_element_ids_start),
+            vertex_buffer_element_ids_range: Span::from_start_end(vb_element_ids_start, vb_topology_ids_start),
+            vertex_buffer_topology_ids_range: Span::from_start_end(vb_topology_ids_start, vb_edge_ids_start),
+            vertex_buffer_edge_ids_range: Span::from_start_end(vb_edge_ids_start, vb_combined_size),
+            index_buffer_range: Span::from_start_end(0, index_buffer_size),
             materials,
             bbox: data.bbox,
         })

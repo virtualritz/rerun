@@ -6,7 +6,7 @@ use re_chunk::{ComponentIdentifier, TimelineName};
 use re_chunk_store::LatestAtQuery;
 use re_entity_db::{EntityPath, TimeInt};
 use re_sdk_types::blueprint::components::VisualizerInstructionId;
-use re_sdk_types::blueprint::datatypes::{ComponentSourceKind, VisualizerComponentMapping};
+use re_sdk_types::blueprint::encodings::{ComponentSourceKind, VisualizerComponentMapping};
 use re_sdk_types::{
     InvalidComponentIdentifierError,
     blueprint::archetypes::{self as blueprint_archetypes, EntityBehavior},
@@ -31,6 +31,9 @@ pub enum VisualizerComponentSource {
 
     /// See [`ComponentSourceKind::Default`].
     Default,
+
+    /// See [`ComponentSourceKind::AnnotationContext`].
+    AnnotationContext,
 }
 
 impl VisualizerComponentSource {
@@ -60,6 +63,8 @@ impl VisualizerComponentSource {
             ComponentSourceKind::Override => Self::Override,
 
             ComponentSourceKind::Default => Self::Default,
+
+            ComponentSourceKind::AnnotationContext => Self::AnnotationContext,
         })
     }
 
@@ -68,23 +73,21 @@ impl VisualizerComponentSource {
             Self::SourceComponent { .. } => ComponentSourceKind::SourceComponent,
             Self::Override => ComponentSourceKind::Override,
             Self::Default => ComponentSourceKind::Default,
+            Self::AnnotationContext => ComponentSourceKind::AnnotationContext,
         }
     }
 
-    pub fn component_source_kind(&self) -> ComponentSourceKind {
-        match self {
-            Self::SourceComponent { .. } => ComponentSourceKind::SourceComponent,
-            Self::Override => ComponentSourceKind::Override,
-            Self::Default => ComponentSourceKind::Default,
+    /// Maps directly from the given source component without a selector.
+    pub fn simple_map(source_component: ComponentIdentifier) -> Self {
+        Self::SourceComponent {
+            source_component,
+            selector: String::new(),
         }
     }
 
     /// The identity mapping for the given target component.
     pub fn identity(target: ComponentIdentifier) -> Self {
-        Self::SourceComponent {
-            source_component: target,
-            selector: String::new(),
-        }
+        Self::simple_map(target)
     }
 
     /// True if the mapping have no effect on the target.
@@ -92,6 +95,25 @@ impl VisualizerComponentSource {
     /// I.e. it maps directly from the target back to the target.
     pub fn is_identity_mapping(&self, target: ComponentIdentifier) -> bool {
         self == &Self::identity(target)
+    }
+
+    /// Returns a human-readable description of the component source.
+    pub fn summary(&self) -> String {
+        match self {
+            Self::SourceComponent {
+                source_component,
+                selector,
+            } => {
+                if selector.is_empty() {
+                    source_component.as_str().to_owned()
+                } else {
+                    format!("{}{}", source_component.as_str(), selector)
+                }
+            }
+            Self::AnnotationContext => "Annotation context".to_owned(),
+            Self::Override => "Custom".to_owned(),
+            Self::Default => "View default".to_owned(),
+        }
     }
 }
 
@@ -277,6 +299,13 @@ impl VisualizerInstruction {
                     VisualizerComponentSource::Default => VisualizerComponentMapping {
                         target,
                         source_kind: ComponentSourceKind::Default,
+                        source_component: None,
+                        selector: None,
+                    },
+
+                    VisualizerComponentSource::AnnotationContext => VisualizerComponentMapping {
+                        target,
+                        source_kind: ComponentSourceKind::AnnotationContext,
                         source_component: None,
                         selector: None,
                     },

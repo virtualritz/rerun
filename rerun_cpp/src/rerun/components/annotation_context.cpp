@@ -3,7 +3,7 @@
 
 #include "annotation_context.hpp"
 
-#include "../datatypes/class_description_map_elem.hpp"
+#include "../encodings/class_description_map_elem.hpp"
 
 #include <arrow/builder.h>
 #include <arrow/type_fwd.h>
@@ -11,11 +11,11 @@
 namespace rerun::components {}
 
 namespace rerun {
-    const std::shared_ptr<arrow::DataType>& Loggable<components::AnnotationContext>::arrow_datatype(
-    ) {
+    const std::shared_ptr<arrow::DataType>&
+        Loggable<components::AnnotationContext>::arrow_data_type() {
         static const auto datatype = arrow::list(arrow::field(
             "item",
-            Loggable<rerun::datatypes::ClassDescriptionMapElem>::arrow_datatype(),
+            Loggable<rerun::encodings::ClassDescriptionMapElem>::arrow_data_type(),
             false
         ));
         return datatype;
@@ -26,7 +26,7 @@ namespace rerun {
     ) {
         // TODO(andreas): Allow configuring the memory pool.
         arrow::MemoryPool* pool = arrow::default_memory_pool();
-        auto datatype = arrow_datatype();
+        auto datatype = arrow_data_type();
 
         ARROW_ASSIGN_OR_RAISE(auto builder, arrow::MakeBuilder(datatype, pool))
         if (instances && num_instances > 0) {
@@ -64,7 +64,7 @@ namespace rerun {
             ARROW_RETURN_NOT_OK(builder->Append());
             if (element.class_map.data()) {
                 RR_RETURN_NOT_OK(
-                    Loggable<rerun::datatypes::ClassDescriptionMapElem>::fill_arrow_array_builder(
+                    Loggable<rerun::encodings::ClassDescriptionMapElem>::fill_arrow_array_builder(
                         value_builder,
                         element.class_map.data(),
                         element.class_map.size()

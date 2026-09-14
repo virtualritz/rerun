@@ -6,10 +6,14 @@
 //! necessary conversion code (in the form of `From` and `TryFrom` traits) in this crate.
 
 pub mod external {
-    pub use prost;
+    pub use {prost, re_span};
 }
 
+pub mod capabilities;
+
 pub mod headers;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod reflection;
 pub mod trace_id_layer;
 
 pub use re_log_types::{EntryName, InvalidEntryNameError};
@@ -81,6 +85,8 @@ pub mod cloud {
             pub use crate::v1alpha1::rerun_cloud_v1alpha1_ext_chunk_key::*;
             pub use crate::v1alpha1::rerun_cloud_v1alpha1_ext_schemas::*;
         }
+
+        pub use crate::capabilities;
 
         /// Server-supported feature flags advertised via `VersionResponse.features`.
         ///
@@ -165,6 +171,9 @@ pub enum TypeConversionError {
 
     #[error("failed to convert arrow data: {0}")]
     ArrowError(#[from] arrow::error::ArrowError),
+
+    #[error(transparent)]
+    DowncastError(#[from] re_arrow_util::DowncastError),
 
     #[error("{0}")]
     UnknownEnumValue(#[from] prost::UnknownEnumValue),

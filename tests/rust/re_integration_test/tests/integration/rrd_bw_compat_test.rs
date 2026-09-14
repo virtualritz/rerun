@@ -8,14 +8,14 @@ use egui_kittest::SnapshotResults;
 use egui_kittest::kittest::Queryable as _;
 use futures::StreamExt as _;
 use re_integration_test::HarnessExt as _;
+use re_integration_test::ViewerHarnessExt as _;
 use re_viewer::external::re_log_types::TimelineName;
 use re_viewer::external::re_ui::notifications::NotificationLevel;
-use re_viewer::viewer_test_utils::{self, AppTestingExt as _, HarnessOptions, step_until};
+use re_viewer::viewer_test_utils::{self, AppTestingExt as _, HarnessOptions};
 use re_viewer::{SystemCommand, SystemCommandSender as _};
 use re_viewer_context::TimeControlCommand;
 use std::io::Write as _;
 use std::path::Path;
-use std::time::Duration;
 
 /// Maximum number of concurrent downloads.
 const DOWNLOAD_CONCURRENCY: usize = 8;
@@ -23,10 +23,17 @@ const DOWNLOAD_CONCURRENCY: usize = 8;
 /// Prefix used for in-flight download temp files in the cache directory.
 const DOWNLOAD_TEMP_PREFIX: &str = ".rrd-download-";
 
+/// A `major.minor` version, without the patch.
+#[derive(Clone, Copy)]
+struct MinorVersion {
+    major: u32,
+    minor: u32,
+}
+
 /// Derive previous minor version from `CARGO_PKG_VERSION`.
 ///
-/// E.g., `"0.32.0-alpha.1+dev"` → `(0, 31)`.
-fn previous_minor_version() -> (u32, u32) {
+/// E.g., `"0.32.0-alpha.1+dev"` → `0.31`.
+fn previous_minor_version() -> MinorVersion {
     let version = env!("CARGO_PKG_VERSION"); // e.g. "0.32.0-alpha.1+dev"
     let parts: Vec<&str> = version.split('.').collect();
     let major: u32 = parts[0].parse().expect("failed to parse major version");
@@ -35,7 +42,10 @@ fn previous_minor_version() -> (u32, u32) {
         minor > 0,
         "Cannot derive previous version from minor=0 (version={version})"
     );
-    (major, minor - 1)
+    MinorVersion {
+        major,
+        minor: minor - 1,
+    }
 }
 
 /// Probe `app.rerun.io` to find the latest patch for a given `major.minor`.
@@ -197,8 +207,8 @@ async fn ensure_rrd_cached(
 #[tokio::test(flavor = "multi_thread")]
 async fn test_old_rrds_in_current_viewer() {
     let client = reqwest::Client::new();
-    let (major, prev_minor) = previous_minor_version();
-    let version = resolve_latest_patch(&client, major, prev_minor).await;
+    let MinorVersion { major, minor } = previous_minor_version();
+    let version = resolve_latest_patch(&client, major, minor).await;
     eprintln!("Testing backward compatibility with version {version}");
 
     let cache_dir = directories::ProjectDirs::from("io", "rerun", "rerun-integration-tests")
@@ -255,21 +265,14 @@ async fn test_old_rrds_in_current_viewer() {
             window_size: Some(WINDOW_SIZE),
             startup_url: Some(file_path),
             max_steps: Some(200),
+            app_options_editor: Some(Box::new(|app_options| {
+                // TODO(RR-5258): Removing the flag will break this test since it implies a change in behavior.
+                app_options.use_viewer_catalog = false;
+            })),
             ..Default::default()
         });
 
-        // Wait for the loading popup to disappear.
-        step_until(
-            "loading popup dismissed",
-            &mut harness,
-            |harness| {
-                !harness
-                    .query_all_by_role(Role::Window)
-                    .any(|window| window.query_by_label_contains("Loading").is_some())
-            },
-            Duration::from_millis(100),
-            Duration::from_secs(10),
-        );
+        harness.step_until_active_recording_fully_loaded();
 
         assert!(
             harness.state().active_recording_id().is_some(),

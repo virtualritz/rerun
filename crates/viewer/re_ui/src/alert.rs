@@ -75,7 +75,6 @@ impl Alert {
             .fill(colors.fill)
             .corner_radius(6)
             .inner_margin(6.0)
-            .outer_margin(1.0) // Needed because we set clip_rect_margin. TODO(emilk/egui#5605): remove clip_rect_margin
     }
 
     pub fn show<T>(self, ui: &mut Ui, content: impl FnOnce(&mut Ui) -> T) -> InnerResponse<T> {
@@ -86,6 +85,27 @@ impl Alert {
                 content(ui)
             })
             .inner
+        })
+    }
+
+    /// A titled alert with the content laid out below the icon and title,
+    /// for notices that hold more than a line of text.
+    pub fn show_with_title<T>(
+        self,
+        ui: &mut Ui,
+        title: impl Into<String>,
+        content: impl FnOnce(&mut Ui) -> T,
+    ) -> InnerResponse<T> {
+        let colors = self.kind.colors(ui);
+        let (icon, icon_color, text_color) = (self.kind.icon(), colors.icon, colors.text);
+        self.frame(ui).inner_margin(8).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::splat(4.0);
+                ui.small_icon(&icon, Some(icon_color));
+                ui.label(egui::RichText::new(title.into()).strong().color(text_color));
+            });
+            content(ui)
         })
     }
 
@@ -118,18 +138,6 @@ impl Alert {
             }
         })
         .response
-    }
-
-    pub fn text_widget(
-        self,
-        visible_text: impl Into<String>,
-        full_text: Option<String>,
-    ) -> AlertText {
-        AlertText {
-            alert: self,
-            visible_text: visible_text.into(),
-            full_text,
-        }
     }
 }
 

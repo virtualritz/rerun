@@ -11,7 +11,7 @@ import numpy as np
 import pyarrow as pa
 from attrs import define, field
 
-from .. import components, datatypes
+from .. import components, encodings
 from .._baseclasses import (
     Archetype,
     ComponentColumnList,
@@ -22,7 +22,7 @@ from ..error_utils import catch_and_log_exceptions
 from .video_frame_reference_ext import VideoFrameReferenceExt
 
 if TYPE_CHECKING:
-    from ..blueprint.datatypes import VisualizerComponentMappingLike
+    from ..blueprint.encodings import VisualizerComponentMappingLike
 
 __all__ = ["VideoFrameReference"]
 
@@ -32,12 +32,11 @@ class VideoFrameReference(VideoFrameReferenceExt, Archetype, VisualizableArchety
     """
     **Archetype**: References a single video frame.
 
-    Used to display individual video frames from a [`archetypes.AssetVideo`][rerun.archetypes.AssetVideo].
+    Used to display individual video frames from an [`archetypes.AssetVideo`][rerun.archetypes.AssetVideo] or [`archetypes.VideoStream`][rerun.archetypes.VideoStream].
     To show an entire video, a video frame reference for each frame of the video should be logged.
+    References to a [`archetypes.VideoStream`][rerun.archetypes.VideoStream] use the active Viewer timeline.
 
     See <https://rerun.io/docs/reference/video> for details of what is and isn't supported.
-
-    TODO(#10422): [`archetypes.VideoFrameReference`][rerun.archetypes.VideoFrameReference] does not yet work with [`archetypes.VideoStream`][rerun.archetypes.VideoStream].
 
     Examples
     --------
@@ -149,10 +148,10 @@ class VideoFrameReference(VideoFrameReferenceExt, Archetype, VisualizableArchety
         cls,
         *,
         clear_unset: bool = False,
-        timestamp: datatypes.VideoTimestampLike | None = None,
-        video_reference: datatypes.EntityPathLike | None = None,
-        opacity: datatypes.Float32Like | None = None,
-        draw_order: datatypes.Float32Like | None = None,
+        timestamp: encodings.VideoTimestampLike | None = None,
+        video_reference: encodings.EntityPathLike | None = None,
+        opacity: encodings.Float32Like | None = None,
+        draw_order: encodings.Float32Like | None = None,
     ) -> VideoFrameReference:
         """
         Update only some specific fields of a `VideoFrameReference`.
@@ -171,7 +170,7 @@ class VideoFrameReference(VideoFrameReferenceExt, Archetype, VisualizableArchety
             This is oftentimes equivalent to presentation timestamps (known as PTS), but in the presence of B-frames
             (bidirectionally predicted frames) there may be an offset on the first presentation timestamp in the video.
         video_reference:
-            Optional reference to an entity with a [`archetypes.AssetVideo`][rerun.archetypes.AssetVideo].
+            Optional reference to an entity with an [`archetypes.AssetVideo`][rerun.archetypes.AssetVideo] or [`archetypes.VideoStream`][rerun.archetypes.VideoStream].
 
             If none is specified, the video is assumed to be at the same entity.
             Note that blueprint overrides on the referenced video will be ignored regardless,
@@ -251,10 +250,10 @@ class VideoFrameReference(VideoFrameReferenceExt, Archetype, VisualizableArchety
     def columns(
         cls,
         *,
-        timestamp: datatypes.VideoTimestampArrayLike | None = None,
-        video_reference: datatypes.EntityPathArrayLike | None = None,
-        opacity: datatypes.Float32ArrayLike | None = None,
-        draw_order: datatypes.Float32ArrayLike | None = None,
+        timestamp: encodings.VideoTimestampArrayLike | None = None,
+        video_reference: encodings.EntityPathArrayLike | None = None,
+        opacity: encodings.Float32ArrayLike | None = None,
+        draw_order: encodings.Float32ArrayLike | None = None,
     ) -> ComponentColumnList:
         """
         Construct a new column-oriented component bundle.
@@ -276,7 +275,7 @@ class VideoFrameReference(VideoFrameReferenceExt, Archetype, VisualizableArchety
             This is oftentimes equivalent to presentation timestamps (known as PTS), but in the presence of B-frames
             (bidirectionally predicted frames) there may be an offset on the first presentation timestamp in the video.
         video_reference:
-            Optional reference to an entity with a [`archetypes.AssetVideo`][rerun.archetypes.AssetVideo].
+            Optional reference to an entity with an [`archetypes.AssetVideo`][rerun.archetypes.AssetVideo] or [`archetypes.VideoStream`][rerun.archetypes.VideoStream].
 
             If none is specified, the video is assumed to be at the same entity.
             Note that blueprint overrides on the referenced video will be ignored regardless,
@@ -370,7 +369,7 @@ class VideoFrameReference(VideoFrameReferenceExt, Archetype, VisualizableArchety
         default=None,
         converter=components.EntityPathBatch._converter,  # type: ignore[misc]
     )
-    # Optional reference to an entity with a [`archetypes.AssetVideo`][rerun.archetypes.AssetVideo].
+    # Optional reference to an entity with an [`archetypes.AssetVideo`][rerun.archetypes.AssetVideo] or [`archetypes.VideoStream`][rerun.archetypes.VideoStream].
     #
     # If none is specified, the video is assumed to be at the same entity.
     # Note that blueprint overrides on the referenced video will be ignored regardless,

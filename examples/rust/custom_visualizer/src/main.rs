@@ -14,6 +14,7 @@ mod height_field_archetype;
 mod height_field_renderer;
 mod height_field_visualizer;
 
+use height_field_renderer::HeightFieldRenderer;
 use height_field_visualizer::HeightFieldVisualizer;
 
 // By using `re_memory::AccountingAllocator` Rerun can keep track of exactly how much memory it is using,
@@ -69,6 +70,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "Could not get a runtime handle from the current Tokio runtime or Wasm bindgen.",
                 ),
             );
+            app.with_render_ctx_mut(|render_ctx| {
+                render_ctx.renderers_mut().register::<HeightFieldRenderer>();
+            })
+            .ok_or_else(|| {
+                std::io::Error::other("The custom visualizer requires an active renderer.")
+            })?;
+
             app.add_log_receiver(grpc_rx);
             app.add_log_receiver(builtin_recording_rx);
 
@@ -105,10 +113,10 @@ fn builtin_recording() -> Result<re_log_channel::LogReceiver, rerun::RecordingSt
     let cols = 512u32;
     let rows = 512u32;
     let num_terrain_frames = 60;
-    let format = rerun::components::ImageFormat(rerun::datatypes::ImageFormat::from_color_model(
+    let format = rerun::components::ImageFormat(rerun::encodings::ImageFormat::from_color_model(
         [cols, rows],
-        rerun::datatypes::ColorModel::L,
-        rerun::datatypes::ChannelDatatype::F32,
+        rerun::encodings::ColorModel::L,
+        rerun::encodings::ChannelDatatype::F32,
     ));
 
     for frame in 0..num_terrain_frames {

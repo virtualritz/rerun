@@ -2,6 +2,7 @@ use ahash::HashMap;
 use arrow::array::RecordBatch;
 
 use itertools::chain;
+use re_async::AsyncRuntimeHandle;
 use re_chunk::Chunk;
 use re_entity_db::{
     ChunkFetcher, ChunkPrefetchOptions, FetchStage, RemainingByteBudget, StoreBundle,
@@ -28,6 +29,7 @@ pub struct RecordingPrefetchInfo {
 /// recordings over background recordings.
 pub fn prefetch_chunks_for_recordings(
     egui_ctx: &egui::Context,
+    async_runtime: &AsyncRuntimeHandle,
     store_bundle: &mut StoreBundle,
     recordings_info: &HashMap<StoreId, RecordingPrefetchInfo>,
     total_bytes_in_memory: u64,
@@ -177,7 +179,11 @@ pub fn prefetch_chunks_for_recordings(
     // Then finish fetching for all
     let results = chain!(active_states, preview_states, background_states)
         .map(|state| {
-            let load_fn = make_load_fn(egui_ctx, connection_registry, &state.origin);
+            let load_fn = make_load_fn(
+                egui_ctx,
+                async_runtime,
+                connection_registry.connection_handle(state.origin.clone()),
+            );
 
             (state.store_id, state.fetcher.finish(&load_fn))
         })
@@ -203,27 +209,33 @@ pub fn prefetch_chunks_for_recordings(
 
 fn make_load_fn<'a>(
     egui_ctx: &'a egui::Context,
-    connection_registry: &'a re_redap_client::ConnectionRegistryHandle,
-    origin: &'a re_uri::Origin,
+    async_runtime: &'a AsyncRuntimeHandle,
+    connection: re_redap_client::ConnectionHandle,
 ) -> impl Fn(RecordBatch) -> re_entity_db::ChunkPromise + 'a {
     move |rb| {
         egui_ctx.request_repaint();
-        let connection_registry = connection_registry.clone();
-        let origin = origin.clone();
+        let egui_ctx = egui_ctx.clone();
+        let connection = connection.clone();
 
-        let fut = async move {
-            let mut client = connection_registry.client(origin).await.map_err(|err| {
-                re_log::warn_once!("Failed to connect to server: {err}");
-            })?;
-            load_chunks(&mut client, &rb).await.map_err(|err| {
-                re_log::warn_once!("{err}");
-            })
-        };
+        let (sender, promise) = poll_promise::Promise::new();
+        async_runtime.spawn_future(async move {
+            let result = async {
+                let mut client = connection.client().await.map_err(|err| {
+                    re_log::warn_once!("Failed to connect to server: {err}");
+                })?;
+                load_chunks(&mut client, &rb).await.map_err(|err| {
+                    re_log::warn_once!("{err}");
+                })
+            }
+            .await;
 
-        cfg_select! {
-            target_arch = "wasm32" => poll_promise::Promise::spawn_local(fut),
-            _ => poll_promise::Promise::spawn_async(fut),
-        }
+            // The promise must be fulfilled before the repaint is requested,
+            // or the frame it triggers may poll the promise before the result is in it.
+            sender.send(result);
+            egui_ctx.request_repaint();
+        });
+
+        promise
     }
 }
 
@@ -239,7 +251,7 @@ async fn load_chunks(client: &mut ConnectionClient, batch: &RecordBatch) -> ApiR
 
     let chunk_stream = client.fetch_segment_chunks_by_id(batch).await?;
     let mut chunk_stream =
-        re_redap_client::fetch_chunks_response_to_chunk_and_segment_id(chunk_stream);
+        re_redap_client::fetch_chunks_response_to_chunk_and_segment_id(chunk_stream, None);
     let mut all_chunks = Vec::new();
     while let Some(chunks) = chunk_stream.next().await {
         for (chunk, _partition_id) in chunks? {

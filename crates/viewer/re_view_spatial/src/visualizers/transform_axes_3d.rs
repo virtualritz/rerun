@@ -48,6 +48,7 @@ impl VisualizerSystem for TransformAxes3DVisualizer {
                 .collect(),
             ),
             queried: TransformAxes3D::all_components().iter().cloned().collect(),
+            annotation_context: None,
         }
     }
 
@@ -165,9 +166,10 @@ impl VisualizerSystem for TransformAxes3DVisualizer {
                 }
             }
 
-            // Early exit if there's nothing to do.
+            // Nothing to draw for *this* instruction (e.g. its transform frame can't be
+            // resolved to the view's target frame).
             if transforms_to_draw.is_empty() {
-                return Ok(output);
+                continue;
             }
 
             let axis_length_identifier = TransformAxes3D::descriptor_axis_length().component;

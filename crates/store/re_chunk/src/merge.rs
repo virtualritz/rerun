@@ -90,7 +90,7 @@ impl Chunk {
                         .map(|timeline| format!("{}: {}", timeline.name(), timeline.typ()))
                         .format(", "),
                 )
-            } else if !cl.same_datatypes(cr) {
+            } else if !cl.same_encodings(cr) {
                 format!(
                     "cannot concatenate chunks with different datatypes for shared components:\n{}\n{}",
                     cl.component_descriptors().format(", "),
@@ -118,7 +118,7 @@ impl Chunk {
             #[expect(clippy::unwrap_used)]
             // concatenating 2 RowId arrays must yield another RowId array
             row_ids
-                .downcast_array_ref::<FixedSizeBinaryArray>()
+                .try_downcast_array_ref::<FixedSizeBinaryArray>()
                 .unwrap()
                 .clone()
         };
@@ -325,7 +325,7 @@ impl Chunk {
     ///
     /// Ignores potential differences in component descriptors.
     #[inline]
-    pub fn same_datatypes(&self, rhs: &Self) -> bool {
+    pub fn same_encodings(&self, rhs: &Self) -> bool {
         self.components.values().all(|lhs_column| {
             if let Some(rhs_column) = rhs.components.get(lhs_column.descriptor.component) {
                 lhs_column.list_array.data_type() == rhs_column.list_array.data_type()
@@ -343,7 +343,7 @@ impl Chunk {
     /// * Use the same datatypes for the components they have in common.
     #[inline]
     pub fn concatenable(&self, rhs: &Self) -> bool {
-        self.same_entity_paths(rhs) && self.same_timelines(rhs) && self.same_datatypes(rhs)
+        self.same_entity_paths(rhs) && self.same_timelines(rhs) && self.same_encodings(rhs)
     }
 }
 
@@ -382,6 +382,7 @@ impl TimeColumn {
 #[cfg(test)]
 mod tests {
     use re_log_types::example_components::{MyColor, MyLabel, MyPoint, MyPoint64, MyPoints};
+    use std::assert_matches;
 
     use super::*;
     use crate::{Chunk, RowId, Timeline};
@@ -954,14 +955,14 @@ mod tests {
                 )
                 .build()?;
 
-            assert!(matches!(
+            assert_matches!(
                 chunk1.concatenated_unsorted(&chunk2),
                 Err(ChunkError::Malformed { .. })
-            ));
-            assert!(matches!(
+            );
+            assert_matches!(
                 chunk2.concatenated_unsorted(&chunk1),
                 Err(ChunkError::Malformed { .. })
-            ));
+            );
         }
 
         // Different timelines
@@ -993,14 +994,14 @@ mod tests {
                 )
                 .build()?;
 
-            assert!(matches!(
+            assert_matches!(
                 chunk1.concatenated_unsorted(&chunk2),
                 Err(ChunkError::Malformed { .. })
-            ));
-            assert!(matches!(
+            );
+            assert_matches!(
                 chunk2.concatenated_unsorted(&chunk1),
                 Err(ChunkError::Malformed { .. })
-            ));
+            );
         }
 
         // Different datatypes
@@ -1038,14 +1039,14 @@ mod tests {
                 )
                 .build()?;
 
-            assert!(matches!(
+            assert_matches!(
                 chunk1.concatenated_unsorted(&chunk2),
                 Err(ChunkError::Malformed { .. })
-            ));
-            assert!(matches!(
+            );
+            assert_matches!(
                 chunk2.concatenated_unsorted(&chunk1),
                 Err(ChunkError::Malformed { .. })
-            ));
+            );
         }
 
         Ok(())

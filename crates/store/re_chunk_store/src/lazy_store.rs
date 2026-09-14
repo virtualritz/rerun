@@ -5,13 +5,13 @@ use ahash::{HashMap, HashMapExt as _};
 use nohash_hasher::{IntMap, IntSet};
 
 use re_chunk::{Chunk, ChunkId};
-use re_log_encoding::{ChunkProvider, RawRrdManifest, RrdManifest};
+use re_log_encoding::{ChunkProvider, ChunkProviderError, RawRrdManifest, RrdManifest};
 use re_log_types::{AbsoluteTimeRange, EntityPath, StoreId, TimelineName};
 
 use crate::{
     ChunkStore, ChunkStoreConfig, ChunkStoreHandle, ChunkStoreResult, ChunkTrackingMode,
-    EntityTree, ExtractPropertiesError, LatestAtQuery, QueryResults, RangeQuery, StoreSchema,
-    extract_properties_from_chunks,
+    EarliestAtQuery, EntityTree, ExtractPropertiesError, LatestAtQuery, QueryResults, RangeQuery,
+    StoreSchema, extract_properties_from_chunks,
 };
 
 /// A [`ChunkStore`] backed by a [`ChunkProvider`], with index loaded but chunks loaded on demand.
@@ -29,7 +29,7 @@ pub struct LazyStore {
     store: ChunkStoreHandle,
     provider: Arc<dyn ChunkProvider>,
 
-    /// Precomputed map from `ChunkId` to manifest row index.
+    /// Precomputed map from `ChunkId` to its row index in the provider's manifest.
     chunk_id_to_index: HashMap<ChunkId, usize>,
 
     /// Precomputed per-chunk timeline ranges.
@@ -44,7 +44,9 @@ impl LazyStore {
     /// Build a lazy store from any chunk provider.
     ///
     /// The provider's manifest is used to populate the inner [`ChunkStore`]'s virtual index; the
-    /// provider's `load_chunks` serves on-demand reads.
+    /// provider's `load_chunks` serves on-demand reads. A provider serving the chunks of more than
+    /// one segment, e.g. a dataset segment and the assets it references, describes all of them in
+    /// that one manifest, which has a column for the segment of every chunk.
     ///
     /// Infallible: every fallible step (manifest parsing, file open, etc.) happens during the
     /// provider's own construction.
@@ -139,32 +141,20 @@ impl LazyStore {
         self.manifest().num_chunks()
     }
 
-    /// The parsed manifest for this store.
-    pub fn manifest(&self) -> &Arc<RrdManifest> {
-        self.provider.manifest()
-    }
-
-    /// Human-readable source identifier of the underlying provider, for diagnostics.
-    pub fn source(&self) -> String {
-        self.provider.source()
-    }
-
-    /// The raw manifest as-parsed from the RRD footer, before validation/extraction.
-    ///
-    /// Kept around so the server can synthesize `GetRrdManifest` responses without materializing
-    /// chunks: the footer already contains everything a client needs to pick which chunks to fetch.
-    pub fn raw_manifest(&self) -> &Arc<RawRrdManifest> {
-        self.provider.raw_manifest()
-    }
-
     /// The underlying chunk provider.
     pub fn provider(&self) -> &Arc<dyn ChunkProvider> {
         &self.provider
     }
 
-    /// Look up the manifest row index for a given chunk ID.
+    /// Look up the row index of a chunk in [`Self::manifest`].
     pub fn chunk_row_index(&self, chunk_id: &ChunkId) -> Option<usize> {
         self.chunk_id_to_index.get(chunk_id).copied()
+    }
+
+    /// The deflated byte size of a chunk.
+    pub fn chunk_byte_size(&self, chunk_id: &ChunkId) -> Option<u64> {
+        let row = self.chunk_row_index(chunk_id)?;
+        self.manifest().col_chunk_byte_size().get(row).copied()
     }
 
     /// Per-chunk timeline ranges.
@@ -228,6 +218,27 @@ impl LazyStore {
             )
     }
 
+    /// Run an earliest-at query against the virtual index.
+    ///
+    /// Returns [`QueryResults`] with physical chunks in `chunks` and
+    /// not-yet-loaded chunk IDs in `missing_virtual`.
+    pub fn earliest_at_relevant_chunks_for_all_components(
+        &self,
+        report_mode: ChunkTrackingMode,
+        query: &EarliestAtQuery,
+        entity_path: &EntityPath,
+        include_static: bool,
+    ) -> QueryResults {
+        self.store
+            .read()
+            .earliest_at_relevant_chunks_for_all_components(
+                report_mode,
+                query,
+                entity_path,
+                include_static,
+            )
+    }
+
     /// Run a range query against the virtual index.
     ///
     /// Returns [`QueryResults`] with physical chunks in `chunks` and
@@ -245,6 +256,29 @@ impl LazyStore {
             entity_path,
             include_static,
         )
+    }
+}
+
+// `LazyStore` is itself a provider.
+#[async_trait::async_trait]
+impl ChunkProvider for LazyStore {
+    fn manifest(&self) -> &Arc<RrdManifest> {
+        self.provider.manifest()
+    }
+
+    fn raw_manifest(&self) -> &Arc<RawRrdManifest> {
+        self.provider.raw_manifest()
+    }
+
+    fn source(&self) -> String {
+        self.provider().source()
+    }
+
+    async fn load_chunks(&self, ids: &[ChunkId]) -> Result<Vec<Arc<Chunk>>, ChunkProviderError> {
+        // We delegate to the inherant method, which tracks loaded chunks.
+        Self::load_chunks(self, ids)
+            .await
+            .map_err(|err| ChunkProviderError(Box::new(err)))
     }
 }
 
@@ -278,7 +312,7 @@ mod tests {
             for frame_idx in 0..num_frames {
                 let entity_path = EntityPath::from(format!("/entity_{entity_idx}"));
                 let row_id = RowId::new();
-                let points = MyPoint::from_iter(frame_idx as u32..frame_idx as u32 + 1);
+                let points = MyPoint::from_iter((frame_idx as u32)..=(frame_idx as u32));
                 let chunk = Chunk::builder(entity_path)
                     .with_sparse_component_batches(
                         row_id,

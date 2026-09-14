@@ -1,7 +1,7 @@
 // This is a Rerun type definition for the SDK, not executable code.
 // It is parsed by `re_types_builder` to generate the Rust, Python and C++ bindings.
 
-/// A time series view for scalars over time, for use with [archetypes.Scalars].
+/// A time series view for scalars over time, for use with [`rerun::archetypes::Scalars`].
 ///
 /// \example views/timeseries title="Use a blueprint to customize a TimeSeriesView." image="https://static.rerun.io/timeseries_view/c87150647feb413627fdb8563afe33b39d7dbf57/1200w.png"
 #[rerun::rerun_type]
@@ -19,6 +19,9 @@ pub struct TimeSeriesView {
 
     /// Configures the background of the plot.
     pub background: rerun::blueprint::archetypes::PlotBackground,
+
+    /// Configures tooltip and data point marker behavior.
+    pub interaction: rerun::blueprint::archetypes::PlotInteraction,
 
     /// Configures which range on each timeline is shown by this view (unless specified differently per entity).
     ///

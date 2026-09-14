@@ -12,6 +12,14 @@ pub struct AppOptions {
     /// Experimental feature flags.
     pub experimental: ExperimentalAppOptions,
 
+    /// Load `.rrd` files through the Viewer's in-process catalog instead of importing them
+    /// as a live recording.
+    ///
+    /// When enabled, opened `.rrd` files are registered with the catalog and surfaced as redap
+    /// datasets under an internal server in the recording panel. When disabled, files are imported
+    /// directly into the viewer as plain recordings.
+    pub use_viewer_catalog: bool,
+
     /// Warn if the e2e latency exceeds this value.
     pub warn_e2e_latency: f32,
 
@@ -22,6 +30,9 @@ pub struct AppOptions {
     ///
     /// If false, you can still view them in the notifications panel.
     pub show_notification_toasts: bool,
+
+    /// Check for a newer Rerun version when the Viewer starts.
+    pub check_for_updates_on_startup: bool,
 
     /// Use Rerun's custom window decorations instead of the native OS decorations.
     pub custom_window_decorations: bool,
@@ -87,13 +98,17 @@ impl Default for AppOptions {
 impl AppOptions {
     fn default_with_custom_window_decorations(custom_window_decorations: bool) -> Self {
         Self {
-            experimental: Default::default(),
+            experimental: ExperimentalAppOptions::default(),
+
+            use_viewer_catalog: true,
 
             warn_e2e_latency: 1.0,
 
             show_metrics: cfg!(debug_assertions),
 
             show_notification_toasts: true,
+
+            check_for_updates_on_startup: true,
 
             custom_window_decorations,
 
@@ -126,6 +141,19 @@ impl AppOptions {
         Self {
             memory_limit: MemoryLimit::UNLIMITED,
             show_metrics: false, // flaky in snapshot tests
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            custom_window_decorations: false,
+            video: VideoOptions::test(),
+
+            // Always show the full date so timestamps render as `YYYY-MM-DD HH:MM:SS`
+            // regardless of when the test runs. The default `HideDateToday` would
+            // silently break snapshots once the calendar day rolls over.
+            timestamp_format: TimestampFormat::default()
+                .with_date_visibility(re_log_types::DateVisibility::ShowDate),
+
+            // Hide toast notifications by default in tests since they have a show-timeout and can cause flakiness in snapshot tests.
+            show_notification_toasts: false,
+
             // Ensure to not probe the Wayland compositor, because tests run without one.
             ..Self::default_with_custom_window_decorations(false)
         }
@@ -159,6 +187,7 @@ impl AppOptions {
     pub fn video_decoder_settings(&self) -> DecodeSettings {
         DecodeSettings {
             hw_acceleration: self.video.hw_acceleration,
+            allow_slow_av1_decoding: self.video.allow_slow_av1_decoding,
 
             #[cfg(not(target_arch = "wasm32"))]
             ffmpeg_path: self
@@ -174,6 +203,9 @@ impl AppOptions {
 pub struct VideoOptions {
     /// Preferred method for video decoding on web.
     pub hw_acceleration: DecodeHardwareAcceleration,
+
+    /// Allow native AV1 decoding without assembly optimizations.
+    pub allow_slow_av1_decoding: bool,
 
     /// Override the path to the FFmpeg binary.
     ///
@@ -192,14 +224,25 @@ pub struct VideoOptions {
     pub ffmpeg_path: String,
 }
 
+impl VideoOptions {
+    pub fn test() -> Self {
+        Self {
+            hw_acceleration: DecodeHardwareAcceleration::default(),
+            allow_slow_av1_decoding: true,
+            override_ffmpeg_path: true,
+            // Force the FFmpeg path to be wrong so we have a reproducible behavior.
+            ffmpeg_path: "/fake/ffmpeg/path".to_owned(),
+        }
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize, Clone)]
 #[serde(default)]
 pub struct ExperimentalAppOptions {
-    /// Enable table cards and blueprints.
+    /// Enable the agent panel: a chat with a coding agent that can drive the viewer.
     ///
-    /// This enables registered table blueprints,
-    /// plus the table/card layout toggle for server-supplied tables.
-    pub table_cards_and_blueprints: bool,
+    /// Native only.
+    pub agent_panel: bool,
 
     /// Enable gamepad navigation in 3D spatial views.
     pub gamepad_navigation: bool,
@@ -209,12 +252,4 @@ pub struct ExperimentalAppOptions {
     /// Off by default: transparent point clouds are sorted on the CPU every frame, which is
     /// slow for large clouds. Opaque point clouds render much faster.
     pub point_cloud_transparency: bool,
-
-    /// Load `.rrd` files through the Viewer's in-process catalog instead of importing them
-    /// as a live recording.
-    ///
-    /// When enabled, opened `.rrd` files are registered with the catalog and surfaced as redap
-    /// datasets under an internal server in the recording panel. When disabled, files are imported
-    /// directly into the viewer as plain recordings.
-    pub use_internal_catalog: bool,
 }

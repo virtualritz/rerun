@@ -11,9 +11,9 @@ use arrow::array::types::{
     Int64Type, RunEndIndexType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 use arrow::array::{
-    Array, ArrayAccessor as _, DictionaryArray, FixedSizeBinaryArray, FixedSizeListArray,
-    GenericBinaryArray, GenericListArray, MapArray, OffsetSizeTrait, PrimitiveArray, RunArray,
-    StructArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    Array, ArrayAccessor as _, DictionaryArray, FixedSizeListArray, GenericBinaryArray,
+    GenericListArray, MapArray, OffsetSizeTrait, PrimitiveArray, RunArray, StructArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
     TimestampSecondArray, UnionArray, as_generic_binary_array, downcast_dictionary_array,
     downcast_integer_array, downcast_run_array,
 };
@@ -26,6 +26,7 @@ use arrow::util::display::{ArrayFormatter, FormatOptions};
 use egui::{RichText, Ui};
 use itertools::Itertools as _;
 use re_log_types::TimestampFormat;
+use re_span::Span;
 use re_ui::list_item::{CustomContent, LabelContent};
 use re_ui::syntax_highlighting::SyntaxHighlightedBuilder;
 use re_ui::{UiExt as _, UiLayout};
@@ -141,7 +142,11 @@ impl<'a> ArrayUi<'a> {
 
     /// Show a `list_item` based tree view of the data.
     pub fn show(&self, ui: &mut Ui) {
-        list_ui(ui, 0..self.array.len(), &*self.show_index);
+        list_ui(
+            ui,
+            Span::from_start_len(0, self.array.len()),
+            &*self.show_index,
+        );
     }
 
     /// Returns a [`SyntaxHighlightedBuilder`] that displays the entire array.
@@ -193,13 +198,7 @@ fn make_ui<'a>(
         DataType::Timestamp(TimeUnit::Nanosecond, _) => {
             show_custom(array.as_primitive::<TimestampNanosecondType>(), options)
         }
-        DataType::FixedSizeBinary(_) => {
-            let a = array
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .expect("FixedSizeBinaryArray downcast failed");
-            show_arrow_builtin(a, options)
-        }
+        DataType::FixedSizeBinary(_) => show_arrow_builtin(array.as_fixed_size_binary(), options),
         DataType::Binary => {
             show_custom(as_generic_binary_array::<i32>(array), options)
         }
@@ -212,13 +211,7 @@ fn make_ui<'a>(
         }
         DataType::List(_) => show_custom(as_generic_list_array::<i32>(array), options),
         DataType::LargeList(_) => show_custom(as_generic_list_array::<i64>(array), options),
-        DataType::FixedSizeList(_, _) => {
-            let a = array
-                .as_any()
-                .downcast_ref::<FixedSizeListArray>()
-                .expect("FixedSizeListArray downcast failed");
-            show_custom(a, options)
-        }
+        DataType::FixedSizeList(_, _) => show_custom(array.as_fixed_size_list(), options),
         DataType::Struct(_) => show_custom(as_struct_array(array), options),
         DataType::Map(_, _) => show_custom(as_map_array(array), options),
         DataType::Union(_, _) => show_custom(as_union_array(array), options),
@@ -569,14 +562,14 @@ fn write_list(
 ///
 /// If there are enough items, it will show items in a tree of ranges.
 ///
-/// Since arrow arrays might not start at 0, you need pass a `Range<usize>`.
+/// Since arrow arrays might not start at 0, you need pass a [`Span`].
 /// E.g. a [`GenericListArray`] consists of a single large values array and an offsets array.
 /// So the nth list would be a slice of the main array based on the offsets array at n.
 /// See the [`GenericListArray`] docs for more info.
 ///
 /// The indexes shown in the UI will be _normalized_ so it's always `0..end-start`.
-pub(crate) fn list_ui(ui: &mut Ui, range: Range<usize>, values: &dyn ShowIndex) {
-    let ui_range = 0..(range.end - range.start);
+pub(crate) fn list_ui(ui: &mut Ui, range: Span<usize>, values: &dyn ShowIndex) {
+    let ui_range = Span::from_start_len(0, range.len);
 
     list_item_ranges(ui, ui_range, &mut |ui, ui_idx| {
         let node = ArrowNode::index(ui_idx, values);
@@ -610,7 +603,7 @@ impl<'a, O: OffsetSizeTrait> ShowIndexState<'a> for &'a GenericListArray<O> {
         let offsets = self.value_offsets();
         let end = offsets[idx + 1].as_usize();
         let start = offsets[idx].as_usize();
-        list_ui(ui, start..end, show_index.as_ref());
+        list_ui(ui, Span::from_start_end(start, end), show_index.as_ref());
     }
 
     fn is_item_nested(&self) -> bool {
@@ -664,7 +657,7 @@ impl<'a> ShowIndexState<'a> for &'a FixedSizeListArray {
     ) {
         let start = idx * *value_length;
         let end = start + *value_length;
-        list_ui(ui, start..end, values.as_ref());
+        list_ui(ui, Span::from_start_end(start, end), values.as_ref());
     }
 
     fn is_item_nested(&self) -> bool {
@@ -846,8 +839,7 @@ impl<'a> ShowIndexState<'a> for &'a UnionArray {
         };
 
         let max_id = fields.iter().map(|(id, _)| id).max().unwrap_or_default() as usize;
-        let mut show_fields: Vec<Option<FieldDisplay<'_>>> =
-            (0..max_id + 1).map(|_| None).collect();
+        let mut show_fields: Vec<Option<FieldDisplay<'_>>> = (0..=max_id).map(|_| None).collect();
         for (i, field) in fields.iter() {
             let formatter = make_ui(self.child(i).as_ref(), options)?;
             show_fields[i as usize] = Some((field, formatter));

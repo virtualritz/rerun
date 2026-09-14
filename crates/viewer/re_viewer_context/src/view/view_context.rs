@@ -60,6 +60,22 @@ impl<'a> ViewContext<'a> {
             instruction_id: instruction_id.into(),
             archetype_name: None,
             query,
+            annotation_context: None,
+        }
+    }
+
+    /// The same context, but addressing a different view.
+    ///
+    /// The returned context has an empty [`Self::query_result`], so it is only good for reading
+    /// and writing that view's blueprint properties.
+    pub fn with_view_id(&self, view_id: ViewId) -> Self {
+        static EMPTY_QUERY_RESULT: std::sync::LazyLock<DataQueryResult> =
+            std::sync::LazyLock::new(DataQueryResult::default);
+
+        Self {
+            view_id,
+            query_result: &EMPTY_QUERY_RESULT,
+            ..*self
         }
     }
 

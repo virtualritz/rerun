@@ -16,20 +16,21 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::wildcard_imports)]
 
+use ::arrow::array::ArrayRef;
 use ::re_types_core::SerializationResult;
+use ::re_types_core::SerializedComponentBatch;
 use ::re_types_core::try_serialize_field;
-use ::re_types_core::{ComponentBatch as _, SerializedComponentBatch};
 use ::re_types_core::{ComponentDescriptor, ComponentType};
 use ::re_types_core::{DeserializationError, DeserializationResult};
+use ::std::borrow::Cow;
 
 /// **Archetype**: References a single video frame.
 ///
-/// Used to display individual video frames from a [`archetypes::AssetVideo`][crate::archetypes::AssetVideo].
+/// Used to display individual video frames from an [`archetypes::AssetVideo`][crate::archetypes::AssetVideo] or [`archetypes::VideoStream`][crate::archetypes::VideoStream].
 /// To show an entire video, a video frame reference for each frame of the video should be logged.
+/// References to a [`archetypes::VideoStream`][crate::archetypes::VideoStream] use the active Viewer timeline.
 ///
 /// See <https://rerun.io/docs/reference/video> for details of what is and isn't supported.
-///
-/// TODO(#10422): [`archetypes::VideoFrameReference`][crate::archetypes::VideoFrameReference] does not yet work with [`archetypes::VideoStream`][crate::archetypes::VideoStream].
 ///
 /// ## Examples
 ///
@@ -147,7 +148,7 @@ pub struct VideoFrameReference {
     /// (bidirectionally predicted frames) there may be an offset on the first presentation timestamp in the video.
     pub timestamp: Option<SerializedComponentBatch>,
 
-    /// Optional reference to an entity with a [`archetypes::AssetVideo`][crate::archetypes::AssetVideo].
+    /// Optional reference to an entity with an [`archetypes::AssetVideo`][crate::archetypes::AssetVideo] or [`archetypes::VideoStream`][crate::archetypes::VideoStream].
     ///
     /// If none is specified, the video is assumed to be at the same entity.
     /// Note that blueprint overrides on the referenced video will be ignored regardless,
@@ -273,31 +274,33 @@ impl ::re_types_core::Archetype for VideoFrameReference {
     }
 
     #[inline]
-    fn required_components() -> ::std::borrow::Cow<'static, [ComponentDescriptor]> {
+    fn required_components() -> Cow<'static, [ComponentDescriptor]> {
         REQUIRED_COMPONENTS.as_slice().into()
     }
 
     #[inline]
-    fn recommended_components() -> ::std::borrow::Cow<'static, [ComponentDescriptor]> {
+    fn recommended_components() -> Cow<'static, [ComponentDescriptor]> {
         RECOMMENDED_COMPONENTS.as_slice().into()
     }
 
     #[inline]
-    fn optional_components() -> ::std::borrow::Cow<'static, [ComponentDescriptor]> {
+    fn optional_components() -> Cow<'static, [ComponentDescriptor]> {
         OPTIONAL_COMPONENTS.as_slice().into()
     }
 
     #[inline]
-    fn all_components() -> ::std::borrow::Cow<'static, [ComponentDescriptor]> {
+    fn all_components() -> Cow<'static, [ComponentDescriptor]> {
         ALL_COMPONENTS.as_slice().into()
     }
 
     #[inline]
     fn from_arrow_components(
-        arrow_data: impl IntoIterator<Item = (ComponentDescriptor, arrow::array::ArrayRef)>,
+        arrow_data: impl IntoIterator<Item = (ComponentDescriptor, ArrayRef)>,
     ) -> DeserializationResult<Self> {
         re_tracing::profile_function!();
-        use ::re_types_core::{Loggable as _, ResultExt as _};
+        use ::re_types_core::{
+            ArrowDataType as _, FromArrow as _, FromArrowOpt as _, ResultExt as _,
+        };
         let arrays_by_descr: ::nohash_hasher::IntMap<_, _> = arrow_data.into_iter().collect();
         let timestamp = arrays_by_descr
             .get(&Self::descriptor_timestamp())
@@ -372,7 +375,7 @@ impl VideoFrameReference {
     /// Clear all the fields of a `VideoFrameReference`.
     #[inline]
     pub fn clear_fields() -> Self {
-        use ::re_types_core::Loggable as _;
+        use ::re_types_core::ArrowDataType as _;
         Self {
             timestamp: Some(SerializedComponentBatch::new(
                 crate::components::VideoTimestamp::arrow_empty(),
@@ -479,7 +482,7 @@ impl VideoFrameReference {
         self
     }
 
-    /// Optional reference to an entity with a [`archetypes::AssetVideo`][crate::archetypes::AssetVideo].
+    /// Optional reference to an entity with an [`archetypes::AssetVideo`][crate::archetypes::AssetVideo] or [`archetypes::VideoStream`][crate::archetypes::VideoStream].
     ///
     /// If none is specified, the video is assumed to be at the same entity.
     /// Note that blueprint overrides on the referenced video will be ignored regardless,

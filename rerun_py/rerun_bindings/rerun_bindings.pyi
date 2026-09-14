@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -13,6 +13,10 @@ import pyarrow as pa
 
 from .types import (
     IndexValuesLike as IndexValuesLike,
+    MergeSplitSettingsDict as MergeSplitSettingsDict,
+    OwnChunkRuleDict as OwnChunkRuleDict,
+    TemporalTimelineType as TemporalTimelineType,
+    TimelineType as TimelineType,
 )
 
 # NOTE
@@ -1083,7 +1087,7 @@ class DatasetEntryInternal:
 
     # ---
 
-    def segment_store(self, segment_id: str) -> LazyStoreInternal: ...
+    def segment_store(self, segment_id: str, *, include_assets: bool = True) -> LazyStoreInternal: ...
 
     # ---
 
@@ -1340,6 +1344,7 @@ class ViewerClientInternal:
     def __init__(self, addr: str) -> None: ...
     def send_table(self, id: str, table: pa.RecordBatch) -> None: ...
     def save_screenshot(self, file_path: str, view_id: str | None) -> None: ...
+    def set_time_cursor(self, timeline: str | None, time: int, play: bool) -> None: ...
 
 class NotFoundError(Exception):
     """Raised when the requested resource is not found."""
@@ -1370,7 +1375,9 @@ class DeriveLensInternal:
         selector: SelectorInternal,
         cast_to: pa.DataType | Literal["auto"] | None = None,
     ) -> DeriveLensInternal: ...
-    def to_timeline(self, timeline_name: str, timeline_type: str, selector: SelectorInternal) -> DeriveLensInternal: ...
+    def to_timeline(
+        self, timeline_name: str, timeline_type: TimelineType, selector: SelectorInternal
+    ) -> DeriveLensInternal: ...
 
 class MutateLensInternal:
     def __init__(
@@ -1401,7 +1408,7 @@ class _ServerInternal:
         host:
             The IP address to bind the server to.
         port:
-            The port to bind the server to.
+            The port to bind the server to, or `0` to let the OS pick a free port.
         datasets:
             Optional dictionary mapping dataset names to lists of RRD file paths.
         dataset_prefixes:
@@ -1543,7 +1550,7 @@ def _log_tracing_session_finished(
 #####################################################################################################################
 
 class ChunkStoreInternal:
-    """Internal implementation. Use ChunkStore from rerun.experimental instead."""
+    """Internal implementation. Use ChunkStore from rerun.chunk instead."""
 
     @staticmethod
     def from_chunks(chunks: list[ChunkInternal]) -> ChunkStoreInternal: ...
@@ -1551,6 +1558,16 @@ class ChunkStoreInternal:
     def num_chunks(self) -> int: ...
     def summary(self) -> str: ...
     def stream(self) -> LazyChunkStreamInternal: ...
+    def _chunk_index(self) -> tuple[str, pa.RecordBatch]: ...
+    def _optimized_stream(
+        self,
+        *,
+        chunk_max_bytes: int | None = None,
+        chunk_max_rows: int | None = None,
+        chunk_max_rows_if_unsorted: int | None = None,
+        target_timeline: str | None = None,
+        own_chunk: Sequence[OwnChunkRuleDict] | None = None,
+    ) -> LazyChunkStreamInternal: ...
     def reader(
         self,
         *,
@@ -1563,17 +1580,27 @@ class ChunkStoreInternal:
     ) -> TableProviderAdapterInternal: ...
 
 class LazyStoreInternal:
-    """Internal implementation. Use LazyStore from rerun.experimental instead."""
+    """Internal implementation. Use LazyStore from rerun.chunk instead."""
 
     def schema(self) -> SchemaInternal: ...
     def num_chunks(self) -> int: ...
     def summary(self) -> str: ...
     def stream(self) -> LazyChunkStreamInternal: ...
+    def _chunk_index(self) -> tuple[str, pa.RecordBatch]: ...
+    def _optimized_stream(
+        self,
+        *,
+        chunk_max_bytes: int | None = None,
+        chunk_max_rows: int | None = None,
+        chunk_max_rows_if_unsorted: int | None = None,
+        target_timeline: str | None = None,
+        own_chunk: Sequence[OwnChunkRuleDict] | None = None,
+    ) -> LazyChunkStreamInternal: ...
     @property
     def _chunks_loaded(self) -> int: ...
 
 class StoreEntryInternal:
-    """Internal implementation. Use StoreEntry from rerun.experimental instead."""
+    """Internal implementation. Use StoreEntry from rerun.chunk instead."""
 
     @property
     def kind(self) -> Literal["recording", "blueprint"]: ...
@@ -1583,7 +1610,7 @@ class StoreEntryInternal:
     def recording_id(self) -> str: ...
 
 class RrdReaderInternal:
-    """Internal implementation. Use RrdReader from rerun.experimental instead."""
+    """Internal implementation. Use RrdReader from rerun.chunk instead."""
 
     def __init__(self, path: str) -> None: ...
     def store_entries(self) -> list[StoreEntryInternal]: ...
@@ -1681,12 +1708,12 @@ class _McapInfoInternal:
     def channels(self) -> list[_McapChannelInfoInternal]: ...
 
 class McapReaderInternal:
-    """Internal implementation. Use McapReader from rerun.experimental instead."""
+    """Internal implementation. Use McapReader from rerun.chunk instead."""
 
     def __init__(
         self,
         path: str,
-        timeline_type: str,
+        timeline_type: TemporalTimelineType,
         timestamp_offset_ns: int | None,
         decoders: list[str] | None,
         include_topic_regex: list[str] | None,
@@ -1728,7 +1755,7 @@ class Mp4ReaderInternal:
         mode: Literal["asset", "stream"] = "stream",
         chunk_by_gop: bool = True,
         timeline_name: str = "video",
-        timeline_type: Literal["duration", "timestamp"] = "duration",
+        timeline_type: TemporalTimelineType = "duration_ns",
         transcode: Mp4TranscodeOptionsInternal | None = None,
         entity_path: str | None = None,
     ) -> None: ...
@@ -1774,7 +1801,7 @@ class ParquetReaderInternal:
     def path(self) -> Path: ...
 
 class LazyChunkStreamInternal:
-    """Internal implementation. Use LazyChunkStream from rerun.experimental instead."""
+    """Internal implementation. Use LazyChunkStream from rerun.chunk instead."""
 
     def filter(
         self,
@@ -1909,6 +1936,9 @@ class _QueryMetrics:
     entity_path_narrowing_applied: bool
     """True when projection-based entity-path narrowing actually trimmed the set of entity paths sent to `query_dataset`."""
 
+    target_partitions: int
+    """DataFusion target partition count for this scan — the degree of parallelism the plan was built for. Makes `peak_inflight_fetches` interpretable."""
+
     # Execution-time
     total_duration: timedelta
     """Wall-clock time from the start of `scan()` until the query finished (cleanly or via error). Always populated."""
@@ -2012,6 +2042,19 @@ class _QueryMetrics:
 
     pipeline_stall_breaker_activations: int
     """Number of saturated-pipeline stall-breaker activations."""
+
+    # Delivered payload, decode cost, observed parallelism
+    delivered_rows: int
+    """Total rows delivered to the consumer, summed across partitions — post-decode, post-query, post-client-filter."""
+
+    delivered_bytes: int
+    """In-memory (decoded) size of every record batch delivered to the consumer, summed across partitions."""
+
+    decode_duration: timedelta
+    """Total CPU time spent decoding/decompressing fetched chunks (both fetch paths). Compare against `total_duration` to separate CPU-bound queries from network-bound ones."""
+
+    peak_inflight_fetches: int
+    """Highest number of fetch tasks in flight at once across the whole query (one unit per concurrent merged transport batch)."""
 
 class _MetricsCollectorHandle:
     """Opaque handle held by the `query_metrics()` context manager."""

@@ -16,8 +16,9 @@ FILES_ALLOWED_TO_BE_LARGE = {
     "crates/store/re_protos/proto/schema_snapshot.yaml",
     "crates/store/re_protos/src/v1alpha1/rerun.cloud.v1alpha1.rs",
     "crates/store/re_protos/src/v1alpha1/rerun.cloud.v1alpha1.ext.rs",
+    "crates/store/re_protos/src/v1alpha1/rerun.v1alpha1.fds.bin",
     "crates/store/re_query/src/range_zip/generated.rs",
-    "crates/store/re_sdk_types/src/datatypes/tensor_buffer.rs",
+    "crates/store/re_sdk_types/src/encodings/tensor_buffer.rs",
     "crates/store/re_sdk_types/src/reflection/mod.rs",
     "crates/top/re_sdk/src/recording_stream.rs",
     "crates/viewer/re_ui/data/Inter-Medium.otf",
@@ -39,11 +40,9 @@ PATH_PREFIXES_ALLOWED_TO_CONTAIN_NON_LFS_PNGS = (
     "crates/viewer/re_ui/data/logo_light_mode.png",
     "crates/viewer/re_viewer/data/app_icon.png",
     "crates/viewer/re_viewer/data/app_icon_mac.png",
-    "crates/viewer/re_web_viewer_server/web_viewer/apple-touch-icon.png",
+    "crates/top/re_web_viewer_server/web_viewer/apple-touch-icon.png",
     "docs/snippets/all/archetypes/ferris.png",
-    "docs/snippets/all/archetypes/encoded_depth.png",
     "docs/snippets/src/snippets/ferris.png",
-    "docs/snippets/src/snippets/encoded_depth.png",
     "examples/assets/example.png",
 )
 

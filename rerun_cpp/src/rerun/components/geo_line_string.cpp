@@ -3,7 +3,7 @@
 
 #include "geo_line_string.hpp"
 
-#include "../datatypes/dvec2d.hpp"
+#include "../encodings/dvec2d.hpp"
 
 #include <arrow/builder.h>
 #include <arrow/type_fwd.h>
@@ -11,9 +11,9 @@
 namespace rerun::components {}
 
 namespace rerun {
-    const std::shared_ptr<arrow::DataType>& Loggable<components::GeoLineString>::arrow_datatype() {
+    const std::shared_ptr<arrow::DataType>& Loggable<components::GeoLineString>::arrow_data_type() {
         static const auto datatype = arrow::list(
-            arrow::field("item", Loggable<rerun::datatypes::DVec2D>::arrow_datatype(), false)
+            arrow::field("item", Loggable<rerun::encodings::DVec2D>::arrow_data_type(), false)
         );
         return datatype;
     }
@@ -23,7 +23,7 @@ namespace rerun {
     ) {
         // TODO(andreas): Allow configuring the memory pool.
         arrow::MemoryPool* pool = arrow::default_memory_pool();
-        auto datatype = arrow_datatype();
+        auto datatype = arrow_data_type();
 
         ARROW_ASSIGN_OR_RAISE(auto builder, arrow::MakeBuilder(datatype, pool))
         if (instances && num_instances > 0) {
@@ -59,7 +59,7 @@ namespace rerun {
             const auto& element = elements[elem_idx];
             ARROW_RETURN_NOT_OK(builder->Append());
             if (element.lat_lon.data()) {
-                RR_RETURN_NOT_OK(Loggable<rerun::datatypes::DVec2D>::fill_arrow_array_builder(
+                RR_RETURN_NOT_OK(Loggable<rerun::encodings::DVec2D>::fill_arrow_array_builder(
                     value_builder,
                     element.lat_lon.data(),
                     element.lat_lon.size()

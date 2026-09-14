@@ -30,6 +30,7 @@ mod heuristics;
 mod image_info;
 mod item;
 mod item_collection;
+mod item_counter;
 mod link_button;
 mod maybe_mut_ref;
 pub mod open_url;
@@ -58,8 +59,8 @@ pub use re_ui::UiLayout;
 
 pub use self::active_store_context::ActiveStoreContext;
 pub use self::annotations::{
-    AnnotationContextStoreSubscriber, AnnotationMap, Annotations, ResolvedAnnotationInfo,
-    ResolvedAnnotationInfos,
+    AnnotationContextQuery, AnnotationContextStoreSubscriber, AnnotationContextTarget,
+    AnnotationContextTargetKind, AnnotationMap, Annotations, ResolvedAnnotationInfo,
 };
 pub use self::app_context::{AppContext, AuthContext};
 pub use self::app_options::{AppOptions, ExperimentalAppOptions, VideoOptions};
@@ -84,7 +85,8 @@ pub use self::component_fallbacks::{
     ComponentFallbackError, FallbackProviderRegistry, typed_fallback_for,
 };
 pub use self::component_ui_registry::{
-    ComponentUiRegistry, ComponentUiTypes, EditTarget, TryShowEditUiResult, VariantName,
+    ComponentUiRegistry, ComponentUiTypes, EditTarget, FallbackComponentUiCallback,
+    TryShowEditUiResult, VariantName,
 };
 pub use self::contents::{Contents, ContentsName, blueprint_id_to_tile_id};
 pub use self::drag_and_drop::{DragAndDropFeedback, DragAndDropManager, DragAndDropPayload};
@@ -99,6 +101,7 @@ pub use self::item::{
     resolve_mono_instance_path_item,
 };
 pub use self::item_collection::{ItemCollection, ItemContext};
+pub use self::item_counter::ItemCounter;
 pub use self::link_button::{
     LinkKind, ResolvedEntry, UrlNameLookup, make_url_decorator, segment_button_atoms, url_atoms,
 };
@@ -107,8 +110,8 @@ pub use self::query_context::{
     DataQueryResult, DataResultHandle, DataResultNode, DataResultTree, QueryContext,
 };
 pub use self::query_range::QueryRange;
-pub use self::recording_or_table::RecordingOrTable;
-pub use self::route::Route;
+pub use self::recording_or_table::RecordingOrLocalTable;
+pub use self::route::{EntryKind, Route};
 pub use self::selection_state::{
     ApplicationSelectionState, HoverHighlight, InteractionHighlight, SelectionChange,
     SelectionHighlight,
@@ -134,22 +137,24 @@ pub use self::utils::{
     video_timestamp_component_to_video_time,
 };
 pub use self::view::{
-    BufferAndFormatConstraint, DataResult, IdentifiedViewSystem, OptionalViewEntityHighlight,
-    PerSystemEntities, PreviewState, RecommendedMappings, RecommendedView, RecommendedVisualizers,
-    SingleRequiredComponentConstraint, SystemExecutionOutput, ViewClass, ViewClassExt,
-    ViewClassLayoutPriority, ViewClassPlaceholder, ViewClassRegistry, ViewClassRegistryError,
-    ViewClassUiOutput, ViewContext, ViewContextCollection, ViewContextSystem,
-    ViewContextSystemOncePerFrameResult, ViewEntityHighlight, ViewHighlights, ViewOutlineMasks,
-    ViewQuery, ViewSpawnHeuristics, ViewState, ViewStateExt, ViewStates, ViewSystemExecutionError,
-    ViewSystemIdentifier, ViewSystemRegistrator, ViewSystemState, ViewerDiagnostic,
-    ViewerReportSeverity, VisualizabilityConstraints, VisualizerCollection,
-    VisualizerComponentMappings, VisualizerComponentSource, VisualizerExecutionOutput,
-    VisualizerInstruction, VisualizerInstructionReport, VisualizerInstructionsPerType,
-    VisualizerQueryInfo, VisualizerReportContext, VisualizerSystem, VisualizerTypeReport,
-    VisualizerViewReport, VisualizersSectionOutput, VisualizersSectionUi,
+    BufferAndFormatConstraint, DataResult, IdentifiedViewSystem, MAX_VIEWS_SPAWNED,
+    OptionalViewEntityHighlight, PerSystemEntities, PreviewState, RecommendedMappings,
+    RecommendedView, RecommendedVisualizers, SingleRequiredComponentConstraint,
+    SystemExecutionOutput, ViewClass, ViewClassExt, ViewClassLayoutPriority, ViewClassPlaceholder,
+    ViewClassRegistry, ViewClassRegistryError, ViewClassUiOutput, ViewContext,
+    ViewContextCollection, ViewContextSystem, ViewContextSystemOncePerFrameResult,
+    ViewEntityHighlight, ViewHighlights, ViewOutlineMasks, ViewQuery, ViewSpawnHeuristics,
+    ViewState, ViewStateExt, ViewStates, ViewSystemExecutionError, ViewSystemIdentifier,
+    ViewSystemRegistrator, ViewSystemState, ViewerDiagnostic, ViewerReportSeverity,
+    VisualizabilityConstraints, VisualizerCollection, VisualizerComponentMappings,
+    VisualizerComponentSource, VisualizerExecutionOutput, VisualizerInstruction,
+    VisualizerInstructionReport, VisualizerInstructionsPerType, VisualizerQueryInfo,
+    VisualizerReportContext, VisualizerSystem, VisualizerTypeReport, VisualizerViewReport,
+    VisualizersSectionOutput, VisualizersSectionUi,
 };
 pub use self::viewer_context::ViewerContext;
 pub use self::visitor_flow_control::VisitorControlFlow; // Historical reasons
+pub use re_uri::TableReference;
 
 pub mod external {
     #[cfg(not(target_arch = "wasm32"))]
@@ -192,14 +197,6 @@ pub fn icon_for_container_kind(kind: &egui_tiles::ContainerKind) -> &'static re_
         egui_tiles::ContainerKind::Horizontal => &re_ui::icons::CONTAINER_HORIZONTAL,
         egui_tiles::ContainerKind::Vertical => &re_ui::icons::CONTAINER_VERTICAL,
         egui_tiles::ContainerKind::Grid => &re_ui::icons::CONTAINER_GRID,
-    }
-}
-
-/// The style to use for displaying this view name in the UI.
-pub fn contents_name_style(name: &ContentsName) -> re_ui::LabelStyle {
-    match name {
-        ContentsName::Named(_) => re_ui::LabelStyle::Normal,
-        ContentsName::Placeholder(_) => re_ui::LabelStyle::Unnamed,
     }
 }
 

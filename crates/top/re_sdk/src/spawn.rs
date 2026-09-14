@@ -128,12 +128,11 @@ impl SpawnOptions {
             if std::fs::metadata(&local_build_path).is_ok() {
                 re_log::info!("Spawning the locally built rerun at {local_build_path}");
                 return local_build_path;
-            } else {
-                re_log::info!(
-                    "No locally built rerun found at {local_build_path:?}, using executable named {:?} from PATH.",
-                    self.executable_name
-                );
             }
+            re_log::info!(
+                "No locally built rerun found at {local_build_path:?}, using executable named {:?} from PATH.",
+                self.executable_name
+            );
         }
 
         self.executable_name.clone()
@@ -321,7 +320,11 @@ pub fn spawn(opts: &SpawnOptions) -> Result<SpawnInfo, SpawnError> {
         .ok()
         .and_then(|output| {
             let output = String::from_utf8_lossy(&output.stdout);
-            re_build_info::CrateVersion::try_parse_from_build_info_string(output).ok()
+            let version =
+                re_build_info::CrateVersion::try_parse_from_build_info_string(&output).ok()?;
+            Some(re_build_info::CrateVersion::<'static>::from_bytes(
+                version.to_bytes(),
+            ))
         });
 
     if let Some(viewer_version) = viewer_version {

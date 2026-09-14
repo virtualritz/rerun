@@ -29,6 +29,7 @@ mod transform_frames_ui;
 mod video_ui;
 
 mod extra_data_ui;
+pub mod item_title;
 pub mod item_ui;
 
 pub use self::component_ui_registry::{add_to_registry, register_component_uis};
@@ -143,14 +144,17 @@ where
 
 // ---------------------------------------------------------------------------
 
-pub fn annotations(
+pub(crate) fn annotations(
     ctx: &StoreViewContext<'_>,
     entity_path: &re_entity_db::EntityPath,
 ) -> std::sync::Arc<re_viewer_context::Annotations> {
     re_tracing::profile_function!();
     let mut annotation_map = re_viewer_context::AnnotationMap::default();
     annotation_map.load(ctx.db, &ctx.query());
-    annotation_map.find(entity_path)
+    annotation_map.find(entity_path).map_or_else(
+        || std::sync::Arc::new(re_viewer_context::Annotations::missing_ref().clone()),
+        |annotations| std::sync::Arc::new(annotations.clone()),
+    )
 }
 
 /// Finds and deserializes the given component type if its descriptor matches the given archetype name.

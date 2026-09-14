@@ -46,6 +46,10 @@ pub enum CppAttr {
 /// How a type is presented in the documentation.
 #[derive(AsRefStr, Clone, Copy, Debug, Display, EnumIter, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DocsAttr {
+    /// The view can display data regardless of which archetype it belongs to.
+    #[strum(serialize = "attr.docs.archetype_agnostic")]
+    ArchetypeAgnostic,
+
     /// The heading the type is listed under, e.g. `Spatial 3D`.
     #[strum(serialize = "attr.docs.category")]
     Category,
@@ -86,6 +90,11 @@ pub enum RerunAttr {
     #[strum(serialize = "attr.rerun.no_ui_edit")]
     NoUiEdit,
 
+    /// Require this optional field in generated convenience constructors without making it
+    /// required for recording, reflection, or querying.
+    #[strum(serialize = "attr.rerun.required_for_constructor")]
+    RequiredForConstructor,
+
     /// One of the three lists an archetype field belongs to; see also
     /// [`Recommended`](Self::Recommended) and [`Required`](Self::Required).
     #[strum(serialize = "attr.rerun.optional")]
@@ -94,6 +103,14 @@ pub enum RerunAttr {
     /// The Arrow type of the field, when it is not the one its Rust type implies.
     #[strum(serialize = "attr.rerun.override_type")]
     OverrideType,
+
+    /// The component always gets a chunk of its own, never sharing one with any other component.
+    ///
+    /// This is for small components that a reader wants without the bulk they are logged next to,
+    /// e.g. `IsKeyframe` beside the video samples it points at. It overrides the rule that keeps
+    /// an archetype's components together in one chunk.
+    #[strum(serialize = "attr.rerun.own_chunk")]
+    OwnChunk,
 
     /// The field has a good default, so it is set unless the user says otherwise; see also
     /// [`Optional`](Self::Optional) and [`Required`](Self::Required).
@@ -129,6 +146,14 @@ pub enum RerunAttr {
 /// What the Rust backend does with a type.
 #[derive(AsRefStr, Clone, Copy, Debug, Display, EnumIter, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RustAttr {
+    /// Also implement the nullable Arrow traits, `ToArrowOpt` and `FromArrowOpt`.
+    ///
+    /// Every type implements `ToArrow` and `FromArrow`. The nullable variants are only needed by
+    /// types that appear as a nullable field of another type, since that field's (de)serializer
+    /// calls them.
+    #[strum(serialize = "attr.rust.arrow_opt")]
+    ArrowOpt,
+
     /// Traits to `#[derive]` on the generated type, on top of the ones every type gets.
     #[strum(serialize = "attr.rust.derive")]
     Derive,

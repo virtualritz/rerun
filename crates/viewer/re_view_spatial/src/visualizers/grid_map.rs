@@ -6,7 +6,7 @@ use re_sdk_types::components::{
     CellSize, Colormap, ImageBuffer, ImageFormat, Opacity, RotationAxisAngle, RotationQuat,
     Translation3D,
 };
-use re_sdk_types::datatypes::ColorModel;
+use re_sdk_types::encodings::ColorModel;
 use re_sdk_types::image::ImageKind;
 use re_sdk_types::reflection::Enum as _;
 use re_viewer_context::{
@@ -126,10 +126,7 @@ impl GridMapVisualizer {
         if all_formats.is_empty() {
             return;
         }
-        let all_cell_sizes = results.iter_required(GridMap::descriptor_cell_size().component);
-        if all_cell_sizes.is_empty() {
-            return;
-        }
+        let all_cell_sizes = results.iter_optional(GridMap::descriptor_cell_size().component);
         let all_translations = results.iter_optional(GridMap::descriptor_translation().component);
         let all_rotations =
             results.iter_optional(GridMap::descriptor_rotation_axis_angle().component);
@@ -169,7 +166,12 @@ impl GridMapVisualizer {
                         formats?.first()?.0,
                         ImageKind::Color,
                     ),
-                    cell_size: CellSize::from(*cell_sizes?.first()?),
+                    cell_size: cell_sizes
+                        .and_then(|sizes| sizes.first().copied())
+                        .map(CellSize::from)
+                        .unwrap_or_else(|| {
+                            typed_fallback_for(ctx, GridMap::descriptor_cell_size().component)
+                        }),
                     translation: translations
                         .and_then(|t| t.first().copied())
                         .map(Translation3D::from),
@@ -255,7 +257,7 @@ impl GridMapVisualizer {
             &entity_path.to_string(),
             &image,
             &image_stats,
-            Some(&spatial_ctx.annotations),
+            spatial_ctx.annotations,
             color_mode.colormap(),
         ) {
             Ok(texture) => texture,
@@ -346,7 +348,7 @@ impl GridMapVisualizer {
             Colormap::RvizMap | Colormap::RvizCostmap | Colormap::Costmap
         ) && !matches!(
             component_data.image.format.datatype(),
-            re_sdk_types::datatypes::ChannelDatatype::U8
+            re_sdk_types::encodings::ChannelDatatype::U8
         ) {
             results.report_for_component(
                 GridMap::descriptor_colormap().component,

@@ -23,7 +23,10 @@ pub trait TypeErasedDrawData: Any + wgpu::WasmNotSendSync {
     /// Returns the key of the renderer that this draw data is associated with.
     ///
     /// This also makes sure that the renderer has been initialized already.
-    fn renderer_key(&self, ctx: &RenderContext) -> RendererTypeId;
+    fn renderer_key(
+        &self,
+        ctx: &RenderContext,
+    ) -> Result<RendererTypeId, crate::RendererRegistrationError>;
 }
 
 impl<D: DrawData + wgpu::WasmNotSendSync + 'static> TypeErasedDrawData for D {
@@ -39,8 +42,12 @@ impl<D: DrawData + wgpu::WasmNotSendSync + 'static> TypeErasedDrawData for D {
         std::any::type_name::<D::Renderer>()
     }
 
-    fn renderer_key(&self, ctx: &RenderContext) -> RendererTypeId {
-        ctx.renderer::<D::Renderer>().key()
+    fn renderer_key(
+        &self,
+        ctx: &RenderContext,
+    ) -> Result<RendererTypeId, crate::RendererRegistrationError> {
+        ctx.renderer::<D::Renderer>()?;
+        ctx.renderers().get_key::<D::Renderer>()
     }
 }
 

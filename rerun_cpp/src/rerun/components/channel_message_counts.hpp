@@ -4,7 +4,7 @@
 #pragma once
 
 #include "../collection.hpp"
-#include "../datatypes/channel_count_pair.hpp"
+#include "../encodings/channel_count_pair.hpp"
 #include "../result.hpp"
 
 #include <cstdint>
@@ -26,16 +26,16 @@ namespace rerun::components {
     ///
     struct ChannelMessageCounts {
         /// The channel ID to message count pairs.
-        rerun::Collection<rerun::datatypes::ChannelCountPair> counts;
+        rerun::Collection<rerun::encodings::ChannelCountPair> counts;
 
       public:
         ChannelMessageCounts() = default;
 
-        ChannelMessageCounts(rerun::Collection<rerun::datatypes::ChannelCountPair> counts_)
+        ChannelMessageCounts(rerun::Collection<rerun::encodings::ChannelCountPair> counts_)
             : counts(std::move(counts_)) {}
 
         ChannelMessageCounts& operator=(
-            rerun::Collection<rerun::datatypes::ChannelCountPair> counts_
+            rerun::Collection<rerun::encodings::ChannelCountPair> counts_
         ) {
             counts = std::move(counts_);
             return *this;
@@ -53,7 +53,7 @@ namespace rerun {
         static constexpr std::string_view ComponentType = "rerun.components.ChannelMessageCounts";
 
         /// Returns the arrow data type this type corresponds to.
-        static const std::shared_ptr<arrow::DataType>& arrow_datatype();
+        static const std::shared_ptr<arrow::DataType>& arrow_data_type();
 
         /// Serializes an array of `rerun::components::ChannelMessageCounts` into an arrow array.
         static Result<std::shared_ptr<arrow::Array>> to_arrow(

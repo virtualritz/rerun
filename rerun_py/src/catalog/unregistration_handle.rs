@@ -1,16 +1,13 @@
-// This whole module should really be shared with `registration_handle`,
-// but there are result handling differences that make it impossible currently.
+// Unregistration only reports how its tasks ended. `registration_handle` maps the same tasks back
+// to one result per segment.
 use pyo3::{Py, PyResult, Python, exceptions::PyValueError, pyclass, pymethods};
-use re_protos::{
-    cloud::v1alpha1::ext::{QueryTasksDataframe, QueryTasksOnCompletionResponse},
-    common::v1alpha1::TaskId,
-};
-use re_redap_client::TraceId;
+use re_protos::common::v1alpha1::TaskId;
+use re_redap_client::{TaskCompletion, TraceId, format_trace_ids};
 use tokio_stream::StreamExt as _;
 use tracing::Instrument as _;
 
 use crate::{
-    catalog::{PyCatalogClientInternal, registration_handle::format_trace_ids, to_py_err},
+    catalog::{PyCatalogClientInternal, to_py_err},
     trace_context::read_trace_context_from_python,
     utils::wait_for_future,
 };
@@ -68,49 +65,33 @@ impl PyUnregistrationHandleInternal {
         wait_for_future(
             py,
             async move {
-                let mut response_stream = connection
+                let mut completions = connection
                     .client()
                     .await?
-                    .query_tasks_on_completion(task_ids, timeout)
+                    .task_completions(task_ids, timeout)
                     .await
                     .map_err(to_py_err)?;
 
                 // Trace-id of this completion query.
-                let query_trace_id = response_stream.trace_id();
+                let query_trace_id = completions.trace_id();
 
                 let mut errors = Vec::new();
 
-                while let Some(response) = response_stream.next().await {
-                    let response: QueryTasksOnCompletionResponse =
-                        response.map_err(to_py_err)?.try_into().map_err(to_py_err)?;
+                while let Some(completion) = completions.next().await {
+                    let TaskCompletion {
+                        task_id,
+                        status,
+                        message,
+                    } = completion.map_err(to_py_err)?;
 
-                    let on_err = |err| {
-                        PyValueError::new_err(format!(
-                            "invalid QueryTasks response dataframe: {err}"
-                        ))
+                    let error = match status.as_str() {
+                        "success" => None,
+                        "cancelled" => Some("unregistration was cancelled".to_owned()),
+                        _ => Some(message.unwrap_or_default()),
                     };
-                    let task_ids = QueryTasksDataframe::COLUMN_TASK_ID
-                        .extract(&response.data)
-                        .map_err(on_err)?;
-                    let statuses = QueryTasksDataframe::COLUMN_EXEC_STATUS
-                        .extract(&response.data)
-                        .map_err(on_err)?;
-                    let msgs = QueryTasksDataframe::COLUMN_MSGS
-                        .extract(&response.data)
-                        .map_err(on_err)?;
 
-                    for (task_id, status, msg) in itertools::izip!(&task_ids, &statuses, &msgs) {
-                        let msg = msg.unwrap_or_default();
-
-                        let error = match status {
-                            "success" => None,
-                            "cancelled" => Some("unregistration was cancelled".to_owned()),
-                            _ => Some(msg.to_owned()),
-                        };
-
-                        if let Some(err) = error {
-                            errors.push(format!("Unregistration task '{task_id}' failed: {err}"));
-                        }
+                    if let Some(err) = error {
+                        errors.push(format!("Unregistration task '{task_id}' failed: {err}"));
                     }
                 }
 
@@ -118,7 +99,7 @@ impl PyUnregistrationHandleInternal {
                 if !errors.is_empty() {
                     return Err(PyValueError::new_err(format!(
                         "Unregistration failed.{}\n\nThe following segments failed:\n{}",
-                        format_trace_ids(request_trace_id.as_ref(), query_trace_id.as_ref()),
+                        format_trace_ids(request_trace_id, query_trace_id),
                         errors.join("\n"),
                     )));
                 }

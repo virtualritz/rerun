@@ -546,8 +546,8 @@ fn frame_info_ui(
 ) {
     let FrameInfo {
         is_sync,
-        sample_idx,
         frame_nr,
+        source,
         presentation_timestamp,
         duration: _,
         latest_decode_timestamp,
@@ -590,7 +590,8 @@ fn frame_info_ui(
         }
     }
 
-    if let Some(sample_idx) = sample_idx
+    if let Some(sample_idx) =
+        source.and_then(|source| video_descr.sample_index_of_source(presentation_timestamp, source))
         && stream_kind == StreamKind::Video
     {
         ui.list_item_flat_noninteractive(PropertyContent::new("Sample").value_fn(move |ui, _| {
@@ -658,7 +659,9 @@ fn frame_info_ui(
 
         if let Some(sample_range) = video_descr.gop_sample_range_for_keyframe(keyframe_idx) {
             let first_sample = video_descr.samples.get(sample_range.start);
-            let last_sample = video_descr.samples.get(sample_range.end.saturating_sub(1));
+            let last_sample = video_descr
+                .samples
+                .get(sample_range.end().saturating_sub(1));
 
             if let Some((first_sample, last_sample)) = Option::zip(
                 first_sample.and_then(|s| s.sample()),
@@ -764,7 +767,7 @@ pub enum VideoUi {
     Asset(
         Arc<Result<re_renderer::video::Video, VideoLoadError>>,
         Option<VideoTimestamp>,
-        re_sdk_types::datatypes::Blob,
+        re_sdk_types::encodings::Blob,
     ),
 }
 
@@ -774,7 +777,7 @@ impl VideoUi {
         entity_path: &re_log_types::EntityPath,
         blob_row_id: RowId,
         blob_component_descriptor: &ComponentDescriptor,
-        blob: &re_sdk_types::datatypes::Blob,
+        blob: &re_sdk_types::encodings::Blob,
         media_type: Option<&MediaType>,
         video_timestamp: Option<VideoTimestamp>,
     ) -> Option<Self> {

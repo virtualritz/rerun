@@ -1,6 +1,5 @@
-use std::ops::Range;
-
 use enumset::{EnumSet, enum_set};
+use re_span::Span;
 use smallvec::smallvec;
 
 use super::{DrawData, DrawError, RenderContext, Renderer};
@@ -55,7 +54,7 @@ pub struct VoxelGridOptions {
     /// Each range is drawn as an extra draw call in the outline-mask phase only, so this is
     /// meant for a limited number of "extra selections" (e.g. picked voxels), not bulk highlighting.
     /// These override the overall mask for the covered voxels.
-    pub additional_outline_mask_ids_instance_ranges: Vec<(Range<u32>, OutlineMaskPreference)>,
+    pub additional_outline_mask_ids_instance_ranges: Vec<(Span<u32>, OutlineMaskPreference)>,
 
     /// Depth offset used to resolve z-fighting.
     pub depth_offset: DepthOffset,
@@ -104,7 +103,7 @@ mod gpu_data {
 #[derive(Clone)]
 struct VoxelGridDraw {
     bind_group: GpuBindGroup,
-    instance_range: Range<u32>,
+    instance_range: Span<u32>,
     active_phases: EnumSet<DrawPhase>,
 }
 
@@ -141,13 +140,22 @@ impl DrawData for VoxelGridDrawData {
     }
 }
 
+#[derive(thiserror::Error, Debug, PartialEq, Eq)]
+pub enum VoxelGridDrawDataError {
+    #[error(transparent)]
+    CpuWriteGpuRead(#[from] CpuWriteGpuReadError),
+
+    #[error(transparent)]
+    Renderer(#[from] crate::RendererRegistrationError),
+}
+
 impl VoxelGridDrawData {
     /// Creates compact GPU draw data for a sparse voxel grid.
     pub fn new(
         ctx: &RenderContext,
         instances: &[VoxelGridInstance],
         options: VoxelGridOptions,
-    ) -> Result<Self, CpuWriteGpuReadError> {
+    ) -> Result<Self, VoxelGridDrawDataError> {
         re_tracing::profile_function!();
 
         let VoxelGridOptions {
@@ -160,7 +168,7 @@ impl VoxelGridDrawData {
             depth_offset,
         } = options;
 
-        let renderer = ctx.renderer::<VoxelGridRenderer>();
+        let renderer = ctx.renderer::<VoxelGridRenderer>()?;
         let voxel_count = instances.len() as u32;
         let draw_phase = if instances.iter().any(|instance| instance.color.a() < 255) {
             DrawPhase::Transparent
@@ -241,7 +249,7 @@ impl VoxelGridDrawData {
                     make_uniform(outline_mask_ids),
                 ),
             ),
-            instance_range: 0..voxel_count,
+            instance_range: Span::from_start_len(0, voxel_count),
             active_phases: overall_phases,
         }];
 
@@ -437,7 +445,7 @@ impl Renderer for VoxelGridRenderer {
             for drawable in *drawables {
                 let draw = &draw_data.draws[drawable.draw_data_payload as usize];
                 pass.set_bind_group(1, &draw.bind_group, &[]);
-                pass.draw(0..VERTICES_PER_VOXEL, draw.instance_range.clone());
+                pass.draw(0..VERTICES_PER_VOXEL, draw.instance_range.range());
             }
         }
 
@@ -483,14 +491,16 @@ mod tests {
         assert_eq!(draw_data.voxel_count(), 2);
 
         let mut draw_phase_manager = DrawPhaseManager::new(EnumSet::all());
-        draw_phase_manager.add_draw_data(
-            &ctx,
-            draw_data.into(),
-            &DrawableCollectionViewInfo {
-                view_id: crate::ViewBuilderId::new(0),
-                camera_world_position: glam::Vec3A::ZERO,
-            },
-        );
+        draw_phase_manager
+            .add_draw_data(
+                &ctx,
+                draw_data.into(),
+                &DrawableCollectionViewInfo {
+                    view_id: crate::ViewBuilderId::new(0),
+                    camera_world_position: glam::Vec3A::ZERO,
+                },
+            )
+            .unwrap();
 
         assert_eq!(
             draw_phase_manager
@@ -542,14 +552,16 @@ mod tests {
         assert_eq!(draw_data.voxel_count(), 1);
 
         let mut draw_phase_manager = DrawPhaseManager::new(EnumSet::all());
-        draw_phase_manager.add_draw_data(
-            &ctx,
-            draw_data.into(),
-            &DrawableCollectionViewInfo {
-                view_id: crate::ViewBuilderId::new(0),
-                camera_world_position: glam::Vec3A::ZERO,
-            },
-        );
+        draw_phase_manager
+            .add_draw_data(
+                &ctx,
+                draw_data.into(),
+                &DrawableCollectionViewInfo {
+                    view_id: crate::ViewBuilderId::new(0),
+                    camera_world_position: glam::Vec3A::ZERO,
+                },
+            )
+            .unwrap();
 
         assert!(
             draw_phase_manager
@@ -603,8 +615,14 @@ mod tests {
                 // No overall outline, but two individually highlighted voxels.
                 outline_mask_ids: OutlineMaskPreference::NONE,
                 additional_outline_mask_ids_instance_ranges: vec![
-                    (0..1, OutlineMaskPreference::some(1, 0)),
-                    (2..3, OutlineMaskPreference::some(2, 0)),
+                    (
+                        Span::from_start_len(0, 1),
+                        OutlineMaskPreference::some(1, 0),
+                    ),
+                    (
+                        Span::from_start_len(2, 1),
+                        OutlineMaskPreference::some(2, 0),
+                    ),
                 ],
                 depth_offset: 0,
             },
@@ -612,14 +630,16 @@ mod tests {
         .unwrap();
 
         let mut draw_phase_manager = DrawPhaseManager::new(EnumSet::all());
-        draw_phase_manager.add_draw_data(
-            &ctx,
-            draw_data.into(),
-            &DrawableCollectionViewInfo {
-                view_id: crate::ViewBuilderId::new(0),
-                camera_world_position: glam::Vec3A::ZERO,
-            },
-        );
+        draw_phase_manager
+            .add_draw_data(
+                &ctx,
+                draw_data.into(),
+                &DrawableCollectionViewInfo {
+                    view_id: crate::ViewBuilderId::new(0),
+                    camera_world_position: glam::Vec3A::ZERO,
+                },
+            )
+            .unwrap();
 
         // No overall mask, so the only outline drawables are the two per-instance ones.
         assert_eq!(

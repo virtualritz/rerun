@@ -11,7 +11,7 @@ import numpy as np
 import pyarrow as pa
 from attrs import define, field
 
-from .. import components, datatypes
+from .. import components, encodings
 from .._baseclasses import (
     Archetype,
     ComponentColumnList,
@@ -150,14 +150,14 @@ class GridMap(Archetype):
     def __init__(
         self: Any,
         *,
-        data: datatypes.BlobLike,
-        format: datatypes.ImageFormatLike,
-        cell_size: datatypes.Float32Like,
-        translation: datatypes.Vec3DLike | None = None,
-        rotation_axis_angle: datatypes.RotationAxisAngleLike | None = None,
-        quaternion: datatypes.QuaternionLike | None = None,
-        opacity: datatypes.Float32Like | None = None,
-        draw_order: datatypes.Float32Like | None = None,
+        data: encodings.BlobLike,
+        format: encodings.ImageFormatLike,
+        cell_size: encodings.Float32Like,
+        translation: encodings.Vec3DLike | None = None,
+        rotation_axis_angle: encodings.RotationAxisAngleLike | None = None,
+        quaternion: encodings.QuaternionLike | None = None,
+        opacity: encodings.Float32Like | None = None,
+        draw_order: encodings.Float32Like | None = None,
         colormap: components.ColormapLike | None = None,
     ) -> None:
         """
@@ -171,6 +171,8 @@ class GridMap(Archetype):
             The format of the grid's image data.
         cell_size:
             The scene unit size of a single grid cell (e.g. m / pixel).
+
+            Defaults to 0.01 scene units per pixel.
         translation:
             Translation of the lower-left corner of the grid map in space.
 
@@ -249,14 +251,14 @@ class GridMap(Archetype):
         cls,
         *,
         clear_unset: bool = False,
-        data: datatypes.BlobLike | None = None,
-        format: datatypes.ImageFormatLike | None = None,
-        cell_size: datatypes.Float32Like | None = None,
-        translation: datatypes.Vec3DLike | None = None,
-        rotation_axis_angle: datatypes.RotationAxisAngleLike | None = None,
-        quaternion: datatypes.QuaternionLike | None = None,
-        opacity: datatypes.Float32Like | None = None,
-        draw_order: datatypes.Float32Like | None = None,
+        data: encodings.BlobLike | None = None,
+        format: encodings.ImageFormatLike | None = None,
+        cell_size: encodings.Float32Like | None = None,
+        translation: encodings.Vec3DLike | None = None,
+        rotation_axis_angle: encodings.RotationAxisAngleLike | None = None,
+        quaternion: encodings.QuaternionLike | None = None,
+        opacity: encodings.Float32Like | None = None,
+        draw_order: encodings.Float32Like | None = None,
         colormap: components.ColormapLike | None = None,
     ) -> GridMap:
         """
@@ -272,6 +274,8 @@ class GridMap(Archetype):
             The format of the grid's image data.
         cell_size:
             The scene unit size of a single grid cell (e.g. m / pixel).
+
+            Defaults to 0.01 scene units per pixel.
         translation:
             Translation of the lower-left corner of the grid map in space.
 
@@ -412,14 +416,14 @@ class GridMap(Archetype):
     def columns(
         cls,
         *,
-        data: datatypes.BlobArrayLike | None = None,
-        format: datatypes.ImageFormatArrayLike | None = None,
-        cell_size: datatypes.Float32ArrayLike | None = None,
-        translation: datatypes.Vec3DArrayLike | None = None,
-        rotation_axis_angle: datatypes.RotationAxisAngleArrayLike | None = None,
-        quaternion: datatypes.QuaternionArrayLike | None = None,
-        opacity: datatypes.Float32ArrayLike | None = None,
-        draw_order: datatypes.Float32ArrayLike | None = None,
+        data: encodings.BlobArrayLike | None = None,
+        format: encodings.ImageFormatArrayLike | None = None,
+        cell_size: encodings.Float32ArrayLike | None = None,
+        translation: encodings.Vec3DArrayLike | None = None,
+        rotation_axis_angle: encodings.RotationAxisAngleArrayLike | None = None,
+        quaternion: encodings.QuaternionArrayLike | None = None,
+        opacity: encodings.Float32ArrayLike | None = None,
+        draw_order: encodings.Float32ArrayLike | None = None,
         colormap: components.ColormapArrayLike | None = None,
     ) -> ComponentColumnList:
         """
@@ -438,6 +442,8 @@ class GridMap(Archetype):
             The format of the grid's image data.
         cell_size:
             The scene unit size of a single grid cell (e.g. m / pixel).
+
+            Defaults to 0.01 scene units per pixel.
         translation:
             Translation of the lower-left corner of the grid map in space.
 
@@ -560,6 +566,8 @@ class GridMap(Archetype):
         converter=components.CellSizeBatch._converter,  # type: ignore[misc]
     )
     # The scene unit size of a single grid cell (e.g. m / pixel).
+    #
+    # Defaults to 0.01 scene units per pixel.
     #
     # (Docstring intentionally commented out to hide this field from the docs)
 

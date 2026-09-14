@@ -33,6 +33,7 @@
 #include "archetypes/mcap_message.hpp"
 #include "archetypes/mcap_schema.hpp"
 #include "archetypes/mcap_statistics.hpp"
+#include "archetypes/measurements.hpp"
 #include "archetypes/mesh3d.hpp"
 #include "archetypes/pinhole.hpp"
 #include "archetypes/points2d.hpp"
@@ -52,4 +53,5 @@
 #include "archetypes/video_frame_reference.hpp"
 #include "archetypes/video_stream.hpp"
 #include "archetypes/view_coordinates.hpp"
+#include "archetypes/volume3d.hpp"
 #include "archetypes/voxel_grid_map.hpp"

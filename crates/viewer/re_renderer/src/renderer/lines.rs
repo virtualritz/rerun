@@ -76,10 +76,10 @@
 //!
 
 use std::num::NonZeroU64;
-use std::ops::Range;
 
 use bitflags::bitflags;
 use enumset::{EnumSet, enum_set};
+use re_span::Span;
 use re_tracing::profile_function;
 use smallvec::smallvec;
 
@@ -186,7 +186,7 @@ pub mod gpu_data {
 #[derive(Clone)]
 struct LineStripBatch {
     bind_group: GpuBindGroup,
-    vertex_range: Range<u32>,
+    vertex_range: Span<u32>,
     active_phases: EnumSet<DrawPhase>,
 }
 
@@ -316,7 +316,7 @@ pub struct LineBatchInfo {
     /// Having many of these individual outline masks can be slow as they require each their own uniform buffer & draw call.
     /// This feature is meant for a limited number of "extra selections"
     /// If an overall mask is defined as well, the per-vertex-range masks is overwriting the overall mask.
-    pub additional_outline_mask_ids_vertex_ranges: Vec<(Range<u32>, OutlineMaskPreference)>,
+    pub additional_outline_mask_ids_vertex_ranges: Vec<(Span<u32>, OutlineMaskPreference)>,
 
     /// Picking object id that applies for the entire batch.
     pub picking_object_id: PickingLayerObjectId,
@@ -372,6 +372,9 @@ pub enum LineDrawDataError {
 
     #[error(transparent)]
     DataTextureSourceWriteError(#[from] crate::allocator::DataTextureSourceWriteError),
+
+    #[error(transparent)]
+    Renderer(#[from] crate::RendererRegistrationError),
 }
 
 impl LineDrawData {
@@ -392,7 +395,7 @@ impl LineDrawData {
             alpha_blending,
         } = line_builder;
 
-        let line_renderer = ctx.renderer::<LineRenderer>();
+        let line_renderer = ctx.renderer::<LineRenderer>()?;
 
         if strips_buffer.is_empty() || vertices_buffer.is_empty() {
             return Ok(Self {
@@ -564,7 +567,7 @@ impl LineDrawData {
                     ctx,
                     batch_info.label.clone(),
                     uniform_buffer_binding,
-                    start_vertex_for_next_batch..line_vertex_range_end,
+                    Span::from_start_end(start_vertex_for_next_batch, line_vertex_range_end),
                     active_phases,
                 ));
 
@@ -573,7 +576,7 @@ impl LineDrawData {
                         ctx,
                         format!("{} strip-only {range:?}", batch_info.label).into(),
                         uniform_buffer_bindings_mask_only_batches.next().unwrap(),
-                        range.clone(),
+                        *range,
                         enum_set![DrawPhase::OutlineMask],
                     ));
                 }
@@ -605,7 +608,7 @@ impl LineRenderer {
         ctx: &RenderContext,
         label: Label,
         uniform_buffer_binding: BindGroupEntry,
-        line_vertex_range: Range<u32>,
+        line_vertex_range: Span<u32>,
         active_phases: EnumSet<DrawPhase>,
     ) -> LineStripBatch {
         // TODO(andreas): There should be only a single bindgroup with dynamic indices for all batches.
@@ -625,7 +628,7 @@ impl LineRenderer {
             // We spawn a quad for every line skeleton vertex. Naturally, this yields one extra quad in total.
             // Which is rather convenient because we need to ensure there are start and end triangles,
             // so just from a number-of=vertices perspective this is correct already and the shader can take care of offsets.
-            vertex_range: (line_vertex_range.start * 6)..(line_vertex_range.end * 6),
+            vertex_range: line_vertex_range.scale(6),
             active_phases,
         }
     }
@@ -767,8 +770,6 @@ impl Renderer for LineRenderer {
                 ..render_pipeline_desc_color_opaque.clone()
             },
         );
-        // Lines in the picking pass ignore depth (draw on top of faces).
-        // Back-face culling is done on CPU via normal dot product.
         let render_pipeline_picking_layer = render_pipelines.get_or_create(
             ctx,
             &RenderPipelineDesc {
@@ -861,7 +862,7 @@ impl Renderer for LineRenderer {
             for drawable in *drawables {
                 let batch = &draw_data.batches[drawable.draw_data_payload as usize];
                 pass.set_bind_group(2, &batch.bind_group, &[]);
-                pass.draw(batch.vertex_range.clone(), 0..1);
+                pass.draw(batch.vertex_range.range(), 0..1);
             }
         }
 
@@ -887,7 +888,8 @@ mod tests {
                     .unwrap();
 
             let empty = LineDrawableBuilder::new(ctx);
-            view.queue_draw(ctx, empty.into_draw_data().unwrap());
+            view.queue_draw(ctx, empty.into_draw_data().unwrap())
+                .unwrap();
 
             // This is the case that triggered
             // https://github.com/rerun-io/rerun/issues/8639
@@ -896,7 +898,8 @@ mod tests {
             empty_batch
                 .batch("empty batch")
                 .add_strip(std::iter::empty());
-            view.queue_draw(ctx, empty_batch.into_draw_data().unwrap());
+            view.queue_draw(ctx, empty_batch.into_draw_data().unwrap())
+                .unwrap();
 
             let mut empty_batch_between_non_empty = LineDrawableBuilder::new(ctx);
             empty_batch_between_non_empty
@@ -908,7 +911,8 @@ mod tests {
             empty_batch_between_non_empty
                 .batch("non-empty batch")
                 .add_strip([glam::Vec3::ZERO, glam::Vec3::ZERO].into_iter());
-            view.queue_draw(ctx, empty_batch_between_non_empty.into_draw_data().unwrap());
+            view.queue_draw(ctx, empty_batch_between_non_empty.into_draw_data().unwrap())
+                .unwrap();
 
             [view.draw(ctx, Rgba::BLACK).unwrap()]
         });

@@ -1,18 +1,30 @@
+mod projection;
+mod segment_stream_common;
+
+pub(crate) use self::segment_stream_common::{
+    PlanSummary, compute_chunk_info_aggregates, group_chunk_infos_by_segment_id,
+    prepend_string_column_schema, schema_with_array_datatypes, segment_belongs_to_partition,
+    segment_stream_plan_properties,
+};
+// Outside this module only the native-only local chunk-store provider builds its own claims.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use self::segment_stream_common::physical_column_by_name;
+
+use self::projection::{
+    all_schema_components, compute_schema_for_query, extract_projected_components,
+    extract_projected_entity_paths,
+};
 use crate::analytics::{QueryInfo, QueryType, expr_filter_signature};
 use crate::batch_coalescer::coalesce_exec::SizedCoalesceBatchesExec;
 use crate::batch_coalescer::coalescer::CoalescerOptions;
 use crate::pushdown_expressions::{apply_filter_expr_to_queries, filter_expr_is_supported};
-use ahash::{HashMap, HashMapExt as _, HashSet};
-use arrow::array::{
-    ArrayRef, DurationNanosecondArray, Int64Array, RecordBatch, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt32Array,
-};
-use arrow::compute::concat_batches;
-use arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef, TimeUnit};
+use ahash::HashSet;
+use arrow::array::{RecordBatch, UInt32Array};
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatchOptions;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{Column, DataFusionError, downcast_value, exec_datafusion_err};
+use datafusion::common::{Column, DataFusionError, exec_datafusion_err};
 use datafusion::datasource::TableType;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
@@ -20,9 +32,8 @@ use futures::StreamExt as _;
 use itertools::Itertools as _;
 use parking_lot::Mutex;
 use re_async::AsyncRuntimeHandle;
-use re_dataframe::external::re_chunk_store::ChunkStore;
 use re_dataframe::{Index, IndexValue, QueryExpression, SparseFillStrategy};
-use re_log_types::{EntityPath, EntryId};
+use re_log_types::EntryId;
 use re_protos::cloud::v1alpha1::ext::QueryDatasetDataframe;
 use re_protos::cloud::v1alpha1::ext::ScanSegmentTableDataframe;
 use re_protos::cloud::v1alpha1::{
@@ -34,14 +45,10 @@ use re_protos::{
     cloud::v1alpha1::ext::{Query, QueryDatasetRequest, QueryLatestAt, QueryRange},
     common::v1alpha1::ext::SegmentId,
 };
-use re_redap_client::{ApiError, ApiResult, ConnectionClient, ConnectionRegistryHandle};
+use re_redap_client::{ApiError, ApiResult, ConnectionClient, ConnectionHandle};
 
 use crate::{IntoDfError as _, SegmentStreamExec};
-use re_sorbet::{
-    BatchType, ChunkColumnDescriptors, ColumnDescriptor, ColumnKind, ComponentColumnSelector,
-};
-use re_uri::Origin;
-use std::cmp::Ordering;
+use re_sorbet::ComponentColumnSelector;
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr as _;
 use std::sync::Arc;
@@ -166,6 +173,9 @@ struct FilterCapture {
 /// responses more directly.
 #[async_trait]
 pub trait DataframeClientAPI: std::fmt::Debug + Clone + Send + Sync + Unpin + 'static {
+    /// The server this client talks to, named in the errors it produces.
+    fn origin(&self) -> &re_uri::Origin;
+
     async fn get_dataset_schema(
         &mut self,
         request: tonic::Request<GetDatasetSchemaRequest>,
@@ -186,6 +196,11 @@ pub trait DataframeClientAPI: std::fmt::Debug + Clone + Send + Sync + Unpin + 's
 
 #[async_trait]
 impl DataframeClientAPI for ConnectionClient {
+    fn origin(&self) -> &re_uri::Origin {
+        // The inherent `RedapClient::origin`, not this trait method.
+        Self::origin(self)
+    }
+
     async fn get_dataset_schema(
         &mut self,
         request: tonic::Request<GetDatasetSchemaRequest>,
@@ -219,8 +234,7 @@ impl DataframeQueryTableProvider<ConnectionClient> {
     /// RPC is skipped — useful when the caller has already fetched the schema.
     #[tracing::instrument(level = "info", skip_all)]
     pub async fn new(
-        origin: Origin,
-        connection_registry: ConnectionRegistryHandle,
+        connection: ConnectionHandle,
         dataset_id: EntryId,
         query_expression: &QueryExpression,
         segment_ids: &[impl AsRef<str> + Sync],
@@ -229,7 +243,8 @@ impl DataframeQueryTableProvider<ConnectionClient> {
         #[cfg(not(target_arch = "wasm32"))] trace_headers: Option<crate::TraceHeaders>,
         metrics_collectors: Vec<crate::MetricsCollector>,
     ) -> ApiResult<Self> {
-        let connection = connection_registry.connection(origin.clone()).await?;
+        let origin = connection.origin().clone();
+        let connection = connection.connection().await?;
 
         let mut provider = Self::new_from_client(
             connection.client,
@@ -248,6 +263,7 @@ impl DataframeQueryTableProvider<ConnectionClient> {
             let async_runtime = AsyncRuntimeHandle::from_current_tokio_runtime_or_wasmbindgen()
                 .map_err(|err| {
                     ApiError::internal_with_source(
+                        &origin,
                         None,
                         err,
                         "failed to capture the async runtime for query analytics",
@@ -272,6 +288,8 @@ impl<T: DataframeClientAPI> DataframeQueryTableProvider<T> {
         #[cfg(not(target_arch = "wasm32"))] trace_headers: Option<crate::TraceHeaders>,
         metrics_collectors: Vec<crate::MetricsCollector>,
     ) -> ApiResult<Self> {
+        let origin = client.origin().clone();
+
         // Either use the caller-provided schema or fetch it from the server.
         let (schema, trace_id) = if let Some(schema) = arrow_schema {
             (schema, None)
@@ -280,10 +298,15 @@ impl<T: DataframeClientAPI> DataframeQueryTableProvider<T> {
             let response = client
                 .get_dataset_schema(request)
                 .await
-                .map_err(|err| ApiError::tonic(err, "get_dataset_schema"))?;
+                .map_err(|err| ApiError::tonic(&origin, err, "get_dataset_schema"))?;
             let trace_id = re_redap_client::extract_trace_id(response.metadata());
             let schema = response.into_inner().schema().map_err(|err| {
-                ApiError::deserialization_with_source(trace_id, err, "decoding dataset schema")
+                ApiError::deserialization_with_source(
+                    &origin,
+                    trace_id,
+                    err,
+                    "decoding dataset schema",
+                )
             })?;
             (schema, trace_id)
         };
@@ -291,7 +314,12 @@ impl<T: DataframeClientAPI> DataframeQueryTableProvider<T> {
         let schema = compute_schema_for_query(&schema, query_expression).map_err(|err| {
             // `compute_schema_for_query` fails when the caller-provided query
             // references columns/entity-paths not present in the dataset schema
-            ApiError::invalid_arguments_with_source(trace_id, err, "computing schema for query")
+            ApiError::invalid_arguments_with_source(
+                &origin,
+                trace_id,
+                err,
+                "computing schema for query",
+            )
         })?;
 
         let entity_paths = query_expression
@@ -571,6 +599,7 @@ impl<T: DataframeClientAPI> TableProvider for DataframeQueryTableProvider<T> {
             let mut response_futures = futures::stream::iter(dataset_queries)
                 .map(|dataset_query| {
                     let client = self.client.clone();
+                    let origin = client.origin().clone();
                     let dataset_id = self.dataset_id;
                     async move {
                         // Hold a process-wide permit for the whole open+drain so
@@ -594,13 +623,13 @@ impl<T: DataframeClientAPI> TableProvider for DataframeQueryTableProvider<T> {
                         let response =
                             re_redap_client::with_retry_resource_exhausted("query_dataset", || {
                                 let mut client = client.clone();
+                                let origin = origin.clone();
                                 let request = tonic::Request::new(proto_request.clone())
                                     .with_entry_id(dataset_id);
                                 async move {
-                                    client
-                                        .query_dataset(request)
-                                        .await
-                                        .map_err(|err| ApiError::tonic(err, "query_dataset"))
+                                    client.query_dataset(request).await.map_err(|err| {
+                                        ApiError::tonic(&origin, err, "query_dataset")
+                                    })
                                 }
                             })
                             .await
@@ -619,7 +648,7 @@ impl<T: DataframeClientAPI> TableProvider for DataframeQueryTableProvider<T> {
                             }
 
                             let response = response.map_err(|err| {
-                                ApiError::tonic(err, "query_dataset response stream")
+                                ApiError::tonic(&origin, err, "query_dataset response stream")
                                     .with_trace_id(trace_id)
                                     .into_df_error()
                             })?;
@@ -628,6 +657,7 @@ impl<T: DataframeClientAPI> TableProvider for DataframeQueryTableProvider<T> {
                             };
                             let batch: RecordBatch = dataframe_part.try_into().map_err(|err| {
                                 ApiError::deserialization_with_source(
+                                    &origin,
                                     trace_id,
                                     err,
                                     "decoding query_dataset response batch",
@@ -667,6 +697,7 @@ impl<T: DataframeClientAPI> TableProvider for DataframeQueryTableProvider<T> {
                 .as_ref()
                 .map(compute_chunk_info_aggregates)
                 .unwrap_or_default();
+            let target_partitions = state.config().target_partitions();
             let query_info = QueryInfo {
                 dataset_id: self.dataset_id.to_string(),
                 query_chunks: agg.chunks,
@@ -675,6 +706,7 @@ impl<T: DataframeClientAPI> TableProvider for DataframeQueryTableProvider<T> {
                 query_columns: self.schema.fields().len(),
                 query_entities: self.query_dataset_request.entity_paths.len(),
                 query_bytes: agg.bytes,
+                target_partitions,
                 query_chunks_per_segment_min: agg.chunks_per_segment_min,
                 query_chunks_per_segment_max: agg.chunks_per_segment_max,
                 query_chunks_per_segment_mean: agg.chunks_per_segment_mean,
@@ -732,7 +764,7 @@ impl<T: DataframeClientAPI> TableProvider for DataframeQueryTableProvider<T> {
                 &self.schema,
                 self.sort_index,
                 projection,
-                state.config().target_partitions(),
+                target_partitions,
                 chunk_info_batches,
                 query_expression,
                 self.index_values.clone(),
@@ -821,370 +853,6 @@ impl<T: DataframeClientAPI> TableProvider for DataframeQueryTableProvider<T> {
         });
 
         Ok(results)
-    }
-}
-
-/// Extract entity paths referenced by the projected columns and filter expressions.
-///
-/// Returns `None` when no narrowing is possible (`projection` is `None`).
-/// Returns `Some(empty set)` when projection contains only non-entity columns
-/// (e.g. time / `segment_id`) — caller should not narrow in this case.
-fn extract_projected_entity_paths(
-    schema: &SchemaRef,
-    projection: &Vec<usize>,
-    filters: &[Expr],
-) -> BTreeSet<EntityPath> {
-    let mut entity_paths = BTreeSet::new();
-
-    // Collect entity paths from projected columns.
-    for &idx in projection {
-        if let Some(path) = entity_path_from_field(schema.field(idx)) {
-            entity_paths.insert(path);
-        }
-    }
-
-    // Collect entity paths from filter-referenced columns. Filters may reference
-    // columns that aren't in the projection (e.g. `WHERE t.b > 5` with only `t.a`
-    // projected) — we must still fetch data for those entities.
-    for filter in filters {
-        for col_ref in filter.column_refs() {
-            if let Ok(field) = schema.field_with_name(col_ref.name())
-                && let Some(path) = entity_path_from_field(field)
-            {
-                entity_paths.insert(path);
-            }
-        }
-    }
-
-    entity_paths
-}
-
-/// Extract an [`EntityPath`] from an Arrow field's metadata, if present.
-///
-/// Component columns carry `rerun:entity_path` metadata; time/index columns
-/// and the prepended `rerun_segment_id` column do not.
-fn entity_path_from_field(field: &Field) -> Option<EntityPath> {
-    field
-        .metadata()
-        .get(re_sorbet::metadata::SORBET_ENTITY_PATH)
-        .map(|s| EntityPath::from(&**s))
-}
-
-/// The component identifier of a field, or `None` if it isn't a component column.
-///
-/// Only genuine component columns carry an entity path; gating on it (the
-/// same signal `extract_projected_entity_paths` uses) drops the prepended,
-/// unmarked `rerun_segment_id`, which would otherwise be misclassified as a
-/// `Component` (`ColumnKind` defaults to `Component` for unmarked fields).
-/// Index/time columns also lack an entity path, so the same gate excludes
-/// them (and as a backstop they carry `rerun:kind=index`, which
-/// `try_from_arrow_field` maps to a non-`Component` descriptor).
-fn component_from_field(field: &Field) -> Option<String> {
-    field
-        .metadata()
-        .get(re_sorbet::metadata::SORBET_ENTITY_PATH)?;
-    match ColumnDescriptor::try_from_arrow_field(None, field) {
-        Ok(ColumnDescriptor::Component(component)) => Some(component.component.to_string()),
-        _ => None,
-    }
-}
-
-/// Every component identifier present in `schema`.
-///
-/// Used to detect a full projection: when the projection references every
-/// component, narrowing `fuzzy_descriptors` is a no-op for chunk skipping, but
-/// the server treats a non-empty list as exhaustive and would drop chunks for
-/// static-only components (those with no temporal index). So we only narrow when
-/// the projection is a strict subset.
-fn all_schema_components(schema: &SchemaRef) -> BTreeSet<String> {
-    schema
-        .fields()
-        .iter()
-        .filter_map(|field| component_from_field(field))
-        .collect()
-}
-
-/// Component identifiers referenced by a query's projection and filters.
-///
-/// Counterpart to [`extract_projected_entity_paths`] at component granularity:
-/// it lets the scan narrow `fuzzy_descriptors` so the server skips chunks for
-/// unselected components (e.g. a heavy `VideoStream:sample` sitting next to a tiny `is_keyframe`).
-/// Time/index and `rerun_segment_id` columns are not components and are simply ignored.
-fn extract_projected_components(
-    schema: &SchemaRef,
-    projection: &[usize],
-    filters: &[Expr],
-) -> BTreeSet<String> {
-    let mut components = BTreeSet::new();
-
-    for &idx in projection {
-        if let Some(component) = component_from_field(schema.field(idx)) {
-            components.insert(component);
-        }
-    }
-
-    // Filters may reference components outside the projection (e.g. `WHERE
-    // is_keyframe IS NOT NULL` while only the index is projected); those chunks
-    // are still needed to evaluate the filter, so keep them too.
-    for filter in filters {
-        for col_ref in filter.column_refs() {
-            if let Ok(field) = schema.field_with_name(col_ref.name())
-                && let Some(component) = component_from_field(field)
-            {
-                components.insert(component);
-            }
-        }
-    }
-
-    components
-}
-
-/// Compute the output schema for a query on a dataset. When we call `get_dataset_schema`
-/// on the catalog server, we will get the schema for all entities and all components. This
-/// method is used to down select from that full schema based on `query_expression`.
-#[tracing::instrument(level = "trace", skip_all)]
-fn compute_schema_for_query(
-    dataset_schema: &Schema,
-    query_expression: &QueryExpression,
-) -> Result<SchemaRef, DataFusionError> {
-    // Short circuit for empty datasets. Needed because `ChunkColumnDescriptors::try_from_arrow_fields`
-    // needs row ids, which we only have for non-empty datasets.
-    if dataset_schema.fields.is_empty() {
-        return Ok(Arc::new(Schema::empty()));
-    }
-
-    // Schema returned from `get_dataset_schema` does not match the required ChunkColumnDescriptors ordering
-    // which is row id, then time, then data. We don't need perfect ordering other than that.
-    let mut fields = dataset_schema
-        .fields()
-        .iter()
-        .map(Arc::clone)
-        .collect::<Vec<_>>();
-    fields.sort_by(|a, b| {
-        let Ok(a) = ColumnKind::try_from(a.as_ref()) else {
-            return Ordering::Equal;
-        };
-        let Ok(b) = ColumnKind::try_from(b.as_ref()) else {
-            return Ordering::Equal;
-        };
-
-        match (a, b) {
-            (ColumnKind::RowId, _) => Ordering::Less,
-            (_, ColumnKind::RowId) => Ordering::Greater,
-            (ColumnKind::Index, _) => Ordering::Less,
-            (_, ColumnKind::Index) => Ordering::Greater,
-            _ => Ordering::Equal,
-        }
-    });
-    let fields: arrow::datatypes::Fields = fields.into();
-
-    let column_descriptors = ChunkColumnDescriptors::try_from_arrow_fields(None, &fields)
-        .map_err(|err| exec_datafusion_err!("col desc {err}"))?;
-
-    // Create the actual filter to apply to the column descriptors
-    let filter = ChunkStore::create_component_filter_from_query(query_expression);
-
-    // When we call QueryDataset we will not return row_id, so we only select indices and
-    // components from the column descriptors.
-    let filtered_fields = column_descriptors
-        .filter_components(filter)
-        .indices_and_components()
-        .into_iter()
-        .map(|cd| cd.to_arrow_field(BatchType::Dataframe))
-        .collect::<Vec<_>>();
-
-    Ok(Arc::new(Schema::new_with_metadata(
-        filtered_fields,
-        dataset_schema.metadata().clone(),
-    )))
-}
-
-pub(crate) fn prepend_string_column_schema(schema: &Schema, column_name: &str) -> Schema {
-    let mut fields = vec![Field::new(column_name, DataType::Utf8, false)];
-    fields.extend(schema.fields().iter().map(|f| (**f).clone()));
-    Schema::new_with_metadata(fields, schema.metadata.clone())
-}
-
-/// Hash a segment id for DataFusion partition routing.
-///
-/// Hashes the underlying string with DataFusion's `HashValue` so the result
-/// matches `RepartitionExec`'s hashing of the segment-id string column.
-pub(crate) fn segment_partition_hash(segment_id: &SegmentId) -> u64 {
-    use datafusion::common::hash_utils::HashValue as _;
-    use datafusion::physical_plan::repartition::REPARTITION_RANDOM_STATE;
-
-    segment_id
-        .as_str()
-        .hash_one(REPARTITION_RANDOM_STATE.random_state())
-}
-
-/// We need to create `num_partitions` of DataFusion partition stream outputs, each of
-/// which will be fed from multiple `rerun_segment_id` sources. The partitioning
-/// output is a hash of the `rerun_segment_id`. We will reuse some of the
-/// underlying execution code from `DataFusion`'s `RepartitionExec` to compute
-/// these DataFusion partition IDs, just to be certain they match partitioning generated
-/// from sources other than Rerun gRPC services.
-/// This function will do the relevant grouping of chunk infos by chunk's segment id,
-/// and we will eventually fire individual queries for each group. Segments must be ordered,
-/// see `SegmentStreamExec::try_new` for more details.
-#[tracing::instrument(level = "trace", skip_all)]
-pub(crate) fn group_chunk_infos_by_segment_id(
-    chunk_info_batches: &[RecordBatch],
-) -> Result<Arc<BTreeMap<SegmentId, Vec<RecordBatch>>>, DataFusionError> {
-    let mut results: BTreeMap<SegmentId, Vec<RecordBatch>> = BTreeMap::new();
-
-    for batch in chunk_info_batches {
-        let segment_ids = QueryDatasetDataframe::COLUMN_CHUNK_SEGMENT_ID
-            .extract(batch)
-            .map_err(|err| exec_datafusion_err!("{err}"))?;
-
-        // group rows by segment ID
-        let mut segment_rows: BTreeMap<SegmentId, Vec<usize>> = BTreeMap::new();
-        for (row_idx, segment_id) in segment_ids.into_iter_owned().enumerate() {
-            segment_rows.entry(segment_id).or_default().push(row_idx);
-        }
-
-        for (segment_id, row_indices) in segment_rows {
-            if row_indices.is_empty() {
-                continue;
-            }
-
-            let segment_batch = re_arrow_util::take_record_batch(batch, &row_indices)?;
-
-            results.entry(segment_id).or_default().push(segment_batch);
-        }
-    }
-
-    Ok(Arc::new(results))
-}
-
-#[tracing::instrument(level = "trace", skip_all)]
-#[expect(dead_code)]
-pub(crate) fn time_array_ref_to_i64(time_array: &ArrayRef) -> Result<Int64Array, DataFusionError> {
-    Ok(match time_array.data_type() {
-        DataType::Int64 => downcast_value!(time_array, Int64Array).reinterpret_cast::<Int64Type>(),
-        DataType::Timestamp(TimeUnit::Second, _) => {
-            let nano_array = downcast_value!(time_array, TimestampSecondArray);
-            nano_array.reinterpret_cast::<Int64Type>()
-        }
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            let nano_array = downcast_value!(time_array, TimestampMillisecondArray);
-            nano_array.reinterpret_cast::<Int64Type>()
-        }
-        DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            let nano_array = downcast_value!(time_array, TimestampMicrosecondArray);
-            nano_array.reinterpret_cast::<Int64Type>()
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-            let nano_array = downcast_value!(time_array, TimestampNanosecondArray);
-            nano_array.reinterpret_cast::<Int64Type>()
-        }
-        DataType::Duration(TimeUnit::Nanosecond) => {
-            let duration_array = downcast_value!(time_array, DurationNanosecondArray);
-            duration_array.reinterpret_cast::<Int64Type>()
-        }
-        _ => {
-            return Err(exec_datafusion_err!(
-                "Unexpected type for time column {}",
-                time_array.data_type()
-            ));
-        }
-    })
-}
-
-/// Compact, display-friendly snapshot of the plan-time decisions that drove a scan.
-///
-/// Surfaced via `DisplayAs::Verbose` on `SegmentStreamExec` so plain `EXPLAIN`
-/// (without `ANALYZE`) shows the most useful planning-phase decisions.
-#[derive(Debug, Clone)]
-pub(crate) struct PlanSummary {
-    pub query_type: &'static str,
-    pub query_chunks: usize,
-    pub query_segments: usize,
-    pub query_bytes: u64,
-    pub filters_pushed_down: usize,
-    pub filters_applied_client_side: usize,
-    pub entity_path_narrowing_applied: bool,
-}
-
-impl PlanSummary {
-    pub fn from_query_info(info: &crate::analytics::QueryInfo) -> Self {
-        Self {
-            query_type: info.query_type.as_str(),
-            query_chunks: info.query_chunks,
-            query_segments: info.query_segments,
-            query_bytes: info.query_bytes,
-            filters_pushed_down: info.filters_pushed_down,
-            filters_applied_client_side: info.filters_applied_client_side,
-            entity_path_narrowing_applied: info.entity_path_narrowing_applied,
-        }
-    }
-}
-
-/// Aggregates derived from the deduplicated chunk metadata returned by `query_dataset`.
-///
-/// These are cheap zero-copy Arrow reads (no per-element allocation except the
-/// segment histogram map). The scan path computes them once to seed the
-/// analytics span without adding an extra pass.
-#[derive(Default)]
-pub(crate) struct ChunkInfoAggregates {
-    pub chunks: usize,
-    pub segments: usize,
-    pub layers: usize,
-    pub bytes: u64,
-    pub chunks_per_segment_min: u32,
-    pub chunks_per_segment_max: u32,
-    pub chunks_per_segment_mean: f32,
-}
-
-pub(crate) fn compute_chunk_info_aggregates(batch: &RecordBatch) -> ChunkInfoAggregates {
-    let chunks = batch.num_rows();
-
-    // Lenient: these are analytics aggregates — a missing or mistyped column yields zeros.
-    let segment_ids = QueryDatasetDataframe::COLUMN_CHUNK_SEGMENT_ID
-        .extract(batch)
-        .ok();
-    let layer_names = QueryDatasetDataframe::COLUMN_RERUN_SEGMENT_LAYER
-        .extract(batch)
-        .ok();
-    let byte_lens = QueryDatasetDataframe::COLUMN_CHUNK_BYTE_LEN
-        .extract(batch)
-        .ok();
-
-    // Segment count + per-segment histogram in one pass
-    let mut per_segment: HashMap<&str, u32> = HashMap::new();
-    for v in segment_ids.iter().flatten() {
-        *per_segment.entry(v).or_default() += 1;
-    }
-    let segments = per_segment.len();
-    let (chunks_per_segment_min, chunks_per_segment_max) = per_segment
-        .into_values()
-        .fold((u32::MAX, 0u32), |(min, max), v| (min.min(v), max.max(v)));
-    // Clamp the sentinel back to 0 when the histogram was empty.
-    let chunks_per_segment_min = if segments == 0 {
-        0
-    } else {
-        chunks_per_segment_min
-    };
-    let chunks_per_segment_mean = if segments == 0 {
-        0.0
-    } else {
-        // chunks fits in u32 for realistic queries; precision loss is acceptable for analytics.
-        chunks as f32 / segments as f32
-    };
-
-    let layers = layer_names.map_or(0, |col| col.iter().collect::<HashSet<_>>().len());
-
-    let bytes: u64 = byte_lens.map_or(0, |col| col.iter().sum());
-
-    ChunkInfoAggregates {
-        chunks,
-        segments,
-        layers,
-        bytes,
-        chunks_per_segment_min,
-        chunks_per_segment_max,
-        chunks_per_segment_mean,
     }
 }
 
@@ -1303,8 +971,18 @@ fn compute_unique_chunk_info_ids(
         return Ok(None);
     }
 
-    let schema = chunk_info_batches[0].schema();
-    let combined = concat_batches(&schema, &chunk_info_batches)?;
+    // Merge by column *name*, not by position: a `query_dataset` response schema is only
+    // pinned by name (that is what `QueryDatasetDataframe::COLUMN_*` extraction relies on),
+    // and the batches we get here come from several independent responses — one per fan-out
+    // branch, each free to carry a different column order and a different set of optional
+    // columns (`chunk_byte_offset`, `{timeline}:start`, …). A branch that selected nothing
+    // typically answers with the server's fallback empty batch, whose columns are neither
+    // ordered nor shaped like the populated branches'. Concatenating those positionally
+    // either fails outright (`It is not possible to concatenate arrays of different data
+    // types (Utf8, Boolean)`) or, worse, silently pairs up same-typed but unrelated columns.
+    let combined = re_arrow_util::concat_polymorphic_batches(&chunk_info_batches)
+        .map_err(|err| exec_datafusion_err!("merging chunk-info batches: {err}"))?;
+    let schema = combined.schema();
     drop(chunk_info_batches);
 
     let chunk_ids = QueryDatasetDataframe::COLUMN_CHUNK_ID
@@ -1335,8 +1013,7 @@ fn compute_unique_chunk_info_ids(
 mod tests {
     use std::{collections::HashMap, iter::once};
 
-    use arrow::array::{FixedSizeBinaryBuilder, StringArray};
-    use re_protos::cloud::v1alpha1::ext;
+    use arrow::datatypes::{DataType, Field};
 
     use super::*;
 
@@ -1517,420 +1194,6 @@ mod tests {
         assert_untouched(&req);
     }
 
-    #[test]
-    fn test_batches_grouping() {
-        let schema = Arc::new(Schema::new_with_metadata(
-            vec![
-                Arc::new(ext::QueryDatasetDataframe::COLUMN_CHUNK_SEGMENT_ID.arrow_field()),
-                Arc::new(ext::QueryDatasetDataframe::COLUMN_CHUNK_ID.arrow_field()),
-            ],
-            HashMap::default(),
-        ));
-
-        let capacity = 4;
-        let byte_width = 16;
-        let mut chunk_id_builder = FixedSizeBinaryBuilder::with_capacity(capacity, byte_width);
-        chunk_id_builder.append_value([0u8; 16]).unwrap();
-        chunk_id_builder.append_value([1u8; 16]).unwrap();
-        chunk_id_builder.append_value([2u8; 16]).unwrap();
-        chunk_id_builder.append_value([3u8; 16]).unwrap();
-        let chunk_id_array = Arc::new(chunk_id_builder.finish());
-
-        let batch1 = RecordBatch::try_new_with_options(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec![
-                    Some("A"),
-                    Some("B"),
-                    Some("A"),
-                    Some("C"),
-                ])),
-                chunk_id_array,
-            ],
-            &RecordBatchOptions::new().with_row_count(Some(4)),
-        )
-        .unwrap();
-
-        let mut chunk_id_builder = FixedSizeBinaryBuilder::with_capacity(capacity, byte_width);
-        chunk_id_builder.append_value([4u8; 16]).unwrap();
-        chunk_id_builder.append_value([5u8; 16]).unwrap();
-        chunk_id_builder.append_value([6u8; 16]).unwrap();
-        let chunk_id_array = Arc::new(chunk_id_builder.finish());
-
-        let batch2 = RecordBatch::try_new_with_options(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec![Some("B"), Some("C"), Some("D")])),
-                chunk_id_array,
-            ],
-            &RecordBatchOptions::new().with_row_count(Some(3)),
-        )
-        .unwrap();
-
-        let chunk_info_batches = Arc::new(vec![batch1, batch2]);
-
-        let grouped = group_chunk_infos_by_segment_id(&chunk_info_batches).unwrap();
-
-        assert_eq!(grouped.len(), 4);
-
-        fn chunk_ids_of(batch: &RecordBatch) -> Vec<re_types_core::ChunkId> {
-            QueryDatasetDataframe::COLUMN_CHUNK_ID
-                .extract(batch)
-                .unwrap()
-                .to_vec()
-        }
-
-        let group_a = grouped.get("A").unwrap();
-        assert_eq!(group_a.len(), 1);
-        assert_eq!(
-            chunk_ids_of(&group_a[0]),
-            [[0u8; 16], [2u8; 16]].map(re_types_core::ChunkId::from)
-        );
-
-        let group_b = grouped.get("B").unwrap();
-        assert_eq!(group_b.len(), 2);
-        assert_eq!(
-            chunk_ids_of(&group_b[0]),
-            [[1u8; 16]].map(re_types_core::ChunkId::from)
-        );
-        assert_eq!(
-            chunk_ids_of(&group_b[1]),
-            [[4u8; 16]].map(re_types_core::ChunkId::from)
-        );
-
-        let group_c = grouped.get("C").unwrap();
-        assert_eq!(group_c.len(), 2);
-        assert_eq!(
-            chunk_ids_of(&group_c[0]),
-            [[3u8; 16]].map(re_types_core::ChunkId::from)
-        );
-        assert_eq!(
-            chunk_ids_of(&group_c[1]),
-            [[5u8; 16]].map(re_types_core::ChunkId::from)
-        );
-
-        let group_d = grouped.get("D").unwrap();
-        assert_eq!(group_d.len(), 1);
-        assert_eq!(
-            chunk_ids_of(&group_d[0]),
-            [[6u8; 16]].map(re_types_core::ChunkId::from)
-        );
-    }
-
-    // ==================== Entity path projection pushdown tests ====================
-
-    /// Build a schema mimicking `DataframeQueryTableProvider`'s output schema:
-    /// - Index 0: `rerun_segment_id` (Utf8, no entity path metadata)
-    /// - Index 1: `log_time` (Int64, with `rerun:kind=index` metadata)
-    /// - Index 2: `/points:Position3D:positions` (component, `entity_path=/points`)
-    /// - Index 3: `/points:Color:colors` (component, `entity_path=/points`)
-    /// - Index 4: `/cameras:Transform3D:transform` (component, `entity_path=/cameras`)
-    fn make_schema_with_entities() -> SchemaRef {
-        use re_sorbet::metadata::{RERUN_KIND, SORBET_ENTITY_PATH};
-
-        let index_metadata = HashMap::from([(RERUN_KIND.to_owned(), "index".to_owned())]);
-        let points_metadata =
-            HashMap::from([(SORBET_ENTITY_PATH.to_owned(), "/points".to_owned())]);
-        let cameras_metadata =
-            HashMap::from([(SORBET_ENTITY_PATH.to_owned(), "/cameras".to_owned())]);
-
-        Arc::new(Schema::new_with_metadata(
-            vec![
-                Field::new("rerun_segment_id", DataType::Utf8, false),
-                Field::new("log_time", DataType::Int64, false).with_metadata(index_metadata),
-                Field::new("/points:Position3D:positions", DataType::Utf8, true)
-                    .with_metadata(points_metadata.clone()),
-                Field::new("/points:Color:colors", DataType::Utf8, true)
-                    .with_metadata(points_metadata),
-                Field::new("/cameras:Transform3D:transform", DataType::Utf8, true)
-                    .with_metadata(cameras_metadata),
-            ],
-            HashMap::new(),
-        ))
-    }
-
-    /// Like [`make_schema_with_entities`] but with `rerun:component` metadata, so
-    /// component columns parse to their real identifiers (`positions`, `colors`,
-    /// `transform`) instead of falling back to the full column name — matching
-    /// the metadata that real dataset schemas carry.
-    fn make_schema_with_components() -> SchemaRef {
-        use re_sorbet::metadata::{RERUN_KIND, SORBET_ENTITY_PATH};
-        // `re_types_core::FIELD_METADATA_KEY_COMPONENT`.
-        const COMPONENT: &str = "rerun:component";
-
-        let index_metadata = HashMap::from([(RERUN_KIND.to_owned(), "index".to_owned())]);
-        let component_metadata = |entity: &str, component: &str| {
-            HashMap::from([
-                (SORBET_ENTITY_PATH.to_owned(), entity.to_owned()),
-                (COMPONENT.to_owned(), component.to_owned()),
-            ])
-        };
-
-        Arc::new(Schema::new_with_metadata(
-            vec![
-                Field::new("rerun_segment_id", DataType::Utf8, false),
-                Field::new("log_time", DataType::Int64, false).with_metadata(index_metadata),
-                Field::new("/points:Position3D:positions", DataType::Utf8, true)
-                    .with_metadata(component_metadata("/points", "positions")),
-                Field::new("/points:Color:colors", DataType::Utf8, true)
-                    .with_metadata(component_metadata("/points", "colors")),
-                Field::new("/cameras:Transform3D:transform", DataType::Utf8, true)
-                    .with_metadata(component_metadata("/cameras", "transform")),
-            ],
-            HashMap::new(),
-        ))
-    }
-
-    #[test]
-    fn test_projection_single_entity() {
-        let schema = make_schema_with_entities();
-        // Select seg_id + log_time + both /points columns
-        let projection = vec![0, 1, 2, 3];
-        let paths = extract_projected_entity_paths(&schema, &projection, &[]);
-        assert_eq!(paths.len(), 1);
-        assert!(paths.contains(&EntityPath::from("/points")));
-    }
-
-    #[test]
-    fn test_projection_multiple_entities() {
-        let schema = make_schema_with_entities();
-        // Select seg_id + one /points col + /cameras col
-        let projection = vec![0, 2, 4];
-        let paths = extract_projected_entity_paths(&schema, &projection, &[]);
-        assert_eq!(paths.len(), 2);
-        assert!(paths.contains(&EntityPath::from("/points")));
-        assert!(paths.contains(&EntityPath::from("/cameras")));
-    }
-
-    #[test]
-    fn test_projection_only_non_entity_cols() {
-        let schema = make_schema_with_entities();
-        // Select only seg_id + log_time — no entity paths
-        let projection = vec![0, 1];
-        let paths = extract_projected_entity_paths(&schema, &projection, &[]);
-        assert!(paths.is_empty());
-    }
-
-    #[test]
-    fn test_filter_adds_entity_paths() {
-        use datafusion::logical_expr::col;
-
-        let schema = make_schema_with_entities();
-        // Project only /points column
-        let projection = vec![0, 2];
-        // Filter references /cameras column
-        let filters = vec![col("/cameras:Transform3D:transform").is_not_null()];
-        let paths = extract_projected_entity_paths(&schema, &projection, &filters);
-        assert_eq!(paths.len(), 2);
-        assert!(paths.contains(&EntityPath::from("/points")));
-        assert!(paths.contains(&EntityPath::from("/cameras")));
-    }
-
-    #[test]
-    fn test_filter_with_non_entity_cols_only() {
-        use datafusion::logical_expr::{col, lit};
-
-        let schema = make_schema_with_entities();
-        // Project only /points column
-        let projection = vec![0, 2];
-        // Filter references segment_id (no entity path) and time index (no entity path)
-        let filters = vec![
-            col("rerun_segment_id").eq(lit("seg_a")),
-            col("log_time").gt(lit(100_i64)),
-        ];
-        let paths = extract_projected_entity_paths(&schema, &projection, &filters);
-        // Only /points from projection — filters don't add entity paths
-        assert_eq!(paths.len(), 1);
-        assert!(paths.contains(&EntityPath::from("/points")));
-    }
-
-    #[test]
-    fn test_component_projection_single() {
-        let schema = make_schema_with_components();
-        // Select seg_id + log_time + only the positions component of /points.
-        let projection = vec![0, 1, 2];
-        let components = extract_projected_components(&schema, &projection, &[]);
-        assert_eq!(
-            components,
-            once("positions".to_owned()).collect::<BTreeSet<_>>(),
-            "only the projected component should be selected, not its sibling `colors`",
-        );
-    }
-
-    #[test]
-    fn test_component_projection_skips_non_component_columns() {
-        let schema = make_schema_with_components();
-        // Select only seg_id + log_time — neither is a component column.
-        let projection = vec![0, 1];
-        let components = extract_projected_components(&schema, &projection, &[]);
-        assert!(
-            components.is_empty(),
-            "segment-id and index columns must not be treated as components",
-        );
-    }
-
-    #[test]
-    fn test_component_projection_filter_adds_component() {
-        use datafusion::logical_expr::col;
-
-        let schema = make_schema_with_components();
-        // Project only the positions component, but filter on a sibling component.
-        let projection = vec![0, 2];
-        let filters = vec![col("/points:Color:colors").is_not_null()];
-        let components = extract_projected_components(&schema, &projection, &filters);
-        assert_eq!(
-            components,
-            ["positions".to_owned(), "colors".to_owned()]
-                .into_iter()
-                .collect::<BTreeSet<_>>(),
-            "a component referenced only by a filter must still be fetched",
-        );
-    }
-
-    #[test]
-    fn test_all_schema_components() {
-        let schema = make_schema_with_components();
-        assert_eq!(
-            all_schema_components(&schema),
-            [
-                "positions".to_owned(),
-                "colors".to_owned(),
-                "transform".to_owned()
-            ]
-            .into_iter()
-            .collect::<BTreeSet<_>>(),
-            "every component column in the schema must be reported, deduped",
-        );
-    }
-
-    #[test]
-    fn test_component_projection_full_read_is_not_narrowed() {
-        // A full read projects every column. The projected components then equal
-        // the full schema set, so the scan must NOT narrow `fuzzy_descriptors`
-        // (an exhaustive list would drop static-only components server-side).
-        let schema = make_schema_with_components();
-        let projection: Vec<usize> = (0..schema.fields().len()).collect();
-        let projected = extract_projected_components(&schema, &projection, &[]);
-        assert_eq!(
-            projected,
-            all_schema_components(&schema),
-            "projecting all columns must reference every component",
-        );
-        assert!(
-            projected.len() >= all_schema_components(&schema).len(),
-            "a full projection is not a strict subset, so narrowing must be skipped",
-        );
-    }
-
-    #[test]
-    fn test_narrowing_intersects_with_original() {
-        let projected_paths: BTreeSet<EntityPath> = once(EntityPath::from("/points")).collect();
-        let mut query = QueryDatasetRequest {
-            entity_paths: vec![
-                EntityPath::from("/points"),
-                EntityPath::from("/cameras"),
-                EntityPath::from("/meshes"),
-            ],
-            select_all_entity_paths: false,
-            ..Default::default()
-        };
-
-        query
-            .entity_paths
-            .retain(|path| projected_paths.contains(path));
-
-        assert_eq!(query.entity_paths, vec![EntityPath::from("/points")]);
-    }
-
-    #[test]
-    fn test_narrowing_empty_projected_no_change() {
-        let projected_paths: BTreeSet<EntityPath> = BTreeSet::new();
-        let mut query = QueryDatasetRequest {
-            entity_paths: vec![EntityPath::from("/points"), EntityPath::from("/cameras")],
-            select_all_entity_paths: false,
-            ..Default::default()
-        };
-        let original = query.entity_paths.clone();
-
-        // Empty projected_paths → caller should skip narrowing
-        if !projected_paths.is_empty() {
-            query
-                .entity_paths
-                .retain(|path| projected_paths.contains(path));
-        }
-
-        assert_eq!(query.entity_paths, original);
-    }
-
-    #[test]
-    fn test_narrowing_select_all_no_change() {
-        let projected_paths: BTreeSet<EntityPath> = once(EntityPath::from("/points")).collect();
-        let mut query = QueryDatasetRequest {
-            entity_paths: vec![],
-            select_all_entity_paths: true,
-            ..Default::default()
-        };
-
-        // select_all_entity_paths=true → skip narrowing
-        if !query.select_all_entity_paths && !query.entity_paths.is_empty() {
-            query
-                .entity_paths
-                .retain(|path| projected_paths.contains(path));
-        }
-
-        assert!(query.entity_paths.is_empty());
-        assert!(query.select_all_entity_paths);
-    }
-
-    #[test]
-    fn test_narrowing_preserves_multiple_queries() {
-        let projected_paths: BTreeSet<EntityPath> = once(EntityPath::from("/points")).collect();
-        let mut queries = vec![
-            QueryDatasetRequest {
-                entity_paths: vec![EntityPath::from("/points"), EntityPath::from("/cameras")],
-                select_all_entity_paths: false,
-                ..Default::default()
-            },
-            QueryDatasetRequest {
-                entity_paths: vec![EntityPath::from("/points"), EntityPath::from("/meshes")],
-                select_all_entity_paths: false,
-                ..Default::default()
-            },
-        ];
-
-        for query in &mut queries {
-            if !query.select_all_entity_paths && !query.entity_paths.is_empty() {
-                query
-                    .entity_paths
-                    .retain(|path| projected_paths.contains(path));
-            }
-        }
-
-        assert_eq!(queries[0].entity_paths, vec![EntityPath::from("/points")]);
-        assert_eq!(queries[1].entity_paths, vec![EntityPath::from("/points")]);
-    }
-
-    #[test]
-    fn test_narrowing_skipped_with_fill_latest_at() {
-        let projected_paths: BTreeSet<EntityPath> = once(EntityPath::from("/points")).collect();
-        let mut query = QueryDatasetRequest {
-            entity_paths: vec![EntityPath::from("/points"), EntityPath::from("/cameras")],
-            select_all_entity_paths: false,
-            ..Default::default()
-        };
-        let original = query.entity_paths.clone();
-
-        // Simulate fill_latest_at=true check
-        let sparse_fill_strategy = SparseFillStrategy::LatestAtGlobal;
-        if sparse_fill_strategy == SparseFillStrategy::None && !projected_paths.is_empty() {
-            query
-                .entity_paths
-                .retain(|path| projected_paths.contains(path));
-        }
-
-        assert_eq!(query.entity_paths, original);
-    }
-
     // -------------------------------------------------------------------
     // `query_from_query_expression` — gating of `latest_at` synthesis on
     // `synthesize_latest_at` for the user-supplied-range path. This is the
@@ -2030,123 +1293,5 @@ mod tests {
              synthesize_latest_at=false",
         );
         assert!(query.range.is_none(), "static-only must have no range");
-    }
-
-    /// Build a synthetic chunk-info `RecordBatch` from parallel column vectors.
-    fn make_chunk_info_batch(
-        segment_ids: &[&str],
-        layer_names: &[&str],
-        byte_lens: &[u64],
-    ) -> RecordBatch {
-        use arrow::array::UInt64Array;
-
-        let schema = Arc::new(Schema::new_with_metadata(
-            vec![
-                Arc::new(ext::QueryDatasetDataframe::COLUMN_CHUNK_SEGMENT_ID.arrow_field()),
-                Arc::new(ext::QueryDatasetDataframe::COLUMN_RERUN_SEGMENT_LAYER.arrow_field()),
-                Arc::new(ext::QueryDatasetDataframe::COLUMN_CHUNK_BYTE_LEN.arrow_field()),
-            ],
-            HashMap::default(),
-        ));
-
-        let n = segment_ids.len();
-        assert_eq!(n, layer_names.len());
-        assert_eq!(n, byte_lens.len());
-
-        RecordBatch::try_new_with_options(
-            schema,
-            vec![
-                Arc::new(StringArray::from(segment_ids.to_vec())),
-                Arc::new(StringArray::from(layer_names.to_vec())),
-                Arc::new(UInt64Array::from(byte_lens.to_vec())),
-            ],
-            &RecordBatchOptions::new().with_row_count(Some(n)),
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn chunk_info_aggregates_empty() {
-        let batch = make_chunk_info_batch(&[], &[], &[]);
-        let agg = compute_chunk_info_aggregates(&batch);
-        assert_eq!(agg.chunks, 0);
-        assert_eq!(agg.segments, 0);
-        assert_eq!(agg.layers, 0);
-        assert_eq!(agg.bytes, 0);
-        assert_eq!(agg.chunks_per_segment_min, 0);
-        assert_eq!(agg.chunks_per_segment_max, 0);
-        assert_eq!(agg.chunks_per_segment_mean, 0.0);
-    }
-
-    #[test]
-    fn chunk_info_aggregates_single_segment() {
-        // 3 chunks, all in segment "A", all in layer "base".
-        let batch =
-            make_chunk_info_batch(&["A", "A", "A"], &["base", "base", "base"], &[10, 20, 30]);
-        let agg = compute_chunk_info_aggregates(&batch);
-        assert_eq!(agg.chunks, 3);
-        assert_eq!(agg.segments, 1);
-        assert_eq!(agg.layers, 1);
-        assert_eq!(agg.bytes, 60);
-        assert_eq!(agg.chunks_per_segment_min, 3);
-        assert_eq!(agg.chunks_per_segment_max, 3);
-        assert!((agg.chunks_per_segment_mean - 3.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn chunk_info_aggregates_uniform_segments() {
-        // 6 chunks spread evenly: A,A | B,B | C,C.
-        let batch = make_chunk_info_batch(
-            &["A", "A", "B", "B", "C", "C"],
-            &["base"; 6],
-            &[1, 1, 1, 1, 1, 1],
-        );
-        let agg = compute_chunk_info_aggregates(&batch);
-        assert_eq!(agg.chunks, 6);
-        assert_eq!(agg.segments, 3);
-        assert_eq!(agg.layers, 1);
-        assert_eq!(agg.bytes, 6);
-        assert_eq!(agg.chunks_per_segment_min, 2);
-        assert_eq!(agg.chunks_per_segment_max, 2);
-        assert!((agg.chunks_per_segment_mean - 2.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn chunk_info_aggregates_skewed_segments() {
-        // Sizes [1, 5, 10] — 16 chunks across 3 segments.
-        let mut segs = vec!["A"];
-        segs.extend(std::iter::repeat_n("B", 5));
-        segs.extend(std::iter::repeat_n("C", 10));
-        let layers = vec!["base"; segs.len()];
-        let bytes = vec![1u64; segs.len()];
-
-        let batch = make_chunk_info_batch(&segs, &layers, &bytes);
-        let agg = compute_chunk_info_aggregates(&batch);
-        assert_eq!(agg.chunks, 16);
-        assert_eq!(agg.segments, 3);
-        assert_eq!(agg.layers, 1);
-        assert_eq!(agg.bytes, 16);
-        assert_eq!(agg.chunks_per_segment_min, 1);
-        assert_eq!(agg.chunks_per_segment_max, 10);
-        // mean = 16/3 ≈ 5.333
-        assert!((agg.chunks_per_segment_mean - (16.0 / 3.0)).abs() < 1e-5);
-    }
-
-    #[test]
-    fn chunk_info_aggregates_multi_layer() {
-        // Two segments, each touched in two layers — 4 distinct (segment, layer) rows.
-        let batch = make_chunk_info_batch(
-            &["A", "A", "B", "B"],
-            &["base", "v2", "base", "v2"],
-            &[100, 200, 300, 400],
-        );
-        let agg = compute_chunk_info_aggregates(&batch);
-        assert_eq!(agg.chunks, 4);
-        assert_eq!(agg.segments, 2);
-        assert_eq!(agg.layers, 2);
-        assert_eq!(agg.bytes, 1000);
-        assert_eq!(agg.chunks_per_segment_min, 2);
-        assert_eq!(agg.chunks_per_segment_max, 2);
-        assert!((agg.chunks_per_segment_mean - 2.0).abs() < f32::EPSILON);
     }
 }

@@ -1,13 +1,13 @@
 use egui::{
     CollapsingResponse, Color32, IntoAtoms, Margin, NumExt as _, Rangef, Rect, StrokeKind,
-    Widget as _, WidgetInfo, WidgetText, pos2,
+    UiBuilder, Widget as _, WidgetInfo, WidgetText, pos2,
 };
 use egui::{CornerRadius, emath::GuiRounding as _};
 
 use crate::alert::Alert;
 use crate::button::ReButton;
 use crate::list_item::{self, LabelContent};
-use crate::{ContextExt as _, DesignTokens, Icon, LabelStyle, Size, Variant, icons};
+use crate::{ContextExt as _, DesignTokens, Icon, Size, Variant, icons};
 
 static FULL_SPAN_TAG: &str = "rerun_full_span";
 
@@ -54,6 +54,13 @@ pub trait UiExt {
         crate::loading_indicator::loading_indicator_ui(self.ui_mut(), reason)
     }
 
+    /// Like [`Self::loading_indicator`], but as tall as one line of text, so a label can take its
+    /// place without changing layout.
+    #[doc(alias = "spinner")]
+    fn inline_loading_indicator(&mut self, reason: &str) -> egui::Response {
+        crate::loading_indicator::inline_loading_indicator_ui(self.ui_mut(), reason)
+    }
+
     /// Small orange "debug only" pill, marking UI that is only present in debug builds.
     #[cfg(debug_assertions)]
     fn debug_only_badge(&mut self) -> egui::Response {
@@ -62,36 +69,36 @@ pub trait UiExt {
 
     /// Shows a success label with a large border.
     ///
-    /// If the text contains [`re_error::DETAILS_SEPARATOR`], the details are
+    /// If the text has a details section (see [`re_error::StructuredError`]), the details are
     /// shown on hover instead of inline.
     ///
     /// If you don't want a border, use [`crate::ContextExt::success_text`].
     fn success_label(&mut self, success_text: impl Into<String>) -> egui::Response {
-        let success_text = success_text.into();
-        let (summary, details) = re_error::split_details(&success_text);
-        Alert::success().show_text(self.ui_mut(), summary, details.map(str::to_owned))
+        let text = re_error::StructuredError::parse(success_text.into());
+        let details = text.details_joined();
+        Alert::success().show_text(self.ui_mut(), text.summary, details)
     }
 
     /// Shows an info label with a large border.
     ///
-    /// If the text contains [`re_error::DETAILS_SEPARATOR`], the details are
+    /// If the text has a details section (see [`re_error::StructuredError`]), the details are
     /// shown on hover instead of inline.
     fn info_label(&mut self, info_text: impl Into<String>) -> egui::Response {
-        let info_text = info_text.into();
-        let (summary, details) = re_error::split_details(&info_text);
-        Alert::info().show_text(self.ui_mut(), summary, details.map(str::to_owned))
+        let text = re_error::StructuredError::parse(info_text.into());
+        let details = text.details_joined();
+        Alert::info().show_text(self.ui_mut(), text.summary, details)
     }
 
     /// Shows a warning label with a large border.
     ///
-    /// If the text contains [`re_error::DETAILS_SEPARATOR`], the details are
+    /// If the text has a details section (see [`re_error::StructuredError`]), the details are
     /// shown on hover instead of inline.
     ///
     /// If you don't want a border, use [`crate::ContextExt::warning_text`].
     fn warning_label(&mut self, warning_text: impl Into<String>) -> egui::Response {
-        let warning_text = warning_text.into();
-        let (summary, details) = re_error::split_details(&warning_text);
-        Alert::warning().show_text(self.ui_mut(), summary, details.map(str::to_owned))
+        let text = re_error::StructuredError::parse(warning_text.into());
+        let details = text.details_joined();
+        Alert::warning().show_text(self.ui_mut(), text.summary, details)
     }
 
     /// Shows a small error label with the given text on hover and copies the text to the clipboard on click with a large border.
@@ -107,7 +114,7 @@ pub trait UiExt {
 
     /// Shows an error label with the entire error text and copies the text to the clipboard on click.
     ///
-    /// If the text contains [`re_error::DETAILS_SEPARATOR`], the details are
+    /// If the text has a details section (see [`re_error::StructuredError`]), the details are
     /// shown on hover instead of inline.
     ///
     /// Use this only if the error message is short, or you have a lot of room.
@@ -115,9 +122,9 @@ pub trait UiExt {
     ///
     /// This has a large border! If you don't want a border, use [`crate::ContextExt::error_text`].
     fn error_label(&mut self, error_text: impl Into<String>) -> egui::Response {
-        let error_text = error_text.into();
-        let (summary, details) = re_error::split_details(&error_text);
-        Alert::error().show_text(self.ui_mut(), summary, details.map(str::to_owned))
+        let text = re_error::StructuredError::parse(error_text.into());
+        let details = text.details_joined();
+        Alert::error().show_text(self.ui_mut(), text.summary, details)
     }
 
     /// The `alt_text` will be used for accessibility (e.g. read by screen readers),
@@ -417,53 +424,28 @@ pub trait UiExt {
     /// This title bar is meant to be used in a panel with proper inner margin and clip rectangle
     /// set.
     ///
-    /// Use [`UiExt::panel_title_bar_with_buttons`] to display buttons in the title bar.
+    /// Shorthand for [`crate::PanelTitleBar`], which also supports buttons.
     fn panel_title_bar(&mut self, label: &str, hover_text: Option<&str>) {
         self.panel_title_bar_with_buttons(label, hover_text, |_ui| {});
     }
 
-    /// Static title bar used to separate panels into section with custom buttons when hovered.
-    ///h
+    /// Static title bar used to separate panels into section, with buttons at its right edge.
+    ///
     /// This title bar is meant to be used in a panel with proper inner margin and clip rectangle
     /// set.
+    ///
+    /// Shorthand for [`crate::PanelTitleBar`], which also supports buttons after the label.
     fn panel_title_bar_with_buttons<R>(
         &mut self,
         label: &str,
         hover_text: Option<&str>,
         add_right_buttons: impl FnOnce(&mut egui::Ui) -> R,
     ) -> R {
-        let tokens = self.tokens();
-        let ui = self.ui_mut();
-
-        ui.allocate_ui_with_layout(
-            egui::vec2(ui.available_width(), tokens.title_bar_height()),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                // draw horizontal separator lines
-                let rect = egui::Rect::from_x_y_ranges(
-                    ui.full_span(),
-                    ui.available_rect_before_wrap().y_range(),
-                );
-
-                ui.painter()
-                    .rect_filled(rect, 0.0, ui.tokens().section_header_color);
-
-                // draw label
-                let resp = ui.strong(label);
-                if let Some(hover_text) = hover_text {
-                    resp.on_hover_text(hover_text);
-                }
-
-                // draw hover buttons
-                ui.allocate_ui_with_layout(
-                    ui.available_size(),
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    add_right_buttons,
-                )
-                .inner
-            },
-        )
-        .inner
+        let mut title_bar = crate::PanelTitleBar::new(label);
+        if let Some(hover_text) = hover_text {
+            title_bar = title_bar.hover_text(hover_text);
+        }
+        title_bar.show_with_right_buttons(self.ui_mut(), add_right_buttons)
     }
 
     /// Replacement for [`egui::CollapsingHeader`] that respect our style.
@@ -505,6 +487,13 @@ pub trait UiExt {
         let (_, rect) = ui.allocate_space(desired_size);
 
         let mut header_response = ui.interact(rect, id, egui::Sense::click());
+        header_response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::CollapsingHeader,
+                ui.is_enabled(),
+                galley.text(),
+            )
+        });
         let text_pos = pos2(
             text_pos.x,
             header_response.rect.center().y - galley.size().y / 2.0,
@@ -717,19 +706,9 @@ pub trait UiExt {
         icon: &Icon,
         text: impl Into<egui::WidgetText>,
         selected: bool,
-        style: LabelStyle,
     ) -> egui::Response {
-        let mut text = text.into();
+        let text = text.into();
         let ui = self.ui_mut();
-        let text_color = ui.visuals().text_color();
-        match style {
-            LabelStyle::Normal => {}
-            LabelStyle::Unnamed => {
-                // TODO(ab): use design tokens
-                let text_color = text_color.gamma_multiply(0.5);
-                text = text.italics().color(text_color);
-            }
-        }
         let raw_text = text.text().to_owned();
 
         let button = || {
@@ -771,18 +750,45 @@ pub trait UiExt {
         })
     }
 
+    /// Shows a loading screen or a terminal error for the same operation.
+    ///
+    /// Returns whether the optional error action was clicked.
     fn loading_screen(
         &mut self,
         header: impl Into<egui::RichText>,
         source: impl Into<egui::RichText>,
-    ) {
+        error: Option<&str>,
+        error_action: Option<&str>,
+    ) -> bool {
         let header = header.into();
-        // Reuse the header text as the loading reason shown on hover in debug builds.
-        let reason = header.text().to_owned();
-        self.loading_screen_ui(&reason, |ui| {
-            ui.label(header.heading().color(ui.style().visuals.weak_text_color()));
-            ui.strong(source);
-        });
+        let source = source.into();
+
+        if let Some(error) = error {
+            let error = re_error::StructuredError::parse(error);
+            let details = error.details_joined();
+
+            // Derive the limit before `center` inserts space based on the previous frame's content
+            // size. Using the remaining width inside the closure creates a layout feedback loop.
+            let max_width = self.ui().available_width() * 0.75;
+
+            self.ui_mut().center("loading error", |ui| {
+                ui.set_max_width(max_width);
+                ui.vertical_centered(|ui| {
+                    Alert::error().show_text(ui, error.summary, details);
+                    error_action.is_some_and(|label| ui.button(label).clicked())
+                })
+                .inner
+            })
+        } else {
+            // Reuse the header text as the loading reason shown on hover in debug builds.
+            let reason = header.text().to_owned();
+            self.loading_screen_ui(&reason, |ui| {
+                ui.label(header.heading().color(ui.style().visuals.weak_text_color()));
+                ui.strong(source);
+            });
+
+            false
+        }
     }
 
     /// Paints a time cursor for indicating the time on a time axis along x.
@@ -870,6 +876,12 @@ pub trait UiExt {
         let id = ui.make_persistent_id(id_salt);
 
         let text_size: Option<TextSize> = ui.data(|reader| reader.get_temp(id));
+
+        if text_size.is_none() {
+            // The first pass measures the content. Rerun it with the measurement so the displayed
+            // frame is centered.
+            ui.ctx().request_discard("UiExt::center is measuring");
+        }
 
         // ensure the current ui has a vertical orientation so the space we add is in the correct
         // direction
@@ -1369,6 +1381,42 @@ pub trait UiExt {
             egui::Stroke::new(1.0, ui.visuals().error_fg_color);
         ui.visuals_mut().widgets.inactive.bg_stroke =
             egui::Stroke::new(1.0, ui.visuals().error_fg_color);
+    }
+
+    /// Show `contents` as one wrapping unit inside a [`egui::Ui::horizontal_wrapped`] layout.
+    ///
+    /// Don't use too many of these in the same layout, as it could take a frame per row and wrap
+    /// unit to settle.
+    fn wrap_unit<R>(
+        &mut self,
+        contents: impl FnOnce(&mut egui::Ui) -> R,
+    ) -> egui::InnerResponse<R> {
+        let ui = self.ui_mut();
+
+        let id = ui.next_auto_id();
+        let last_width = ui.read_response(id).map(|response| response.rect.width());
+        let available = ui.available_rect_before_wrap().width();
+
+        // Only break a row that already has something on it: `end_row` moves
+        // down by one row height even on an empty row, which would leave a
+        // blank row above the contents.
+        let row_has_content = available < ui.max_rect().width() - 0.5;
+
+        if row_has_content && last_width.is_some_and(|width| available < width) {
+            ui.end_row();
+        }
+
+        let layout = ui.layout().with_main_wrap(false);
+        let response = ui.scope_builder(UiBuilder::new().id(id).layout(layout), contents);
+
+        // The contents have a width we did not know about when we placed them.
+        // Ask for one more pass, so the next one puts them on the correct row.
+        let width = response.response.rect.width();
+        if last_width.is_none_or(|last_width| 0.5 < (last_width - width).abs()) {
+            ui.request_discard("wrap_unit width changed");
+        }
+
+        response
     }
 }
 

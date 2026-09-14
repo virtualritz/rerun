@@ -77,10 +77,14 @@ impl LoginFlow {
     pub fn ui(&mut self, ui: &mut egui::Ui, cmd: &CommandSender) -> Option<LoginFlowResult> {
         cfg_select! {
             target_arch = "wasm32" => {
-                if !self.started {
+                if self.started {
+                    // Show loading indicator while waiting
+                    self.state.ui(ui);
+                    self.done(ui, cmd)
+                } else {
                     // Show button to start the flow
                     if ActionButton::new(&re_ui::icons::EXTERNAL_LINK, "Log in", "Log in")
-                        .variant(re_ui::Variant::Outlined)
+                        .variant(re_ui::Variant::Primary)
                         .show(ui, &mut false)
                         .clicked()
                     {
@@ -90,10 +94,6 @@ impl LoginFlow {
                         self.started = true;
                     }
                     None
-                } else {
-                    // Show loading indicator while waiting
-                    self.state.ui(ui);
-                    self.done(ui, cmd)
                 }
             }
             _ => {

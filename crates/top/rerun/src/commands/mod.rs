@@ -23,6 +23,7 @@ impl CallSource {
 
 #[cfg(feature = "auth")]
 mod auth;
+mod cli_data_source;
 mod download;
 
 mod entrypoint;
@@ -30,6 +31,8 @@ mod entrypoint;
 mod mcap;
 mod rrd;
 mod stdio;
+#[cfg(feature = "importers")]
+mod table_util;
 
 #[cfg(feature = "analytics")]
 mod analytics;

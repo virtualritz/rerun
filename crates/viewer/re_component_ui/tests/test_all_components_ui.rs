@@ -15,7 +15,7 @@ use re_log_types::EntityPath;
 use re_sdk_types::ComponentDescriptor;
 use re_sdk_types::blueprint::components::{ComponentColumnSelector, QueryExpression};
 use re_sdk_types::components::{self, GraphEdge, GraphNode, ImageFormat, Text};
-use re_sdk_types::datatypes::{ChannelDatatype, PixelFormat};
+use re_sdk_types::encodings::{ChannelDatatype, PixelFormat};
 use re_test_context::TestContext;
 use re_types_core::reflection::Reflection;
 use re_types_core::{Component, ComponentBatch, ComponentType};
@@ -362,7 +362,9 @@ fn check_for_unused_snapshots(test_cases: &[TestCase], snapshot_options: &Snapsh
 
         let file_name = path.file_name().unwrap().to_string_lossy().to_string();
 
-        if file_name.ends_with(".png")
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
             && !file_name.ends_with(".diff.png")
             && !file_name.ends_with(".new.png")
             && !file_name.ends_with(".old.png")

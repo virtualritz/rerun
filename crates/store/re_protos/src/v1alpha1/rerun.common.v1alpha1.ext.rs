@@ -184,6 +184,15 @@ impl DatasetKind {
         }
     }
 
+    /// The kind of catalog entry that a dataset of this kind is stored as.
+    pub fn entry_kind(self) -> super::rerun_cloud_v1alpha1::EntryKind {
+        match self {
+            Self::Recording => super::rerun_cloud_v1alpha1::EntryKind::Dataset,
+            Self::Blueprint => super::rerun_cloud_v1alpha1::EntryKind::BlueprintDataset,
+            Self::Asset => super::rerun_cloud_v1alpha1::EntryKind::AssetDataset,
+        }
+    }
+
     pub fn store_kind(self) -> re_log_types::StoreKind {
         match self {
             Self::Recording | Self::Asset => re_log_types::StoreKind::Recording,
@@ -432,7 +441,7 @@ impl From<crate::common::v1alpha1::TaskId> for String {
 }
 
 // Make `quiver::Column<TaskId>` work (backed by a `Utf8` column):
-quiver::newtype_datatype!(crate::common::v1alpha1::TaskId, quiver::Utf8);
+quiver::newtype_data_type!(crate::common::v1alpha1::TaskId, quiver::Utf8);
 
 // ---
 
@@ -740,7 +749,7 @@ impl From<re_log_types::TableId> for crate::common::v1alpha1::TableId {
 impl From<crate::common::v1alpha1::TableId> for re_log_types::TableId {
     #[inline]
     fn from(value: crate::common::v1alpha1::TableId) -> Self {
-        TableId::from(value.id)
+        TableId::new(value.id)
     }
 }
 
@@ -988,8 +997,8 @@ impl From<crate::common::v1alpha1::BuildInfo> for re_build_info::BuildInfo {
     }
 }
 
-impl From<re_build_info::CrateVersion> for crate::common::v1alpha1::SemanticVersion {
-    fn from(version: re_build_info::CrateVersion) -> Self {
+impl From<re_build_info::CrateVersion<'_>> for crate::common::v1alpha1::SemanticVersion {
+    fn from(version: re_build_info::CrateVersion<'_>) -> Self {
         crate::common::v1alpha1::SemanticVersion {
             major: Some(version.major.into()),
             minor: Some(version.minor.into()),
@@ -999,7 +1008,7 @@ impl From<re_build_info::CrateVersion> for crate::common::v1alpha1::SemanticVers
     }
 }
 
-impl From<crate::common::v1alpha1::SemanticVersion> for re_build_info::CrateVersion {
+impl From<crate::common::v1alpha1::SemanticVersion> for re_build_info::CrateVersion<'static> {
     fn from(version: crate::common::v1alpha1::SemanticVersion) -> Self {
         Self {
             major: version.major() as u8,
@@ -1010,8 +1019,8 @@ impl From<crate::common::v1alpha1::SemanticVersion> for re_build_info::CrateVers
     }
 }
 
-impl From<re_build_info::Meta> for crate::common::v1alpha1::semantic_version::Meta {
-    fn from(version_meta: re_build_info::Meta) -> Self {
+impl From<re_build_info::Meta<'_>> for crate::common::v1alpha1::semantic_version::Meta {
+    fn from(version_meta: re_build_info::Meta<'_>) -> Self {
         match version_meta {
             re_build_info::Meta::Rc(v) => Self::Rc(v.into()),
 
@@ -1027,7 +1036,7 @@ impl From<re_build_info::Meta> for crate::common::v1alpha1::semantic_version::Me
     }
 }
 
-impl From<crate::common::v1alpha1::semantic_version::Meta> for re_build_info::Meta {
+impl From<crate::common::v1alpha1::semantic_version::Meta> for re_build_info::Meta<'static> {
     fn from(version_meta: crate::common::v1alpha1::semantic_version::Meta) -> Self {
         match version_meta {
             crate::common::v1alpha1::semantic_version::Meta::Rc(v) => Self::Rc(v as _),

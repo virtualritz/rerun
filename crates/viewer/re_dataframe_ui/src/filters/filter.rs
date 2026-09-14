@@ -1,7 +1,7 @@
 use arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::logical_expr::Expr;
 use re_log_types::TimestampFormat;
-use re_types_core::{Component as _, FIELD_METADATA_KEY_COMPONENT_TYPE, Loggable as _};
+use re_types_core::{ArrowDataType as _, Component as _, FIELD_METADATA_KEY_COMPONENT_TYPE};
 use re_ui::SyntaxHighlighting;
 use re_ui::syntax_highlighting::SyntaxHighlightedBuilder;
 
@@ -55,9 +55,9 @@ pub trait Filter {
     fn on_commit(&mut self) {}
 }
 
-/// Concrete implementation of a [`Filter`] with static dispatch.
+/// Concrete implementation of a `Filter` with static dispatch.
 ///
-/// ## Why does this exists?
+/// ## Why does this exist?
 ///
 /// The obvious alternative would be some kind of `Box<dyn FilterTrait>` instead. After trying quite
 /// a bit, I decided that the complexity of this is not worth the advantages, which are non-obvious
@@ -115,7 +115,7 @@ impl TypedFilter {
             }
 
             data_type
-                if data_type == &re_sdk_types::components::Timestamp::arrow_datatype()
+                if data_type == &re_sdk_types::components::Timestamp::arrow_data_type()
                     && column_field
                         .metadata()
                         .get(FIELD_METADATA_KEY_COMPONENT_TYPE)

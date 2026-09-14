@@ -8,8 +8,8 @@ An RGBA color with unmultiplied/separate alpha, in sRGB gamma space with linear 
 The color is stored as a 32-bit integer, where the most significant
 byte is `R` and the least significant byte is `A`.
 
-## Rerun datatype
-[`Rgba32`](../datatypes/rgba32.md)
+## Rerun encoding
+[`Rgba32`](../encodings/rgba32.md)
 
 
 ## Arrow datatype
@@ -34,12 +34,13 @@ UInt32
 * [`Cylinders3D`](../archetypes/cylinders3d.md)
 * [`Ellipses2D`](../archetypes/ellipses2d.md)
 * [`Ellipsoids3D`](../archetypes/ellipsoids3d.md)
-* [`GaussianSplats3D`](../archetypes/gaussian_splats3d.md?speculative-link)
+* [`GaussianSplats3D`](../archetypes/gaussian_splats3d.md)
 * [`GeoLineStrings`](../archetypes/geo_line_strings.md)
 * [`GeoPoints`](../archetypes/geo_points.md)
 * [`GraphNodes`](../archetypes/graph_nodes.md)
 * [`LineStrips2D`](../archetypes/line_strips2d.md)
 * [`LineStrips3D`](../archetypes/line_strips3d.md)
+* [`Measurements`](../archetypes/measurements.md?speculative-link)
 * [`Mesh3D`](../archetypes/mesh3d.md)
 * [`Pinhole`](../archetypes/pinhole.md)
 * [`Points2D`](../archetypes/points2d.md)

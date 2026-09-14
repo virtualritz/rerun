@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "../datatypes/scalar_union.hpp"
+#include "../encodings/scalar_union.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -19,22 +19,22 @@ namespace arrow {
 
 namespace rerun::components {
     struct AffixFuzzer15 {
-        std::optional<rerun::datatypes::ScalarUnion> single_optional_union;
+        std::optional<rerun::encodings::ScalarUnion> single_optional_union;
 
       public:
         AffixFuzzer15() = default;
 
-        AffixFuzzer15(std::optional<rerun::datatypes::ScalarUnion> single_optional_union_)
+        AffixFuzzer15(std::optional<rerun::encodings::ScalarUnion> single_optional_union_)
             : single_optional_union(std::move(single_optional_union_)) {}
 
-        AffixFuzzer15& operator=(std::optional<rerun::datatypes::ScalarUnion> single_optional_union_
+        AffixFuzzer15& operator=(std::optional<rerun::encodings::ScalarUnion> single_optional_union_
         ) {
             single_optional_union = std::move(single_optional_union_);
             return *this;
         }
 
-        /// Cast to the underlying ScalarUnion datatype
-        operator std::optional<rerun::datatypes::ScalarUnion>() const {
+        /// Cast to the underlying ScalarUnion encoding
+        operator std::optional<rerun::encodings::ScalarUnion>() const {
             return single_optional_union;
         }
     };
@@ -50,7 +50,7 @@ namespace rerun {
         static constexpr std::string_view ComponentType = "rerun.testing.components.AffixFuzzer15";
 
         /// Returns the arrow data type this type corresponds to.
-        static const std::shared_ptr<arrow::DataType>& arrow_datatype();
+        static const std::shared_ptr<arrow::DataType>& arrow_data_type();
 
         /// Serializes an array of `rerun::components::AffixFuzzer15` into an arrow array.
         static Result<std::shared_ptr<arrow::Array>> to_arrow(

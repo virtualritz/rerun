@@ -17,10 +17,6 @@ use crate::{
 };
 
 /// Configuration data needed to build a [`VisualizerEntitySubscriber`].
-///
-/// This is the immutable "template" stored in the [`crate::ViewClassRegistry`],
-/// extracted from a visualizer's query info at registration time.
-// We use Arc:s, so this is more or less amortized.
 #[derive(Clone, re_byte_size::SizeBytes)] // Cheap to clone; uses ref-counted data internally.
 pub struct VisualizerEntityConfig {
     /// Visualizer type this config is associated with.
@@ -259,13 +255,13 @@ fn process_entity_components(
                     continue;
                 }
 
-                let Some(arrow_datatype) = &c.inner_arrow_datatype else {
+                let Some(arrow_data_type) = &c.inner_arrow_datatype else {
                     continue;
                 };
 
                 if let Some(match_info) = constraint.check_datatype_match(
                     known_builtin_enum_components,
-                    arrow_datatype,
+                    arrow_data_type,
                     c.descriptor.component_type,
                     c.descriptor.component,
                 ) {
@@ -294,12 +290,12 @@ fn process_entity_components(
 
         VisualizabilityConstraints::BufferAndFormat(constraint) => {
             for c in components {
-                let Some(arrow_datatype) = &c.inner_arrow_datatype else {
+                let Some(arrow_data_type) = &c.inner_arrow_datatype else {
                     continue;
                 };
 
-                let buffer_match = constraint.check_buffer_match(arrow_datatype, &c.descriptor);
-                let is_format_match = constraint.check_format_match(arrow_datatype, &c.descriptor);
+                let buffer_match = constraint.check_buffer_match(arrow_data_type, &c.descriptor);
+                let is_format_match = constraint.check_format_match(arrow_data_type, &c.descriptor);
                 if buffer_match.is_none() && !is_format_match {
                     continue;
                 }
@@ -402,7 +398,8 @@ mod tests {
     };
     use re_log_types::{example_components::MyPoint, example_components::MyPoints};
     use re_sdk_types::ComponentDescriptor;
-    use re_types_core::Loggable as _;
+    use re_types_core::ArrowDataType as _;
+    use std::assert_matches;
 
     const BUFFER_CTYPE: &str = "test.components.Buffer";
     const FORMAT_CTYPE: &str = "test.components.Format";
@@ -538,7 +535,7 @@ mod tests {
                     entity_path: entity.clone(),
                     components: vec![re_chunk_store::ChunkComponentMeta {
                         descriptor: MyPoints::descriptor_points(),
-                        inner_arrow_datatype: Some(MyPoint::arrow_datatype()),
+                        inner_arrow_datatype: Some(MyPoint::arrow_data_type()),
                         has_data: false, // This would happen if someone logs an entity without any rows!
                         is_static: false,
                     }],
@@ -571,10 +568,10 @@ mod tests {
 
         let m = expect_buffer_and_format_visualizable(&sub, &entity);
         assert_eq!(m.buffer_matches.len(), 1);
-        assert!(matches!(
+        assert_matches!(
             m.buffer_matches.get(&"buf".into()),
             Some(DatatypeMatch::NativeSemantics { .. })
-        ));
+        );
         assert!(m.format_matches.contains(&ComponentIdentifier::from("fmt")));
     }
 
@@ -626,10 +623,10 @@ mod tests {
         sub.on_events(&[schema_addition_event(&store_id, &entity, &columns)]);
 
         let m = expect_buffer_and_format_visualizable(&sub, &entity);
-        assert!(matches!(
+        assert_matches!(
             m.buffer_matches.get(&"buf".into()),
             Some(DatatypeMatch::PhysicalDatatypeOnly { .. })
-        ));
+        );
     }
 
     #[test]
@@ -704,14 +701,14 @@ mod tests {
         // Both buffer matches should be visible.
         let m = expect_buffer_and_format_visualizable(&sub, &entity);
         assert_eq!(m.buffer_matches.len(), 2);
-        assert!(matches!(
+        assert_matches!(
             m.buffer_matches.get(&"buf1".into()),
             Some(DatatypeMatch::NativeSemantics { .. })
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             m.buffer_matches.get(&"buf2".into()),
             Some(DatatypeMatch::PhysicalDatatypeOnly { .. })
-        ));
+        );
     }
 
     #[test]
@@ -753,14 +750,14 @@ mod tests {
         // Both buffers and both formats should be tracked in a single entry.
         let m = expect_buffer_and_format_visualizable(&sub, &entity);
         assert_eq!(m.buffer_matches.len(), 2);
-        assert!(matches!(
+        assert_matches!(
             m.buffer_matches.get(&"buf1".into()),
             Some(DatatypeMatch::NativeSemantics { .. })
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             m.buffer_matches.get(&"buf2".into()),
             Some(DatatypeMatch::PhysicalDatatypeOnly { .. })
-        ));
+        );
         assert!(
             m.format_matches
                 .contains(&ComponentIdentifier::from("fmt1"))

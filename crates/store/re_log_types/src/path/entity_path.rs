@@ -325,8 +325,21 @@ impl EntityPath {
 
     /// Returns the first common ancestor of a list of entity paths.
     pub fn common_ancestor_of<'a>(mut entities: impl Iterator<Item = &'a Self>) -> Self {
-        let first = entities.next().cloned().unwrap_or_else(Self::root);
-        entities.fold(first, |acc, e| acc.common_ancestor(e))
+        let Some(first) = entities.next() else {
+            return Self::root();
+        };
+
+        let common_len = entities.fold(first.len(), |common_len, entity| {
+            std::iter::zip(&first.parts[..common_len], entity.iter())
+                .take_while(|(a, b)| a == b)
+                .count()
+        });
+
+        if common_len == first.len() {
+            first.clone()
+        } else {
+            Self::from(&first.parts[..common_len])
+        }
     }
 
     /// Returns short names for a collection of entities based on the last part(s), ensuring
@@ -452,16 +465,16 @@ impl From<EntityPath> for String {
 
 // Make `quiver::Column<EntityPath>` work (backed by a `Utf8` column).
 // Reading parses with `parse_forgiving` (via `From<String>`).
-quiver::newtype_datatype!(EntityPath, quiver::Utf8);
+quiver::newtype_data_type!(EntityPath, quiver::Utf8);
 
-impl From<re_types_core::datatypes::EntityPath> for EntityPath {
+impl From<re_types_core::encodings::EntityPath> for EntityPath {
     #[inline]
-    fn from(value: re_types_core::datatypes::EntityPath) -> Self {
+    fn from(value: re_types_core::encodings::EntityPath) -> Self {
         Self::parse_forgiving(&value.0)
     }
 }
 
-impl From<&EntityPath> for re_types_core::datatypes::EntityPath {
+impl From<&EntityPath> for re_types_core::encodings::EntityPath {
     #[inline]
     fn from(value: &EntityPath) -> Self {
         Self(value.to_string().into())
@@ -541,30 +554,20 @@ impl std::ops::Div<&'static str> for EntityPath {
 
 // ----------------------------------------------------------------------------
 
-use re_types_core::Loggable;
+use re_types_core::{ArrowDataType, FromArrow, ToArrow};
 
 use super::entity_path_part::RESERVED_NAMESPACE_PREFIX;
 
 re_types_core::macros::impl_into_cow!(EntityPath);
 
-impl Loggable for EntityPath {
+impl ArrowDataType for EntityPath {
     #[inline]
-    fn arrow_datatype() -> arrow::datatypes::DataType {
-        re_types_core::datatypes::Utf8::arrow_datatype()
+    fn arrow_data_type() -> arrow::datatypes::DataType {
+        re_types_core::encodings::Utf8::arrow_data_type()
     }
+}
 
-    fn to_arrow_opt<'a>(
-        _data: impl IntoIterator<Item = Option<impl Into<std::borrow::Cow<'a, Self>>>>,
-    ) -> re_types_core::SerializationResult<arrow::array::ArrayRef>
-    where
-        Self: 'a,
-    {
-        Err(re_types_core::SerializationError::not_implemented(
-            "rerun.controls.EntityPath",
-            "EntityPaths are never nullable, use `to_arrow()` instead",
-        ))
-    }
-
+impl ToArrow for EntityPath {
     #[inline]
     fn to_arrow<'a>(
         data: impl IntoIterator<Item = impl Into<std::borrow::Cow<'a, Self>>>,
@@ -572,17 +575,19 @@ impl Loggable for EntityPath {
     where
         Self: 'a,
     {
-        re_types_core::datatypes::Utf8::to_arrow(
+        re_types_core::encodings::Utf8::to_arrow(
             data.into_iter()
                 .map(Into::into)
-                .map(|ent_path| re_types_core::datatypes::Utf8(ent_path.to_string().into())),
+                .map(|ent_path| re_types_core::encodings::Utf8(ent_path.to_string().into())),
         )
     }
+}
 
+impl FromArrow for EntityPath {
     fn from_arrow(
         array: &dyn ::arrow::array::Array,
     ) -> re_types_core::DeserializationResult<Vec<Self>> {
-        Ok(re_types_core::datatypes::Utf8::from_arrow(array)?
+        Ok(re_types_core::encodings::Utf8::from_arrow(array)?
             .into_iter()
             .map(|utf8| Self::from(utf8.to_string()))
             .collect())
@@ -685,6 +690,19 @@ mod tests {
     }
 
     #[test]
+    fn test_roundtrip_above_bmp() {
+        // Code points above `U+FFFF` (emoji, …) are escaped with more than four
+        // hex digits, and must survive a roundtrip through `Display`.
+        let path = EntityPath::new(vec!["camera".into(), "😀".into()]);
+        assert_eq!(path.to_string(), r"/camera/\u{1F600}");
+        assert_eq!(
+            EntityPath::parse_strict(&path.to_string()),
+            Ok(path.clone())
+        );
+        assert_eq!(EntityPath::from(path.to_string().as_str()), path);
+    }
+
+    #[test]
     fn test_incremental_walk() {
         assert_eq!(
             EntityPath::incremental_walk(None, &EntityPath::root()).collect::<Vec<_>>(),
@@ -744,6 +762,28 @@ mod tests {
             EntityPath::from("mario/bowser").common_ancestor(&EntityPath::from("luigi/bowser")),
             EntityPath::root()
         );
+    }
+
+    #[test]
+    fn test_common_ancestor_of() {
+        for (paths, expected) in [
+            (&[][..], "/"),
+            (
+                &["foo/bar/mario", "foo/bar/luigi/kart", "foo/bar/toad"][..],
+                "foo/bar",
+            ),
+            (&["foo", "foo/bar/baz"][..], "foo"),
+            (&["foo/bar", "other/bar"][..], "/"),
+        ] {
+            let entities = paths
+                .iter()
+                .map(|path| EntityPath::from(*path))
+                .collect_vec();
+            assert_eq!(
+                EntityPath::common_ancestor_of(entities.iter()),
+                EntityPath::from(expected)
+            );
+        }
     }
 
     #[test]

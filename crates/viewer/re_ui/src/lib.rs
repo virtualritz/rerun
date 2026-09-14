@@ -23,9 +23,12 @@ mod markdown_utils;
 pub mod menu;
 pub mod modal;
 pub mod notifications;
+mod panel_title_bar;
 mod relative_time_range;
+mod requested_object;
 mod section_collapsing_header;
 pub mod syntax_highlighting;
+mod tab_bar;
 pub mod text_edit;
 pub mod time;
 mod time_drag_value;
@@ -42,8 +45,8 @@ pub mod re_form;
 #[cfg(feature = "testing")]
 pub mod testing;
 
-use egui::NumExt as _;
-use re_log::debug_assert;
+use egui::style::WidgetVisuals;
+use egui::{NumExt as _, Style};
 
 pub use self::button::*;
 pub use self::combo_item::*;
@@ -59,7 +62,8 @@ pub use self::command_palette::{
 };
 pub use self::context_ext::ContextExt;
 pub use self::design_tokens::{
-    AlertVisuals, ButtonVisuals, DesignTokens, TableStyle, WindowFrameConfig,
+    AlertVisuals, ButtonVisuals, DesignTokens, MetaLineVisuals, Outlines, TabVisuals, TableStyle,
+    TextEditVisuals, WindowFrameConfig,
 };
 pub use self::egui_ext::widget_ext::*;
 pub use self::fuzzy::{FuzzyMatch, FuzzyQuery};
@@ -70,15 +74,20 @@ pub use self::icons::Icon;
 pub use self::link_button::LinkButton;
 pub use self::markdown_utils::*;
 pub use self::notifications::Link;
+pub use self::panel_title_bar::PanelTitleBar;
 pub use self::relative_time_range::{
     RelativeTimeRange, relative_time_range_boundary_label_text, relative_time_range_label_text,
 };
+pub use self::requested_object::{RequestedObject, ServerValue};
 pub use self::section_collapsing_header::SectionCollapsingHeader;
 pub use self::syntax_highlighting::SyntaxHighlighting;
+pub use self::tab_bar::{TAB_TOOLBAR_HEIGHT, TAB_TOOLBAR_MARGIN_Y, TabBar};
 pub use self::time_drag_value::TimeDragValue;
 pub use self::ui_ext::UiExt;
 pub use self::ui_layout::UiLayout;
 pub use self::url_decorator::{UrlDecorator, UrlDecoratorFn};
+use crate::egui_ext::garbage_collect::EguiMemoryGarbageCollector;
+use re_log::debug_assert;
 
 // ---------------------------------------------------------------------------
 
@@ -174,19 +183,6 @@ pub struct TopBarStyle {
     pub indent: f32,
 }
 
-/// The style of a label.
-///
-/// This should be used for all UI widgets that support these styles.
-#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LabelStyle {
-    /// Regular style for a label.
-    #[default]
-    Normal,
-
-    /// Label displaying the placeholder text for a yet unnamed item (e.g. an unnamed view).
-    Unnamed,
-}
-
 // ----------------------------------------------------------------------------
 
 pub fn design_tokens_of_visuals(visuals: &egui::Visuals) -> &'static DesignTokens {
@@ -270,6 +266,8 @@ pub fn apply_style_and_install_loaders(egui_ctx: &egui::Context) {
             egui_ctx.request_repaint();
         });
     }
+
+    egui_ctx.add_plugin(EguiMemoryGarbageCollector::default());
 }
 
 fn set_themes(egui_ctx: &egui::Context) {
@@ -363,4 +361,12 @@ fn is_in_resizable_panel(ui: &egui::Ui) -> bool {
     } else {
         false // Safe fallback
     }
+}
+
+fn all_visuals(style: &mut Style, f: impl Fn(&mut WidgetVisuals)) {
+    f(&mut style.visuals.widgets.active);
+    f(&mut style.visuals.widgets.hovered);
+    f(&mut style.visuals.widgets.inactive);
+    f(&mut style.visuals.widgets.noninteractive);
+    f(&mut style.visuals.widgets.open);
 }

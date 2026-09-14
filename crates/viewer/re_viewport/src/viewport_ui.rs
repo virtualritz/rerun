@@ -19,7 +19,7 @@ use re_viewer_context::{
     SystemExecutionOutput, ViewId, ViewQuery, ViewStates, ViewerContext, icon_for_container_kind,
 };
 use re_viewport_blueprint::{
-    ViewBlueprint, ViewportBlueprint, ViewportCommand, create_entity_add_info,
+    CanAddToView, ViewBlueprint, ViewportBlueprint, ViewportCommand, create_entity_add_info,
 };
 
 use crate::system_execution::{execute_systems_for_all_views, execute_systems_for_view};
@@ -276,36 +276,77 @@ impl ViewportUi {
 
     /// Handle the entities being dragged over a view.
     ///
-    /// Design decisions:
-    /// - We accept the drop only if at least one of the entities is visualizable and not already
-    ///   included.
-    /// - When the drop happens, of all dropped entities, we only add those which are visualizable.
+    /// A dragged entity is added with an including-subtree rule, so it is worth dropping as soon
+    /// as one entity of its subtree, possibly itself, is:
+    /// - visualizable,
+    /// - not part of the view yet,
+    /// - and accepted by the view class.
     ///
-    fn handle_drop_entities_to_view(
+    /// All three must hold for the *same* entity: a subtree whose only additions would be
+    /// entities the view can't show has nothing to contribute.
+    ///
+    /// Design decisions:
+    /// - We accept the drop as soon as one of the dragged entities is worth dropping.
+    /// - When the drop happens, of all dragged entities, we only add those.
+    /// - If nothing is left to accept, we show the most specific reason we have.
+    ///
+    /// This is public so that view crates can test how their class handles entity drops.
+    pub fn handle_drop_entities_to_view(
         ctx: &ViewerContext<'_>,
         view_blueprint: &ViewBlueprint,
         entities: &[EntityPath],
         released: bool,
     ) -> DragAndDropFeedback {
         let recording_engine = ctx.recording_engine();
+        let entity_tree = recording_engine.store().entity_tree();
         let add_info = create_entity_add_info(
             ctx,
-            recording_engine.store().entity_tree(),
+            entity_tree,
             view_blueprint,
             ctx.lookup_query_result(view_blueprint.id),
         );
+        let view_class = view_blueprint.class(ctx.view_class_registry());
 
-        // check if any entity or its children are visualizable and not yet included in the view
-        let can_entity_be_added = |entity: &EntityPath| {
-            add_info
-                .get(entity)
-                .is_some_and(|info| info.can_add_self_or_descendant.is_compatible_and_missing())
-        };
+        let mut acceptable_entities = Vec::new();
 
-        let any_is_visualizable = entities.iter().any(can_entity_be_added);
+        // Why we had to turn an entity down, in decreasing order of specificity. Only shown if
+        // nothing is acceptable in the end.
+        let mut class_rejection = None;
+        let mut any_already_in_view = false;
 
-        if !any_is_visualizable {
-            return DragAndDropFeedback::Reject(None);
+        for entity in entities {
+            let Some(subtree) = entity_tree.subtree(entity) else {
+                continue;
+            };
+
+            let mut is_acceptable = false;
+            subtree.visit_children_recursively(|entity_path| {
+                // Entities no visualizer of this class can show are silently ignored: that is
+                // evident enough from the streams panel.
+                let Some(CanAddToView::Compatible { already_added }) =
+                    add_info.get(entity_path).map(|info| &info.can_add)
+                else {
+                    return;
+                };
+
+                if let Some(reason) = view_class.reject_entity_drop_reason(ctx, entity_path) {
+                    class_rejection.get_or_insert(reason);
+                } else if *already_added {
+                    any_already_in_view = true;
+                } else {
+                    is_acceptable = true;
+                }
+            });
+
+            if is_acceptable {
+                acceptable_entities.push(entity);
+            }
+        }
+
+        if acceptable_entities.is_empty() {
+            let reason =
+                class_rejection.or_else(|| any_already_in_view.then_some("Already in this view"));
+            return DragAndDropFeedback::Reject(reason);
         }
 
         // drop incoming!
@@ -315,13 +356,11 @@ impl ViewportUi {
             view_blueprint
                 .contents
                 .mutate_entity_path_filter(ctx, |filter| {
-                    for entity in entities {
-                        if can_entity_be_added(entity) {
-                            filter.add_rule(
-                                RuleEffect::Include,
-                                ResolvedEntityPathRule::including_subtree(entity),
-                            );
-                        }
+                    for entity in acceptable_entities {
+                        filter.add_rule(
+                            RuleEffect::Include,
+                            ResolvedEntityPathRule::including_subtree(entity),
+                        );
                     }
                 });
 
@@ -474,7 +513,6 @@ impl<'a> egui_tiles::Behavior<ViewId> for TilesDelegate<'a, '_> {
 
     fn tab_title_for_pane(&mut self, view_id: &ViewId) -> egui::WidgetText {
         if let Some(view) = self.viewport_blueprint.view(view_id) {
-            // Note: the formatting for unnamed views is handled by `TabWidget::new()`
             view.display_name_or_default().as_ref().into()
         } else {
             // All panes are views, so this shouldn't happen unless we have a bug
@@ -931,7 +969,6 @@ struct TabWidget {
     icon_rect: egui::Rect,
     bg_color: egui::Color32,
     text_color: egui::Color32,
-    unnamed_style: bool,
     label: Option<String>,
 }
 
@@ -948,7 +985,6 @@ impl TabWidget {
 
         struct TabDesc {
             widget_text: egui::WidgetText,
-            user_named: bool,
             icon: &'static re_ui::Icon,
             item: Option<Item>,
             label: Option<String>,
@@ -959,7 +995,6 @@ impl TabWidget {
                 if let Some(view) = tab_viewer.viewport_blueprint.view(view_id) {
                     TabDesc {
                         widget_text: tab_viewer.tab_title_for_pane(view_id),
-                        user_named: view.display_name.is_some(),
                         icon: view.class(tab_viewer.ctx.view_class_registry()).icon(),
                         item: Some(Item::View(*view_id)),
                         label: Some(view.display_name_or_default().into()),
@@ -970,7 +1005,6 @@ impl TabWidget {
                     TabDesc {
                         widget_text: tab_viewer.ctx.egui_ctx().error_text("Unknown view").into(),
                         icon: &re_ui::icons::VIEW_GENERIC,
-                        user_named: false,
                         item: None,
                         label: None,
                     }
@@ -980,31 +1014,24 @@ impl TabWidget {
                 if let Some(Contents::Container(container_id)) =
                     tab_viewer.contents_per_tile_id.get(&tile_id)
                 {
-                    let (label, user_named) = if let Some(container_blueprint) =
+                    let label = if let Some(container_blueprint) =
                         tab_viewer.viewport_blueprint.container(container_id)
                     {
-                        (
-                            container_blueprint
-                                .display_name_or_default()
-                                .as_ref()
-                                .into(),
-                            container_blueprint.display_name.is_some(),
-                        )
+                        container_blueprint
+                            .display_name_or_default()
+                            .as_ref()
+                            .into()
                     } else {
                         re_log::warn_once!("Container {container_id} missing during egui_tiles");
-                        (
-                            tab_viewer
-                                .ctx
-                                .egui_ctx()
-                                .error_text("Internal error")
-                                .into(),
-                            false,
-                        )
+                        tab_viewer
+                            .ctx
+                            .egui_ctx()
+                            .error_text("Internal error")
+                            .into()
                     };
 
                     TabDesc {
                         widget_text: label,
-                        user_named,
                         icon: icon_for_container_kind(&container.kind()),
                         item: Some(Item::Container(*container_id)),
                         label: None,
@@ -1028,7 +1055,6 @@ impl TabWidget {
                             .error_text("Unknown container")
                             .into(),
                         icon: &re_ui::icons::VIEW_GENERIC,
-                        user_named: false,
                         item: None,
                         label: None,
                     }
@@ -1044,7 +1070,6 @@ impl TabWidget {
                         .error_text("Internal error")
                         .into(),
                     icon: &re_ui::icons::VIEW_UNKNOWN,
-                    user_named: false,
                     item: None,
                     label: None,
                 }
@@ -1065,11 +1090,20 @@ impl TabWidget {
         let icon_width_plus_padding = icon_size.x + tokens.text_to_icon_padding();
 
         // tab title
-        let text = if tab_desc.user_named {
-            tab_desc.widget_text
+        //
+        // Note that we used to distinguish named & unnamed tabs:
+        // But we concluded by now that whether someone typed the name or it came from the
+        // origin is not something the reader is trying to tell apart.
+        //
+        // `strong` bakes its own color into the galley, which the painter cannot override
+        // afterwards, so the tab's color has to be stated here.
+        let text_color = if selected {
+            tokens.viewport_tab_selected_text_color
         } else {
-            tab_desc.widget_text.italics() // TODO(ab): use design tokens
-        };
+            tab_viewer.tab_text_color(ui.visuals(), tiles, tile_id, tab_state)
+        }
+        .gamma_multiply(alpha);
+        let text = tab_desc.widget_text.strong().color(text_color);
 
         let font_id = egui::TextStyle::Button.resolve(ui.style());
         let galley = text.into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, font_id);
@@ -1098,18 +1132,7 @@ impl TabWidget {
             tab_viewer.tab_bar_color(ui.visuals())
         };
 
-        let text_color = if selected {
-            if hovered {
-                ui.tokens().text_color_on_primary_hovered
-            } else {
-                ui.tokens().text_color_on_primary
-            }
-        } else {
-            tab_viewer.tab_text_color(ui.visuals(), tiles, tile_id, tab_state)
-        };
-
         let bg_color = bg_color.gamma_multiply(alpha);
-        let text_color = text_color.gamma_multiply(alpha);
 
         Self {
             galley,
@@ -1120,7 +1143,6 @@ impl TabWidget {
             icon_rect,
             bg_color,
             text_color,
-            unnamed_style: !tab_desc.user_named,
             label: tab_desc.label,
         }
     }
@@ -1135,19 +1157,12 @@ impl TabWidget {
             .tint(self.text_color);
         icon_image.paint_at(ui, self.icon_rect);
 
-        //TODO(ab): use design tokens
-        let label_color = if self.unnamed_style {
-            self.text_color.gamma_multiply(0.5)
-        } else {
-            self.text_color
-        };
-
         ui.painter().galley(
             egui::Align2::CENTER_CENTER
                 .align_size_within_rect(self.galley.size(), self.galley_rect)
                 .min,
             self.galley,
-            label_color,
+            self.text_color,
         );
     }
 }

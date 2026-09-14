@@ -4,8 +4,54 @@
 use std::sync::Arc;
 
 use re_log_encoding::RrdManifest;
-use re_log_types::{LogMsg, StoreId, TableMsg, impl_into_enum};
-use re_protos::sdk_comms::v1alpha1::{GetViewerStateResponse, SetTimeCursorResponse};
+use re_log_types::{ApplicationId, LogMsg, StoreId, TableMsg, impl_into_enum};
+use re_protos::sdk_comms::v1alpha1::{
+    CloseRecordingsResponse, GetViewerLogsResponse, GetViewerStateResponse, SetTimeCursorResponse,
+};
+
+/// Calls back on the UI thread once a command completes.
+type UiCallbackFn<T> = Box<dyn FnOnce(T) + Send>;
+
+pub struct UiCallback<T>(Arc<parking_lot::Mutex<Option<UiCallbackFn<T>>>>);
+
+impl<T> Clone for UiCallback<T> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<T> UiCallback<T> {
+    /// Creates a callback.
+    pub fn new(callback: impl FnOnce(T) + Send + 'static) -> Self {
+        Self(Arc::new(parking_lot::Mutex::new(Some(Box::new(callback)))))
+    }
+
+    /// Calls the callback once.
+    pub fn call(&self, value: T) {
+        if let Some(callback) = self.0.lock().take() {
+            callback(value);
+        }
+    }
+}
+
+impl<T> std::fmt::Debug for UiCallback<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("UiCallback").finish()
+    }
+}
+
+/// The recordings a close command targets.
+#[derive(Clone, Debug)]
+pub enum CloseRecordingTarget {
+    /// The active recording.
+    Current,
+
+    /// Every open recording.
+    All,
+
+    /// The named recordings.
+    Some(Vec<StoreId>),
+}
 
 /// Message from a data source.
 ///
@@ -24,6 +70,12 @@ pub enum DataSourceMessage {
     /// See [`LogMsg`].
     LogMsg(LogMsg),
 
+    /// Associate a fully received blueprint with one of its consumers.
+    // TODO(andreas): Whenever we make the request for a blueprint we should just keep the information
+    // about why we pulled it in the first place and therefore should know upon arrival what to do with it?
+    // TODO(andreas): If needed, make this more flexible than just making a thing the default.
+    DefaultBlueprintRegistration(DefaultBlueprintRegistration),
+
     /// See [`TableMsg`].
     TableMsg(TableMsg),
 
@@ -35,6 +87,11 @@ pub enum DataSourceMessage {
 }
 
 impl_into_enum!(LogMsg, DataSourceMessage, LogMsg);
+impl_into_enum!(
+    DefaultBlueprintRegistration,
+    DataSourceMessage,
+    DefaultBlueprintRegistration
+);
 impl_into_enum!(TableMsg, DataSourceMessage, TableMsg);
 impl_into_enum!(DataSourceUiCommand, DataSourceMessage, UiCommand);
 
@@ -45,6 +102,7 @@ impl DataSourceMessage {
             Self::RrdManifest(..) => "RrdManifest",
             Self::RrdManifestComplete(_) => "RrdManifestComplete",
             Self::LogMsg(_) => "LogMsg",
+            Self::DefaultBlueprintRegistration(_) => "BlueprintRegistration",
             Self::TableMsg(_) => "TableMsg",
             Self::UiCommand(_) => "UiCommand",
         }
@@ -55,11 +113,28 @@ impl DataSourceMessage {
         match self {
             Self::LogMsg(log_msg) => log_msg.insert_arrow_record_batch_metadata(key, value),
             Self::TableMsg(table_msg) => table_msg.insert_arrow_record_batch_metadata(key, value),
-            Self::RrdManifest(..) | Self::RrdManifestComplete(_) | Self::UiCommand(_) => {
+            Self::RrdManifest(..)
+            | Self::RrdManifestComplete(_)
+            | Self::DefaultBlueprintRegistration(_)
+            | Self::UiCommand(_) => {
                 // Not everything needs latency tracking
             }
         }
     }
+}
+
+/// An ordered association command sent after all data for a blueprint store.
+#[derive(Clone, Debug, re_byte_size::SizeBytes)]
+pub struct DefaultBlueprintRegistration {
+    pub blueprint_id: StoreId,
+    pub target: BlueprintTarget,
+}
+
+/// The consumer of a blueprint.
+#[derive(Clone, Debug, re_byte_size::SizeBytes)]
+pub enum BlueprintTarget {
+    Application(ApplicationId),
+    Table(re_uri::TableReference),
 }
 
 /// UI commands issued when streaming in datasets.
@@ -87,8 +162,8 @@ pub enum DataSourceUiCommand {
         /// If none is provided, the entire viewer is screenshotted.
         view_id: Option<String>,
 
-        /// Optional completion signal, sent once the screenshot has been written (or failed).
-        on_done: Option<futures::channel::mpsc::UnboundedSender<Result<(), SaveScreenshotError>>>,
+        /// Optional completion callback, called once the screenshot has been written (or failed).
+        on_done: Option<UiCallback<Result<(), SaveScreenshotError>>>,
     },
 
     /// Run one `egui_inspection` request against the viewer and return its response.
@@ -96,10 +171,10 @@ pub enum DataSourceUiCommand {
         /// MessagePack-encoded `egui_inspection::protocol::Request`.
         request: Vec<u8>,
 
-        /// Channel the viewer sends the MessagePack-encoded `egui_inspection::protocol::Response`
-        /// back on, or an [`InspectError`] if the request could not be decoded or the response
-        /// could not be encoded.
-        on_done: futures::channel::mpsc::UnboundedSender<Result<Vec<u8>, InspectError>>,
+        /// Callback receiving the MessagePack-encoded `egui_inspection::protocol::Response`, or
+        /// an [`InspectError`] if the request could not be decoded or the response could not be
+        /// encoded.
+        on_done: UiCallback<Result<Vec<u8>, InspectError>>,
     },
 
     /// Snapshot the current viewer state (open recordings, route, timelines + ranges,
@@ -107,8 +182,29 @@ pub enum DataSourceUiCommand {
     ///
     /// Used by `re_viewer_mcp`'s `GetViewerState` gRPC method to give an agent context.
     GetViewerState {
-        /// Channel the viewer sends the state back on.
-        on_done: futures::channel::mpsc::UnboundedSender<GetViewerStateResponse>,
+        /// Callback receiving the state.
+        on_done: UiCallback<GetViewerStateResponse>,
+    },
+
+    /// Close recordings.
+    CloseRecordings {
+        /// Recordings to close.
+        target: CloseRecordingTarget,
+
+        /// Channel the viewer reports the closed recordings back on, or `Err(message)` if the
+        /// recording could not be resolved.
+        on_done: UiCallback<Result<CloseRecordingsResponse, String>>,
+    },
+
+    /// Fetch the viewer's buffered log messages, optionally only those after a sequence number.
+    ///
+    /// Used by `re_viewer_mcp`'s `GetViewerLogs` gRPC method.
+    GetViewerLogs {
+        /// Only entries with a greater sequence number are returned.
+        after_sequence: Option<u64>,
+
+        /// Callback receiving the entries.
+        on_done: UiCallback<GetViewerLogsResponse>,
     },
 
     /// Open a URL in the viewer (a recording/blueprint file, a `rerun://` dataset URI, a redap
@@ -121,7 +217,7 @@ pub enum DataSourceUiCommand {
 
         /// Channel the viewer reports back on: `Ok(())` once the URL was opened, or `Err(message)`
         /// if it could not be parsed.
-        on_done: futures::channel::mpsc::UnboundedSender<Result<(), String>>,
+        on_done: UiCallback<Result<(), String>>,
     },
 
     /// Move the time cursor (timeline position) of a recording.
@@ -142,7 +238,7 @@ pub enum DataSourceUiCommand {
 
         /// Channel the viewer reports back on: `Ok(response)` describing what was applied, or
         /// `Err(message)` if the recording/timeline could not be resolved.
-        on_done: futures::channel::mpsc::UnboundedSender<Result<SetTimeCursorResponse, String>>,
+        on_done: UiCallback<Result<SetTimeCursorResponse, String>>,
     },
 }
 
@@ -152,6 +248,14 @@ pub enum SaveScreenshotError {
     /// The requested view id could not be parsed as a UUID.
     #[error("Failed to parse view id {view_id:?}, expected a UUID")]
     InvalidViewId { view_id: String },
+
+    /// The requested view does not exist (or is not currently visible).
+    #[error("View {view_id} not found")]
+    ViewNotFound { view_id: String },
+
+    /// The requested view is too small to screenshot.
+    #[error("View {view_id} is too small for a screenshot")]
+    ViewTooSmall { view_id: String },
 
     /// The captured pixel data could not be turned into an image.
     #[error("Failed to create image from screenshot data")]
@@ -188,7 +292,15 @@ impl re_byte_size::SizeBytes for DataSourceUiCommand {
 
             Self::Inspect { request, .. } => request.len() as u64,
 
-            Self::GetViewerState { on_done: _ } => 0,
+            Self::GetViewerState { on_done: _ }
+            | Self::GetViewerLogs {
+                after_sequence: _,
+                on_done: _,
+            } => 0,
+            Self::CloseRecordings { target, on_done: _ } => match target {
+                CloseRecordingTarget::Current | CloseRecordingTarget::All => 0,
+                CloseRecordingTarget::Some(store_ids) => store_ids.heap_size_bytes(),
+            },
             Self::OpenUrl { url, on_done: _ } => url.heap_size_bytes(),
             Self::SetTimeCursor {
                 store_id: recording_id,

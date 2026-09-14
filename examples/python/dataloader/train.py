@@ -56,7 +56,7 @@ EPOCHS = 5
 BATCH_SIZE = 8
 LR = 1e-5
 NUM_WORKERS = 4
-FETCH_SIZE = 256
+FETCH_BLOCK_SIZE = 256
 
 
 class CollateFn:
@@ -126,7 +126,9 @@ def parse_args() -> argparse.Namespace:
         parents=[common],
         help="RerunIterableDataset: streaming iteration with internal shuffling (default)",
     )
-    iterable.add_argument("--fetch-size", type=int, default=FETCH_SIZE, help="Samples fetched per server query")
+    iterable.add_argument(
+        "--fetch-block-size", type=int, default=FETCH_BLOCK_SIZE, help="Samples fetched per server query"
+    )
     iterable.add_argument(
         "--shuffle",
         choices=("block", "sample", "none"),
@@ -160,7 +162,7 @@ def parse_args() -> argparse.Namespace:
     # Bare `train.py` behaves like `train.py iterable` with its defaults.
     parser.set_defaults(
         dataset_style="iterable",
-        fetch_size=FETCH_SIZE,
+        fetch_block_size=FETCH_BLOCK_SIZE,
         shuffle="block",
         shuffle_buffer_size=None,
         shuffle_buffer_min_fill=None,
@@ -188,19 +190,20 @@ def main() -> None:
         "action": Field(
             "/action:Scalars:scalars",
             decode=NumericDecoder(),
-            window=(1, CHUNK_SIZE),
+            # `frame_index` is an integer timeline, so offsets are integral frame steps.
+            window=tuple(range(1, CHUNK_SIZE + 1)),
         ),
         "image_laptop": Field(
             "/observation.images.laptop:VideoStream:sample",
-            decode=VideoFrameDecoder(codec="av1", keyframe_interval=2),
+            decode=VideoFrameDecoder(codec="av1"),
         ),
         "image_phone": Field(
             "/observation.images.phone:VideoStream:sample",
-            decode=VideoFrameDecoder(codec="av1", keyframe_interval=2),
+            decode=VideoFrameDecoder(codec="av1"),
         ),
         "image_side": Field(
             "/observation.images.side:VideoStream:sample",
-            decode=VideoFrameDecoder(codec="av1", keyframe_interval=2),
+            decode=VideoFrameDecoder(codec="av1"),
         ),
     }
 
@@ -225,7 +228,7 @@ def main() -> None:
             source=source,
             index="frame_index",
             fields=fields,
-            fetch_size=args.fetch_size,
+            fetch_block_size=args.fetch_block_size,
             shuffle_strategy=shuffle_strategies[args.shuffle],
             decode_threads=args.decode_threads,
         )
@@ -233,7 +236,7 @@ def main() -> None:
 
     # IterableDataset doesn't support indexing, so probe shape via iteration.
     state_tensor = next(iter(ds))["state"]
-    assert state_tensor is not None  # NumericDecoder never returns None
+    assert isinstance(state_tensor, torch.Tensor)  # NumericDecoder always returns tensors
     state_dim = state_tensor.shape[0]
     action_dim = state_dim
     print(f"Dimensions: {state_dim=}, {action_dim=}")

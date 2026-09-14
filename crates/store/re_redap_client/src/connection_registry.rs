@@ -6,12 +6,14 @@ use std::sync::{Arc, OnceLock};
 
 use re_auth::Jwt;
 use re_auth::credentials::CredentialsProviderError;
+use re_byte_size::SizeBytes as _;
+use re_protos::capabilities::ServerCapabilities;
 use re_protos::cloud::v1alpha1::{EntryFilter, FindEntriesRequest, WhoAmIRequest};
 use re_uri::Origin;
 use tokio::sync::RwLock;
 use tonic::Code;
 
-use crate::connection_client::{Connection, ConnectionClient, RedapClient};
+use crate::connection_client::{Connection, RedapClient};
 use crate::grpc::RedapClientStack;
 use crate::{ApiError, ApiResult, TonicStatusError};
 
@@ -36,7 +38,7 @@ pub struct ConnectionRegistry {
     /// be persisted.
     ///
     /// When no saved token is available for a given server, we fall back to the `REDAP_TOKEN`
-    /// envvar if set. See [`ConnectionRegistryHandle::client`].
+    /// envvar if set. See [`crate::ConnectionHandle::client`].
     saved_credentials: HashMap<re_uri::Origin, Credentials>,
 
     /// Fallback token.
@@ -49,9 +51,6 @@ pub struct ConnectionRegistry {
     /// Connections are much cheaper to clone than create (since the latter involves establishing an
     /// actual TCP connection), so we keep them around once created.
     remote_connections: HashMap<re_uri::Origin, Connection>,
-
-    /// Latest errors received for specific redap URIs.
-    uri_errors: HashMap<re_uri::DatasetSegmentUri, String>,
 }
 
 impl ConnectionRegistry {
@@ -66,7 +65,6 @@ impl ConnectionRegistry {
                 saved_credentials: HashMap::new(),
                 fallback_token: None,
                 remote_connections: HashMap::new(),
-                uri_errors: Default::default(),
             })),
             internal: Arc::new(OnceLock::new()),
             use_stored_credentials: true,
@@ -84,46 +82,48 @@ impl ConnectionRegistry {
                 saved_credentials: HashMap::new(),
                 fallback_token: None,
                 remote_connections: HashMap::new(),
-                uri_errors: Default::default(),
             })),
             internal: Arc::new(OnceLock::new()),
             use_stored_credentials: false,
         }
     }
+}
 
-    // URI errors
+impl re_byte_size::MemUsageTreeCapture for ConnectionRegistry {
+    fn capture_mem_usage_tree(&self) -> re_byte_size::MemUsageTree {
+        let Self {
+            saved_credentials,
+            fallback_token,
+            remote_connections,
+        } = self;
 
-    /// Clear the latest error for this URI.
-    pub fn clear_uri_error(&mut self, uri: re_uri::DatasetSegmentUri) {
-        self.uri_errors.remove(&uri.without_fragment());
+        re_byte_size::MemUsageNode::default()
+            .with_child("saved_credentials", saved_credentials.total_size_bytes())
+            .with_child("fallback_token", fallback_token.total_size_bytes())
+            .with_child("remote_connections", remote_connections.total_size_bytes())
+            .into_tree()
     }
+}
 
-    /// Set the latest error for this URI.
-    pub fn set_uri_error(&mut self, uri: re_uri::DatasetSegmentUri, error: String) {
-        self.uri_errors.insert(uri.without_fragment(), error);
-    }
-
-    /// Get the latest error for this URI.
-    pub fn error_for_uri(&self, uri: re_uri::DatasetSegmentUri) -> Option<&str> {
-        self.uri_errors
-            .get(&uri.without_fragment())
-            .map(|s| s.as_str())
+impl re_byte_size::MemUsageTreeCapture for ConnectionRegistryHandle {
+    fn capture_mem_usage_tree(&self) -> re_byte_size::MemUsageTree {
+        wrap_blocking_lock(|| self.inner.blocking_read().capture_mem_usage_tree())
     }
 }
 
 /// Possible errors when creating a connection.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientCredentialsError {
-    #[error("error when refreshing credentials\nDetails: {0}")]
+    #[error("{}", re_error::format_with_details("error when refreshing credentials", .0.to_string()))]
     RefreshError(TonicStatusError),
 
     #[error("the credentials are expired")]
     SessionExpired,
 
-    #[error("the server requires an authentication token but none was provided\nDetails: {0}")]
+    #[error("{}", re_error::format_with_details("the server requires an authentication token but none was provided", .0.to_string()))]
     UnauthenticatedMissingToken(TonicStatusError),
 
-    #[error("the server rejected the provided authentication token\nDetails: {status}")]
+    #[error("{}", re_error::format_with_details("the server rejected the provided authentication token", .status.to_string()))]
     UnauthenticatedBadToken {
         status: TonicStatusError,
         credentials: SourcedCredentials,
@@ -136,9 +136,10 @@ pub enum ClientCredentialsError {
     NotAuthorized,
 }
 
-/// Registry of all tokens and connections to the redap servers.
+/// Owns shared connection and credential state for redap origins.
 ///
-/// This registry is cheap to clone.
+/// Use [`ConnectionRegistryHandle::connection_handle`] to bind this state to one origin for
+/// application workflows. This registry is cheap to clone.
 #[derive(Clone)]
 pub struct ConnectionRegistryHandle {
     inner: Arc<RwLock<ConnectionRegistry>>,
@@ -147,7 +148,7 @@ pub struct ConnectionRegistryHandle {
     ///
     /// Shared across cloned handles and readable from sync code without taking the async registry
     /// lock.
-    internal: Arc<OnceLock<(re_uri::Origin, Connection)>>,
+    internal: Arc<OnceLock<Connection>>,
 
     /// Whether to use credentials stored on the host machine by default.
     /// Since some tests run on a single-threaded tokio runtime and this is never updated,
@@ -155,7 +156,7 @@ pub struct ConnectionRegistryHandle {
     use_stored_credentials: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, re_byte_size::SizeBytes)]
 pub enum Credentials {
     /// Explicit token
     Token(Jwt),
@@ -203,6 +204,12 @@ pub struct SourcedCredentials {
     pub credentials: Credentials,
 }
 
+/// A client stack that passed the `/WhoAmI` check, and the capabilities that call returned.
+struct ValidatedClientStack {
+    client_stack: RedapClientStack,
+    capabilities: ServerCapabilities,
+}
+
 impl ConnectionRegistryHandle {
     pub fn set_credentials(&self, origin: &re_uri::Origin, credentials: Credentials) {
         wrap_blocking_lock(|| {
@@ -216,6 +223,29 @@ impl ConnectionRegistryHandle {
         wrap_blocking_lock(|| {
             let inner = self.inner.blocking_read();
             inner.saved_credentials.get(origin).cloned()
+        })
+    }
+
+    /// What the server at this origin implements and supports, for any caller.
+    ///
+    /// This says nothing about what the caller is allowed to do. Capabilities arrive when the
+    /// connection is made, so an origin we have not connected to yet is
+    /// [`ServerCapabilities::unknown`].
+    pub fn capabilities(&self, origin: &re_uri::Origin) -> ServerCapabilities {
+        if let Some(connection) = self.internal.get()
+            && connection.origin() == origin
+        {
+            return connection.capabilities().clone();
+        }
+
+        wrap_blocking_lock(|| {
+            self.inner
+                .blocking_read()
+                .remote_connections
+                .get(origin)
+                .map_or_else(ServerCapabilities::unknown, |connection| {
+                    connection.capabilities().clone()
+                })
         })
     }
 
@@ -238,17 +268,17 @@ impl ConnectionRegistryHandle {
         self.use_stored_credentials
     }
 
-    pub fn with_internal(self, internal: (re_uri::Origin, Connection)) -> Self {
+    pub fn with_internal(self, internal: Connection) -> Self {
         self.set_internal(internal);
         self
     }
 
-    pub fn set_internal(&self, internal: (re_uri::Origin, Connection)) {
-        if let Err((new_origin, _connection)) = self.internal.set(internal) {
+    pub fn set_internal(&self, internal: Connection) {
+        if let Err(rejected) = self.internal.set(internal) {
+            let new_origin = rejected.origin();
             let existing_origin = self
-                .internal
-                .get()
-                .map(|(origin, _connection)| origin.to_string())
+                .internal_origin()
+                .map(|origin| origin.to_string())
                 .unwrap_or_else(|| "<missing>".to_owned());
             re_log::debug!(
                 "Ignoring duplicate internal connection for {new_origin}; already set for {existing_origin}"
@@ -259,37 +289,22 @@ impl ConnectionRegistryHandle {
     pub fn internal_origin(&self) -> Option<re_uri::Origin> {
         self.internal
             .get()
-            .map(|(origin, _connection)| origin.clone())
+            .map(|connection| connection.origin().clone())
+    }
+
+    pub fn connection_handle(&self, origin: re_uri::Origin) -> crate::ConnectionHandle {
+        crate::ConnectionHandle::new(self.clone(), origin)
+    }
+
+    pub fn internal_connection_handle(&self) -> Option<crate::ConnectionHandle> {
+        self.internal_origin()
+            .map(|origin| self.connection_handle(origin))
     }
 
     pub fn is_internal_origin(&self, origin: &re_uri::Origin) -> bool {
         self.internal
             .get()
-            .is_some_and(|(internal_origin, _connection)| internal_origin == origin)
-    }
-
-    /// Clear the latest error for this URI.
-    pub fn clear_uri_error(&self, uri: re_uri::DatasetSegmentUri) {
-        wrap_blocking_lock(|| {
-            self.inner.blocking_write().clear_uri_error(uri);
-        });
-    }
-
-    /// Set the latest error for this URI.
-    pub fn set_uri_error(&self, uri: re_uri::DatasetSegmentUri, error: String) {
-        wrap_blocking_lock(|| {
-            self.inner.blocking_write().set_uri_error(uri, error);
-        });
-    }
-
-    /// Get the latest error for this URI.
-    pub fn error_for_uri(&self, uri: re_uri::DatasetSegmentUri) -> Option<String> {
-        wrap_blocking_lock(|| {
-            self.inner
-                .blocking_read()
-                .error_for_uri(uri)
-                .map(str::to_owned)
-        })
+            .is_some_and(|connection| connection.origin() == origin)
     }
 
     /// Get a connection for the given origin, creating one if it doesn't exist yet.
@@ -306,9 +321,9 @@ impl ConnectionRegistryHandle {
     ///
     /// Failing that, no token will be used.
     #[tracing::instrument(level = "info", skip_all)]
-    pub async fn connection(&self, origin: re_uri::Origin) -> ApiResult<Connection> {
-        if let Some((internal_origin, connection)) = self.internal.get()
-            && internal_origin == &origin
+    pub(crate) async fn connection(&self, origin: re_uri::Origin) -> ApiResult<Connection> {
+        if let Some(connection) = self.internal.get()
+            && connection.origin() == &origin
         {
             return Ok(connection.clone());
         }
@@ -360,16 +375,13 @@ impl ConnectionRegistryHandle {
             add_cred(&mut credentials_to_try, cred);
         }
 
-        let (client_stack, successful_credentials) =
-            Self::try_connect_client_stack(origin.clone(), credentials_to_try.into_iter()).await?;
-
-        let connection = Connection {
-            client: RedapClient::new(crate::grpc::boxed_redap_grpc_client(client_stack.clone())),
-            analytics: Some(crate::ConnectionAnalyticsExporter::from_remote_service(
-                origin.clone(),
+        let (
+            ValidatedClientStack {
                 client_stack,
-            )),
-        };
+                capabilities,
+            },
+            successful_credentials,
+        ) = Self::try_connect_client_stack(origin.clone(), credentials_to_try.into_iter()).await?;
 
         // We have a successful connection, so we cache it and remember about the successful token.
         //
@@ -377,8 +389,22 @@ impl ConnectionRegistryHandle {
         // concurrently attempt to create the connection and would override each-other's results. This
         // is acceptable since both should reach the same conclusion, and preferable that holding
         // the lock for the entire time, as the connection process can take a while.
-        {
+        let connection = {
             let mut inner = self.inner.write().await;
+
+            let connection = Connection {
+                client: RedapClient::new(
+                    origin.clone(),
+                    crate::grpc::boxed_redap_grpc_client(client_stack.clone()),
+                    Some(crate::ChunkCacheHandle::default()),
+                ),
+                analytics: Some(crate::ConnectionAnalyticsExporter::from_remote_service(
+                    origin.clone(),
+                    client_stack,
+                )),
+                capabilities,
+            };
+
             inner
                 .remote_connections
                 .insert(origin.clone(), connection.clone());
@@ -394,15 +420,11 @@ impl ConnectionRegistryHandle {
                     inner.saved_credentials.remove(&origin);
                 }
             }
-        }
+
+            connection
+        };
 
         Ok(connection)
-    }
-
-    /// Get a redap RPC client for the given origin, creating a connection if it doesn't exist yet.
-    #[tracing::instrument(level = "info", skip_all)]
-    pub async fn client(&self, origin: re_uri::Origin) -> ApiResult<ConnectionClient> {
-        Ok(self.connection(origin).await?.client)
     }
 
     /// Try connecting with whatever credentials we have available.
@@ -412,7 +434,7 @@ impl ConnectionRegistryHandle {
     async fn try_connect_client_stack(
         origin: re_uri::Origin,
         possible_credentials: impl Iterator<Item = SourcedCredentials>,
-    ) -> ApiResult<(RedapClientStack, Option<SourcedCredentials>)> {
+    ) -> ApiResult<(ValidatedClientStack, Option<SourcedCredentials>)> {
         let mut first_failed_attempt = None;
 
         for credentials in possible_credentials {
@@ -421,8 +443,8 @@ impl ConnectionRegistryHandle {
                     .await;
 
             match result {
-                Ok(client_stack) => {
-                    return Ok((client_stack, Some(credentials)));
+                Ok(validated) => {
+                    return Ok((validated, Some(credentials)));
                 }
 
                 Err(err) if err.is_client_credentials_error() => {
@@ -441,7 +463,7 @@ impl ConnectionRegistryHandle {
         let result = Self::connect_and_validate_client_stack(origin.clone(), None).await;
 
         match result {
-            Ok(client_stack) => Ok((client_stack, None)),
+            Ok(validated) => Ok((validated, None)),
 
             Err(err) => {
                 // If we actually tried tokens, this error is more relevant.
@@ -469,7 +491,7 @@ impl ConnectionRegistryHandle {
                     if let Some(suggested) = suggest_api_prefix(origin) {
                         write!(msg, ". Did you mean '{suggested}'?").ok();
                     }
-                    ApiError::connection(msg)
+                    ApiError::connection(origin, msg)
                 })
         })
         .await?;
@@ -496,7 +518,7 @@ impl ConnectionRegistryHandle {
                 }
             });
         Err(ApiError::invalid_server_with_response(
-            origin.clone(),
+            origin,
             res.status,
             &res.status_text,
             body_snippet.as_deref(),
@@ -508,7 +530,7 @@ impl ConnectionRegistryHandle {
     async fn connect_and_validate_client_stack(
         origin: re_uri::Origin,
         credentials: Option<SourcedCredentials>,
-    ) -> ApiResult<RedapClientStack> {
+    ) -> ApiResult<ValidatedClientStack> {
         // Check the token's allowed hosts before wrapping it in a provider that
         // would blindly attach it to every outgoing request. If the host
         // doesn't match, return a credentials error so the caller can skip
@@ -519,6 +541,7 @@ impl ConnectionRegistryHandle {
                 Some(Credentials::Token(token)) => {
                     token.for_host(&host).map_err(|err| {
                         ApiError::credentials_with_source(
+                            &origin,
                             None,
                             ClientCredentialsError::HostMismatch(err),
                             format!("token not allowed for host '{host}'"),
@@ -534,6 +557,7 @@ impl ConnectionRegistryHandle {
                     if let Ok(Some(c)) = re_auth::oauth::load_credentials() {
                         c.access_token().jwt().for_host(&host).map_err(|err| {
                             ApiError::credentials_with_source(
+                                &origin,
                                 None,
                                 ClientCredentialsError::HostMismatch(err),
                                 format!("stored token not allowed for host '{host}'"),
@@ -579,7 +603,7 @@ impl ConnectionRegistryHandle {
                         }),
                     })
                     .await
-                    .map(drop)
+                    .map(|_| ServerCapabilities::unknown())
             }
             Ok(resp) => {
                 let trace_id = crate::extract_trace_id(resp.metadata());
@@ -587,40 +611,49 @@ impl ConnectionRegistryHandle {
                     user_id,
                     can_read,
                     can_write,
+                    capabilities,
                 } = resp.into_inner();
                 let is_anonymous = user_id.is_none();
                 let user_id = user_id.as_deref().unwrap_or("<anonymous>");
+                let capabilities =
+                    capabilities.map_or_else(ServerCapabilities::unknown, Into::into);
                 re_log::debug_once!(
-                    "Connected to {origin}: {user_id}, can_read={can_read}, can_write={can_write}",
+                    "Connected to {origin}: {user_id}, can_read={can_read}, can_write={can_write}, capabilities={capabilities:?}",
                 );
                 if !can_read {
                     if is_anonymous {
                         // Anonymous user without read access — treat as a credentials error
                         // so the auth flow is triggered.
                         return Err(ApiError::credentials_with_source(
+                            &origin,
                             trace_id,
                             ClientCredentialsError::NotAuthorized,
                             "the server requires authentication for read access",
                         ));
                     }
                     return Err(ApiError::permission_denied(
+                        &origin,
                         trace_id,
                         "the server reports that you do not have read access",
                     ));
                 }
-                Ok(())
+                Ok(capabilities)
             }
             Err(err) => Err(err),
         };
 
         match request_result {
-            Ok(()) => Ok(client_stack),
+            Ok(capabilities) => Ok(ValidatedClientStack {
+                client_stack,
+                capabilities,
+            }),
 
             // catch unauthenticated errors and forget the token if they happen
             Err(err) if err.code() == Code::Unauthenticated => {
                 let trace_id = crate::extract_trace_id(err.metadata());
                 if let Some(credentials) = credentials {
                     Err(ApiError::credentials_with_source(
+                        &origin,
                         trace_id,
                         ClientCredentialsError::UnauthenticatedBadToken {
                             status: err.into(),
@@ -630,6 +663,7 @@ impl ConnectionRegistryHandle {
                     ))
                 } else {
                     Err(ApiError::credentials_with_source(
+                        &origin,
                         trace_id,
                         ClientCredentialsError::UnauthenticatedMissingToken(err.into()),
                         "unauthenticated: missing token",
@@ -644,6 +678,7 @@ impl ConnectionRegistryHandle {
                     match cred_error {
                         CredentialsProviderError::SessionExpired => {
                             Err(ApiError::credentials_with_source(
+                                &origin,
                                 None,
                                 ClientCredentialsError::SessionExpired,
                                 "session expired",
@@ -651,6 +686,7 @@ impl ConnectionRegistryHandle {
                         }
                         CredentialsProviderError::Custom(_) => {
                             Err(ApiError::credentials_with_source(
+                                &origin,
                                 None,
                                 ClientCredentialsError::RefreshError(err.into()),
                                 "refreshing credentials",
@@ -658,7 +694,11 @@ impl ConnectionRegistryHandle {
                         }
                     }
                 } else {
-                    Err(ApiError::tonic(err, "verifying connection to server"))
+                    Err(ApiError::tonic(
+                        &origin,
+                        err,
+                        "verifying connection to server",
+                    ))
                 }
             }
         }
@@ -722,6 +762,22 @@ impl ConnectionRegistryHandle {
                 && inner.fallback_token.is_none()
             {
                 inner.fallback_token = Some(fallback_token);
+            }
+        });
+    }
+
+    /// Clears all chunk caches.
+    pub fn purge_memory(&self) {
+        wrap_blocking_lock(|| {
+            // Each cache has its own lock, so purging them only needs a read lock on the registry.
+            let inner = self.inner.blocking_read();
+
+            #[expect(clippy::iter_over_hash_type)]
+            // Every cache is purged, so order isn't important.
+            for connection in inner.remote_connections.values() {
+                if let Some(cache) = connection.client.chunk_cache() {
+                    cache.write().purge_memory();
+                }
             }
         });
     }

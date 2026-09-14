@@ -2,7 +2,7 @@ use itertools::Itertools as _;
 use rayon::prelude::*;
 use re_sdk_types::archetypes::SeriesPoints;
 use re_sdk_types::components::{self, MarkerShape, MarkerSize};
-use re_sdk_types::{Archetype as _, Loggable as _, archetypes};
+use re_sdk_types::{Archetype as _, FromArrow as _, archetypes};
 use re_view::{ChunksWithComponent, clamped_or_nothing, range_with_blueprint_resolved_data};
 use re_viewer_context::external::re_entity_db::InstancePath;
 use re_viewer_context::{
@@ -46,7 +46,7 @@ impl VisualizerSystem for SeriesPointsSystem {
             constraints: SingleRequiredComponentConstraint::new::<components::Scalar>(
                 &archetypes::Scalars::descriptor_scalars(),
             )
-            .with_additional_physical_types(util::series_supported_datatypes())
+            .with_additional_physical_types(util::series_supported_encodings())
             .with_allow_static_data(false)
             .into(),
             queried: std::iter::chain(
@@ -55,6 +55,7 @@ impl VisualizerSystem for SeriesPointsSystem {
             )
             .cloned()
             .collect(),
+            annotation_context: None,
         }
     }
 
@@ -182,9 +183,7 @@ impl SeriesPointsSystem {
             }
         }
     }
-}
 
-impl SeriesPointsSystem {
     fn load_series(
         ctx: &ViewContext<'_>,
         view_query: &ViewQuery<'_>,
@@ -279,6 +278,7 @@ impl SeriesPointsSystem {
         let default_point = PlotPoint {
             time: 0,
             value: 0.0,
+            variance: 0.0,
             attrs: PlotPointAttrs {
                 // Filled out later.
                 color: egui::Color32::DEBUG_COLOR,
@@ -292,7 +292,11 @@ impl SeriesPointsSystem {
             },
         };
 
-        let num_series = determine_num_series(all_scalar_chunks, &results);
+        let num_series = determine_num_series(
+            all_scalar_chunks,
+            &results,
+            archetypes::Scalars::descriptor_scalars().component,
+        );
         let mut points_per_series =
             allocate_plot_points(&query, &default_point, all_scalar_chunks, num_series);
 
@@ -441,17 +445,22 @@ impl SeriesPointsSystem {
             };
 
             util::points_to_series(
-                instance_path,
+                util::SeriesProperties {
+                    instance_path,
+                    label,
+                    unit: None,
+                    visible,
+                    // Scatter series never draw an error band.
+                    has_variances: false,
+                    visualizer_instruction_id: instruction.id,
+                },
                 time_per_pixel,
-                visible,
                 points,
                 ctx.recording_engine().store(),
                 view_query,
-                label,
                 // Aggregation for points is not supported.
                 re_sdk_types::components::AggregationPolicy::Off,
                 &mut series,
-                instruction.id,
             );
         }
 

@@ -3,7 +3,7 @@
 
 /// Configuration for the 3D line grid.
 #[rerun::rerun_type]
-#[python(aliases = "datatypes.BoolLike")]
+#[python(aliases = "encodings.BoolLike")]
 #[rerun(scope = "blueprint")]
 #[rerun(state = "unstable")]
 pub struct LineGrid3D {
@@ -22,7 +22,7 @@ pub struct LineGrid3D {
 
     /// In what plane the grid is drawn.
     ///
-    /// Defaults to the plane at zero units along the up/down axis defined by [archetypes.SpatialInformation]'s axes property.
+    /// Defaults to the plane at zero units along the up/down axis defined by [`rerun::blueprint::archetypes::SpatialInformation`]'s axes property.
     #[rerun(optional)]
     pub plane: Option<rerun::components::Plane3D>,
 

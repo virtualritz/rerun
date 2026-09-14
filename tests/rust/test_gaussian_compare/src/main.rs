@@ -15,7 +15,7 @@ use re_renderer::{
     ScreenshotProcessor, device_caps,
 };
 use re_sdk_types::archetypes::GaussianSplats3D;
-use re_types_core::Loggable as _;
+use re_types_core::FromArrow as _;
 
 /// Defaults render the checked-in `cactus.ply` from a fixed camera.
 #[derive(clap::Parser)]
@@ -165,7 +165,7 @@ fn main() -> anyhow::Result<()> {
         &[],
     );
 
-    view_builder.queue_draw(&ctx, splat_builder.into_draw_data()?);
+    view_builder.queue_draw(&ctx, splat_builder.into_draw_data()?)?;
     view_builder.schedule_screenshot(&ctx, 42, ())?;
 
     let command_buffer = view_builder.draw(&ctx, Rgba::BLACK)?;

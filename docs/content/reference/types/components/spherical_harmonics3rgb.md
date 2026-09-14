@@ -8,8 +8,8 @@ View-dependent color, expressed as spherical harmonics coefficients of degrees 1
 
 The view-independent (degree-0) base color is represented as a separate [`components.Color`](https://rerun.io/docs/reference/types/components/color).
 
-## Rerun datatype
-[`SphericalHarmonics3Rgb`](../datatypes/spherical_harmonics3rgb.md)
+## Rerun encoding
+[`SphericalHarmonics3Rgb`](../encodings/spherical_harmonics3rgb.md)
 
 
 ## Arrow datatype
@@ -18,11 +18,11 @@ FixedSizeList(15 x non-null FixedSizeList(3 x non-null Float16))
 ```
 
 ## API reference links
- * 🌊 [C++ API docs for `SphericalHarmonics3Rgb`](https://ref.rerun.io/docs/cpp/stable/structrerun_1_1components_1_1SphericalHarmonics3Rgb.html?speculative-link)
- * 🐍 [Python API docs for `SphericalHarmonics3Rgb`](https://ref.rerun.io/docs/python/stable/common/components?speculative-link#rerun.components.SphericalHarmonics3Rgb)
- * 🦀 [Rust API docs for `SphericalHarmonics3Rgb`](https://docs.rs/rerun/latest/rerun/components/struct.SphericalHarmonics3Rgb.html?speculative-link)
+ * 🌊 [C++ API docs for `SphericalHarmonics3Rgb`](https://ref.rerun.io/docs/cpp/stable/structrerun_1_1components_1_1SphericalHarmonics3Rgb.html)
+ * 🐍 [Python API docs for `SphericalHarmonics3Rgb`](https://ref.rerun.io/docs/python/stable/common/components#rerun.components.SphericalHarmonics3Rgb)
+ * 🦀 [Rust API docs for `SphericalHarmonics3Rgb`](https://docs.rs/rerun/latest/rerun/components/struct.SphericalHarmonics3Rgb.html)
 
 
 ## Used by
 
-* [`GaussianSplats3D`](../archetypes/gaussian_splats3d.md?speculative-link)
+* [`GaussianSplats3D`](../archetypes/gaussian_splats3d.md)

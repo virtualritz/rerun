@@ -56,7 +56,7 @@ pub struct LoadingIndicator {
 
 use ahash::HashMap;
 use re_entity_db::EntityPath;
-use re_sdk_types::datatypes::{KeypointId, KeypointPair};
+use re_sdk_types::encodings::{KeypointId, KeypointPair};
 use re_view::clamped_or_else;
 use re_viewer_context::{
     Annotations, IdentifiedViewSystem as _, QueryContext, SystemExecutionOutput,
@@ -241,7 +241,7 @@ pub fn load_keypoint_connections(
     re_tracing::profile_function!();
 
     // TODO(andreas): We should be able to compute this already when we load the keypoints
-    // in `process_annotation_and_keypoint_slices`
+    // in `process_keypoint_slices`
     let max_num_connections = keypoints
         .iter()
         .map(|((class_id, _time), _keypoints_in_class)| {

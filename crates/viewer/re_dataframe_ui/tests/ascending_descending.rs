@@ -2,14 +2,15 @@ mod common;
 
 use std::sync::Arc;
 
-use arrow::array::{Array as _, ListArray, RecordBatch, StringBuilder};
+use arrow::array::{Array as _, ListArray, StringBuilder};
 use arrow::datatypes::{Field, Schema};
 use datafusion::prelude::SessionContext;
 use egui::accesskit::Role;
 use egui_kittest::kittest::Queryable as _;
 use re_async::AsyncRuntimeHandle;
-use re_dataframe_ui::{DataFusionTableWidget, SortBy, TableBlueprint};
+use re_dataframe_ui::{DataFusionTableWidget, SortBy, TableBlueprints};
 use re_test_context::TestContext;
+use re_viewer_context::TableReference;
 
 use common::run_async_harness;
 
@@ -23,18 +24,23 @@ async fn test_no_sort() {
         .setup_kittest_for_rendering_ui([600.0, 400.0])
         .build_ui(|ui| {
             test_context.run_recording(&ui.ctx().clone(), |ctx| {
-                DataFusionTableWidget::new(Arc::clone(&session_context), table_ref)
-                    .title("No sort")
-                    .show(
-                        ctx.app_ctx,
-                        &runtime_handle,
-                        ui,
-                        &mut test_context.view_states.lock(),
-                    );
+                DataFusionTableWidget::new(
+                    Arc::clone(&session_context),
+                    table_ref,
+                    TableReference::local("test_table"),
+                )
+                .title("No sort")
+                .show(
+                    ctx.app_ctx,
+                    &runtime_handle,
+                    ui,
+                    &TableBlueprints::default(),
+                    &mut test_context.view_states.lock(),
+                );
             });
         });
 
-    run_async_harness(&mut harness).await;
+    run_async_harness(&test_context, &mut harness).await;
     harness.snapshot("test_no_sort");
 }
 
@@ -48,22 +54,24 @@ async fn test_ascending() {
         .setup_kittest_for_rendering_ui([600.0, 400.0])
         .build_ui(|ui| {
             test_context.run_recording(&ui.ctx().clone(), |ctx| {
-                DataFusionTableWidget::new(Arc::clone(&session_context), table_ref)
-                    .title("Ascending")
-                    .initial_blueprint(TableBlueprint {
-                        sort_by: Some(SortBy::ascending("col")),
-                        ..Default::default()
-                    })
-                    .show(
-                        ctx.app_ctx,
-                        &runtime_handle,
-                        ui,
-                        &mut test_context.view_states.lock(),
-                    );
+                DataFusionTableWidget::new(
+                    Arc::clone(&session_context),
+                    table_ref,
+                    TableReference::local("test_table"),
+                )
+                .title("Ascending")
+                .sort_by(SortBy::ascending("col".into()))
+                .show(
+                    ctx.app_ctx,
+                    &runtime_handle,
+                    ui,
+                    &TableBlueprints::default(),
+                    &mut test_context.view_states.lock(),
+                );
             });
         });
 
-    run_async_harness(&mut harness).await;
+    run_async_harness(&test_context, &mut harness).await;
     harness.snapshot("test_ascending");
 }
 
@@ -77,22 +85,24 @@ async fn test_descending() {
         .setup_kittest_for_rendering_ui([600.0, 400.0])
         .build_ui(|ui| {
             test_context.run_recording(&ui.ctx().clone(), |ctx| {
-                DataFusionTableWidget::new(Arc::clone(&session_context), table_ref)
-                    .title("Descending")
-                    .initial_blueprint(TableBlueprint {
-                        sort_by: Some(SortBy::descending("col")),
-                        ..Default::default()
-                    })
-                    .show(
-                        ctx.app_ctx,
-                        &runtime_handle,
-                        ui,
-                        &mut test_context.view_states.lock(),
-                    );
+                DataFusionTableWidget::new(
+                    Arc::clone(&session_context),
+                    table_ref,
+                    TableReference::local("test_table"),
+                )
+                .title("Descending")
+                .sort_by(SortBy::descending("col".into()))
+                .show(
+                    ctx.app_ctx,
+                    &runtime_handle,
+                    ui,
+                    &TableBlueprints::default(),
+                    &mut test_context.view_states.lock(),
+                );
             });
         });
 
-    run_async_harness(&mut harness).await;
+    run_async_harness(&test_context, &mut harness).await;
     harness.snapshot("test_descending");
 }
 
@@ -106,24 +116,29 @@ async fn test_column_menu_button() {
         .setup_kittest_for_rendering_ui([600.0, 400.0])
         .build_ui(|ui| {
             test_context.run_recording(&ui.ctx().clone(), |ctx| {
-                DataFusionTableWidget::new(Arc::clone(&session_context), table_ref)
-                    .title("Column menu button")
-                    .show(
-                        ctx.app_ctx,
-                        &runtime_handle,
-                        ui,
-                        &mut test_context.view_states.lock(),
-                    );
+                DataFusionTableWidget::new(
+                    Arc::clone(&session_context),
+                    table_ref,
+                    TableReference::local("test_table"),
+                )
+                .title("Column menu button")
+                .show(
+                    ctx.app_ctx,
+                    &runtime_handle,
+                    ui,
+                    &TableBlueprints::default(),
+                    &mut test_context.view_states.lock(),
+                );
             });
         });
 
-    run_async_harness(&mut harness).await;
+    run_async_harness(&test_context, &mut harness).await;
     let node = harness
         .query_all_by_role_and_label(Role::Button, "More options")
         .next()
         .unwrap();
     node.click();
-    run_async_harness(&mut harness).await;
+    run_async_harness(&test_context, &mut harness).await;
     harness.snapshot("test_column_menu_button");
 }
 
@@ -144,19 +159,5 @@ fn prepare_session_context() -> (Arc<SessionContext>, &'static str) {
         vec![Field::new("col", column.data_type().clone(), true)],
         Default::default(),
     ));
-    let batch = RecordBatch::try_new_with_options(
-        schema.clone(),
-        vec![Arc::new(column)],
-        &Default::default(),
-    )
-    .expect("Failed to create a record batch");
-
-    // create a datafusion session context with that table
-    let session_context = Arc::new(SessionContext::new());
-    let table_ref = "test_table";
-    session_context
-        .register_batch(table_ref, batch)
-        .expect("Failed to register the table");
-
-    (session_context, table_ref)
+    common::register_test_table("test_table", schema, vec![Arc::new(column)])
 }

@@ -4,7 +4,7 @@
 #pragma once
 
 #include "../../collection.hpp"
-#include "../../datatypes/entity_path.hpp"
+#include "../../encodings/entity_path.hpp"
 #include "../../result.hpp"
 
 #include <cstdint>
@@ -26,15 +26,15 @@ namespace rerun::blueprint::components {
     /// ⚠ **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**
     ///
     struct ColumnOrder {
-        rerun::Collection<rerun::datatypes::EntityPath> entity_paths;
+        rerun::Collection<rerun::encodings::EntityPath> entity_paths;
 
       public:
         ColumnOrder() = default;
 
-        ColumnOrder(rerun::Collection<rerun::datatypes::EntityPath> entity_paths_)
+        ColumnOrder(rerun::Collection<rerun::encodings::EntityPath> entity_paths_)
             : entity_paths(std::move(entity_paths_)) {}
 
-        ColumnOrder& operator=(rerun::Collection<rerun::datatypes::EntityPath> entity_paths_) {
+        ColumnOrder& operator=(rerun::Collection<rerun::encodings::EntityPath> entity_paths_) {
             entity_paths = std::move(entity_paths_);
             return *this;
         }
@@ -51,7 +51,7 @@ namespace rerun {
         static constexpr std::string_view ComponentType = "rerun.blueprint.components.ColumnOrder";
 
         /// Returns the arrow data type this type corresponds to.
-        static const std::shared_ptr<arrow::DataType>& arrow_datatype();
+        static const std::shared_ptr<arrow::DataType>& arrow_data_type();
 
         /// Serializes an array of `rerun::blueprint:: components::ColumnOrder` into an arrow array.
         static Result<std::shared_ptr<arrow::Array>> to_arrow(

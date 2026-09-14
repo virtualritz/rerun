@@ -102,7 +102,16 @@ impl MeshElementDrawData {
         ctx: &RenderContext,
         meshes: impl IntoIterator<Item = (std::sync::Arc<crate::mesh::GpuMesh>, MeshElementStyle)>,
     ) -> Self {
-        let renderer = ctx.renderer::<MeshElementRenderer>();
+        // Upstream made `renderer::<T>()` fallible (explicit registration).
+        // This constructor returns `Self`, so an unregistered renderer yields
+        // draw data with no batches -- it draws nothing rather than taking the
+        // process down. `register_renderers` registers this one, so the arm is
+        // unreachable in a correctly built context.
+        let Ok(renderer_ok) = ctx.renderer::<MeshElementRenderer>() else {
+            return Self {
+                batches: std::sync::Arc::new(Vec::new()),
+            };
+        };
 
         let batches = meshes
             .into_iter()
@@ -164,11 +173,11 @@ impl MeshElementDrawData {
                                     as u64),
                             },
                         ],
-                        layout: renderer.bind_group_layout,
+                        layout: renderer_ok.bind_group_layout,
                     },
                 );
 
-                let num_indices = (mesh.index_buffer_range.end - mesh.index_buffer_range.start)
+                let num_indices = (mesh.index_buffer_range.end() - mesh.index_buffer_range.start)
                     / std::mem::size_of::<u32>() as u64;
 
                 MeshElementBatch {

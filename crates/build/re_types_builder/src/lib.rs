@@ -75,7 +75,7 @@
 //!
 //! We say "broadly" here because the way these affixes ultimately affect objects in practice will
 //! actually depend on the kind of object that they are applied to, of which there are 3: archetypes,
-//! components and datatypes.
+//! components and encodings.
 //!
 //! Not only that, but objects defined in Rerun's IDL are materialized into 3 distinct environments:
 //! IDL definitions, Arrow datatypes and native code (e.g. Rust & Python).
@@ -136,10 +136,11 @@ pub use self::codegen::{
     CodeGenerator, CppCodeGenerator, DefinitionsCodeGenerator, DocsCodeGenerator,
     PythonCodeGenerator, RustCodeGenerator, SnippetsRefCodeGenerator,
 };
+pub use self::data_type::AtomicDataType;
 pub use self::docs::Docs;
 pub use self::format::{CodeFormatter, CppCodeFormatter, PythonCodeFormatter, RustCodeFormatter};
 pub use self::objects::{
-    Attributes, ElementType, Object, ObjectClass, ObjectField, ObjectKind, Objects, Type,
+    Attributes, EnumIntegerType, Object, ObjectClass, ObjectField, ObjectKind, Objects, Type,
 };
 pub use self::report::{Report, Reporter};
 pub use self::type_registry::TypeRegistry;
@@ -161,12 +162,8 @@ pub fn generate_lang_agnostic(
 ) -> (Objects, TypeRegistry) {
     re_tracing::profile_function!();
 
-    let mut objects = Objects::from_rust_definitions(reporter, definitions_dir);
-
-    let mut type_registry = TypeRegistry::default();
-    for obj in objects.objects.values_mut() {
-        type_registry.register(obj);
-    }
+    let objects = Objects::from_rust_definitions(reporter, definitions_dir);
+    let type_registry = TypeRegistry::from_objects(&objects);
 
     (objects, type_registry)
 }

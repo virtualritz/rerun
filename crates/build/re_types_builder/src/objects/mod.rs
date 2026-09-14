@@ -1,7 +1,4 @@
-//! This package implements the semantic pass of the codegen process.
-//!
-//! The semantic pass transforms the low-level raw reflection data into higher level types that
-//! are much easier to inspect and manipulate / friendlier to work with.
+//! The intermediate representation the whole pipeline is written against, and its validation.
 //!
 //! Everything in here is IDL-agnostic: it is a plain intermediate representation with no notion
 //! of the syntax it was parsed from.
@@ -9,18 +6,18 @@
 
 pub(crate) mod from_rust;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 
-use crate::data_type::LazyDatatype;
-use crate::{Docs, Reporter, RerunAttr};
+use crate::data_type::AtomicDataType;
+use crate::{Docs, DocsAttr, Reporter, RerunAttr};
 
 // ---
 
-/// The result of the semantic pass: an intermediate representation of all available object
-/// types; including structs, enums and unions.
+/// An intermediate representation of all available object types; including structs, enums and
+/// unions.
 #[derive(Debug, Default)]
 pub struct Objects {
     /// Maps fully-qualified type names to their resolved object definitions.
@@ -28,21 +25,29 @@ pub struct Objects {
 }
 
 impl Objects {
-    /// The IDL-agnostic half of the semantic pass.
+    /// Validates the object graph.
     ///
-    /// Validates the object graph. Every frontend must call this once it has produced the raw
-    /// [`Object`] map.
+    /// Every frontend must call this once it has produced the raw [`Object`] map.
     pub(crate) fn validate(&self, reporter: &Reporter) {
-        // Validate field types: archetypes consist of components, Views (aka SuperArchetypes) consist of archetypes, everything else consists of datatypes.
+        // Validate field types: archetypes consist of components, Views (aka SuperArchetypes) consist of archetypes, everything else consists of encodings.
         for obj in self.objects.values() {
+            // Validate that archetype agnostic attribute is only used on views.
+            if obj.is_attr_set(DocsAttr::ArchetypeAgnostic) && obj.kind != ObjectKind::View {
+                reporter.error(
+                    &obj.virtpath,
+                    &obj.fqname,
+                    "`#[docs(archetype_agnostic)]` is only valid on views",
+                );
+            }
+
             for field in &obj.fields {
                 let virtpath = &field.virtpath;
                 if let Some(field_type_fqname) = field.typ.fqname() {
                     let field_obj = &self[field_type_fqname];
                     match obj.kind {
-                        ObjectKind::Datatype | ObjectKind::Component => {
-                            if field_obj.kind != ObjectKind::Datatype {
-                                reporter.error(virtpath, field_type_fqname, "Is part of a Component or Datatype but is itself not a Datatype. Only archetype fields can be components, all other fields have to be primitive or be a datatypes.");
+                        ObjectKind::Encoding | ObjectKind::Component => {
+                            if field_obj.kind != ObjectKind::Encoding {
+                                reporter.error(virtpath, field_type_fqname, "Is part of a Component or Encoding but is itself not an Encoding. Only archetype fields can be components, all other fields have to be primitive or be an encoding.");
                             }
                         }
                         ObjectKind::Archetype => {
@@ -58,11 +63,11 @@ impl Objects {
                             }
                         }
                     }
-                } else if obj.kind != ObjectKind::Datatype {
+                } else if obj.kind != ObjectKind::Encoding {
                     let is_enum_component = obj.kind == ObjectKind::Component && obj.is_enum(); // Enum components are allowed to have no datatype.
-                    let is_test_component = obj.kind == ObjectKind::Component && obj.is_testing(); // Test components are allowed to have datatypes for the moment. TODO(andreas): Should clean this up as well!
+                    let is_test_component = obj.kind == ObjectKind::Component && obj.is_testing(); // Test components are allowed to have encodings for the moment. TODO(andreas): Should clean this up as well!
                     if !is_enum_component && !is_test_component {
-                        reporter.error(virtpath, &obj.fqname, format!("Field {:?} s a primitive field of type {:?}. Primitive types are only allowed on DataTypes.", field.fqname, field.typ));
+                        reporter.error(virtpath, &obj.fqname, format!("Field {:?} s a primitive field of type {:?}. Primitive types are only allowed on encodings.", field.fqname, field.typ));
                     }
                 }
 
@@ -76,7 +81,7 @@ impl Objects {
 
                 // Validate whether someone is using a type we use for non-nullable arrays to describe some nullable field.
                 if field.is_nullable
-                    && (obj.kind == ObjectKind::Datatype || obj.kind == ObjectKind::Component)
+                    && (obj.kind == ObjectKind::Encoding || obj.kind == ObjectKind::Component)
                     && let Some(field_type_fqname) = field.typ.fqname()
                     // TODO(andreas): This is a hack, here because introducing this warning, I really don't want to touch annotation info right now.
                     && obj.name != "AnnotationInfo"
@@ -84,7 +89,7 @@ impl Objects {
                     let field_obj = &self[field_type_fqname];
                     if field_obj.is_arrow_transparent() {
                         let suggestion = if field_obj.name == "Utf8" {
-                            "Use `string (nullable)` instead of `rerun.datatypes.Utf8 (nullable)`."
+                            "Use `string (nullable)` instead of `rerun.encodings.Utf8 (nullable)`."
                                 .to_owned()
                         } else {
                             format!(
@@ -105,6 +110,27 @@ impl Objects {
                                 ),
                             );
                     }
+                }
+            }
+        }
+
+        // Validate that archetype agnostic views are not redundantly included in archetypes
+        let archetype_agnostic_views = self
+            .objects_of_kind(ObjectKind::View)
+            .filter(|view| view.is_attr_set(DocsAttr::ArchetypeAgnostic))
+            .map(|view| view.name.as_str())
+            .collect::<HashSet<_>>();
+        for archetype in self.objects_of_kind(ObjectKind::Archetype) {
+            for view in archetype.archetype_view_types().unwrap_or_default() {
+                if archetype_agnostic_views.contains(view.view_name.as_str()) {
+                    reporter.error(
+                        &archetype.virtpath,
+                        &archetype.fqname,
+                        format!(
+                            "View `{}` is already included by its `#[docs(archetype_agnostic)]` attribute",
+                            view.view_name
+                        ),
+                    );
                 }
             }
         }
@@ -159,8 +185,8 @@ impl Objects {
 /// E.g.:
 /// ```ignore
 /// # let objects = Objects::default();
-/// let obj = &objects["rerun.datatypes.Vec3D"];
-/// let obj = &objects["rerun.datatypes.Angle"];
+/// let obj = &objects["rerun.encodings.Vec3D"];
+/// let obj = &objects["rerun.encodings.Angle"];
 /// let obj = &objects["rerun.components.Text"];
 /// let obj = &objects["rerun.archetypes.Position2D"];
 /// ```
@@ -179,7 +205,7 @@ impl std::ops::Index<&str> for Objects {
 /// The kind of the object, as determined by its package root (e.g. `rerun.components`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectKind {
-    Datatype,
+    Encoding,
     Component,
     Archetype,
 
@@ -256,7 +282,7 @@ impl State {
 }
 
 impl ObjectKind {
-    pub const ALL: [Self; 4] = [Self::Datatype, Self::Component, Self::Archetype, Self::View];
+    pub const ALL: [Self; 4] = [Self::Encoding, Self::Component, Self::Archetype, Self::View];
 
     // TODO(#2364): use an attr instead of the path
     pub fn from_pkg_name(pkg_name: &str, attrs: &Attributes) -> Self {
@@ -268,8 +294,8 @@ impl ObjectKind {
         };
 
         let pkg_name = pkg_name.replace(".testing", "");
-        if pkg_name.starts_with(format!("rerun{scope}.datatypes").as_str()) {
-            Self::Datatype
+        if pkg_name.starts_with(format!("rerun{scope}.encodings").as_str()) {
+            Self::Encoding
         } else if pkg_name.starts_with(format!("rerun{scope}.components").as_str()) {
             Self::Component
         } else if pkg_name.starts_with(format!("rerun{scope}.archetypes").as_str()) {
@@ -284,7 +310,7 @@ impl ObjectKind {
 
     pub fn plural_snake_case(&self) -> &'static str {
         match self {
-            Self::Datatype => "datatypes",
+            Self::Encoding => "encodings",
             Self::Component => "components",
             Self::Archetype => "archetypes",
             Self::View => "views",
@@ -293,7 +319,7 @@ impl ObjectKind {
 
     pub fn singular_name(&self) -> &'static str {
         match self {
-            Self::Datatype => "Datatype",
+            Self::Encoding => "Encoding",
             Self::Component => "Component",
             Self::Archetype => "Archetype",
             Self::View => "View",
@@ -302,7 +328,7 @@ impl ObjectKind {
 
     pub fn plural_name(&self) -> &'static str {
         match self {
-            Self::Datatype => "Datatypes",
+            Self::Encoding => "Encodings",
             Self::Component => "Components",
             Self::Archetype => "Archetypes",
             Self::View => "Views",
@@ -340,7 +366,7 @@ pub struct Object {
     /// The object's multiple layers of documentation.
     pub docs: Docs,
 
-    /// The object's kind: datatype, component or archetype.
+    /// The object's kind: encoding, component or archetype.
     pub kind: ObjectKind,
 
     /// The object's attributes.
@@ -357,12 +383,6 @@ pub struct Object {
 
     /// struct, enum, or union?
     pub class: ObjectClass,
-
-    /// The Arrow datatype of this `Object`, or `None` if the object is Arrow-transparent.
-    ///
-    /// This is lazily computed when the parent object gets registered into the Arrow registry and
-    /// will be `None` until then.
-    pub datatype: Option<LazyDatatype>,
 }
 
 impl PartialEq for Object {
@@ -524,6 +544,10 @@ pub fn is_testing_fqname(fqname: &str) -> bool {
     fqname.contains("rerun.testing")
 }
 
+/// What integer a C-style `enum` is stored as, i.e. the `#[repr(u8)]` of its definition.
+///
+/// Unsigned only, and it is the arrow datatype too ([`Self::to_atomic`]): an enum is a plain
+/// integer array, not a union.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnumIntegerType {
     U8,
@@ -533,13 +557,17 @@ pub enum EnumIntegerType {
 }
 
 impl EnumIntegerType {
-    pub fn to_type(self) -> Type {
+    pub fn to_atomic(self) -> AtomicDataType {
         match self {
-            Self::U8 => Type::UInt8,
-            Self::U16 => Type::UInt16,
-            Self::U32 => Type::UInt32,
-            Self::U64 => Type::UInt64,
+            Self::U8 => AtomicDataType::UInt8,
+            Self::U16 => AtomicDataType::UInt16,
+            Self::U32 => AtomicDataType::UInt32,
+            Self::U64 => AtomicDataType::UInt64,
         }
+    }
+
+    pub fn to_type(self) -> Type {
+        Type::Atomic(self.to_atomic())
     }
 
     pub fn format_value(&self, value: u64) -> String {
@@ -551,7 +579,7 @@ impl EnumIntegerType {
         }
     }
 
-    /// Returns the suffix used for the repr type, e.g. `"u8"`, `"u16"`, etc.
+    /// The Rust spelling of the repr type, e.g. `"u8"`.
     pub fn type_str(self) -> &'static str {
         match self {
             Self::U8 => "u8",
@@ -567,11 +595,10 @@ impl EnumIntegerType {
 pub enum ObjectClass {
     Struct,
 
-    /// Dumb C-style enum.
+    /// Dumb C-style enum, whose variants carry no payload.
     ///
-    /// Encoded as a primitive integer arrow array.
-    ///
-    /// We reserve `0` for a special/implicit `__null_markers` variant,
+    /// Encoded as a primitive integer arrow array, of the given [`EnumIntegerType`].
+    /// We reserve `0` as the invalid value, so that a zeroed byte never names a real variant.
     Enum(EnumIntegerType),
 
     /// Proper sum-type union.
@@ -632,12 +659,6 @@ pub struct ObjectField {
 
     /// Whether the field is nullable.
     pub is_nullable: bool,
-
-    /// The Arrow datatype of this `ObjectField`.
-    ///
-    /// This is lazily computed when the parent object gets registered into the Arrow registry and
-    /// will be `None` until then.
-    pub datatype: Option<LazyDatatype>,
 }
 
 impl ObjectField {
@@ -717,350 +738,110 @@ impl std::fmt::Display for FieldKind {
     }
 }
 
-/// The underlying type of an [`ObjectField`].
+/// The type of an [`ObjectField`], as the definition wrote it.
+///
+/// This is the definition half of the type system, so the variants are the things a definition may
+/// spell: `f32`, `String`, `Vec<f32>`, `[f32; 3]`, `rerun::datatypes::Vec3D`. They are named after
+/// their arrow counterparts because that is what they become —
+/// [`TypeRegistry`](crate::TypeRegistry) derives a [`DataType`](crate::data_type::DataType) from
+/// each one — but they are not the same thing: a `Type` says what the author asked for, a
+/// `DataType` says how it is laid out.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum Type {
-    /// This is the unit type, used for `enum` variants.
+    /// A number, a boolean, or the unit type.
     ///
-    /// In `arrow`, this corresponds to the `null` type.
-    ///
-    /// In rust this would be `()`, and in C++ this would be `void`.
-    Unit,
+    /// The unit type is [`AtomicDataType::Null`]; see [`Self::is_unit`].
+    Atomic(AtomicDataType),
 
-    UInt8,
-    UInt16,
-    UInt32,
-    UInt64,
-    Int8,
-    Int16,
-    Int32,
-    Int64,
-    Bool,
-    Float16,
-    Float32,
-    Float64,
-
-    /// A list of bytes of arbitrary length.
-    ///
-    /// 32-bit or 64-bit
+    /// A list of bytes of arbitrary length, i.e. `rerun::Binary`.
     Binary,
 
-    /// Utf8
-    String,
+    /// A string of arbitrary length, i.e. `String`.
+    Utf8,
 
-    Array {
-        elem_type: ElementType,
-        length: usize,
-    },
-    Vector {
-        elem_type: ElementType,
-    },
-    Object {
-        fqname: String,
-    },
-}
+    /// A fixed-size array, e.g. `[f32; 3]`.
+    ///
+    /// The element type is never the unit type or a [`Self::List`]:
+    /// the frontend rejects both.
+    FixedSizeList { elem_type: Box<Self>, length: usize },
 
-impl From<ElementType> for Type {
-    fn from(typ: ElementType) -> Self {
-        match typ {
-            ElementType::UInt8 => Self::UInt8,
-            ElementType::UInt16 => Self::UInt16,
-            ElementType::UInt32 => Self::UInt32,
-            ElementType::UInt64 => Self::UInt64,
-            ElementType::Int8 => Self::Int8,
-            ElementType::Int16 => Self::Int16,
-            ElementType::Int32 => Self::Int32,
-            ElementType::Int64 => Self::Int64,
-            ElementType::Bool => Self::Bool,
-            ElementType::Float16 => Self::Float16,
-            ElementType::Float32 => Self::Float32,
-            ElementType::Float64 => Self::Float64,
-            ElementType::Binary => Self::Binary,
-            ElementType::String => Self::String,
-            ElementType::Object { fqname } => Self::Object { fqname },
-            ElementType::Array { elem_type, length } => Self::Array {
-                elem_type: *elem_type,
-                length,
-            },
-        }
-    }
+    /// A list of arbitrary length, e.g. `Vec<f32>`.
+    ///
+    /// The element type is never the unit type or a [`Self::List`]:
+    /// the frontend rejects both.
+    List { elem_type: Box<Self> },
+
+    /// Another definition, referred to by fully-qualified name, e.g. `rerun::datatypes::Vec3D`.
+    Object { fqname: String },
 }
 
 impl Type {
-    /// The inverse of `From<ElementType> for Type`: the element type that this type
-    /// corresponds to when used as an array/vector element.
+    /// The unit type, used for `enum` variants.
     ///
-    /// Returns `None` for types that cannot be element types (`Unit`, vectors).
-    pub fn to_element_type(&self) -> Option<ElementType> {
-        match self {
-            Self::UInt8 => Some(ElementType::UInt8),
-            Self::UInt16 => Some(ElementType::UInt16),
-            Self::UInt32 => Some(ElementType::UInt32),
-            Self::UInt64 => Some(ElementType::UInt64),
-            Self::Int8 => Some(ElementType::Int8),
-            Self::Int16 => Some(ElementType::Int16),
-            Self::Int32 => Some(ElementType::Int32),
-            Self::Int64 => Some(ElementType::Int64),
-            Self::Bool => Some(ElementType::Bool),
-            Self::Float16 => Some(ElementType::Float16),
-            Self::Float32 => Some(ElementType::Float32),
-            Self::Float64 => Some(ElementType::Float64),
-            Self::Binary => Some(ElementType::Binary),
-            Self::String => Some(ElementType::String),
-            Self::Object { fqname } => Some(ElementType::Object {
-                fqname: fqname.clone(),
-            }),
-            Self::Array { elem_type, length } => Some(ElementType::Array {
-                elem_type: Box::new(elem_type.clone()),
-                length: *length,
-            }),
+    /// In `arrow` this is the `null` type, in Rust it is `()`, and in C++ it is `void`.
+    pub const UNIT: Self = Self::Atomic(AtomicDataType::Null);
 
-            Self::Unit | Self::Vector { .. } => None,
-        }
+    /// Is this the unit type, i.e. an `enum` variant with no payload?
+    pub fn is_unit(&self) -> bool {
+        self == &Self::UNIT
     }
 
+    /// A list of `self`, or `self` if it is already a list or a fixed-size list.
+    ///
+    /// `None` for the unit type, which cannot be an element type.
     pub fn make_plural(&self) -> Option<Self> {
-        match self {
-            Self::Vector { elem_type: _ }
-            | Self::Array {
-                elem_type: _,
-                length: _,
-            } => Some(self.clone()),
-
-            Self::UInt8 => Some(Self::Vector {
-                elem_type: ElementType::UInt8,
-            }),
-            Self::UInt16 => Some(Self::Vector {
-                elem_type: ElementType::UInt16,
-            }),
-            Self::UInt32 => Some(Self::Vector {
-                elem_type: ElementType::UInt32,
-            }),
-            Self::UInt64 => Some(Self::Vector {
-                elem_type: ElementType::UInt64,
-            }),
-            Self::Int8 => Some(Self::Vector {
-                elem_type: ElementType::Int8,
-            }),
-            Self::Int16 => Some(Self::Vector {
-                elem_type: ElementType::Int16,
-            }),
-            Self::Int32 => Some(Self::Vector {
-                elem_type: ElementType::Int32,
-            }),
-            Self::Int64 => Some(Self::Vector {
-                elem_type: ElementType::Int64,
-            }),
-            Self::Bool => Some(Self::Vector {
-                elem_type: ElementType::Bool,
-            }),
-            Self::Float16 => Some(Self::Vector {
-                elem_type: ElementType::Float16,
-            }),
-            Self::Float32 => Some(Self::Vector {
-                elem_type: ElementType::Float32,
-            }),
-            Self::Float64 => Some(Self::Vector {
-                elem_type: ElementType::Float64,
-            }),
-            Self::Binary => Some(Self::Vector {
-                elem_type: ElementType::Binary,
-            }),
-            Self::String => Some(Self::Vector {
-                elem_type: ElementType::String,
-            }),
-            Self::Object { fqname } => Some(Self::Vector {
-                elem_type: ElementType::Object {
-                    fqname: fqname.clone(),
-                },
-            }),
-
-            Self::Unit => None,
+        if self.is_unit() {
+            None // An array of nothing is nothing.
+        } else if self.is_plural() {
+            Some(self.clone())
+        } else {
+            Some(Self::List {
+                elem_type: Box::new(self.clone()),
+            })
         }
     }
 
-    /// True if this is some kind of array/vector.
+    /// True if this is some kind of list.
     pub fn is_plural(&self) -> bool {
         self.plural_inner().is_some()
     }
 
-    /// Returns element type for arrays and vectors.
-    pub fn plural_inner(&self) -> Option<&ElementType> {
+    /// Returns element type for lists and fixed-size lists.
+    pub fn plural_inner(&self) -> Option<&Self> {
         match self {
-            Self::Vector { elem_type }
-            | Self::Array {
+            Self::List { elem_type }
+            | Self::FixedSizeList {
                 elem_type,
                 length: _,
             } => Some(elem_type),
 
-            Self::Unit
-            | Self::UInt8
-            | Self::UInt16
-            | Self::UInt32
-            | Self::UInt64
-            | Self::Int8
-            | Self::Int16
-            | Self::Int32
-            | Self::Int64
-            | Self::Bool
-            | Self::Float16
-            | Self::Float32
-            | Self::Float64
-            | Self::Binary
-            | Self::String
-            | Self::Object { .. } => None,
+            Self::Atomic(_) | Self::Binary | Self::Utf8 | Self::Object { .. } => None,
         }
     }
 
-    pub fn vector_inner(&self) -> Option<&ElementType> {
+    /// Like [`Self::plural_inner`], but only for [`Self::List`], not for fixed-size ones.
+    pub fn list_inner(&self) -> Option<&Self> {
         self.plural_inner()
-            .filter(|_| matches!(self, Self::Vector { .. }))
+            .filter(|_| matches!(self, Self::List { .. }))
     }
 
-    /// `Some(fqname)` if this is an `Object` or an `Array`/`Vector` of `Object`s.
-    pub fn fqname(&self) -> Option<&str> {
-        match self {
-            Self::Object { fqname } => Some(fqname.as_str()),
-            Self::Array {
-                elem_type,
-                length: _,
-            }
-            | Self::Vector { elem_type } => elem_type.fqname(),
-            _ => None,
-        }
-    }
-
-    /// Is the destructor trivial/default (i.e. is this simple data with no allocations)?
-    pub fn has_default_destructor(&self, objects: &Objects) -> bool {
-        match self {
-            Self::Unit
-            | Self::UInt8
-            | Self::UInt16
-            | Self::UInt32
-            | Self::UInt64
-            | Self::Int8
-            | Self::Int16
-            | Self::Int32
-            | Self::Int64
-            | Self::Bool
-            | Self::Float16
-            | Self::Float32
-            | Self::Float64 => true,
-
-            Self::Binary | Self::String | Self::Vector { .. } => false,
-
-            Self::Array { elem_type, .. } => elem_type.has_default_destructor(objects),
-
-            Self::Object { fqname } => objects[fqname].has_default_destructor(objects),
-        }
-    }
-
-    pub fn is_union(&self, objects: &Objects) -> bool {
-        if let Self::Object { fqname } = self {
-            let obj = &objects[fqname];
-            if obj.is_arrow_transparent() {
-                obj.fields[0].typ.is_union(objects)
-            } else {
-                obj.class == ObjectClass::Union
-            }
-        } else {
-            false
-        }
-    }
-}
-
-/// The underlying element type for arrays/vectors/maps.
-///
-/// Flatbuffers doesn't support directly nesting multiple layers of arrays, they
-/// always have to be wrapped into intermediate layers of structs or tables!
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub enum ElementType {
-    UInt8,
-    UInt16,
-    UInt32,
-    UInt64,
-    Int8,
-    Int16,
-    Int32,
-    Int64,
-    Bool,
-    Float16,
-    Float32,
-    Float64,
-
-    /// A list of bytes of arbitrary length.
+    /// Recursively resolves nested arrays and lists to their innermost element type.
     ///
-    /// 32-bit or 64-bit
-    Binary,
-
-    /// Utf8
-    String,
-
-    Object {
-        fqname: String,
-    },
-
-    /// A nested fixed-size array.
-    ///
-    /// This cannot be expressed directly in the definitions (arrays cannot nest);
-    /// it is produced by the semantic pass when a `transparent` struct wrapping a
-    /// fixed-size array is used as the element type of an array/vector.
-    Array {
-        elem_type: Box<Self>,
-        length: usize,
-    },
-}
-
-impl ElementType {
-    /// `Some(fqname)` if this is an `Object`.
-    pub fn fqname(&self) -> Option<&str> {
-        match self {
-            Self::Object { fqname } => Some(fqname.as_str()),
-            _ => None,
-        }
-    }
-
-    /// Recursively resolves nested arrays to their innermost element type.
-    ///
-    /// Returns `self` for everything but [`Self::Array`].
+    /// Returns `self` for everything but [`Self::FixedSizeList`] and [`Self::List`].
     pub fn innermost_element_type(&self) -> &Self {
         match self {
-            Self::Array { elem_type, .. } => elem_type.innermost_element_type(),
+            Self::FixedSizeList { elem_type, .. } | Self::List { elem_type } => {
+                elem_type.innermost_element_type()
+            }
             _ => self,
         }
     }
 
     /// `Some(Object)` if this is an enum object.
     pub fn enum_obj<'a>(&self, objects: &'a Objects) -> Option<&'a Object> {
-        let Self::Object { fqname } = self else {
-            return None;
-        };
-
-        let obj = &objects[fqname];
-        obj.is_enum().then_some(obj)
-    }
-
-    /// Is the destructor trivial/default (i.e. is this simple data with no allocations)?
-    pub fn has_default_destructor(&self, objects: &Objects) -> bool {
         match self {
-            Self::UInt8
-            | Self::UInt16
-            | Self::UInt32
-            | Self::UInt64
-            | Self::Int8
-            | Self::Int16
-            | Self::Int32
-            | Self::Int64
-            | Self::Bool
-            | Self::Float16
-            | Self::Float32
-            | Self::Float64 => true,
-
-            Self::Binary | Self::String => false,
-
-            Self::Object { fqname } => objects[fqname].has_default_destructor(objects),
-
-            Self::Array { elem_type, .. } => elem_type.has_default_destructor(objects),
+            Self::Object { fqname } => enum_obj_of(objects, fqname),
+            _ => None,
         }
     }
 
@@ -1069,34 +850,58 @@ impl ElementType {
     /// a slice representation.
     pub fn backed_by_scalar_buffer(&self) -> bool {
         match self {
-            Self::UInt8
-            | Self::UInt16
-            | Self::UInt32
-            | Self::UInt64
-            | Self::Int8
-            | Self::Int16
-            | Self::Int32
-            | Self::Int64
-            | Self::Float16
-            | Self::Float32
-            | Self::Float64 => true,
-            Self::Bool | Self::Binary | Self::String | Self::Object { .. } | Self::Array { .. } => {
-                false
+            Self::Atomic(atomic) => atomic.backed_by_scalar_buffer(),
+            _ => false,
+        }
+    }
+
+    /// `Some(fqname)` if this is an `Object`, or a (possibly nested) list of `Object`s.
+    pub fn fqname(&self) -> Option<&str> {
+        match self {
+            Self::Object { fqname } => Some(fqname.as_str()),
+            Self::FixedSizeList {
+                elem_type,
+                length: _,
             }
+            | Self::List { elem_type } => elem_type.fqname(),
+            _ => None,
+        }
+    }
+
+    /// Is the destructor trivial/default (i.e. is this simple data with no allocations)?
+    pub fn has_default_destructor(&self, objects: &Objects) -> bool {
+        match self {
+            Self::Atomic(_) => true,
+
+            Self::Binary | Self::Utf8 | Self::List { .. } => false,
+
+            Self::FixedSizeList { elem_type, .. } => elem_type.has_default_destructor(objects),
+
+            Self::Object { fqname } => objects[fqname].has_default_destructor(objects),
         }
     }
 
     pub fn is_union(&self, objects: &Objects) -> bool {
-        if let Self::Object { fqname } = self {
-            let obj = &objects[fqname];
-            if obj.is_arrow_transparent() {
-                obj.fields[0].typ.is_union(objects)
-            } else {
-                obj.class == ObjectClass::Union
-            }
-        } else {
-            false
+        match self {
+            Self::Object { fqname } => is_union_fqname(objects, fqname),
+            _ => false,
         }
+    }
+}
+
+/// `Some(Object)` if `fqname` names an enum.
+pub(crate) fn enum_obj_of<'a>(objects: &'a Objects, fqname: &str) -> Option<&'a Object> {
+    let obj = &objects[fqname];
+    obj.is_enum().then_some(obj)
+}
+
+/// Does `fqname` name a union, looking through arrow-transparent objects?
+fn is_union_fqname(objects: &Objects, fqname: &str) -> bool {
+    let obj = &objects[fqname];
+    if obj.is_arrow_transparent() {
+        obj.fields[0].typ.is_union(objects)
+    } else {
+        obj.class == ObjectClass::Union
     }
 }
 

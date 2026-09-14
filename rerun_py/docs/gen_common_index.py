@@ -45,13 +45,14 @@ DOCUMENTED_PACKAGES: Final[dict[str, tuple[str, ...]]] = {
     "rerun": ("Core",),
     "rerun.archetypes": ("Archetypes",),
     "rerun.components": ("Components",),
-    "rerun.datatypes": ("Datatypes",),
+    "rerun.encodings": ("Encodings",),
     "rerun.blueprint": ("Blueprint", "APIs"),
     "rerun.blueprint.archetypes": ("Blueprint", "Archetypes"),
     "rerun.blueprint.components": ("Blueprint", "Components"),
-    "rerun.blueprint.datatypes": ("Blueprint", "Datatypes"),
+    "rerun.blueprint.encodings": ("Blueprint", "Encodings"),
     "rerun.blueprint.views": ("Blueprint", "Views"),
     "rerun.catalog": ("Catalog",),
+    "rerun.chunk": ("Chunk",),
     "rerun.experimental": ("Experimental",),
     "rerun.experimental.dataloader": ("Experimental", "Dataloader"),
     "rerun.server": ("Server",),
@@ -91,6 +92,13 @@ EXCLUDED_FROM_TRACK_A: Final[set[str]] = {
     # Sampling-manifest internals; its only public symbol (`Manifest`) is
     # re-exported flat into `rerun.experimental.dataloader` and documented there.
     "rerun.experimental.dataloader.manifest",
+    # Column-decoder internals
+    "rerun.experimental.dataloader.decoders",
+    # Deprecated aliases for `rerun.encodings` / `rerun.blueprint.encodings`, which
+    # are documented. They forward every symbol and warn on import, so documenting
+    # them would advertise the spelling we want people to stop using.
+    "rerun.datatypes",
+    "rerun.blueprint.datatypes",
 }
 
 # Per-package, per-symbol allow-list of public symbols that should NOT be
@@ -178,8 +186,8 @@ CURATED_GROUPS: Final[list[Group]] = [
         title="Annotations",
         items=[
             "archetypes.AnnotationContext",
-            "datatypes.AnnotationInfo",
-            "datatypes.ClassDescription",
+            "encodings.AnnotationInfo",
+            "encodings.ClassDescription",
         ],
     ),
     Group(
@@ -258,8 +266,8 @@ CURATED_GROUPS: Final[list[Group]] = [
             "archetypes.InstancePoses3D",
             "archetypes.ViewCoordinates",
             "components.Scale3D",
-            "datatypes.Quaternion",
-            "datatypes.RotationAxisAngle",
+            "encodings.Quaternion",
+            "encodings.RotationAxisAngle",
             "archetypes.CoordinateFrame",
         ],
     ),
@@ -512,11 +520,11 @@ def display_name(item: str) -> str:
     """
     Compute the rendered name for a curated-table entry.
 
-    Strip `archetypes.` / `components.` / `datatypes.` prefixes when the
+    Strip `archetypes.` / `components.` / `encodings.` prefixes when the
     symbol is also flat-re-exported into top-level `rerun`, so the table
     shows `rerun.Points3D` rather than `rerun.archetypes.Points3D`.
     """
-    for prefix in ("archetypes.", "components.", "datatypes."):
+    for prefix in ("archetypes.", "components.", "encodings."):
         stripped = item.removeprefix(prefix)
         if stripped != item and stripped in rerun_pkg.members:
             return f"rerun.{stripped}"
@@ -544,8 +552,14 @@ overview of what's possible and how.
 Rerun will typically support Python version up until their end-of-life. If you are using an older version
 of Python, you can use the table below to make sure you choose the proper Rerun version for your Python installation.
 
+Python 3.10 is deprecated and reaches end-of-life in October 2026. Rerun 0.39 will move the minimum
+supported version to Python 3.11.
+
 | **Rerun Version** | **Release Date** | **Supported Python Version** |
 |-------------------|------------------|------------------------------|
+| 0.37              | Aug. 31, 2026    | 3.10+                        |
+| 0.36              | Aug. 10, 2026    | 3.10+                        |
+| 0.35              | Jul. 23, 2026    | 3.10+                        |
 | 0.34              | Jul.  6, 2026    | 3.10+                        |
 | 0.33              | May. 29, 2026    | 3.10+                        |
 | 0.32              | May. 13, 2026    | 3.10+                        |

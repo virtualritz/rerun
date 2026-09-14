@@ -25,6 +25,10 @@
 //!
 //! See [`re_viewer_context::VisualizerInstructionReport`] for how these break down further.
 
+#[cfg(all(agent_panel, feature = "analytics"))]
+mod agent_analytics;
+#[cfg(agent_panel)]
+mod agent_panel;
 mod app;
 mod app_blueprint;
 mod app_state;
@@ -45,6 +49,8 @@ mod screenshotter;
 mod startup_options;
 mod texture_readback;
 mod ui;
+mod version_check;
+mod viewer_log;
 
 #[cfg(feature = "analytics")]
 mod viewer_analytics;
@@ -71,6 +77,7 @@ pub use event::{SelectionChangeItem, ViewerEvent, ViewerEventKind};
 pub use external_memory::ExternalMemoryUser;
 pub use re_async::AsyncRuntimeHandle;
 pub use re_capabilities::MainThreadToken;
+pub use re_sdk_types::reflection::{ViewApplicability, ViewReflection};
 pub use re_viewer_context::{
     CommandReceiver, CommandSender, SystemCommand, SystemCommandSender, command_channel,
 };
@@ -309,9 +316,8 @@ pub fn reset_viewer_persistence() -> anyhow::Result<()> {
 
                 if let Err(err) = std::fs::remove_dir_all(&data_dir) {
                     anyhow::bail!("Failed to remove {data_dir:?}: {err}");
-                } else {
-                    re_log::info!("Cleared {data_dir:?}.");
                 }
+                re_log::info!("Cleared {data_dir:?}.");
 
                 if let Ok(analytics) = analytics {
                     // Restore analytics.json:

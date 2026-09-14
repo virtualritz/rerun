@@ -108,17 +108,6 @@ fn all_wgsl_shaders_are_valid() {
             }
         };
 
-        // FORK ADDITION: a fragment that carries the entry points but expects its
-        // *includer* to supply bindings. `instanced_mesh_common.wgsl` holds the
-        // shared body of the mesh shader; `instanced_mesh.wgsl` (storage buffer)
-        // and `instanced_mesh_limited.wgsl` (WebGL2 uniform buffer) each declare
-        // `selected_ids` and `fn is_selected` before importing it. It is validated
-        // transitively through both of those, so skipping it here loses no coverage.
-        if rel.ends_with("shader/instanced_mesh_common.wgsl") {
-            skipped += 1;
-            continue;
-        }
-
         // Files without an entry point are include-only fragments (type/util libraries). They
         // can't be validated standalone — they get validated transitively wherever they're
         // imported into an entry-point shader.

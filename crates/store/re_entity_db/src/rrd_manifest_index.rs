@@ -6,7 +6,7 @@ use itertools::izip;
 use nohash_hasher::IntSet;
 use re_byte_size::{MemUsageTree, MemUsageTreeCapture};
 use re_chunk::{ChunkId, EntityPath, Timeline, TimelineName};
-use re_chunk_store::{ChunkStore, ChunkStoreDiff, ChunkStoreEvent};
+use re_chunk_store::{ChunkStore, ChunkStoreDiff, ChunkStoreEvent, ChunkStoreGeneration};
 use re_log_encoding::{CodecResult, RrdManifest};
 use re_log_types::{AbsoluteTimeRange, StoreKind};
 
@@ -63,6 +63,14 @@ pub struct RootChunkInfo {
 
     state: LoadState,
 
+    /// The store generation at which this chunk became fully loaded.
+    ///
+    /// When the chunk is unloaded this is set to `None`.
+    ///
+    /// Compare it against the generation a query reported a missing chunk at to see
+    /// which of the two came first.
+    loaded_at: Option<ChunkStoreGeneration>,
+
     /// Empty for static chunks
     pub temporals: HashMap<TimelineName, TemporalChunkInfo>,
 }
@@ -72,6 +80,7 @@ impl RootChunkInfo {
         Self {
             entity_path,
             state: LoadState::Unloaded,
+            loaded_at: None,
             row_id: row_idx,
             temporals: Default::default(),
         }
@@ -79,6 +88,13 @@ impl RootChunkInfo {
 
     pub fn is_fully_loaded(&self) -> bool {
         self.state.is_fully_loaded()
+    }
+
+    /// Was this chunk already fully loaded when a query at `generation` ran?
+    pub fn was_fully_loaded_at(&self, generation: ChunkStoreGeneration) -> bool {
+        self.loaded_at
+            .is_some_and(|loaded_at| loaded_at <= generation)
+            && self.is_fully_loaded()
     }
 }
 
@@ -107,7 +123,7 @@ struct LoadedRanges {
 /// A secondary index that keeps track of which chunks have been loaded into memory.
 ///
 /// This is constructed from an [`RrdManifest`], which is what the server sends to the client/viewer.
-/// The manifest may be received in parts and concatenated together.
+/// The manifest may be received in parts and merged together.
 #[derive(Default, re_byte_size::SizeBytes)]
 #[cfg_attr(feature = "testing", derive(Clone))]
 pub struct RrdManifestIndex {
@@ -163,6 +179,12 @@ impl RrdManifestIndex {
     ) -> CodecResult<()> {
         re_tracing::profile_function!();
 
+        // Merge before updating caches.
+        let merged = match &self.manifest {
+            Some(existing) => Some(Arc::new(RrdManifest::merge(&[existing, &delta])?)),
+            None => None,
+        };
+
         self.update_timeline_stats(&delta);
         self.update_entity_static_data(&delta);
         self.chunk_prioritizer.on_rrd_manifest(&delta);
@@ -177,7 +199,7 @@ impl RrdManifestIndex {
             .map_or(0, |manifest| manifest.chunk_fetcher_rb().num_rows());
 
         for (delta_row_idx, (&root_chunk_id, entity_path)) in
-            izip!(delta.col_chunk_ids(), delta.col_chunk_entity_path()).enumerate()
+            izip!(delta.col_chunk_ids(), delta.col_chunk_entity_path_iter()).enumerate()
         {
             self.root_chunks.insert(
                 root_chunk_id,
@@ -210,16 +232,9 @@ impl RrdManifestIndex {
             }
         }
 
-        let new_full_manifest = if let Some(existing) = self.manifest.take() {
-            Arc::new(RrdManifest::concat(&[&existing, &delta])?)
-        } else {
-            delta
-        };
+        self.sorted_chunks.update(entity_tree, delta.temporal_map());
 
-        self.sorted_chunks =
-            SortedTemporalChunks::new(entity_tree, new_full_manifest.temporal_map());
-
-        self.manifest = Some(new_full_manifest);
+        self.manifest = Some(merged.unwrap_or(delta));
 
         Ok(())
     }
@@ -434,6 +449,7 @@ impl RrdManifestIndex {
         re_tracing::profile_function!();
 
         let store_kind = store.id().kind();
+        let generation = store.generation();
 
         let root_chunk_ids = store.find_root_chunks(chunk_id);
 
@@ -450,6 +466,13 @@ impl RrdManifestIndex {
                 if let Some(chunk_info) = self.root_chunks.get_mut(&chunk_id) {
                     let old_state = chunk_info.state;
                     chunk_info.state = new_state;
+
+                    // Only the transition into loaded records the generation.
+                    if !new_state.is_fully_loaded() {
+                        chunk_info.loaded_at = None;
+                    } else if !old_state.is_fully_loaded() {
+                        chunk_info.loaded_at = Some(generation);
+                    }
 
                     // Only update loaded ranges when a chunk actually became loaded or unloaded, to
                     // avoid mismatched increments/decrements. Note that `InTransit` counts as

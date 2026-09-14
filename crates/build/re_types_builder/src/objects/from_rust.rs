@@ -42,8 +42,8 @@ use camino::{Utf8Path, Utf8PathBuf};
 use syn::spanned::Spanned;
 
 use crate::{
-    Attribute, Docs, ElementType, Object, ObjectClass, ObjectField, ObjectKind, Objects, Reporter,
-    RerunAttr, Type,
+    AtomicDataType, Attribute, Docs, Object, ObjectClass, ObjectField, ObjectKind, Objects,
+    Reporter, RerunAttr, Type,
 };
 
 use super::{Attributes, EnumIntegerType, State};
@@ -66,7 +66,7 @@ type Result<T, E = Fail> = std::result::Result<T, E>;
 // --- Entry point ---
 
 impl Objects {
-    /// Runs the semantic pass on a tree of Rust type definitions.
+    /// Parses a tree of Rust type definitions, and validates what comes out.
     ///
     /// `definitions_dir` is the root of the definition tree; a type's package name is its path
     /// relative to that root, so `rerun/components/position3d.def.rs` declares `rerun.components`.
@@ -409,7 +409,6 @@ impl Parser<'_> {
             attrs,
             fields,
             class,
-            datatype: None,
         }
     }
 
@@ -443,7 +442,7 @@ impl Parser<'_> {
         } else {
             match kind {
                 // TODO(#9427): make the `attr.rerun.state` attribute mandatory
-                ObjectKind::Datatype | ObjectKind::Component => State::Stable,
+                ObjectKind::Encoding | ObjectKind::Component => State::Stable,
                 ObjectKind::Archetype => {
                     self.error(span, format!("Missing attribute `{}`", RerunAttr::State));
                     State::Stable
@@ -480,7 +479,6 @@ impl Parser<'_> {
             typ,
             attrs,
             is_nullable: nullable,
-            datatype: None,
         })
     }
 
@@ -497,7 +495,7 @@ impl Parser<'_> {
 
         let payload = match &variant.fields {
             syn::Fields::Unit => MaybeNullable {
-                typ: Type::Unit,
+                typ: Type::UNIT,
                 nullable: class.is_enum(),
             },
 
@@ -558,7 +556,6 @@ impl Parser<'_> {
             typ: payload.typ,
             attrs,
             is_nullable: payload.nullable,
-            datatype: None,
         })
     }
 
@@ -607,7 +604,7 @@ impl Parser<'_> {
         match ty {
             syn::Type::Path(path) => {
                 if let Some(inner) = as_generic(ty, "Vec") {
-                    return Ok(Type::Vector {
+                    return Ok(Type::List {
                         elem_type: self.parse_element_type(inner)?,
                     });
                 }
@@ -621,12 +618,12 @@ impl Parser<'_> {
                 self.parse_named_type(path)
             }
 
-            syn::Type::Array(array) => Ok(Type::Array {
+            syn::Type::Array(array) => Ok(Type::FixedSizeList {
                 elem_type: self.parse_element_type(&array.elem)?,
                 length: self.parse_array_length(&array.len)?,
             }),
 
-            syn::Type::Tuple(tuple) if tuple.elems.is_empty() => Ok(Type::Unit),
+            syn::Type::Tuple(tuple) if tuple.elems.is_empty() => Ok(Type::UNIT),
 
             other => {
                 self.error(
@@ -639,15 +636,27 @@ impl Parser<'_> {
         }
     }
 
-    fn parse_element_type(&self, ty: &syn::Type) -> Result<ElementType> {
+    /// Like [`Self::parse_type`], but for element positions, where the unit type and nested
+    /// `Vec`s are rejected as a decision rather than falling out of the IR.
+    fn parse_element_type(&self, ty: &syn::Type) -> Result<Box<Type>> {
         let typ = self.parse_type(ty)?;
-        typ.to_element_type().ok_or_else(|| {
-            self.error(
-                Spanned::span(ty),
-                format!("{typ:?} cannot be used as an array or vector element"),
-            );
-            Fail
-        })
+        match typ {
+            Type::Atomic(AtomicDataType::Null) => {
+                self.error(
+                    Spanned::span(ty),
+                    "The unit type cannot be used as an array or vector element",
+                );
+                Err(Fail)
+            }
+            Type::List { .. } => {
+                self.error(
+                    Spanned::span(ty),
+                    "Nested `Vec` is not supported yet — only the outermost type may be a `Vec`",
+                );
+                Err(Fail)
+            }
+            _ => Ok(Box::new(typ)),
+        }
     }
 
     fn parse_array_length(&self, expr: &syn::Expr) -> Result<usize> {
@@ -696,25 +705,25 @@ impl Parser<'_> {
 
         if segments.len() == 1 {
             return match segments[0].as_str() {
-                "bool" => Ok(Type::Bool),
-                "u8" => Ok(Type::UInt8),
-                "u16" => Ok(Type::UInt16),
-                "u32" => Ok(Type::UInt32),
-                "u64" => Ok(Type::UInt64),
-                "i8" => Ok(Type::Int8),
-                "i16" => Ok(Type::Int16),
-                "i32" => Ok(Type::Int32),
-                "i64" => Ok(Type::Int64),
-                "f32" => Ok(Type::Float32),
-                "f64" => Ok(Type::Float64),
-                "String" => Ok(Type::String),
+                "bool" => Ok(Type::Atomic(AtomicDataType::Boolean)),
+                "u8" => Ok(Type::Atomic(AtomicDataType::UInt8)),
+                "u16" => Ok(Type::Atomic(AtomicDataType::UInt16)),
+                "u32" => Ok(Type::Atomic(AtomicDataType::UInt32)),
+                "u64" => Ok(Type::Atomic(AtomicDataType::UInt64)),
+                "i8" => Ok(Type::Atomic(AtomicDataType::Int8)),
+                "i16" => Ok(Type::Atomic(AtomicDataType::Int16)),
+                "i32" => Ok(Type::Atomic(AtomicDataType::Int32)),
+                "i64" => Ok(Type::Atomic(AtomicDataType::Int64)),
+                "f32" => Ok(Type::Atomic(AtomicDataType::Float32)),
+                "f64" => Ok(Type::Atomic(AtomicDataType::Float64)),
+                "String" => Ok(Type::Utf8),
 
                 other => {
                     self.error(
                         Spanned::span(path),
                         format!(
                             "Unknown type `{other}`. Refer to other definitions by their full \
-                             path, e.g. `rerun::datatypes::Vec3D`"
+                             path, e.g. `rerun::encodings::Vec3D`"
                         ),
                     );
                     Err(Fail)
@@ -738,7 +747,7 @@ impl Parser<'_> {
         // See `re_types_builder_prelude`.
         if segments.len() == 2 {
             match segments[1].as_str() {
-                "f16" => return Ok(Type::Float16),
+                "f16" => return Ok(Type::Atomic(AtomicDataType::Float16)),
                 "Binary" => return Ok(Type::Binary),
                 _ => {}
             }
@@ -1146,34 +1155,34 @@ mod tests {
     #[test]
     fn struct_with_named_fields() {
         let objects = parse_ok(
-            "rerun.datatypes",
+            "rerun.encodings",
             r#"
             #[rerun_type]
             pub struct AnnotationInfo {
                 pub id: u16,
                 pub label: Option<String>,
-                pub color: Option<rerun::datatypes::Rgba32>,
+                pub color: Option<rerun::encodings::Rgba32>,
             }
             "#,
         );
 
         assert_eq!(objects.len(), 1);
         let object = &objects[0];
-        assert_eq!(object.fqname, "rerun.datatypes.AnnotationInfo");
-        assert_eq!(object.pkg_name, "rerun.datatypes");
+        assert_eq!(object.fqname, "rerun.encodings.AnnotationInfo");
+        assert_eq!(object.pkg_name, "rerun.encodings");
         assert_eq!(object.name, "AnnotationInfo");
-        assert_eq!(object.kind, ObjectKind::Datatype);
+        assert_eq!(object.kind, ObjectKind::Encoding);
         assert_eq!(object.class, ObjectClass::Struct);
 
         assert_eq!(
             field_types(object),
             vec![
-                ("id", &Type::UInt16, false),
-                ("label", &Type::String, true),
+                ("id", &Type::Atomic(AtomicDataType::UInt16), false),
+                ("label", &Type::Utf8, true),
                 (
                     "color",
                     &Type::Object {
-                        fqname: "rerun.datatypes.Rgba32".to_owned()
+                        fqname: "rerun.encodings.Rgba32".to_owned()
                     },
                     true
                 ),
@@ -1181,7 +1190,7 @@ mod tests {
         );
 
         // Source order is the order; there is no `order` attribute to get wrong.
-        assert_eq!(object.fields[0].fqname, "rerun.datatypes.AnnotationInfo#id");
+        assert_eq!(object.fields[0].fqname, "rerun.encodings.AnnotationInfo#id");
     }
 
     #[test]
@@ -1196,14 +1205,14 @@ mod tests {
 
         assert_eq!(
             field_types(&objects[0]),
-            vec![("value", &Type::Float32, false)]
+            vec![("value", &Type::Atomic(AtomicDataType::Float32), false)]
         );
     }
 
     #[test]
     fn every_supported_data_type() {
         let objects = parse_ok(
-            "rerun.datatypes",
+            "rerun.encodings",
             r#"
             #[rerun_type]
             pub struct TypeZoo {
@@ -1218,7 +1227,7 @@ mod tests {
                 pub fixed: [f32; 3],
                 pub list: Vec<u8>,
                 pub nested: [[f32; 4]; 4],
-                pub objects: Vec<rerun::datatypes::Vec3D>,
+                pub objects: Vec<rerun::encodings::Vec3D>,
             }
             "#,
         );
@@ -1226,46 +1235,46 @@ mod tests {
         assert_eq!(
             field_types(&objects[0]),
             vec![
-                ("boolean", &Type::Bool, false),
-                ("unsigned", &Type::UInt64, false),
-                ("signed", &Type::Int8, false),
-                ("half", &Type::Float16, false),
-                ("single", &Type::Float32, false),
-                ("double", &Type::Float64, false),
-                ("text", &Type::String, false),
+                ("boolean", &Type::Atomic(AtomicDataType::Boolean), false),
+                ("unsigned", &Type::Atomic(AtomicDataType::UInt64), false),
+                ("signed", &Type::Atomic(AtomicDataType::Int8), false),
+                ("half", &Type::Atomic(AtomicDataType::Float16), false),
+                ("single", &Type::Atomic(AtomicDataType::Float32), false),
+                ("double", &Type::Atomic(AtomicDataType::Float64), false),
+                ("text", &Type::Utf8, false),
                 ("bytes", &Type::Binary, false),
                 (
                     "fixed",
-                    &Type::Array {
-                        elem_type: ElementType::Float32,
+                    &Type::FixedSizeList {
+                        elem_type: Box::new(Type::Atomic(AtomicDataType::Float32)),
                         length: 3
                     },
                     false
                 ),
                 (
                     "list",
-                    &Type::Vector {
-                        elem_type: ElementType::UInt8
+                    &Type::List {
+                        elem_type: Box::new(Type::Atomic(AtomicDataType::UInt8))
                     },
                     false
                 ),
                 (
                     "nested",
-                    &Type::Array {
-                        elem_type: ElementType::Array {
-                            elem_type: Box::new(ElementType::Float32),
+                    &Type::FixedSizeList {
+                        elem_type: Box::new(Type::FixedSizeList {
+                            elem_type: Box::new(Type::Atomic(AtomicDataType::Float32)),
                             length: 4
-                        },
+                        }),
                         length: 4
                     },
                     false
                 ),
                 (
                     "objects",
-                    &Type::Vector {
-                        elem_type: ElementType::Object {
-                            fqname: "rerun.datatypes.Vec3D".to_owned()
-                        }
+                    &Type::List {
+                        elem_type: Box::new(Type::Object {
+                            fqname: "rerun.encodings.Vec3D".to_owned()
+                        })
                     },
                     false
                 ),
@@ -1319,20 +1328,20 @@ mod tests {
             object
                 .fields
                 .iter()
-                .all(|f| f.typ == Type::Unit && f.is_nullable)
+                .all(|f| f.typ.is_unit() && f.is_nullable)
         );
     }
 
     #[test]
     fn union_with_payloads_and_a_unit_variant() {
         let objects = parse_ok(
-            "rerun.datatypes",
+            "rerun.encodings",
             r#"
             #[rerun_type]
             #[repr(i8)]
             pub enum TimeRangeBoundary {
-                CursorRelative(rerun::datatypes::TimeInt) = 1,
-                Absolute(rerun::datatypes::TimeInt) = 2,
+                CursorRelative(rerun::encodings::TimeInt) = 1,
+                Absolute(rerun::encodings::TimeInt) = 2,
 
                 /// The boundary extends to infinity.
                 Infinite = 3,
@@ -1350,19 +1359,19 @@ mod tests {
                 (
                     "CursorRelative",
                     &Type::Object {
-                        fqname: "rerun.datatypes.TimeInt".to_owned()
+                        fqname: "rerun.encodings.TimeInt".to_owned()
                     },
                     false
                 ),
                 (
                     "Absolute",
                     &Type::Object {
-                        fqname: "rerun.datatypes.TimeInt".to_owned()
+                        fqname: "rerun.encodings.TimeInt".to_owned()
                     },
                     false
                 ),
                 // A unit variant of a union is `Null`, and not nullable — unlike in an enum.
-                ("Infinite", &Type::Unit, false),
+                ("Infinite", &Type::UNIT, false),
             ]
         );
     }
@@ -1410,7 +1419,7 @@ mod tests {
 
         // A path list is emitted verbatim, leading `::` and all.
         let objects = parse_ok(
-            "rerun.datatypes",
+            "rerun.encodings",
             r#"
             #[rerun_type]
             #[rust(derive(Copy, bytemuck::Pod, ::serde::Serialize))]
@@ -1440,7 +1449,7 @@ mod tests {
     #[test]
     fn doc_comments_keep_their_tags() {
         let objects = parse_ok(
-            "rerun.datatypes",
+            "rerun.encodings",
             r#"
             /// A position in 3D space.
             ///
@@ -1471,17 +1480,17 @@ mod tests {
 
     #[test]
     fn state_defaults_by_kind_and_scope() {
-        let datatype = parse_ok("rerun.datatypes", "#[rerun_type] pub struct A(pub f32);");
+        let datatype = parse_ok("rerun.encodings", "#[rerun_type] pub struct A(pub f32);");
         assert_eq!(datatype[0].state, State::Stable);
 
         let blueprint = parse_ok(
-            "rerun.blueprint.datatypes",
+            "rerun.blueprint.encodings",
             r#"#[rerun_type] #[rerun(scope = "blueprint")] pub struct A(pub f32);"#,
         );
         assert_eq!(blueprint[0].state, State::Unstable);
 
         let deprecated = parse_ok(
-            "rerun.datatypes",
+            "rerun.encodings",
             r#"
             #[rerun_type]
             #[rerun(state = "deprecated", deprecated_since = "0.30", deprecated_notice = "Use B")]
@@ -1509,11 +1518,11 @@ mod tests {
     #[test]
     fn errors_point_at_the_offending_line() {
         let error = parse_err(
-            "rerun.datatypes",
+            "rerun.encodings",
             "#[rerun_type]\npub struct A {\n    pub bad: HashMap<u8, u8>,\n}",
         );
         assert!(
-            error.starts_with("/definitions/rerun/datatypes/test.def.rs:3:14:"),
+            error.starts_with("/definitions/rerun/encodings/test.def.rs:3:14:"),
             "{error}"
         );
     }
@@ -1524,7 +1533,7 @@ mod tests {
             // (definition, expected substring of the error)
             ("pub fn foo() {}", "Only `struct` and `enum`"),
             ("impl Foo {}", "Only `struct` and `enum`"),
-            ("use rerun::datatypes::Vec3D;", "Only `struct` and `enum`"),
+            ("use rerun::encodings::Vec3D;", "Only `struct` and `enum`"),
             ("pub const N: u8 = 1;", "Only `struct` and `enum`"),
             ("pub struct A<T> { pub a: T }", "Generic parameters"),
             ("pub struct A<'a> { pub a: &'a u8 }", "Generic parameters"),
@@ -1541,6 +1550,18 @@ mod tests {
                 "Nested `Option` is not supported",
             ),
             ("pub struct A { pub a: Vec<Option<u8>> }", "outermost level"),
+            (
+                "pub struct A { pub a: Vec<Vec<u8>> }",
+                "Nested `Vec` is not supported",
+            ),
+            (
+                "pub struct A { pub a: [Vec<u8>; 2] }",
+                "Nested `Vec` is not supported",
+            ),
+            (
+                "#[repr(i8)] pub enum A { B(Vec<()>) = 1 }",
+                "unit type cannot be used",
+            ),
             ("pub struct A { pub a: [u8; N] }", "plain integer literals"),
             ("#[repr(i8)] pub enum A { B(u8) }", "need an explicit value"),
             ("#[repr(i8)] pub enum A { B(u8) = 0 }", "0 is reserved"),
@@ -1600,7 +1621,7 @@ mod tests {
         ];
 
         for (definition, expected) in cases {
-            let error = parse_err("rerun.datatypes", definition);
+            let error = parse_err("rerun.encodings", definition);
             assert!(
                 error.contains(expected),
                 "Expected {expected:?} in error for {definition:?}, got: {error}"
