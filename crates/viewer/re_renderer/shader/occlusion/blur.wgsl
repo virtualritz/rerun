@@ -1,8 +1,9 @@
-// Depth-aware blur of the occlusion estimate (akatela SPEC-123).
+// Depth- and normal-aware blur of the occlusion estimate (akatela SPEC-123).
 //
 // Removes the estimate's rotation pattern without bleeding a crease's
-// occlusion onto the surface in front of it. Also applies the strength
-// exponent (R8), so the mesh shader reads a finished value.
+// occlusion onto the surface in front of it, or one face's onto the face it
+// folds against. Also applies the strength exponent (R8), so the mesh shader
+// reads a finished value.
 
 #import <../types.wgsl>
 #import <../screen_triangle_vertex.wgsl>
@@ -20,8 +21,49 @@ var<uniform> params: OcclusionUniformBuffer;
 @group(0) @binding(3)
 var raw_bent_normal: texture_2d<f32>;
 
+// The prepass surface normal, in the same view space the estimate used.
+@group(0) @binding(4)
+var normal_texture: texture_2d<f32>;
+
 // Relative view-depth difference past which a neighbour stops counting.
 const DEPTH_TOLERANCE: f32 = 0.05;
+
+// Cosine between a neighbour's surface normal and the centre's, below which
+// the neighbour stops counting.
+//
+// A CONVEX edge is a normal discontinuity with no depth discontinuity: the
+// two faces meet, so their depths agree across the edge and `DEPTH_TOLERANCE`
+// cannot see it. Averaging there mixed two faces that face ~90 degrees apart,
+// and for the horizon method that produced a bent normal agreeing with
+// neither. `specular_occlusion_cone` reads that disagreement as occlusion --
+// a dark line along every convex edge, exactly where a highlight belongs.
+//
+// 0.9 is about 26 degrees: wide enough that a smoothly curving surface still
+// blurs across itself, narrow enough to cut at a fold.
+const NORMAL_TOLERANCE: f32 = 0.9;
+
+// The surface normal at a pixel, back in view space.
+fn surface_normal(pixel: vec2i) -> vec3f {
+    return normalize(textureLoad(normal_texture, pixel, 0).xyz * 2.0 - 1.0);
+}
+
+// How much a neighbouring tap counts: near in depth AND facing the same way.
+//
+// The centre pixel always scores 1 on both, so the caller's `weight_sum` is
+// never zero.
+fn tap_weight(
+    params: OcclusionUniformBuffer,
+    centre_depth: f32,
+    centre_normal: vec3f,
+    tap: vec2i,
+    tap_depth: f32,
+) -> f32 {
+    let difference = abs(abs(view_position(params, tap, tap_depth).z) - centre_depth);
+    let depth_weight = max(1.0 - difference / (DEPTH_TOLERANCE * centre_depth), 0.0);
+    let agreement = dot(surface_normal(tap), centre_normal);
+    let normal_weight = saturate((agreement - NORMAL_TOLERANCE) / (1.0 - NORMAL_TOLERANCE));
+    return depth_weight * normal_weight;
+}
 
 // Interleaved gradient noise (Jimenez, SIGGRAPH 2014) in [-1, 1]. The same
 // formula as `dithereens::InterleavedGradientNoise` with seed 0, so the
@@ -39,6 +81,7 @@ fn main(@builtin(position) frag_position: vec4f) -> @location(0) f32 {
         return 1.0;
     }
     let centre_depth = abs(view_position(params, pixel, depth).z);
+    let centre_normal = surface_normal(pixel);
     let resolution = vec2i(params.framebuffer_resolution);
 
     // A 4x4 window covers one period of the estimate's rotation pattern.
@@ -51,8 +94,7 @@ fn main(@builtin(position) frag_position: vec4f) -> @location(0) f32 {
             if tap_depth <= 0.0 {
                 continue;
             }
-            let difference = abs(abs(view_position(params, tap, tap_depth).z) - centre_depth);
-            let weight = max(1.0 - difference / (DEPTH_TOLERANCE * centre_depth), 0.0);
+            let weight = tap_weight(params, centre_depth, centre_normal, tap, tap_depth);
             sum += textureLoad(raw_occlusion, tap, 0).r * weight;
             weight_sum += weight;
         }
@@ -82,6 +124,7 @@ fn main_with_bent_normal(@builtin(position) frag_position: vec4f) -> BlurOutput 
         return out;
     }
     let centre_depth = abs(view_position(params, pixel, depth).z);
+    let centre_normal = surface_normal(pixel);
     let resolution = vec2i(params.framebuffer_resolution);
 
     var sum = 0.0;
@@ -94,8 +137,7 @@ fn main_with_bent_normal(@builtin(position) frag_position: vec4f) -> BlurOutput 
             if tap_depth <= 0.0 {
                 continue;
             }
-            let difference = abs(abs(view_position(params, tap, tap_depth).z) - centre_depth);
-            let weight = max(1.0 - difference / (DEPTH_TOLERANCE * centre_depth), 0.0);
+            let weight = tap_weight(params, centre_depth, centre_normal, tap, tap_depth);
             sum += textureLoad(raw_occlusion, tap, 0).r * weight;
             bent_sum += (textureLoad(raw_bent_normal, tap, 0).xyz * 2.0 - 1.0) * weight;
             weight_sum += weight;

@@ -380,6 +380,10 @@ impl OcclusionProcessor {
         if horizon {
             blur_entries.push(float_entry(3));
         }
+        // The prepass normal, so the blur can reject a neighbour across a
+        // convex edge -- see `blur.wgsl`, where the depth weight alone could
+        // not see one.
+        blur_entries.push(float_entry(4));
         let layout_blur = ctx.gpu_resources.bind_group_layouts.get_or_create(
             &ctx.device,
             &BindGroupLayoutDesc {
@@ -414,6 +418,7 @@ impl OcclusionProcessor {
         if let Some([raw_bent_normal, _]) = &bent_normals {
             blur_bindings.push(BindGroupEntry::DefaultTextureView(raw_bent_normal.handle));
         }
+        blur_bindings.push(BindGroupEntry::DefaultTextureView(prepass_normal.handle));
         let bind_group_blur = ctx.gpu_resources.bind_groups.alloc(
             &ctx.device,
             &ctx.gpu_resources,
