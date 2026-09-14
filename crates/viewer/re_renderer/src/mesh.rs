@@ -298,6 +298,91 @@ impl GpuMesh {
     pub fn gpu_byte_size(&self) -> u64 {
         self.index_buffer.inner.size() + self.vertex_buffer_combined.size()
     }
+
+    /// This mesh with different materials, sharing its vertex and index buffers.
+    ///
+    /// A material is a handful of texture bindings and a small uniform; the
+    /// buffers are the expensive part. Swapping a matcap through
+    /// [`Self::new`] would re-pack and re-upload every vertex and index --
+    /// on a million-triangle asset, seconds of work to change a texture
+    /// binding. This rebuilds only what actually changed.
+    ///
+    /// `materials` must address the same index ranges as the mesh it came
+    /// from; nothing here re-checks that, because nothing here touches the
+    /// index buffer those ranges refer to.
+    pub fn with_materials(
+        &self,
+        ctx: &RenderContext,
+        label: &Label,
+        materials: &[Material],
+    ) -> Result<Self, MeshError> {
+        Ok(Self {
+            materials: Self::build_materials(ctx, label, materials)?,
+            ..self.clone()
+        })
+    }
+
+    /// The GPU side of a slice of materials: one uniform batch, one bind
+    /// group each. Shared by [`Self::new_with_packed`] and
+    /// [`Self::with_materials`], so the two cannot drift.
+    fn build_materials(
+        ctx: &RenderContext,
+        label: &Label,
+        materials: &[Material],
+    ) -> Result<SmallVec<[GpuMaterial; 1]>, MeshError> {
+        let pools = &ctx.gpu_resources;
+        let device = &ctx.device;
+
+        let uniform_buffer_bindings = create_and_fill_uniform_buffer_batch(
+            ctx,
+            format!("{label} - material uniforms").into(),
+            materials.iter().map(|material| {
+                gpu_data::MaterialUniformBuffer::with_matcap(
+                    material.albedo_factor,
+                    if material.albedo.texture.format().components() == 1 {
+                        gpu_data::TextureFormat::Grayscale
+                    } else {
+                        gpu_data::TextureFormat::Rgba
+                    },
+                    material.use_matcap,
+                    material.specular_roughness,
+                )
+            }),
+        );
+
+        let mut gpu_materials = SmallVec::with_capacity(materials.len());
+
+        // The bind group layout must be in sync with the mesh renderer.
+        let mesh_bind_group_layout = ctx.renderer::<MeshRenderer>()?.bind_group_layout;
+
+        for (material, uniform_buffer_binding) in
+            std::iter::zip(materials, uniform_buffer_bindings)
+        {
+            let bind_group = pools.bind_groups.alloc(
+                device,
+                pools,
+                &BindGroupDesc {
+                    label: material.label.clone(),
+                    entries: smallvec![
+                        BindGroupEntry::DefaultTextureView(material.albedo.handle()),
+                        uniform_buffer_binding,
+                        BindGroupEntry::DefaultTextureView(material.matcap_specular.handle()),
+                    ],
+                    layout: mesh_bind_group_layout,
+                },
+            );
+
+            // TODO(#12223): handle texture transparency
+            let is_transparent = material.albedo_factor.a() < 1.0;
+
+            gpu_materials.push(GpuMaterial {
+                index_range: material.index_range,
+                bind_group,
+                has_transparency: is_transparent,
+            });
+        }
+        Ok(gpu_materials)
+    }
 }
 
 #[derive(Clone)]
@@ -569,57 +654,7 @@ impl GpuMesh {
             index_buffer
         };
 
-        let materials = {
-            let uniform_buffer_bindings = create_and_fill_uniform_buffer_batch(
-                ctx,
-                format!("{} - material uniforms", data.label).into(),
-                data.materials.iter().map(|material| {
-                    gpu_data::MaterialUniformBuffer::with_matcap(
-                        material.albedo_factor,
-                        if material.albedo.texture.format().components() == 1 {
-                            gpu_data::TextureFormat::Grayscale
-                        } else {
-                            gpu_data::TextureFormat::Rgba
-                        },
-                        material.use_matcap,
-                        material.specular_roughness,
-                    )
-                }),
-            );
-
-            let mut materials = SmallVec::with_capacity(data.materials.len());
-
-            // The bind group layout must be in sync with the mesh renderer.
-            let mesh_bind_group_layout = ctx.renderer::<MeshRenderer>()?.bind_group_layout;
-
-            for (material, uniform_buffer_binding) in
-                std::iter::zip(&data.materials, uniform_buffer_bindings)
-            {
-                let bind_group = pools.bind_groups.alloc(
-                    device,
-                    pools,
-                    &BindGroupDesc {
-                        label: material.label.clone(),
-                        entries: smallvec![
-                            BindGroupEntry::DefaultTextureView(material.albedo.handle()),
-                            uniform_buffer_binding,
-                            BindGroupEntry::DefaultTextureView(material.matcap_specular.handle()),
-                        ],
-                        layout: mesh_bind_group_layout,
-                    },
-                );
-
-                // TODO(#12223): handle texture transparency
-                let is_transparent = material.albedo_factor.a() < 1.0;
-
-                materials.push(GpuMaterial {
-                    index_range: material.index_range,
-                    bind_group,
-                    has_transparency: is_transparent,
-                });
-            }
-            materials
-        };
+        let materials = Self::build_materials(ctx, &data.label, &data.materials)?;
 
         let vb_colors_start = vb_positions_size;
         let vb_normals_start = vb_colors_start + vb_color_size;
