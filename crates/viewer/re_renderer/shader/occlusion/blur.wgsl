@@ -16,14 +16,18 @@ var depth_texture: texture_depth_2d;
 @group(0) @binding(2)
 var<uniform> params: OcclusionUniformBuffer;
 
+// The prepass surface normal, in the same view space the estimate used.
+@group(0) @binding(3)
+var normal_texture: texture_2d<f32>;
+
 // The horizon method's raw bent normal (SPEC-123 D3a). Only
 // `main_with_bent_normal` reads it.
-@group(0) @binding(3)
-var raw_bent_normal: texture_2d<f32>;
-
-// The prepass surface normal, in the same view space the estimate used.
+//
+// It must stay the LAST binding: the disk method's bind group leaves it out,
+// and the bind-group pool numbers entries by position, so a gap before any
+// other binding would shift it into this slot.
 @group(0) @binding(4)
-var normal_texture: texture_2d<f32>;
+var raw_bent_normal: texture_2d<f32>;
 
 // Relative view-depth difference past which a neighbour stops counting.
 const DEPTH_TOLERANCE: f32 = 0.05;

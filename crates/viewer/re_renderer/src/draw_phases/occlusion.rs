@@ -376,14 +376,20 @@ impl OcclusionProcessor {
                 entries: vec![depth_entry(0), float_entry(1), uniform_entry(2)],
             },
         );
-        let mut blur_entries = vec![float_entry(0), depth_entry(1), uniform_entry(2)];
-        if horizon {
-            blur_entries.push(float_entry(3));
-        }
-        // The prepass normal, so the blur can reject a neighbour across a
+        // The prepass normal at 3, so the blur can reject a neighbour across a
         // convex edge -- see `blur.wgsl`, where the depth weight alone could
-        // not see one.
-        blur_entries.push(float_entry(4));
+        // not see one. The horizon-only bent normal comes last: the bind-group
+        // pool numbers entries by position, so an optional binding anywhere
+        // else would leave a gap the disk method's bind group cannot match.
+        let mut blur_entries = vec![
+            float_entry(0),
+            depth_entry(1),
+            uniform_entry(2),
+            float_entry(3),
+        ];
+        if horizon {
+            blur_entries.push(float_entry(4));
+        }
         let layout_blur = ctx.gpu_resources.bind_group_layouts.get_or_create(
             &ctx.device,
             &BindGroupLayoutDesc {
@@ -414,11 +420,11 @@ impl OcclusionProcessor {
             BindGroupEntry::DefaultTextureView(raw_occlusion.handle),
             BindGroupEntry::DefaultTextureView(prepass_depth.handle),
             uniform,
+            BindGroupEntry::DefaultTextureView(prepass_normal.handle),
         ];
         if let Some([raw_bent_normal, _]) = &bent_normals {
             blur_bindings.push(BindGroupEntry::DefaultTextureView(raw_bent_normal.handle));
         }
-        blur_bindings.push(BindGroupEntry::DefaultTextureView(prepass_normal.handle));
         let bind_group_blur = ctx.gpu_resources.bind_groups.alloc(
             &ctx.device,
             &ctx.gpu_resources,
@@ -637,6 +643,43 @@ mod tests {
         assert_eq!(offset_of!(U, steps_per_slice), 100);
         // Uniform buffers are allocated in 256-byte steps.
         assert_eq!(size_of::<U>(), 256);
+    }
+
+    /// Both methods must build a valid blur bind group.
+    ///
+    /// The bind-group pool numbers entries by position, so the layout's
+    /// binding numbers must run 0..n with no gap. A gap left by the
+    /// horizon-only bent normal once invalidated the disk method's blur and
+    /// blacked out every view.
+    #[test]
+    fn both_methods_build_valid_bind_groups() {
+        use super::{OcclusionConfig, OcclusionMethod, OcclusionProcessor};
+        use crate::RenderContext;
+
+        for method in [
+            OcclusionMethod::Disk { sample_count: 8 },
+            OcclusionMethod::Horizon {
+                slice_count: 2,
+                steps_per_slice: 4,
+            },
+        ] {
+            let ctx = RenderContext::new_test();
+            let scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let _processor = OcclusionProcessor::new(
+                &ctx,
+                &OcclusionConfig {
+                    method,
+                    world_radius: 1.0,
+                    pixel_radius_range: [2.0, 64.0],
+                    strength: 1.0,
+                },
+                &"test".into(),
+                [64, 64],
+                glam::Mat4::IDENTITY,
+            );
+            let error = pollster::block_on(scope.pop());
+            assert!(error.is_none(), "{method:?}: {error:?}");
+        }
     }
 
     #[test]

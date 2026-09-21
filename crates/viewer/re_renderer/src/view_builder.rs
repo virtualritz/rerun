@@ -49,7 +49,6 @@ impl ViewBuilderId {
     }
 }
 
-
 struct ViewTargetSetup {
     name: Label,
     view_id: ViewBuilderId,
@@ -1197,7 +1196,7 @@ mod tests {
                 vertex_positions,
                 materials: smallvec::smallvec![Material {
                     label: "crease".into(),
-                    index_range: 0..12,
+                    index_range: re_span::Span { start: 0, len: 12 },
                     albedo: ctx.texture_manager_2d.white_texture_unorm_handle().clone(),
                     albedo_factor: crate::Rgba::WHITE,
                     use_matcap: true,
@@ -1341,7 +1340,7 @@ mod tests {
                     target_config.resolution_in_pixel,
                     ctx.render_config().msaa_mode.sample_count(),
                 )
-                .with_label("external depth".into()),
+                .with_label_push(" - external depth"),
             );
             let num_textures_before_view_builder = ctx.gpu_resources.textures.num_resources();
             let expected_additional_color_targets = match ctx.render_config().msaa_mode {
@@ -1392,7 +1391,7 @@ mod tests {
                 target_config.resolution_in_pixel,
                 ctx.render_config().msaa_mode.sample_count(),
             )
-            .with_label("external depth without render attachment".into());
+            .with_label_push(" - external depth without render attachment");
             let external_depth = ctx.gpu_resources.textures.alloc(
                 &ctx.device,
                 &crate::wgpu_resources::TextureDesc {

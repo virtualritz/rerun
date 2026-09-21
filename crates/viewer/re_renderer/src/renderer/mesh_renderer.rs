@@ -1431,11 +1431,11 @@ mod tests {
             "opaque mesh draw data should build",
         );
         assert_eq!(draw_data.batches.len(), 3);
-        assert_eq!(draw_data.batches[0].instance_range.len(), 2);
+        assert_eq!(draw_data.batches[0].instance_range.len, 2);
         assert_eq!(draw_data.batches[0].draw_phase, DrawPhase::Opaque);
-        assert_eq!(draw_data.batches[1].instance_range.len(), 2);
+        assert_eq!(draw_data.batches[1].instance_range.len, 2);
         assert_eq!(draw_data.batches[1].draw_phase, DrawPhase::OcclusionPrepass);
-        assert_eq!(draw_data.batches[2].instance_range.len(), 2);
+        assert_eq!(draw_data.batches[2].instance_range.len, 2);
         assert_eq!(draw_data.batches[2].draw_phase, DrawPhase::PickingLayer);
 
         let mut draw_phase_manager = DrawPhaseManager::new(EnumSet::all());
