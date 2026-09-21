@@ -11,6 +11,7 @@
 #import <./global_bindings.wgsl>
 #import <./mesh_vertex.wgsl>
 #import <./utils/srgb.wgsl>
+#import <./utils/dither.wgsl>
 
 @group(1) @binding(0)
 var albedo_texture: texture_2d<f32>;
@@ -390,16 +391,21 @@ fn shade(in: VertexOut, occlusion: f32, bent: vec4f) -> vec4f {
     return vec4f(shaded_color, alpha);
 }
 
+// Dithers the shaded color before the 8-bit main target rounds it.
+fn dithered(shaded: vec4f, frag_position: vec4f) -> vec4f {
+    return vec4f(dither_linear_for_srgb8(shaded.rgb, frag_position.xy), shaded.a);
+}
+
 @fragment
 fn fs_main_shaded(in: VertexOut) -> @location(0) vec4f {
-    return shade(in, occlusion_at(in.position), bent_normal_at(in.position));
+    return dithered(shade(in, occlusion_at(in.position), bent_normal_at(in.position)), in.position);
 }
 
 // Transparent geometry neither writes nor receives occlusion (SPEC-123 R9).
 // The occlusion behind a transparent surface belongs to what is behind it.
 @fragment
 fn fs_main_shaded_unoccluded(in: VertexOut) -> @location(0) vec4f {
-    return shade(in, 1.0, vec4f(0.0));
+    return dithered(shade(in, 1.0, vec4f(0.0)), in.position);
 }
 
 // The occlusion prepass (SPEC-123): the view-space normal, mapped to [0, 1].

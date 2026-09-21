@@ -212,6 +212,12 @@ pub fn init() {
     }
 
     {
+        let virtpath = Path::new("shader/utils/dither.wgsl");
+        let content = include_str!("../shader/utils/dither.wgsl").into();
+        fs.create_file(virtpath, content).unwrap();
+    }
+
+    {
         let virtpath = Path::new("shader/utils/encoding.wgsl");
         let content = include_str!("../shader/utils/encoding.wgsl").into();
         fs.create_file(virtpath, content).unwrap();

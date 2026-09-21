@@ -1319,6 +1319,47 @@ mod tests {
     use crate::mesh::{CpuMesh, GpuMesh, Material};
     use crate::{Color32, DrawPhaseManager, PickingLayerId, RenderContext, Rgba32Unmul};
 
+    /// Reference for `dither_linear_for_srgb8` in `utils/dither.wgsl`, in the
+    /// sRGB space it works in, followed by the 8-bit rounding the main target
+    /// applies. Keep the noise identical to `interleaved_gradient_noise_signed`.
+    fn dithered_srgb8(srgb: f32, x: u32, y: u32) -> f32 {
+        let value =
+            (52.982_918 * (0.067_110_56 * x as f32 + 0.005_837_15 * y as f32).fract()).fract();
+        let noise = (value * 2.0 - 1.0) * (0.5 / 255.0);
+        ((srgb + noise).clamp(0.0, 1.0) * 255.0).round() / 255.0
+    }
+
+    /// The viewport dither removes banding: across a block of pixels the
+    /// 8-bit result averages to the true value, where plain rounding misses
+    /// it by up to half a step -- the step a smooth gradient shows as a band.
+    #[test]
+    fn dither_averages_to_the_unquantized_value() {
+        let step = 1.0 / 255.0;
+        let mut worst_rounded = 0.0_f32;
+        for i in 0..64 {
+            // A slow gradient across four 8-bit steps.
+            let srgb = 0.3 + i as f32 * (4.0 * step / 64.0);
+            let mut sum = 0.0;
+            for y in 0..64 {
+                for x in 0..64 {
+                    let dithered = dithered_srgb8(srgb, x, y);
+                    // The grain stays within one step of the value.
+                    assert!((dithered - srgb).abs() <= step * 1.001, "{srgb}");
+                    sum += dithered;
+                }
+            }
+            let mean_error = (sum / 4096.0 - srgb).abs();
+            assert!(
+                mean_error < 0.05 * step,
+                "{srgb}: {} steps",
+                mean_error / step
+            );
+            worst_rounded = worst_rounded.max(((srgb * 255.0).round() / 255.0 - srgb).abs());
+        }
+        // Without the noise the same gradient is off by nearly half a step.
+        assert!(worst_rounded > 0.4 * step, "{}", worst_rounded / step);
+    }
+
     fn test_view_info() -> DrawableCollectionViewInfo {
         DrawableCollectionViewInfo {
             view_id: crate::ViewBuilderId::new(0),
