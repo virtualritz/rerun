@@ -255,6 +255,36 @@ fn matcap_uv_compute(eye: vec3f, normal: vec3f) -> vec2f {
     return vec2f(dot(b1, normal), -dot(b2, normal)) * 0.496 + 0.5;
 }
 
+// Cubic B-spline filtered sample, from four bilinear fetches (Sigg and
+// Hadwiger, GPU Gems 2 ch. 20).
+//
+// A matcap is magnified: one texel covers many pixels of a large mesh.
+// Bilinear filtering joins texels with straight segments, and the eye reads
+// the slope change at every texel as a band even in an f16 matcap. The
+// B-spline is smooth across texels and never overshoots, so a highlight does
+// not ring; it softens a little, which a matcap does not mind.
+//
+// Keep in sync with `bspline_4tap_1d` in `mesh_renderer.rs`.
+fn texture_sample_bicubic(t: texture_2d<f32>, s: sampler, uv: vec2f) -> vec4f {
+    let size = vec2f(textureDimensions(t));
+    let texel = uv * size - 0.5;
+    let base = floor(texel);
+    let f = texel - base;
+    let f2 = f * f;
+    let f3 = f2 * f;
+    let w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0;
+    let w1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0;
+    let w2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) / 6.0;
+    let w3 = f3 / 6.0;
+    // Each pair of taps folds into one bilinear fetch between them.
+    let g0 = w0 + w1;
+    let g1 = w2 + w3;
+    let p0 = (base - 0.5 + w1 / g0) / size;
+    let p1 = (base + 1.5 + w3 / g1) / size;
+    return g0.y * (g0.x * textureSample(t, s, vec2f(p0.x, p0.y)) + g1.x * textureSample(t, s, vec2f(p1.x, p0.y)))
+        + g1.y * (g0.x * textureSample(t, s, vec2f(p0.x, p1.y)) + g1.x * textureSample(t, s, vec2f(p1.x, p1.y)));
+}
+
 // Matcap albedo, used when `material.use_matcap != 0`. The bound texture is a
 // matcap, sampled by the view-space normal rather than by the mesh's texture
 // coordinates, so a mesh needs no UVs at all on this path. Returns linear
@@ -269,9 +299,9 @@ fn shade_matcap(normal_world_space: vec3f, position_view: vec3f, additive_tint_r
     // No sRGB decode here. An `Rgba8UnormSrgb` texture is linearised by the
     // sampler, and an EXR lobe is linear already, so decoding would darken
     // both. The previous `linear_from_srgb` call was a second decode.
-    let diffuse_lobe = textureSample(albedo_texture, trilinear_sampler_repeat, matcap_uv).rgb;
-    let specular_lobe = textureSample(specular_matcap_texture, trilinear_sampler_repeat, matcap_uv).rgb;
-    let matcap_sample = textureSample(albedo_texture, trilinear_sampler_repeat, matcap_uv);
+    let matcap_sample = texture_sample_bicubic(albedo_texture, trilinear_sampler_repeat, matcap_uv);
+    let diffuse_lobe = matcap_sample.rgb;
+    let specular_lobe = texture_sample_bicubic(specular_matcap_texture, trilinear_sampler_repeat, matcap_uv).rgb;
 
     // Blender's rule: multiply the diffuse lobe, then ADD the specular lobe.
     // The base colour therefore tints the body without washing out the

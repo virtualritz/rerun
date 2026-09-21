@@ -1319,6 +1319,87 @@ mod tests {
     use crate::mesh::{CpuMesh, GpuMesh, Material};
     use crate::{Color32, DrawPhaseManager, PickingLayerId, RenderContext, Rgba32Unmul};
 
+    /// Linear filtering of a 1D texture at `x` in texel units (texel `i` is
+    /// centred at `i + 0.5`), clamped at the ends, as the sampler does.
+    fn linear_fetch(texels: &[f32], x: f32) -> f32 {
+        let last = texels.len() as i32 - 1;
+        let t = x - 0.5;
+        let i = t.floor();
+        let f = t - i;
+        let at = |k: i32| texels[k.clamp(0, last) as usize];
+        at(i as i32) * (1.0 - f) + at(i as i32 + 1) * f
+    }
+
+    /// One axis of `texture_sample_bicubic` in `instanced_mesh_common.wgsl`:
+    /// the four B-spline taps folded into two linear fetches.
+    fn bspline_4tap_1d(texels: &[f32], x: f32) -> f32 {
+        let texel = x - 0.5;
+        let base = texel.floor();
+        let f = texel - base;
+        let (f2, f3) = (f * f, f * f * f);
+        let w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0;
+        let w1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0;
+        let w2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) / 6.0;
+        let w3 = f3 / 6.0;
+        let (g0, g1) = (w0 + w1, w2 + w3);
+        g0 * linear_fetch(texels, base - 0.5 + w1 / g0)
+            + g1 * linear_fetch(texels, base + 1.5 + w3 / g1)
+    }
+
+    /// The same B-spline from its four taps directly.
+    fn bspline_direct_1d(texels: &[f32], x: f32) -> f32 {
+        let texel = x - 0.5;
+        let base = texel.floor() as i32;
+        let f = texel - texel.floor();
+        let weights = [
+            (1.0 - f).powi(3) / 6.0,
+            (4.0 - 6.0 * f * f + 3.0 * f.powi(3)) / 6.0,
+            (1.0 + 3.0 * f + 3.0 * f * f - 3.0 * f.powi(3)) / 6.0,
+            f.powi(3) / 6.0,
+        ];
+        let last = texels.len() as i32 - 1;
+        weights
+            .iter()
+            .zip(base - 1..)
+            .map(|(w, k)| w * texels[k.clamp(0, last) as usize])
+            .sum()
+    }
+
+    const MATCAP_ROW: [f32; 8] = [0.0, 0.1, 0.5, 1.4, 2.0, 2.2, 2.2, 2.1];
+
+    #[test]
+    fn bicubic_matcap_taps_match_the_direct_b_spline() {
+        for step in 0..=160 {
+            let x = 1.5 + step as f32 * 0.03125;
+            let folded = bspline_4tap_1d(&MATCAP_ROW, x);
+            let direct = bspline_direct_1d(&MATCAP_ROW, x);
+            assert!(
+                (folded - direct).abs() < 1e-4,
+                "x {x}: {folded} vs {direct}"
+            );
+        }
+    }
+
+    /// The reason for the bicubic filter: bilinear changes slope at every
+    /// texel centre, which a magnified matcap shows as a band. The B-spline
+    /// keeps the slope continuous there.
+    #[test]
+    fn bicubic_matcap_has_no_slope_kink_at_texel_centres() {
+        let h = 0.01;
+        let kink = |filter: fn(&[f32], f32) -> f32, x: f32| {
+            let left = (filter(&MATCAP_ROW, x) - filter(&MATCAP_ROW, x - h)) / h;
+            let right = (filter(&MATCAP_ROW, x + h) - filter(&MATCAP_ROW, x)) / h;
+            (right - left).abs()
+        };
+        for centre in 2..6 {
+            let x = centre as f32 + 0.5;
+            let bilinear = kink(linear_fetch, x);
+            let bicubic = kink(bspline_4tap_1d, x);
+            assert!(bilinear > 0.2, "texel {centre}: bilinear kink {bilinear}");
+            assert!(bicubic < 0.05, "texel {centre}: bicubic kink {bicubic}");
+        }
+    }
+
     /// Reference for `dither_linear_for_srgb8` in `utils/dither.wgsl`, in the
     /// sRGB space it works in, followed by the 8-bit rounding the main target
     /// applies. Keep the noise identical to `interleaved_gradient_noise_signed`.
