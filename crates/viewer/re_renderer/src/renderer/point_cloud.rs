@@ -146,12 +146,17 @@ pub mod gpu_data {
 
         /// Index of this batch's first point in the shared point-data textures.
         pub first_point_index: u32,
-        pub _row_padding: u32,
+        /// Ring width in UI points; zero draws no ring. It takes what used to
+        /// be this row's padding, so the ring costs no extra row.
+        pub outline_width_in_points: f32,
 
         pub outline_mask_ids: wgpu_buffer_types::UVec2,
         pub picking_object_id: PickingLayerObjectId,
 
-        pub end_padding: [wgpu_buffer_types::PaddingRow; 16 - 6],
+        /// The ring's colour, linear RGBA with unmultiplied alpha.
+        pub outline_color: wgpu_buffer_types::Vec4,
+
+        pub end_padding: [wgpu_buffer_types::PaddingRow; 16 - 7],
     }
 }
 
@@ -265,6 +270,19 @@ pub struct PointCloudBatchInfo {
     /// Object-space bounds used to place the batch in the draw-phase distance ordering.
     pub object_space_bounding_box: macaw::BoundingBox,
 
+    /// Width of a ring drawn just outside every point in this batch, in UI
+    /// points. Zero -- the default -- draws no ring.
+    ///
+    /// The ring is part of the same quad and the same distance field as the
+    /// point itself, so its inner and outer edges are antialiased alike and it
+    /// costs no extra geometry. It is what makes a marker legible against
+    /// whatever it happens to lie on.
+    pub outline_width_in_points: f32,
+
+    /// The ring's colour. Ignored when [`Self::outline_width_in_points`] is
+    /// zero.
+    pub outline_color: ecolor::Rgba,
+
     /// Optional outline mask setting for the entire batch.
     pub overall_outline_mask_ids: OutlineMaskPreference,
 
@@ -308,6 +326,8 @@ impl Default for PointCloudBatchInfo {
             label: Label::default(),
             world_from_obj: glam::Affine3A::IDENTITY,
             flags: PointCloudBatchFlags::FLAG_ENABLE_SHADING,
+            outline_width_in_points: 0.0,
+            outline_color: ecolor::Rgba::TRANSPARENT,
             point_count: 0,
             object_space_bounding_box: macaw::BoundingBox::nothing(),
             overall_outline_mask_ids: OutlineMaskPreference::NONE,
@@ -367,6 +387,8 @@ impl PointCloudDrawData {
             label: "fallback_batches".into(),
             world_from_obj: glam::Affine3A::IDENTITY,
             flags: PointCloudBatchFlags::empty(),
+            outline_width_in_points: 0.0,
+            outline_color: ecolor::Rgba::TRANSPARENT,
             point_count: num_vertices as _,
             object_space_bounding_box: macaw::BoundingBox::nothing(),
             overall_outline_mask_ids: OutlineMaskPreference::NONE,
@@ -476,7 +498,8 @@ impl PointCloudDrawData {
                         picking_object_id: batch_info.picking_object_id,
                         depth_offset: batch_info.depth_offset as f32,
                         first_point_index: current_first_point_index,
-                        _row_padding: 0,
+                        outline_width_in_points: batch_info.outline_width_in_points,
+                        outline_color: batch_info.outline_color.into(),
                         end_padding: Default::default(),
                     }
                 }),
@@ -511,7 +534,8 @@ impl PointCloudDrawData {
                                         picking_object_id: batch_info.picking_object_id,
                                         depth_offset: batch_info.depth_offset as f32,
                                         first_point_index: current_first_point_index,
-                                        _row_padding: 0,
+                                        outline_width_in_points: batch_info.outline_width_in_points,
+                                        outline_color: batch_info.outline_color.into(),
                                         end_padding: Default::default(),
                                     }),
                             )
