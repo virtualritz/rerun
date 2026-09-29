@@ -69,7 +69,7 @@ impl Renderers {
     ///
     /// Initialization happens on first use.
     /// Registering more than 256 distinct renderer types logs an error, but otherwise fails silently.
-    pub fn register<R: Renderer + Send + Sync + 'static>(&mut self) {
+    pub fn register<R: Renderer + wgpu::WasmNotSendSync + 'static>(&mut self) {
         let type_id = TypeId::of::<R>();
         if self.renderer_entries.contains_key(&type_id) {
             return;
@@ -92,7 +92,7 @@ impl Renderers {
     }
 
     /// Gets a registered renderer, initializing it if necessary.
-    pub fn get<R: Renderer + Send + Sync + 'static>(
+    pub fn get<R: Renderer + wgpu::WasmNotSendSync + 'static>(
         &self,
         ctx: &RenderContext,
     ) -> Result<&R, RendererRegistrationError> {
@@ -112,7 +112,7 @@ impl Renderers {
     /// Gets the key assigned to a registered renderer.
     ///
     /// Does not initialize the renderer.
-    pub fn get_key<R: Renderer + Send + Sync + 'static>(
+    pub fn get_key<R: Renderer + wgpu::WasmNotSendSync + 'static>(
         &self,
     ) -> Result<RendererTypeId, RendererRegistrationError> {
         self.renderer_entries
