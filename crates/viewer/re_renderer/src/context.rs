@@ -430,7 +430,7 @@ This means, either a call to RenderContext::before_submit was omitted, or the pr
     }
 
     /// Convenience method to get a registered renderer, initializing it on first access.
-    pub fn renderer<R: Renderer + Send + Sync + 'static>(
+    pub fn renderer<R: Renderer + wgpu::WasmNotSendSync + 'static>(
         &self,
     ) -> Result<&R, RendererRegistrationError> {
         self.renderers.get::<R>(self)

@@ -189,7 +189,7 @@ pub trait Renderer {
     ) -> Result<(), DrawError>;
 }
 
-pub trait RendererExt: Any + Send + Sync {
+pub trait RendererExt: Any + wgpu::WasmNotSendSync {
     fn run_draw_instructions(
         &self,
         gpu_resources: &GpuRenderPipelinePoolAccessor<'_>,
@@ -199,7 +199,7 @@ pub trait RendererExt: Any + Send + Sync {
     ) -> Result<(), DrawError>;
 }
 
-impl<R: Renderer + Send + Sync + 'static> RendererExt for R {
+impl<R: Renderer + wgpu::WasmNotSendSync + 'static> RendererExt for R {
     fn run_draw_instructions(
         &self,
         gpu_resources: &GpuRenderPipelinePoolAccessor<'_>,
