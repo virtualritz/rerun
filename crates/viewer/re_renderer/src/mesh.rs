@@ -640,12 +640,18 @@ impl GpuMesh {
                 },
             );
 
+            #[cfg(target_arch = "wasm32")]
+            ctx.queue.write_buffer(&index_buffer, 0, &packed.indices);
+
+            #[cfg(not(target_arch = "wasm32"))]
             let mut staging_buffer = ctx.cpu_write_gpu_read_belt.lock().allocate::<u8>(
                 &ctx.device,
                 &ctx.gpu_resources.buffers,
                 index_buffer_size as _,
             )?;
+            #[cfg(not(target_arch = "wasm32"))]
             staging_buffer.extend_from_slice(&packed.indices)?;
+            #[cfg(not(target_arch = "wasm32"))]
             staging_buffer.copy_to_buffer(
                 ctx.active_frame.before_view_builder_encoder.lock().get(),
                 &index_buffer,
