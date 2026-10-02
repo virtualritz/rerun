@@ -32,6 +32,10 @@ struct SdfVoxelUniformBuffer {
     picking_layer_id: vec4u,
 
     /// Fidget render size in pixels: `(width, height, 0, 0)`.
+    ///
+    /// The fragment maps its framebuffer position into this grid, so one
+    /// evaluation serves targets of any resolution -- e.g. the viewport at
+    /// full size and the downscaled picking target in the same frame.
     size: vec4u,
 
     /// Maps Fidget voxel coordinates `(px, py, depth, 1)` to world space.
@@ -118,8 +122,14 @@ struct Hit {
 /// reaching here means the bounds were wrong and the caller should have taken
 /// the mesh fallback.
 fn surface_hit(framebuffer_position: vec4f) -> Hit {
-    let px = u32(framebuffer_position.x);
-    let py = u32(framebuffer_position.y);
+    // Fidget's grid is not necessarily the target's grid: the picking pass
+    // renders at a reduced resolution. Map into the Fidget grid so both
+    // passes read the same evaluation.
+    let buffer_position =
+        vec2u(framebuffer_position.xy
+            * vec2f(config.size.xy) / frame.framebuffer_resolution);
+    let px = buffer_position.x;
+    let py = buffer_position.y;
     if (px >= config.size.x || py >= config.size.y) {
         return Hit(vec3f(0.0), vec3f(0.0, 0.0, 1.0), false);
     }

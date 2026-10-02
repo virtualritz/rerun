@@ -40,7 +40,8 @@ pub struct SdfVoxelConfiguration<'a> {
     /// [`Self::size`], row-major.
     pub geometry: &'a wgpu::Buffer,
 
-    /// Fidget render size in pixels. Must match the view's resolution.
+    /// Fidget render size in pixels. The composite maps framebuffer positions
+    /// into this grid, so it need not match the target's resolution.
     pub size: [u32; 2],
 
     /// Conservative proxy box minimum corner, in the SDF's LOCAL space.
