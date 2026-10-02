@@ -1,9 +1,10 @@
 // FORK DIVERGENCE: direct SDF display pass for akatela SPEC-109.
 //
 // Rasterize the SDF's finite proxy box, reconstruct a world-space camera ray
-// per covered fragment, march the Fidget tape (group 1 bindings 1 and 2) with
-// a bounded linear search plus bisection, and write the projected hit depth.
-// No Lipschitz assumption: the search never advances by `|f|` (SPEC-109 R4).
+// per covered fragment, map it into the SDF's local space, march the Fidget
+// tape (group 1 bindings 1 and 2) with a bounded linear search plus bisection,
+// and write the projected hit depth. No Lipschitz assumption: the search never
+// advances by `|f|` (SPEC-109 R4).
 // The interval pre-pass and gradient-tape normals build on this pass without
 // changing its phase, depth or picking contract.
 
@@ -12,10 +13,10 @@
 #import <./fidget_ops.wgsl>
 
 struct SdfTapeUniformBuffer {
-    /// Proxy box minimum corner, in world space, `xyz` used.
+    /// Proxy box minimum corner, in the SDF's LOCAL space, `xyz` used.
     bounds_min: vec4f,
 
-    /// Proxy box maximum corner, in world space, `xyz` used.
+    /// Proxy box maximum corner, in the SDF's LOCAL space, `xyz` used.
     bounds_max: vec4f,
 
     /// Placeholder flat colour until Slice D reuses the mesh matcap/AO path.
@@ -29,6 +30,12 @@ struct SdfTapeUniformBuffer {
 
     /// `(search_steps, bisection_steps, 0, 0)`.
     counts: vec4u,
+
+    /// Placement of the SDF's local space in world space.
+    world_from_local: mat4x4<f32>,
+
+    /// Inverse of `world_from_local`; maps rays and hits between the spaces.
+    local_from_world: mat4x4<f32>,
 }
 
 @group(1) @binding(0)
@@ -71,12 +78,28 @@ fn main_vs(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     let face = vertex_index / 6u;
     let triangle = (vertex_index % 6u) / 3u;
     let corner_in_quad = QUAD_TRIANGLE[triangle * 3u + vertex_index % 3u];
-    let position = corner(FACE_CORNERS[face][corner_in_quad]);
+    let local_position = corner(FACE_CORNERS[face][corner_in_quad]);
+    let world_position =
+        (config.world_from_local * vec4f(local_position, 1.0)).xyz;
 
     var out: VertexOutput;
-    out.position = frame.projection_from_world * vec4f(position, 1.0);
-    out.world_position = position;
+    out.position = frame.projection_from_world * vec4f(world_position, 1.0);
+    out.world_position = world_position;
     return out;
+}
+
+/// Map a world-space ray into the SDF's local space.
+///
+/// The direction is the linear image, NOT renormalised: with `world = M *
+/// local`, the world-distance parameter `t` is the same in both spaces, so the
+/// marched `t` stays a world distance for the depth projection.
+fn ray_world_to_local(ray: Ray) -> Ray {
+    var local: Ray;
+    local.origin =
+        (config.local_from_world * vec4f(ray.origin, 1.0)).xyz;
+    local.direction =
+        (config.local_from_world * vec4f(ray.direction, 0.0)).xyz;
+    return local;
 }
 
 /// Evaluate the root tape at a world-space point. Negative is inside.
@@ -159,15 +182,21 @@ struct ShadedFragment {
 
 @fragment
 fn fs_main_shaded(in: VertexOutput) -> ShadedFragment {
-    let ray = camera_ray_to_world_pos(in.world_position);
-    let distance = march(ray);
+    let world_ray = camera_ray_to_world_pos(in.world_position);
+    let local_ray = ray_world_to_local(world_ray);
+    let distance = march(local_ray);
     if distance < 0.0 {
         discard;
     }
 
-    let hit = ray.origin + ray.direction * distance;
+    let hit = world_ray.origin + world_ray.direction * distance;
     let clip = frame.projection_from_world * vec4f(hit, 1.0);
-    let normal = field_normal(hit, distance);
+    let local_hit = local_ray.origin + local_ray.direction * distance;
+    let normal_local = field_normal(local_hit, distance);
+    // The gradient is a covector, so the world normal uses the inverse
+    // transpose of `world_from_local` -- exact under non-uniform scale too.
+    let normal =
+        normalize((vec4f(normal_local, 0.0) * config.local_from_world).xyz);
 
     var out: ShadedFragment;
     out.color = config.color * vec4f(normal * 0.5 + 0.5, 1.0);
@@ -185,13 +214,13 @@ struct PickingFragment {
 
 @fragment
 fn fs_main_picking(in: VertexOutput) -> PickingFragment {
-    let ray = camera_ray_to_world_pos(in.world_position);
-    let distance = march(ray);
+    let world_ray = camera_ray_to_world_pos(in.world_position);
+    let distance = march(ray_world_to_local(world_ray));
     if distance < 0.0 {
         discard;
     }
 
-    let hit = ray.origin + ray.direction * distance;
+    let hit = world_ray.origin + world_ray.direction * distance;
     let clip = frame.projection_from_world * vec4f(hit, 1.0);
 
     var out: PickingFragment;

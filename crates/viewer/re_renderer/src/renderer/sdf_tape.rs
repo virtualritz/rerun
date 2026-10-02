@@ -15,7 +15,7 @@ use crate::draw_phases::{DrawPhase, PickingLayerProcessor};
 use crate::renderer::{DrawDataDrawable, DrawInstruction, DrawableCollectionViewInfo};
 use crate::wgpu_resources::{
     BindGroupDesc, BindGroupEntry, BindGroupLayoutDesc, BufferDesc, GpuBindGroup,
-    GpuBindGroupLayoutHandle, GpuRenderPipelineHandle, GpuRenderPipelinePoolAccessor,
+    GpuBindGroupLayoutHandle, GpuBuffer, GpuRenderPipelineHandle, GpuRenderPipelinePoolAccessor,
     PipelineLayoutDesc, RenderPipelineDesc,
 };
 use crate::{DrawableCollector, PickingLayerId, Rgba, ViewBuilder, include_shader_module};
@@ -34,24 +34,79 @@ pub const DEFAULT_BISECTION_STEPS: u32 = 16;
 /// One direct SDF draw: a Fidget bytecode tape, its variable values, the
 /// finite proxy box that clips rays, and the picking id.
 pub struct SdfTapeConfiguration {
-    /// Conservative proxy box minimum corner, in world space.
+    /// Conservative proxy box minimum corner, in the SDF's LOCAL space.
     pub bounds_min: glam::Vec3,
-    /// Conservative proxy box maximum corner, in world space.
+    /// Conservative proxy box maximum corner, in the SDF's LOCAL space.
     pub bounds_max: glam::Vec3,
+    /// Placement of the SDF's local space in world space. The proxy box and
+    /// the tape are local; rays are mapped into local space to march and the
+    /// hit is mapped back for depth, so a transformed or instanced SDF follows
+    /// its placement without rebuilding the tape.
+    pub world_from_local: glam::Mat4,
     /// Placeholder flat colour until Slice D reuses the mesh matcap path.
     pub color: Rgba,
     /// Picking id written into the `PickingLayer` pass.
     pub picking_layer_id: PickingLayerId,
-    /// Fidget bytecode words, two `u32` per tape operation.
-    pub tape: Vec<u32>,
-    /// Free-variable values, indexed by Fidget variable index.
-    pub variables: Vec<f32>,
-    /// Variable indices of `x`, `y`, `z`; `u32::MAX` when the tape has none.
-    pub axes: [u32; 3],
     /// Linear search samples between the proxy entry and exit.
     pub search_steps: u32,
     /// Bisection refinements after a bracketed sign change.
     pub bisection_steps: u32,
+}
+
+/// The immutable GPU half of an SDF: its bytecode and free-variable buffers,
+/// plus the axis variable indices.
+///
+/// Cache this on `sdf_hash` and reuse it across placements: moving or
+/// re-picking an SDF only rewrites the small per-draw uniform in
+/// [`SdfTapeDrawData`], never the tape.
+#[derive(Clone)]
+pub struct SdfTapeResources {
+    tape_buffer: GpuBuffer,
+    variables_buffer: GpuBuffer,
+    /// Variable indices of `x`, `y`, `z`; `u32::MAX` when the tape has none.
+    pub axes: [u32; 3],
+}
+
+impl SdfTapeResources {
+    /// Upload a tape, its free-variable values and the axis variable indices.
+    pub fn new(ctx: &RenderContext, tape: &[u32], variables: &[f32], axes: [u32; 3]) -> Self {
+        let tape_buffer = ctx.gpu_resources.buffers.alloc(
+            &ctx.device,
+            &BufferDesc {
+                label: "SdfTapeResources::tape".into(),
+                size: (tape.len() * std::mem::size_of::<u32>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            },
+        );
+        ctx.queue
+            .write_buffer(&tape_buffer, 0, bytemuck::cast_slice(tape));
+
+        // An absent or empty variable list still needs a bound buffer.
+        let empty_variables = [0.0_f32];
+        let variables = if variables.is_empty() {
+            &empty_variables[..]
+        } else {
+            variables
+        };
+        let variables_buffer = ctx.gpu_resources.buffers.alloc(
+            &ctx.device,
+            &BufferDesc {
+                label: "SdfTapeResources::variables".into(),
+                size: (variables.len() * std::mem::size_of::<f32>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            },
+        );
+        ctx.queue
+            .write_buffer(&variables_buffer, 0, bytemuck::cast_slice(variables));
+
+        Self {
+            tape_buffer,
+            variables_buffer,
+            axes,
+        }
+    }
 }
 
 mod gpu_data {
@@ -70,7 +125,10 @@ mod gpu_data {
         pub picking_layer_id: [u32; 4],
         pub axes: [u32; 4],
         pub counts: [u32; 4],
-        pub end_padding: [wgpu_buffer_types::PaddingRow; 10],
+        /// Column-major, matching WGSL's `mat4x4<f32>` layout.
+        pub world_from_local: [f32; 16],
+        pub local_from_world: [f32; 16],
+        pub end_padding: [wgpu_buffer_types::PaddingRow; 2],
     }
 }
 
@@ -109,9 +167,14 @@ impl DrawData for SdfTapeDrawData {
 }
 
 impl SdfTapeDrawData {
-    /// Upload one SDF draw's tape, variables and uniforms.
+    /// Build one SDF draw's uniform and bind group over cached `resources`.
+    ///
+    /// Call once per placement per frame: the tape buffers are shared, so this
+    /// only allocates the small uniform and the bind group that joins it to
+    /// the tape.
     pub fn new(
         ctx: &RenderContext,
+        resources: &SdfTapeResources,
         config: &SdfTapeConfiguration,
     ) -> Result<Self, crate::RendererRegistrationError> {
         let renderer = ctx.renderer::<SdfTapeRenderer>()?;
@@ -146,42 +209,13 @@ impl SdfTapeDrawData {
                     instance as u32,
                     (instance >> 32) as u32,
                 ],
-                axes: [config.axes[0], config.axes[1], config.axes[2], 0],
+                axes: [resources.axes[0], resources.axes[1], resources.axes[2], 0],
                 counts: [config.search_steps, config.bisection_steps, 0, 0],
+                world_from_local: config.world_from_local.to_cols_array(),
+                local_from_world: config.world_from_local.inverse().to_cols_array(),
                 end_padding: Default::default(),
             },
         );
-
-        // The tape is uploaded once per payload; the pass never rewrites it.
-        let tape_buffer = ctx.gpu_resources.buffers.alloc(
-            &ctx.device,
-            &BufferDesc {
-                label: "SdfTapeDrawData::tape".into(),
-                size: (config.tape.len() * std::mem::size_of::<u32>()) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            },
-        );
-        ctx.queue
-            .write_buffer(&tape_buffer, 0, bytemuck::cast_slice(&config.tape));
-
-        // An absent or empty variable list still needs a bound buffer.
-        let variables = if config.variables.is_empty() {
-            vec![0.0_f32]
-        } else {
-            config.variables.clone()
-        };
-        let variables_buffer = ctx.gpu_resources.buffers.alloc(
-            &ctx.device,
-            &BufferDesc {
-                label: "SdfTapeDrawData::variables".into(),
-                size: (variables.len() * std::mem::size_of::<f32>()) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            },
-        );
-        ctx.queue
-            .write_buffer(&variables_buffer, 0, bytemuck::cast_slice(&variables));
 
         Ok(Self {
             bind_group: ctx.gpu_resources.bind_groups.alloc(
@@ -192,12 +226,12 @@ impl SdfTapeDrawData {
                     entries: smallvec![
                         uniform_buffer,
                         BindGroupEntry::Buffer {
-                            handle: tape_buffer.handle,
+                            handle: resources.tape_buffer.handle,
                             offset: 0,
                             size: None,
                         },
                         BindGroupEntry::Buffer {
-                            handle: variables_buffer.handle,
+                            handle: resources.variables_buffer.handle,
                             offset: 0,
                             size: None,
                         },
@@ -205,7 +239,11 @@ impl SdfTapeDrawData {
                     layout: renderer.bind_group_layout,
                 },
             ),
-            center: (config.bounds_min + config.bounds_max) * 0.5,
+            // The sorter compares world positions, so the local proxy centre
+            // is mapped through the placement, not used raw.
+            center: config
+                .world_from_local
+                .transform_point3((config.bounds_min + config.bounds_max) * 0.5),
         })
     }
 }

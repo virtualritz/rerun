@@ -32,7 +32,7 @@ pub use rectangles::{
 };
 pub use sdf_tape::{
     DEFAULT_BISECTION_STEPS, DEFAULT_SEARCH_STEPS, SdfTapeConfiguration, SdfTapeDrawData,
-    SdfTapeRenderer,
+    SdfTapeRenderer, SdfTapeResources,
 };
 pub use test_triangle::TestTriangleDrawData;
 pub use voxel_grid::{
