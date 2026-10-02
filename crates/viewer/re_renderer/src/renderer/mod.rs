@@ -9,7 +9,6 @@ mod mesh_renderer;
 mod plane_clustering;
 mod point_cloud;
 mod rectangles;
-mod sdf_tape;
 mod sdf_voxel;
 mod test_triangle;
 mod voxel_grid;
@@ -30,10 +29,6 @@ pub use point_cloud::{
 pub use rectangles::{
     ColorMapper, ColormappedTexture, RectangleDrawData, RectangleOptions, ShaderDecoding,
     TextureAlpha, TextureFilterMag, TextureFilterMin, TexturedRect,
-};
-pub use sdf_tape::{
-    DEFAULT_BISECTION_STEPS, DEFAULT_SEARCH_STEPS, SdfTapeConfiguration, SdfTapeDrawData,
-    SdfTapeRenderer, SdfTapeResources,
 };
 pub use sdf_voxel::{SdfVoxelConfiguration, SdfVoxelDrawData, SdfVoxelRenderer};
 pub use test_triangle::TestTriangleDrawData;
@@ -256,10 +251,6 @@ pub fn register_renderers(renderers: &mut crate::Renderers) {
     renderers.register::<mesh_renderer::MeshRenderer>();
     renderers.register::<point_cloud::PointCloudRenderer>();
     renderers.register::<rectangles::RectangleRenderer>();
-    // FORK DIVERGENCE: akatela SPEC-109 direct SDF display pass. Like every
-    // other renderer this must be registered explicitly; an unregistered
-    // `Renderer` fails only at runtime, on the first `queue_draw`.
-    renderers.register::<sdf_tape::SdfTapeRenderer>();
     // FORK DIVERGENCE: akatela SPEC-109 SDF composite pass. Draws Fidget's
     // GPU-resident voxel output into the scene; registered like every other
     // renderer, or `queue_draw` fails only at runtime.

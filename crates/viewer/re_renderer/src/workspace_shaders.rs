@@ -50,12 +50,6 @@ pub fn init() {
     }
 
     {
-        let virtpath = Path::new("shader/fidget_ops.wgsl");
-        let content = include_str!("../shader/fidget_ops.wgsl").into();
-        fs.create_file(virtpath, content).unwrap();
-    }
-
-    {
         let virtpath = Path::new("shader/gaussian_splat.wgsl");
         let content = include_str!("../shader/gaussian_splat.wgsl").into();
         fs.create_file(virtpath, content).unwrap();
@@ -190,12 +184,6 @@ pub fn init() {
     {
         let virtpath = Path::new("shader/screen_triangle_vertex.wgsl");
         let content = include_str!("../shader/screen_triangle_vertex.wgsl").into();
-        fs.create_file(virtpath, content).unwrap();
-    }
-
-    {
-        let virtpath = Path::new("shader/sdf_tape.wgsl");
-        let content = include_str!("../shader/sdf_tape.wgsl").into();
         fs.create_file(virtpath, content).unwrap();
     }
 
