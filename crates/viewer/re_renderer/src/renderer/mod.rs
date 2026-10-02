@@ -9,6 +9,7 @@ mod mesh_renderer;
 mod plane_clustering;
 mod point_cloud;
 mod rectangles;
+mod sdf_tape;
 mod test_triangle;
 mod voxel_grid;
 mod world_grid;
@@ -29,6 +30,7 @@ pub use rectangles::{
     ColorMapper, ColormappedTexture, RectangleDrawData, RectangleOptions, ShaderDecoding,
     TextureAlpha, TextureFilterMag, TextureFilterMin, TexturedRect,
 };
+pub use sdf_tape::{SdfTapeConfiguration, SdfTapeDrawData, SdfTapeRenderer};
 pub use test_triangle::TestTriangleDrawData;
 pub use voxel_grid::{
     VoxelGridDrawData, VoxelGridDrawDataError, VoxelGridInstance, VoxelGridOptions,
@@ -249,6 +251,10 @@ pub fn register_renderers(renderers: &mut crate::Renderers) {
     renderers.register::<mesh_renderer::MeshRenderer>();
     renderers.register::<point_cloud::PointCloudRenderer>();
     renderers.register::<rectangles::RectangleRenderer>();
+    // FORK DIVERGENCE: akatela SPEC-109 direct SDF display pass. Like every
+    // other renderer this must be registered explicitly; an unregistered
+    // `Renderer` fails only at runtime, on the first `queue_draw`.
+    renderers.register::<sdf_tape::SdfTapeRenderer>();
     renderers.register::<test_triangle::TestTriangle>();
     renderers.register::<voxel_grid::VoxelGridRenderer>();
     renderers.register::<world_grid::WorldGridRenderer>();

@@ -188,6 +188,12 @@ pub fn init() {
     }
 
     {
+        let virtpath = Path::new("shader/sdf_tape.wgsl");
+        let content = include_str!("../shader/sdf_tape.wgsl").into();
+        fs.create_file(virtpath, content).unwrap();
+    }
+
+    {
         let virtpath = Path::new("shader/test_triangle.wgsl");
         let content = include_str!("../shader/test_triangle.wgsl").into();
         fs.create_file(virtpath, content).unwrap();
