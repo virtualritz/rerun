@@ -1,10 +1,11 @@
 //! FORK DIVERGENCE: direct SDF display pass for akatela SPEC-109.
 //!
-//! Slice A of the spec: an analytic sphere drawn by rasterizing its finite
-//! proxy box, reconstructing a world-space ray per covered fragment and
-//! writing the projected hit depth. The phase, depth and picking contract is
-//! what the Fidget tape pass will reuse; only the fragment's field evaluation
-//! changes. See `shader/sdf_tape.wgsl`.
+//! Rasterize an SDF's finite proxy box, reconstruct a world-space camera ray
+//! per covered fragment, march a Fidget bytecode tape with a bounded linear
+//! search plus bisection, and write the projected hit depth. The Fidget
+//! opcode table, tape format and interpreter are vendored in
+//! `shader/fidget_ops.wgsl`; the pass, its depth and its picking are ours.
+//! `shader/sdf_tape.wgsl` is the entry point.
 
 use smallvec::smallvec;
 
@@ -13,26 +14,44 @@ use crate::allocator::create_and_fill_uniform_buffer;
 use crate::draw_phases::{DrawPhase, PickingLayerProcessor};
 use crate::renderer::{DrawDataDrawable, DrawInstruction, DrawableCollectionViewInfo};
 use crate::wgpu_resources::{
-    BindGroupDesc, BindGroupLayoutDesc, GpuBindGroup, GpuBindGroupLayoutHandle,
-    GpuRenderPipelineHandle, GpuRenderPipelinePoolAccessor, PipelineLayoutDesc, RenderPipelineDesc,
+    BindGroupDesc, BindGroupEntry, BindGroupLayoutDesc, BufferDesc, GpuBindGroup,
+    GpuBindGroupLayoutHandle, GpuRenderPipelineHandle, GpuRenderPipelinePoolAccessor,
+    PipelineLayoutDesc, RenderPipelineDesc,
 };
 use crate::{DrawableCollector, PickingLayerId, Rgba, ViewBuilder, include_shader_module};
 
-/// One direct SDF draw: the finite proxy box, the analytic sphere used as the
-/// Slice A fixture, its placeholder colour and its picking id.
+/// Default number of linear search samples between the proxy box entry and
+/// exit.
+///
+/// The interval pre-pass replaces this with per-cell work (T013); until then
+/// this is the bounded search that keeps the pass free of any Lipschitz
+/// assumption.
+pub const DEFAULT_SEARCH_STEPS: u32 = 128;
+
+/// Default bisection refinements once a sign change is bracketed.
+pub const DEFAULT_BISECTION_STEPS: u32 = 16;
+
+/// One direct SDF draw: a Fidget bytecode tape, its variable values, the
+/// finite proxy box that clips rays, and the picking id.
 pub struct SdfTapeConfiguration {
     /// Conservative proxy box minimum corner, in world space.
     pub bounds_min: glam::Vec3,
     /// Conservative proxy box maximum corner, in world space.
     pub bounds_max: glam::Vec3,
-    /// Sphere centre in world space.
-    pub center: glam::Vec3,
-    /// Sphere radius.
-    pub radius: f32,
-    /// Flat placeholder colour until Slice D reuses the mesh matcap path.
+    /// Placeholder flat colour until Slice D reuses the mesh matcap path.
     pub color: Rgba,
     /// Picking id written into the `PickingLayer` pass.
     pub picking_layer_id: PickingLayerId,
+    /// Fidget bytecode words, two `u32` per tape operation.
+    pub tape: Vec<u32>,
+    /// Free-variable values, indexed by Fidget variable index.
+    pub variables: Vec<f32>,
+    /// Variable indices of `x`, `y`, `z`; `u32::MAX` when the tape has none.
+    pub axes: [u32; 3],
+    /// Linear search samples between the proxy entry and exit.
+    pub search_steps: u32,
+    /// Bisection refinements after a bracketed sign change.
+    pub bisection_steps: u32,
 }
 
 mod gpu_data {
@@ -47,10 +66,11 @@ mod gpu_data {
     pub struct SdfTapeUniformBuffer {
         pub bounds_min: [f32; 4],
         pub bounds_max: [f32; 4],
-        pub center_radius: [f32; 4],
         pub color: [f32; 4],
         pub picking_layer_id: [u32; 4],
-        pub end_padding: [wgpu_buffer_types::PaddingRow; 11],
+        pub axes: [u32; 4],
+        pub counts: [u32; 4],
+        pub end_padding: [wgpu_buffer_types::PaddingRow; 10],
     }
 }
 
@@ -89,7 +109,7 @@ impl DrawData for SdfTapeDrawData {
 }
 
 impl SdfTapeDrawData {
-    /// Upload one SDF draw's uniforms.
+    /// Upload one SDF draw's tape, variables and uniforms.
     pub fn new(
         ctx: &RenderContext,
         config: &SdfTapeConfiguration,
@@ -114,12 +134,6 @@ impl SdfTapeDrawData {
                     config.bounds_max.z,
                     0.0,
                 ],
-                center_radius: [
-                    config.center.x,
-                    config.center.y,
-                    config.center.z,
-                    config.radius,
-                ],
                 color: [
                     config.color.r(),
                     config.color.g(),
@@ -132,9 +146,42 @@ impl SdfTapeDrawData {
                     instance as u32,
                     (instance >> 32) as u32,
                 ],
+                axes: [config.axes[0], config.axes[1], config.axes[2], 0],
+                counts: [config.search_steps, config.bisection_steps, 0, 0],
                 end_padding: Default::default(),
             },
         );
+
+        // The tape is uploaded once per payload; the pass never rewrites it.
+        let tape_buffer = ctx.gpu_resources.buffers.alloc(
+            &ctx.device,
+            &BufferDesc {
+                label: "SdfTapeDrawData::tape".into(),
+                size: (config.tape.len() * std::mem::size_of::<u32>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            },
+        );
+        ctx.queue
+            .write_buffer(&tape_buffer, 0, bytemuck::cast_slice(&config.tape));
+
+        // An absent or empty variable list still needs a bound buffer.
+        let variables = if config.variables.is_empty() {
+            vec![0.0_f32]
+        } else {
+            config.variables.clone()
+        };
+        let variables_buffer = ctx.gpu_resources.buffers.alloc(
+            &ctx.device,
+            &BufferDesc {
+                label: "SdfTapeDrawData::variables".into(),
+                size: (variables.len() * std::mem::size_of::<f32>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            },
+        );
+        ctx.queue
+            .write_buffer(&variables_buffer, 0, bytemuck::cast_slice(&variables));
 
         Ok(Self {
             bind_group: ctx.gpu_resources.bind_groups.alloc(
@@ -142,11 +189,23 @@ impl SdfTapeDrawData {
                 &ctx.gpu_resources,
                 &BindGroupDesc {
                     label: "SdfTape".into(),
-                    entries: smallvec![uniform_buffer],
+                    entries: smallvec![
+                        uniform_buffer,
+                        BindGroupEntry::Buffer {
+                            handle: tape_buffer.handle,
+                            offset: 0,
+                            size: None,
+                        },
+                        BindGroupEntry::Buffer {
+                            handle: variables_buffer.handle,
+                            offset: 0,
+                            size: None,
+                        },
+                    ],
                     layout: renderer.bind_group_layout,
                 },
             ),
-            center: config.center,
+            center: (config.bounds_min + config.bounds_max) * 0.5,
         })
     }
 }
@@ -161,19 +220,43 @@ impl Renderer for SdfTapeRenderer {
             &ctx.device,
             &BindGroupLayoutDesc {
                 label: "SdfTape::bind_group_layout".into(),
-                entries: vec![wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<
-                            gpu_data::SdfTapeUniformBuffer,
-                        >()
-                            as _),
+                entries: vec![
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<
+                                gpu_data::SdfTapeUniformBuffer,
+                            >(
+                            )
+                                as _),
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            // One bytecode word pair.
+                            min_binding_size: std::num::NonZeroU64::new(8),
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: std::num::NonZeroU64::new(4),
+                        },
+                        count: None,
+                    },
+                ],
             },
         );
 

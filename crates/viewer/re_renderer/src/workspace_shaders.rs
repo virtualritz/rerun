@@ -50,6 +50,12 @@ pub fn init() {
     }
 
     {
+        let virtpath = Path::new("shader/fidget_ops.wgsl");
+        let content = include_str!("../shader/fidget_ops.wgsl").into();
+        fs.create_file(virtpath, content).unwrap();
+    }
+
+    {
         let virtpath = Path::new("shader/gaussian_splat.wgsl");
         let content = include_str!("../shader/gaussian_splat.wgsl").into();
         fs.create_file(virtpath, content).unwrap();

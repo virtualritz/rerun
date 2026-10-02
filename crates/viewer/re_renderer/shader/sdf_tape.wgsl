@@ -1,17 +1,15 @@
 // FORK DIVERGENCE: direct SDF display pass for akatela SPEC-109.
 //
-// This is Slice A of the spec: an analytic sphere drawn by rasterizing its
-// finite proxy box, reconstructing a world-space ray per covered fragment and
-// writing the projected hit depth. The box proxy and the sphere are the test
-// fixture the depth/picking contract is pinned against; the Fidget tape
-// interpreter and its interval pre-pass arrive on top of this pass without
+// Rasterize the SDF's finite proxy box, reconstruct a world-space camera ray
+// per covered fragment, march the Fidget tape (group 1 bindings 1 and 2) with
+// a bounded linear search plus bisection, and write the projected hit depth.
+// No Lipschitz assumption: the search never advances by `|f|` (SPEC-109 R4).
+// The interval pre-pass and gradient-tape normals build on this pass without
 // changing its phase, depth or picking contract.
-//
-// The fragment only runs where the proxy box covers a pixel, so a ray outside
-// the proxy never evaluates the field.
 
 #import <./global_bindings.wgsl>
 #import <./utils/camera.wgsl>
+#import <./fidget_ops.wgsl>
 
 struct SdfTapeUniformBuffer {
     /// Proxy box minimum corner, in world space, `xyz` used.
@@ -20,14 +18,17 @@ struct SdfTapeUniformBuffer {
     /// Proxy box maximum corner, in world space, `xyz` used.
     bounds_max: vec4f,
 
-    /// Sphere centre in `xyz` and radius in `w`.
-    center_radius: vec4f,
-
     /// Placeholder flat colour until Slice D reuses the mesh matcap/AO path.
     color: vec4f,
 
     /// `(object_lo, object_hi, instance_lo, instance_hi)` for the picking layer.
     picking_layer_id: vec4u,
+
+    /// Variable indices of the `x`, `y`, `z` inputs; `0xFFFFFFFF` when absent.
+    axes: vec4u,
+
+    /// `(search_steps, bisection_steps, 0, 0)`.
+    counts: vec4u,
 }
 
 @group(1) @binding(0)
@@ -78,6 +79,76 @@ fn main_vs(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return out;
 }
 
+/// Evaluate the root tape at a world-space point. Negative is inside.
+fn field(position: vec3f) -> f32 {
+    let result = run_tape(
+        0u,
+        array<Value, 3>(build_imm(position.x), build_imm(position.y), build_imm(position.z)),
+        config.axes.xyz,
+    );
+    return result.value.v;
+}
+
+/// Normal from central differences of the root tape. Replaced by fidget's
+/// gradient tape before the pass leaves Slice A (SPEC-109 R6).
+fn field_normal(position: vec3f, distance_to_camera: f32) -> vec3f {
+    // Scale the offset with the distance so the difference is well conditioned
+    // close to the surface and does not underflow far away.
+    let h = max(1e-4, 1e-3 * distance_to_camera);
+    let dx = field(position + vec3f(h, 0.0, 0.0)) - field(position - vec3f(h, 0.0, 0.0));
+    let dy = field(position + vec3f(0.0, h, 0.0)) - field(position - vec3f(0.0, h, 0.0));
+    let dz = field(position + vec3f(0.0, 0.0, h)) - field(position - vec3f(0.0, 0.0, h));
+    return normalize(vec3f(dx, dy, dz));
+}
+
+/// Ray/box intersection: `(near, far)` along the ray, or a negative range on a
+/// miss. Rays are clipped to the validated proxy so the field is never
+/// evaluated outside it (SPEC-109 R3/R13).
+fn ray_box(ray: Ray) -> vec2f {
+    let inverse = 1.0 / ray.direction;
+    let t0 = (config.bounds_min.xyz - ray.origin) * inverse;
+    let t1 = (config.bounds_max.xyz - ray.origin) * inverse;
+    let t_min = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
+    let t_max = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
+    return vec2f(t_min, t_max);
+}
+
+/// Distance along the ray to the first field root, negative on a miss.
+fn march(ray: Ray) -> f32 {
+    let interval = ray_box(ray);
+    let t_near = max(interval.x, 0.0);
+    if interval.y <= t_near {
+        return -1.0;
+    }
+
+    let steps = max(config.counts.x, 1u);
+    let bisections = config.counts.y;
+    let step = (interval.y - t_near) / f32(steps);
+    var previous_t = t_near;
+    if field(ray.origin + ray.direction * t_near) <= 0.0 {
+        return t_near;
+    }
+
+    for (var i = 1u; i <= steps; i = i + 1u) {
+        let t = t_near + f32(i) * step;
+        if field(ray.origin + ray.direction * t) <= 0.0 {
+            var lower = previous_t;
+            var upper = t;
+            for (var j = 0u; j < bisections; j = j + 1u) {
+                let middle = 0.5 * (lower + upper);
+                if field(ray.origin + ray.direction * middle) <= 0.0 {
+                    upper = middle;
+                } else {
+                    lower = middle;
+                }
+            }
+            return 0.5 * (lower + upper);
+        }
+        previous_t = t;
+    }
+    return -1.0;
+}
+
 struct ShadedFragment {
     @location(0)
     color: vec4f,
@@ -89,14 +160,14 @@ struct ShadedFragment {
 @fragment
 fn fs_main_shaded(in: VertexOutput) -> ShadedFragment {
     let ray = camera_ray_to_world_pos(in.world_position);
-    let distance = ray_sphere_distance(ray, config.center_radius.xyz, config.center_radius.w).y;
+    let distance = march(ray);
     if distance < 0.0 {
         discard;
     }
 
     let hit = ray.origin + ray.direction * distance;
     let clip = frame.projection_from_world * vec4f(hit, 1.0);
-    let normal = normalize(hit - config.center_radius.xyz);
+    let normal = field_normal(hit, distance);
 
     var out: ShadedFragment;
     out.color = config.color * vec4f(normal * 0.5 + 0.5, 1.0);
@@ -115,7 +186,7 @@ struct PickingFragment {
 @fragment
 fn fs_main_picking(in: VertexOutput) -> PickingFragment {
     let ray = camera_ray_to_world_pos(in.world_position);
-    let distance = ray_sphere_distance(ray, config.center_radius.xyz, config.center_radius.w).y;
+    let distance = march(ray);
     if distance < 0.0 {
         discard;
     }

@@ -30,7 +30,10 @@ pub use rectangles::{
     ColorMapper, ColormappedTexture, RectangleDrawData, RectangleOptions, ShaderDecoding,
     TextureAlpha, TextureFilterMag, TextureFilterMin, TexturedRect,
 };
-pub use sdf_tape::{SdfTapeConfiguration, SdfTapeDrawData, SdfTapeRenderer};
+pub use sdf_tape::{
+    DEFAULT_BISECTION_STEPS, DEFAULT_SEARCH_STEPS, SdfTapeConfiguration, SdfTapeDrawData,
+    SdfTapeRenderer,
+};
 pub use test_triangle::TestTriangleDrawData;
 pub use voxel_grid::{
     VoxelGridDrawData, VoxelGridDrawDataError, VoxelGridInstance, VoxelGridOptions,
