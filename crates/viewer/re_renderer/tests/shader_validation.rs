@@ -236,6 +236,62 @@ fn material_uniform_layout_matches_the_rust_struct() {
     }
 }
 
+/// The SDF composite uniform's WGSL layout must match `SdfVoxelUniformBuffer`
+/// (akatela SPEC-109).
+///
+/// The Rust half is
+/// `renderer::sdf_voxel::gpu_data::tests::uniform_offsets_match_the_shader`.
+/// Both halves name the same offsets, so neither side can drift alone. A
+/// mismatch here has no validation error: the shader would read the picking id
+/// where the transform is, or a padding word where a bound is, and the SDF
+/// would silently draw in the wrong place.
+#[test]
+fn sdf_voxel_uniform_layout_matches_the_rust_struct() {
+    const EXPECTED: &[(&str, u32)] = &[
+        ("bounds_min", 0),
+        ("bounds_max", 16),
+        ("color", 32),
+        ("picking_layer_id", 48),
+        ("size", 64),
+        ("world_from_voxel", 80),
+        ("world_from_local", 144),
+        ("local_from_world", 208),
+    ];
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let shader_dir = crate_dir.join("shader");
+
+    let mut search_path = SearchPath::default();
+    search_path.push(&shader_dir);
+    let resolver = FileResolver::with_search_path(DiskFileSystem, search_path);
+
+    let shader = shader_dir.join("sdf_voxel.wgsl");
+    let interpolated = resolver
+        .populate(&shader)
+        .expect("sdf_voxel.wgsl should resolve its imports");
+    let source = &interpolated.contents;
+    let module = naga::front::wgsl::parse_str(source)
+        .unwrap_or_else(|err| panic!("sdf_voxel.wgsl should parse: {err}"));
+    let (_, ty) = module
+        .types
+        .iter()
+        .find(|(_, ty)| ty.name.as_deref() == Some("SdfVoxelUniformBuffer"))
+        .expect("sdf_voxel.wgsl should declare SdfVoxelUniformBuffer");
+    let naga::TypeInner::Struct { members, .. } = &ty.inner else {
+        panic!("SdfVoxelUniformBuffer should be a struct");
+    };
+    for (name, expected_offset) in EXPECTED {
+        let member = members
+            .iter()
+            .find(|member| member.name.as_deref() == Some(*name))
+            .unwrap_or_else(|| panic!("SdfVoxelUniformBuffer should have `{name}`"));
+        assert_eq!(
+            member.offset, *expected_offset,
+            "`{name}` sits at WGSL offset {} but Rust writes it at {expected_offset}",
+            member.offset,
+        );
+    }
+}
+
 /// The occlusion uniform's WGSL layout must match `OcclusionUniformBuffer`
 /// (akatela SPEC-123).
 ///

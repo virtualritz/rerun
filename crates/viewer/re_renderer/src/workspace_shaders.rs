@@ -200,6 +200,12 @@ pub fn init() {
     }
 
     {
+        let virtpath = Path::new("shader/sdf_voxel.wgsl");
+        let content = include_str!("../shader/sdf_voxel.wgsl").into();
+        fs.create_file(virtpath, content).unwrap();
+    }
+
+    {
         let virtpath = Path::new("shader/test_triangle.wgsl");
         let content = include_str!("../shader/test_triangle.wgsl").into();
         fs.create_file(virtpath, content).unwrap();
