@@ -30,7 +30,9 @@ pub use rectangles::{
     ColorMapper, ColormappedTexture, RectangleDrawData, RectangleOptions, ShaderDecoding,
     TextureAlpha, TextureFilterMag, TextureFilterMin, TexturedRect,
 };
-pub use sdf_voxel::{SdfVoxelConfiguration, SdfVoxelDrawData, SdfVoxelRenderer};
+pub use sdf_voxel::{
+    SdfVoxelConfiguration, SdfVoxelDrawData, SdfVoxelMaterial, SdfVoxelRenderer, SdfVoxelShading,
+};
 pub use test_triangle::TestTriangleDrawData;
 pub use voxel_grid::{
     VoxelGridDrawData, VoxelGridDrawDataError, VoxelGridInstance, VoxelGridOptions,
