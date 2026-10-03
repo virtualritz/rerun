@@ -20,7 +20,9 @@ use glam::{Mat4, Vec3};
 use smallvec::smallvec;
 
 use super::{DrawData, DrawError, RenderContext, Renderer};
-use crate::draw_phases::{DrawPhase, OutlineMaskProcessor, PickingLayerProcessor};
+use crate::draw_phases::{
+    DrawPhase, OcclusionProcessor, OutlineMaskProcessor, PickingLayerProcessor,
+};
 use crate::resource_managers::GpuTexture2D;
 use crate::renderer::{DrawDataDrawable, DrawInstruction, DrawableCollectionViewInfo};
 use crate::wgpu_resources::{
@@ -184,6 +186,7 @@ mod gpu_data {
 /// The SDF composite pass's pipelines and bind group layout.
 pub struct SdfVoxelRenderer {
     shaded_pipeline: GpuRenderPipelineHandle,
+    occlusion_prepass_pipeline: GpuRenderPipelineHandle,
     outline_mask_pipeline: GpuRenderPipelineHandle,
     picking_pipeline: GpuRenderPipelineHandle,
     bind_group_layout: GpuBindGroupLayoutHandle,
@@ -218,6 +221,10 @@ impl DrawData for SdfVoxelDrawData {
     ) {
         collector.add_drawable(
             DrawPhase::Opaque,
+            DrawDataDrawable::from_world_position(view_info, self.center.into(), 0),
+        );
+        collector.add_drawable(
+            DrawPhase::OcclusionPrepass,
             DrawDataDrawable::from_world_position(view_info, self.center.into(), 0),
         );
         if self.outline_mask_ids.is_some() {
@@ -457,6 +464,26 @@ impl Renderer for SdfVoxelRenderer {
             },
         );
 
+        // The occlusion prepass (akatela SPEC-123): the SDF writes its own
+        // view-space normal, so it receives the same ambient occlusion the
+        // mesh viewport computes (SPEC-109 D16).
+        let occlusion_prepass_pipeline = ctx.gpu_resources.render_pipelines.get_or_create(
+            ctx,
+            &RenderPipelineDesc {
+                label: "SdfVoxel::occlusion_prepass".into(),
+                pipeline_layout,
+                vertex_entrypoint: "main_vs".into(),
+                vertex_handle: shader_module,
+                fragment_entrypoint: "fs_main_occlusion_prepass".into(),
+                fragment_handle: shader_module,
+                vertex_buffers: smallvec![],
+                render_targets: smallvec![Some(OcclusionProcessor::NORMAL_FORMAT.into())],
+                primitive,
+                depth_stencil: Some(ViewBuilder::MAIN_TARGET_DEFAULT_DEPTH_STATE),
+                multisample: wgpu::MultisampleState::default(),
+            },
+        );
+
         let outline_mask_pipeline = ctx.gpu_resources.render_pipelines.get_or_create(
             ctx,
             &RenderPipelineDesc {
@@ -493,6 +520,7 @@ impl Renderer for SdfVoxelRenderer {
 
         Self {
             shaded_pipeline,
+            occlusion_prepass_pipeline,
             outline_mask_pipeline,
             picking_pipeline,
             bind_group_layout,
@@ -507,6 +535,7 @@ impl Renderer for SdfVoxelRenderer {
         draw_instructions: &[DrawInstruction<'_, Self::RendererDrawData>],
     ) -> Result<(), DrawError> {
         let pipeline = match phase {
+            DrawPhase::OcclusionPrepass => self.occlusion_prepass_pipeline,
             DrawPhase::OutlineMask => self.outline_mask_pipeline,
             DrawPhase::PickingLayer => self.picking_pipeline,
             _ => self.shaded_pipeline,

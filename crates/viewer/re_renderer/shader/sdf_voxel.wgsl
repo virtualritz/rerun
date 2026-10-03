@@ -226,6 +226,36 @@ fn fs_main_shaded(@builtin(position) position: vec4f) -> ShadedFragment {
     return out;
 }
 
+struct OcclusionPrepassFragment {
+    @location(0)
+    normal: vec4f,
+
+    @builtin(frag_depth)
+    depth: f32,
+}
+
+/// Write the SDF's view-space normal into the view's occlusion prepass,
+/// exactly as the mesh shader does, so the SDF receives the same ambient
+/// occlusion and bent normal it would as a mesh (SPEC-109 D16).
+@fragment
+fn fs_main_occlusion_prepass(@builtin(position) position: vec4f) -> OcclusionPrepassFragment {
+    let hit = surface_hit(position);
+    if (!hit.found) {
+        discard;
+    }
+
+    let clip = frame.projection_from_world * vec4f(hit.world_position, 1.0);
+    let position_view = frame.view_from_world * vec4f(hit.world_position, 1.0);
+
+    var out: OcclusionPrepassFragment;
+    out.normal = vec4f(
+        facing_view_normal(hit.world_normal, position_view) * 0.5 + 0.5,
+        1.0,
+    );
+    out.depth = clamp(clip.z / clip.w, 0.0, 1.0);
+    return out;
+}
+
 struct OutlineMaskFragment {
     @location(0)
     outline_mask_ids: vec2u,
