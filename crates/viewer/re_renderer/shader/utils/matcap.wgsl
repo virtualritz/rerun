@@ -11,8 +11,8 @@
 // shader cannot drift apart; the Rust twin is
 // `gpu_data::MaterialUniformBuffer` in `mesh.rs`.
 
-#import <./global_bindings.wgsl>
-#import <./types.wgsl>
+#import <../global_bindings.wgsl>
+#import <../types.wgsl>
 
 // Keep in sync with `gpu_data::MaterialUniformBuffer` in mesh.rs.
 //
