@@ -145,7 +145,9 @@ mod gpu_data {
         pub use_matcap: [u32; 4],
         /// Roughness of the specular lobe; `.x` used.
         pub specular_roughness: [f32; 4],
-        pub end_padding: [wgpu_buffer_types::PaddingRow; 11],
+        /// Inverse of `world_from_voxel`, for the gradient transform.
+        pub voxel_from_world: [f32; 16],
+        pub end_padding: [wgpu_buffer_types::PaddingRow; 7],
     }
 
     #[cfg(test)]
@@ -174,6 +176,7 @@ mod gpu_data {
             assert_eq!(offset_of!(SdfVoxelUniformBuffer, albedo_factor), 288);
             assert_eq!(offset_of!(SdfVoxelUniformBuffer, use_matcap), 304);
             assert_eq!(offset_of!(SdfVoxelUniformBuffer, specular_roughness), 320);
+            assert_eq!(offset_of!(SdfVoxelUniformBuffer, voxel_from_world), 336);
             assert_eq!(
                 size_of::<SdfVoxelUniformBuffer>(),
                 512,
@@ -312,6 +315,10 @@ impl SdfVoxelDrawData {
                     0.0,
                     0.0,
                 ],
+                // Fidget's gradient is with respect to VOXEL coordinates and
+                // the voxel-to-world map is projective, so the fragment needs
+                // the inverse map's Jacobian at the hit (see the shader).
+                voxel_from_world: config.world_from_voxel.inverse().to_cols_array(),
                 end_padding: Default::default(),
             }),
         );
