@@ -149,6 +149,10 @@ pub struct SdfVoxelDrawData {
     _geometry_buffer: wgpu::Buffer,
     /// World-space centre, for the `Opaque` distance sort key.
     center: Vec3,
+    /// Whether this draw takes part in the `OutlineMask` pass at all -- the
+    /// same rule the mesh renderer uses, so an unselected SDF costs no extra
+    /// pass.
+    outline_mask_ids: OutlineMaskPreference,
 }
 
 impl DrawData for SdfVoxelDrawData {
@@ -163,10 +167,12 @@ impl DrawData for SdfVoxelDrawData {
             DrawPhase::Opaque,
             DrawDataDrawable::from_world_position(view_info, self.center.into(), 0),
         );
-        collector.add_drawable(
-            DrawPhase::OutlineMask,
-            DrawDataDrawable::from_world_position(view_info, self.center.into(), 0),
-        );
+        if self.outline_mask_ids.is_some() {
+            collector.add_drawable(
+                DrawPhase::OutlineMask,
+                DrawDataDrawable::from_world_position(view_info, self.center.into(), 0),
+            );
+        }
         collector.add_drawable(
             DrawPhase::PickingLayer,
             DrawDataDrawable::from_world_position(view_info, self.center.into(), 0),
@@ -262,6 +268,7 @@ impl SdfVoxelDrawData {
             center: config
                 .world_from_local
                 .transform_point3((config.bounds_min + config.bounds_max) * 0.5),
+            outline_mask_ids: config.outline_mask_ids,
         })
     }
 }
