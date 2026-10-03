@@ -62,11 +62,6 @@ struct SdfVoxelUniformBuffer {
 
     /// Roughness of the specular lobe; `.x` used.
     specular_roughness: vec4f,
-
-    /// Inverse of `world_from_voxel`. Fidget's gradient is with respect to
-    /// voxel coordinates, so the world normal is its transform by this map's
-    /// Jacobian at the hit (see [`surface_hit`]).
-    voxel_from_world: mat4x4<f32>,
 }
 
 @group(1) @binding(0)
@@ -179,41 +174,52 @@ fn surface_hit(framebuffer_position: vec4f) -> Hit {
 
     // Fidget's `GeometryPixel.normal` is the tape gradient with respect to
     // VOXEL coordinates -- its normals pass seeds the derivative bases in
-    // `(px, py, depth)` -- and the voxel-to-world map is projective. A
-    // gradient transforms by the inverse map's Jacobian:
-    // `g_world = J_(world->voxel)^T g_voxel`. Applying the affine
-    // `transpose(local_from_world)` instead treats the gradient as if it were
-    // in the SDF's local space, which rotates and stretches it.
-    let voxel_h = config.voxel_from_world * vec4f(world_position, 1.0);
-    let voxel_at_hit = voxel_h.xyz / voxel_h.w;
-    let world_normal = normalize(
-        inverse_jacobian_row(
-            config.voxel_from_world, voxel_at_hit, voxel_h.w, 0u,
-        ) * pixel.normal.x
-        + inverse_jacobian_row(
-            config.voxel_from_world, voxel_at_hit, voxel_h.w, 1u,
-        ) * pixel.normal.y
-        + inverse_jacobian_row(
-            config.voxel_from_world, voxel_at_hit, voxel_h.w, 2u,
-        ) * pixel.normal.z,
-    );
+    // `(px, py, depth)` -- and `world_from_voxel` maps those projectively. A
+    // gradient transforms by the inverse transpose of the point map's
+    // Jacobian at the hit: `g_world = J^-T g_voxel`.
+    //
+    // `J` is built and inverted HERE, from the forward map. Inverting the
+    // homogeneous matrix itself is not an option: a perspective placement
+    // makes its determinant ~1e-14, so an f32 inverse is noise and the
+    // normals swing as the camera orbits.
+    let homogeneous = config.world_from_voxel * voxel;
+    let world_normal = normalize(inverse_transpose_jacobian(
+        forward_jacobian_column(config.world_from_voxel, homogeneous, 0u),
+        forward_jacobian_column(config.world_from_voxel, homogeneous, 1u),
+        forward_jacobian_column(config.world_from_voxel, homogeneous, 2u),
+        pixel.normal,
+    ));
     return Hit(world_position, world_normal, true);
 }
 
-/// Row `j` of the Jacobian of the projective `voxel_from_world` map at
-/// `voxel`, whose homogeneous image was `voxel_h`.
+/// Column `j` of the Jacobian of the projective `world_from_voxel` map at the
+/// voxel whose homogeneous image is `homogeneous`.
 ///
-/// The map is `v(P) = (N (P, 1)).xyz / (N (P, 1)).w`, so the derivative is
-/// `(N[i][j] * w - v_i * N[3][j]) / w^2`, factored here over the columns of
-/// `N`.
-fn inverse_jacobian_row(
-    inverse_map: mat4x4<f32>,
-    voxel: vec3f,
-    voxel_w: f32,
+/// The map is `P(v) = (M (v, 1)).xyz / (M (v, 1)).w`, so the derivative is
+/// `(M[i][j] * w - P_i * M[3][j]) / w^2`, factored over the columns of `M`.
+fn forward_jacobian_column(
+    world_from_voxel: mat4x4<f32>,
+    homogeneous: vec4f,
     column: u32,
 ) -> vec3f {
-    let axis = inverse_map[column];
-    return (axis.xyz - voxel * axis.w) / voxel_w;
+    let axis = world_from_voxel[column];
+    return (axis.xyz * homogeneous.w - homogeneous.xyz * axis.w)
+        / (homogeneous.w * homogeneous.w);
+}
+
+/// `J^-T g` for a 3x3 Jacobian given by its columns, through the cofactor
+/// rows. `det J` is the triple product, so this needs no matrix inverse.
+fn inverse_transpose_jacobian(
+    j0: vec3f,
+    j1: vec3f,
+    j2: vec3f,
+    g: vec3f,
+) -> vec3f {
+    let r0 = cross(j1, j2);
+    let r1 = cross(j2, j0);
+    let r2 = cross(j0, j1);
+    let determinant = dot(j0, r0);
+    return vec3f(dot(r0, g), dot(r1, g), dot(r2, g)) / determinant;
 }
 
 struct ShadedFragment {
