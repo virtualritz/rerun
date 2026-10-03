@@ -17,6 +17,7 @@
 // the validated bounds.
 
 #import <./global_bindings.wgsl>
+#import <./utils/matcap.wgsl>
 
 struct SdfVoxelUniformBuffer {
     /// Proxy box minimum corner, in the SDF's local space; `xyz` used.
@@ -52,6 +53,15 @@ struct SdfVoxelUniformBuffer {
     /// Channel 0 is the "no outline" background, so an unselected SDF leaves
     /// the shared outline pass exactly as a mesh with no outline mask does.
     outline_mask_ids: vec4u,
+
+    /// Albedo tint for the matcap path; only `rgb` is used.
+    albedo_factor: vec4f,
+
+    /// `1` = matcap shading, `0` = the normal-debug tint; `.x` used.
+    use_matcap: vec4u,
+
+    /// Roughness of the specular lobe; `.x` used.
+    specular_roughness: vec4f,
 }
 
 @group(1) @binding(0)
@@ -65,6 +75,14 @@ struct GeometryPixel {
 /// Fidget's `GeometryPixel` output, one entry per pixel, row-major.
 @group(1) @binding(1)
 var<storage, read> geometry: array<GeometryPixel>;
+
+/// Diffuse matcap lobe, or a 1x1 white texture when there is none.
+@group(1) @binding(2)
+var albedo_texture: texture_2d<f32>;
+
+/// The ADDED specular matcap lobe; 1x1 black when there is none.
+@group(1) @binding(3)
+var specular_matcap_texture: texture_2d<f32>;
 
 // Corner index bits: bit 0 = x, bit 1 = y, bit 2 = z.
 fn corner(index: u32) -> vec3f {
@@ -180,9 +198,30 @@ fn fs_main_shaded(@builtin(position) position: vec4f) -> ShadedFragment {
     let clip = frame.projection_from_world * vec4f(hit.world_position, 1.0);
 
     var out: ShadedFragment;
-    // Placeholder shading: the normal tint makes warped depth and transforms
-    // visible until SPEC-109 T014 reuses the mesh matcap/AO path.
-    out.color = config.color * vec4f(hit.world_normal * 0.5 + 0.5, 1.0);
+    if (config.use_matcap.x != 0u) {
+        // The mesh viewport's captured-material path. Ambient occlusion and
+        // the bent normal come from the view's own occlusion outputs, so the
+        // SDF matches a mesh with the same material and view exactly.
+        let position_view =
+            frame.view_from_world * vec4f(hit.world_position, 1.0);
+        out.color = shade_matcap_lobes(
+            albedo_texture,
+            specular_matcap_texture,
+            trilinear_sampler_repeat,
+            config.albedo_factor,
+            config.specular_roughness.x,
+            hit.world_normal,
+            position_view,
+            vec4f(0.0, 0.0, 0.0, 1.0),
+            occlusion_at(position),
+            bent_normal_at(position),
+        );
+    } else {
+        // Debug mode: the normal tint that makes warped depth and transforms
+        // visible. Selected by the app's explicit shading choice, never the
+        // default (SPEC-109 R6).
+        out.color = config.color * vec4f(hit.world_normal * 0.5 + 0.5, 1.0);
+    }
     out.depth = clamp(clip.z / clip.w, 0.0, 1.0);
     return out;
 }

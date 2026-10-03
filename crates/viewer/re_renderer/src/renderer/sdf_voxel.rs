@@ -21,6 +21,7 @@ use smallvec::smallvec;
 
 use super::{DrawData, DrawError, RenderContext, Renderer};
 use crate::draw_phases::{DrawPhase, OutlineMaskProcessor, PickingLayerProcessor};
+use crate::resource_managers::GpuTexture2D;
 use crate::renderer::{DrawDataDrawable, DrawInstruction, DrawableCollectionViewInfo};
 use crate::wgpu_resources::{
     BindGroupLayoutDesc, BufferDesc, GpuBindGroupLayoutHandle, GpuBuffer, GpuRenderPipelineHandle,
@@ -70,6 +71,49 @@ pub struct SdfVoxelConfiguration<'a> {
     /// [`OutlineMaskPreference::NONE`] writes channel 0 on both channels, the
     /// "no outline" background.
     pub outline_mask_ids: OutlineMaskPreference,
+
+    /// Which shading path the `Opaque` pass takes.
+    pub shading: SdfVoxelShading,
+
+    /// Captured-material inputs for [`SdfVoxelShading::Matcap`], the same
+    /// values the mesh viewport binds for a mesh (SPEC-109 T014).
+    pub material: SdfVoxelMaterial<'a>,
+}
+
+/// The SDF composite's shading path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SdfVoxelShading {
+    /// The mesh viewport's captured-material matcap with ambient occlusion
+    /// and roughness-aware specular occlusion. The default.
+    #[default]
+    Matcap,
+
+    /// The normal tint that made warped depth and transforms visible before
+    /// the matcap path landed. Debug-only, behind the app's shading choice
+    /// (SPEC-109 T014).
+    Normal,
+}
+
+/// The captured-material inputs the matcap path shades with.
+///
+/// Mirrors the mesh viewport's `Material` for the parts a single SDF draw
+/// uses: the diffuse and specular matcap lobes, the albedo tint and the
+/// roughness that drives specular occlusion. Ambient occlusion and the bent
+/// normal come from the view's occlusion outputs, exactly as for meshes, so
+/// they are not fields here.
+pub struct SdfVoxelMaterial<'a> {
+    /// Diffuse matcap lobe, or a 1x1 white texture when there is none.
+    pub albedo: &'a GpuTexture2D,
+
+    /// The ADDED specular matcap lobe; the mesh path's 1x1 black texture when
+    /// the matcap carries no specular group.
+    pub matcap_specular: &'a GpuTexture2D,
+
+    /// Albedo tint, including the object's display tint.
+    pub albedo_factor: Rgba,
+
+    /// Roughness of the specular lobe, in `[0, 1]`.
+    pub specular_roughness: f32,
 }
 
 mod gpu_data {
@@ -93,7 +137,13 @@ mod gpu_data {
         pub local_from_world: [f32; 16],
         /// Outline mask channels A/B; `0` on a channel writes no outline.
         pub outline_mask_ids: [u32; 4],
-        pub end_padding: [wgpu_buffer_types::PaddingRow; 14],
+        /// Albedo tint for the matcap path; only `rgb` is used.
+        pub albedo_factor: [f32; 4],
+        /// `1` = matcap shading, `0` = the normal-debug tint; `.x` used.
+        pub use_matcap: [u32; 4],
+        /// Roughness of the specular lobe; `.x` used.
+        pub specular_roughness: [f32; 4],
+        pub end_padding: [wgpu_buffer_types::PaddingRow; 11],
     }
 
     #[cfg(test)]
@@ -119,6 +169,9 @@ mod gpu_data {
             assert_eq!(offset_of!(SdfVoxelUniformBuffer, world_from_local), 144);
             assert_eq!(offset_of!(SdfVoxelUniformBuffer, local_from_world), 208);
             assert_eq!(offset_of!(SdfVoxelUniformBuffer, outline_mask_ids), 272);
+            assert_eq!(offset_of!(SdfVoxelUniformBuffer, albedo_factor), 288);
+            assert_eq!(offset_of!(SdfVoxelUniformBuffer, use_matcap), 304);
+            assert_eq!(offset_of!(SdfVoxelUniformBuffer, specular_roughness), 320);
             assert_eq!(
                 size_of::<SdfVoxelUniformBuffer>(),
                 512,
@@ -236,6 +289,22 @@ impl SdfVoxelDrawData {
                     let [a, b] = config.outline_mask_ids.0.unwrap_or([0, 0]);
                     [a as u32, b as u32, 0, 0]
                 },
+                albedo_factor: {
+                    let factor = config.material.albedo_factor;
+                    [factor.r(), factor.g(), factor.b(), factor.a()]
+                },
+                use_matcap: [
+                    u32::from(config.shading == SdfVoxelShading::Matcap),
+                    0,
+                    0,
+                    0,
+                ],
+                specular_roughness: [
+                    config.material.specular_roughness.clamp(0.0, 1.0),
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
                 end_padding: Default::default(),
             }),
         );
@@ -254,6 +323,18 @@ impl SdfVoxelDrawData {
                     wgpu::BindGroupEntry {
                         binding: 1,
                         resource: config.geometry.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(
+                            &config.material.albedo.as_ref().default_view,
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(
+                            &config.material.matcap_specular.as_ref().default_view,
+                        ),
                     },
                 ],
             })
@@ -306,6 +387,26 @@ impl Renderer for SdfVoxelRenderer {
                             has_dynamic_offset: false,
                             // One `GeometryPixel`.
                             min_binding_size: std::num::NonZeroU64::new(16),
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
                         },
                         count: None,
                     },
