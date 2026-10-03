@@ -20,13 +20,16 @@ use glam::{Mat4, Vec3};
 use smallvec::smallvec;
 
 use super::{DrawData, DrawError, RenderContext, Renderer};
-use crate::draw_phases::{DrawPhase, PickingLayerProcessor};
+use crate::draw_phases::{DrawPhase, OutlineMaskProcessor, PickingLayerProcessor};
 use crate::renderer::{DrawDataDrawable, DrawInstruction, DrawableCollectionViewInfo};
 use crate::wgpu_resources::{
     BindGroupLayoutDesc, BufferDesc, GpuBindGroupLayoutHandle, GpuBuffer, GpuRenderPipelineHandle,
     GpuRenderPipelinePoolAccessor, PipelineLayoutDesc, RenderPipelineDesc,
 };
-use crate::{DrawableCollector, PickingLayerId, Rgba, ViewBuilder, include_shader_module};
+use crate::{
+    DrawableCollector, OutlineMaskPreference, PickingLayerId, Rgba, ViewBuilder,
+    include_shader_module,
+};
 
 /// One SDF composite draw: where Fidget's voxel result lives, and how to place
 /// it in the scene.
@@ -61,6 +64,12 @@ pub struct SdfVoxelConfiguration<'a> {
 
     /// Picking id written into the `PickingLayer` pass.
     pub picking_layer_id: PickingLayerId,
+
+    /// Outline mask written into the `OutlineMask` pass, so a hovered or
+    /// selected SDF outlines through the same pass as meshes (SPEC-109 T013).
+    /// [`OutlineMaskPreference::NONE`] writes channel 0 on both channels, the
+    /// "no outline" background.
+    pub outline_mask_ids: OutlineMaskPreference,
 }
 
 mod gpu_data {
@@ -82,7 +91,9 @@ mod gpu_data {
         pub world_from_voxel: [f32; 16],
         pub world_from_local: [f32; 16],
         pub local_from_world: [f32; 16],
-        pub end_padding: [wgpu_buffer_types::PaddingRow; 15],
+        /// Outline mask channels A/B; `0` on a channel writes no outline.
+        pub outline_mask_ids: [u32; 4],
+        pub end_padding: [wgpu_buffer_types::PaddingRow; 14],
     }
 
     #[cfg(test)]
@@ -107,6 +118,7 @@ mod gpu_data {
             assert_eq!(offset_of!(SdfVoxelUniformBuffer, world_from_voxel), 80);
             assert_eq!(offset_of!(SdfVoxelUniformBuffer, world_from_local), 144);
             assert_eq!(offset_of!(SdfVoxelUniformBuffer, local_from_world), 208);
+            assert_eq!(offset_of!(SdfVoxelUniformBuffer, outline_mask_ids), 272);
             assert_eq!(
                 size_of::<SdfVoxelUniformBuffer>(),
                 512,
@@ -119,6 +131,7 @@ mod gpu_data {
 /// The SDF composite pass's pipelines and bind group layout.
 pub struct SdfVoxelRenderer {
     shaded_pipeline: GpuRenderPipelineHandle,
+    outline_mask_pipeline: GpuRenderPipelineHandle,
     picking_pipeline: GpuRenderPipelineHandle,
     bind_group_layout: GpuBindGroupLayoutHandle,
 }
@@ -148,6 +161,10 @@ impl DrawData for SdfVoxelDrawData {
     ) {
         collector.add_drawable(
             DrawPhase::Opaque,
+            DrawDataDrawable::from_world_position(view_info, self.center.into(), 0),
+        );
+        collector.add_drawable(
+            DrawPhase::OutlineMask,
             DrawDataDrawable::from_world_position(view_info, self.center.into(), 0),
         );
         collector.add_drawable(
@@ -209,6 +226,10 @@ impl SdfVoxelDrawData {
                 world_from_voxel: config.world_from_voxel.to_cols_array(),
                 world_from_local: config.world_from_local.to_cols_array(),
                 local_from_world: config.world_from_local.inverse().to_cols_array(),
+                outline_mask_ids: {
+                    let [a, b] = config.outline_mask_ids.0.unwrap_or([0, 0]);
+                    [a as u32, b as u32, 0, 0]
+                },
                 end_padding: Default::default(),
             }),
         );
@@ -328,6 +349,23 @@ impl Renderer for SdfVoxelRenderer {
             },
         );
 
+        let outline_mask_pipeline = ctx.gpu_resources.render_pipelines.get_or_create(
+            ctx,
+            &RenderPipelineDesc {
+                label: "SdfVoxel::outline_mask".into(),
+                pipeline_layout,
+                vertex_entrypoint: "main_vs".into(),
+                vertex_handle: shader_module,
+                fragment_entrypoint: "fs_main_outline_mask".into(),
+                fragment_handle: shader_module,
+                vertex_buffers: smallvec![],
+                render_targets: smallvec![Some(OutlineMaskProcessor::MASK_FORMAT.into())],
+                primitive,
+                depth_stencil: OutlineMaskProcessor::MASK_DEPTH_STATE,
+                multisample: OutlineMaskProcessor::mask_default_msaa_state(ctx.device_caps().tier),
+            },
+        );
+
         let picking_pipeline = ctx.gpu_resources.render_pipelines.get_or_create(
             ctx,
             &RenderPipelineDesc {
@@ -347,6 +385,7 @@ impl Renderer for SdfVoxelRenderer {
 
         Self {
             shaded_pipeline,
+            outline_mask_pipeline,
             picking_pipeline,
             bind_group_layout,
         }
@@ -360,6 +399,7 @@ impl Renderer for SdfVoxelRenderer {
         draw_instructions: &[DrawInstruction<'_, Self::RendererDrawData>],
     ) -> Result<(), DrawError> {
         let pipeline = match phase {
+            DrawPhase::OutlineMask => self.outline_mask_pipeline,
             DrawPhase::PickingLayer => self.picking_pipeline,
             _ => self.shaded_pipeline,
         };

@@ -47,6 +47,11 @@ struct SdfVoxelUniformBuffer {
     /// Inverse of `world_from_local`. The field gradient is a covector, so the
     /// world normal uses its transpose.
     local_from_world: mat4x4<f32>,
+
+    /// Outline mask channels A/B for the `OutlineMask` pass; `xy` used.
+    /// Channel 0 is the "no outline" background, so an unselected SDF leaves
+    /// the shared outline pass exactly as a mesh with no outline mask does.
+    outline_mask_ids: vec4u,
 }
 
 @group(1) @binding(0)
@@ -178,6 +183,31 @@ fn fs_main_shaded(@builtin(position) position: vec4f) -> ShadedFragment {
     // Placeholder shading: the normal tint makes warped depth and transforms
     // visible until SPEC-109 T014 reuses the mesh matcap/AO path.
     out.color = config.color * vec4f(hit.world_normal * 0.5 + 0.5, 1.0);
+    out.depth = clamp(clip.z / clip.w, 0.0, 1.0);
+    return out;
+}
+
+struct OutlineMaskFragment {
+    @location(0)
+    outline_mask_ids: vec2u,
+
+    @builtin(frag_depth)
+    depth: f32,
+}
+
+/// Write the SDF silhouette into the shared outline mask, so selection and
+/// hover outlines come from the same pass as the mesh ones.
+@fragment
+fn fs_main_outline_mask(@builtin(position) position: vec4f) -> OutlineMaskFragment {
+    let hit = surface_hit(position);
+    if (!hit.found) {
+        discard;
+    }
+
+    let clip = frame.projection_from_world * vec4f(hit.world_position, 1.0);
+
+    var out: OutlineMaskFragment;
+    out.outline_mask_ids = config.outline_mask_ids.xy;
     out.depth = clamp(clip.z / clip.w, 0.0, 1.0);
     return out;
 }

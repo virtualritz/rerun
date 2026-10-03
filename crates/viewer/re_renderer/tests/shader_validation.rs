@@ -256,6 +256,7 @@ fn sdf_voxel_uniform_layout_matches_the_rust_struct() {
         ("world_from_voxel", 80),
         ("world_from_local", 144),
         ("local_from_world", 208),
+        ("outline_mask_ids", 272),
     ];
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let shader_dir = crate_dir.join("shader");
