@@ -172,44 +172,21 @@ fn surface_hit(framebuffer_position: vec4f) -> Hit {
         return Hit(vec3f(0.0), vec3f(0.0, 0.0, 1.0), false);
     }
 
-    // The primary normal differentiates the surface this pass actually
-    // draws: the depth field and `world_from_voxel` both agree with the
-    // rendered hit, so the neighbour normals cannot inherit Fidget's
-    // gradient-space mismatch (SPEC-109 D4).
-    //
-    // Fidget's `GeometryPixel.normal` remains the fallback. It is the tape
-    // gradient with respect to VOXEL coordinates -- its normals pass seeds
-    // the derivative bases in `(px, py, depth)` -- and `world_from_voxel`
-    // maps those projectively. A gradient transforms by the inverse
-    // transpose of the point map's Jacobian at the hit: `g_world = J^-T
-    // g_voxel`. `J` is built and inverted HERE, from the forward map.
-    // Inverting the homogeneous matrix itself is not an option: a
-    // perspective placement makes its determinant ~1e-14, so an f32 inverse
-    // is noise and the normals swing as the camera orbits.
+    // Fidget's `GeometryPixel.normal` is the tape gradient with respect to
+    // VOXEL coordinates -- its normals pass seeds the derivative bases in
+    // `(px, py, depth)` -- and `world_from_voxel` maps those projectively. A
+    // gradient (covector) transforms by the inverse transpose of the point
+    // map's Jacobian at the hit: `g_world = J^-T g_voxel`. `J` is built and
+    // inverted HERE, from the forward map. Inverting the homogeneous matrix
+    // itself is not an option: a perspective placement makes its determinant
+    // ~1e-14, so an f32 inverse is noise.
     let homogeneous = config.world_from_voxel * voxel;
-    let jacobian_x =
-        forward_jacobian_column(config.world_from_voxel, homogeneous, 0u);
-    let jacobian_y =
-        forward_jacobian_column(config.world_from_voxel, homogeneous, 1u);
-    let jacobian_depth =
-        forward_jacobian_column(config.world_from_voxel, homogeneous, 2u);
-    var world_normal = normalize(inverse_transpose_jacobian(
-        jacobian_x,
-        jacobian_y,
-        jacobian_depth,
+    let world_normal = normalize(inverse_transpose_jacobian(
+        forward_jacobian_column(config.world_from_voxel, homogeneous, 0u),
+        forward_jacobian_column(config.world_from_voxel, homogeneous, 1u),
+        forward_jacobian_column(config.world_from_voxel, homogeneous, 2u),
         pixel.normal,
     ));
-
-    // One voxel step in world space at this hit, for the depth-jump guard.
-    // The constant-depth columns give the local grid scale, so a neighbour
-    // that lands on a different surface (across a silhouette) is rejected
-    // rather than folded into the normal.
-    let voxel_step = max(length(jacobian_x), length(jacobian_y));
-    let from_depth =
-        depth_world_normal(px, py, world_position, voxel_step);
-    if (from_depth.usable) {
-        world_normal = from_depth.normal;
-    }
 
     // The normal-debug mode and the occlusion prepass both want the normal
     // turned toward the eye, exactly as the mesh path's
@@ -238,8 +215,14 @@ fn forward_jacobian_column(
         / (homogeneous.w * homogeneous.w);
 }
 
-/// `J^-T g` for a 3x3 Jacobian given by its columns, through the cofactor
-/// rows. `det J` is the triple product, so this needs no matrix inverse.
+/// `J^-T g` for a 3x3 Jacobian given by its columns.
+///
+/// The cofactor matrix `C` has columns `cross(j1, j2)`, `cross(j2, j0)` and
+/// `cross(j0, j1)`, and `J^-T = C / det J`; `det J` is the triple product, so
+/// this needs no matrix inverse. `C g` is the column combination below -- NOT
+/// `(dot(r0, g), dot(r1, g), dot(r2, g))`, which is `J^-1 g`. The two agree
+/// only when `J` is orthogonal, which is why an axis-aligned camera hid the
+/// difference and a camera orbit did not.
 fn inverse_transpose_jacobian(
     j0: vec3f,
     j1: vec3f,
@@ -250,101 +233,7 @@ fn inverse_transpose_jacobian(
     let r1 = cross(j2, j0);
     let r2 = cross(j0, j1);
     let determinant = dot(j0, r0);
-    return vec3f(dot(r0, g), dot(r1, g), dot(r2, g)) / determinant;
-}
-
-/// A Fidget grid sample reconstructed to world space, when it is a hit.
-struct NeighbourSample {
-    world_position: vec3f,
-    hit: bool,
-}
-
-/// The world position of the Fidget sample at grid `(px, py)`; `hit` is false
-/// when the sample is outside the grid or the field misses there.
-fn neighbour_sample(px: i32, py: i32) -> NeighbourSample {
-    let size = vec2i(config.size.xy);
-    if (px < 0 || py < 0 || px >= size.x || py >= size.y) {
-        return NeighbourSample(vec3f(0.0), false);
-    }
-    let pixel = geometry[u32(px) + u32(py) * config.size.x];
-    if (pixel.depth == 0u) {
-        return NeighbourSample(vec3f(0.0), false);
-    }
-    let homogeneous =
-        config.world_from_voxel * vec4f(f32(px), f32(py), f32(pixel.depth), 1.0);
-    return NeighbourSample(homogeneous.xyz / homogeneous.w, true);
-}
-
-/// A world normal reconstructed from the depth field, with a `usable` flag.
-struct DepthNormal {
-    normal: vec3f,
-    usable: bool,
-}
-
-/// `cross(dP/dpx, dP/dpy)` from the depth field around the hit.
-///
-/// A neighbour is dropped when it misses, falls outside the grid, or lands
-/// farther than `gap` from the centre (a different surface, e.g. across a
-/// silhouette). Each tangent then uses the central difference when both of
-/// its neighbours survive, a one-sided difference when only one does, and no
-/// tangent otherwise; `usable` is false when either tangent is missing and
-/// the caller keeps Fidget's gradient for that pixel.
-fn depth_world_normal(
-    px: u32,
-    py: u32,
-    center_world: vec3f,
-    voxel_step: f32,
-) -> DepthNormal {
-    let ix = i32(px);
-    let iy = i32(py);
-    let before_x = neighbour_sample(ix - 1, iy);
-    let after_x = neighbour_sample(ix + 1, iy);
-    let before_y = neighbour_sample(ix, iy - 1);
-    let after_y = neighbour_sample(ix, iy + 1);
-
-    let gap = 4.0 * voxel_step;
-    let before_x_ok =
-        before_x.hit && distance(before_x.world_position, center_world) <= gap;
-    let after_x_ok =
-        after_x.hit && distance(after_x.world_position, center_world) <= gap;
-    let before_y_ok =
-        before_y.hit && distance(before_y.world_position, center_world) <= gap;
-    let after_y_ok =
-        after_y.hit && distance(after_y.world_position, center_world) <= gap;
-
-    var tangent_x = vec3f(0.0);
-    var has_x = false;
-    if (before_x_ok && after_x_ok) {
-        tangent_x = after_x.world_position - before_x.world_position;
-        has_x = true;
-    } else if (after_x_ok) {
-        tangent_x = after_x.world_position - center_world;
-        has_x = true;
-    } else if (before_x_ok) {
-        tangent_x = center_world - before_x.world_position;
-        has_x = true;
-    }
-
-    var tangent_y = vec3f(0.0);
-    var has_y = false;
-    if (before_y_ok && after_y_ok) {
-        tangent_y = after_y.world_position - before_y.world_position;
-        has_y = true;
-    } else if (after_y_ok) {
-        tangent_y = after_y.world_position - center_world;
-        has_y = true;
-    } else if (before_y_ok) {
-        tangent_y = center_world - before_y.world_position;
-        has_y = true;
-    }
-
-    if (has_x && has_y) {
-        let normal = cross(tangent_x, tangent_y);
-        if (length(normal) > 1.0e-12) {
-            return DepthNormal(normalize(normal), true);
-        }
-    }
-    return DepthNormal(vec3f(0.0), false);
+    return (r0 * g.x + r1 * g.y + r2 * g.z) / determinant;
 }
 
 struct ShadedFragment {
