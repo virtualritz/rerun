@@ -44,6 +44,19 @@ pub mod mesh_vertices {
     }
 }
 
+/// The extra usage a vertex or index buffer needs when a ray tracer builds its
+/// acceleration structures straight from it.
+///
+/// `bevy_solari` builds a BLAS from the display mesh, and wgpu only accepts a
+/// buffer for that if it was created with `BLAS_INPUT`. It sits behind a fork
+/// feature because creating such a buffer needs a device with the ray-tracing
+/// features, which a build that never raytraces need not have.
+const RAYTRACING_BUFFER_USAGES: wgpu::BufferUsages = if cfg!(feature = "blas_input") {
+    wgpu::BufferUsages::BLAS_INPUT
+} else {
+    wgpu::BufferUsages::empty()
+};
+
 #[derive(Clone)]
 pub struct CpuMesh {
     pub label: Label,
@@ -601,7 +614,8 @@ impl GpuMesh {
                     // (SPEC-100 T020).
                     usage: wgpu::BufferUsages::VERTEX
                         | wgpu::BufferUsages::STORAGE
-                        | wgpu::BufferUsages::COPY_DST,
+                        | wgpu::BufferUsages::COPY_DST
+                        | RAYTRACING_BUFFER_USAGES,
                     mapped_at_creation: false,
                 },
             );
@@ -635,7 +649,8 @@ impl GpuMesh {
                     // itself rather than relying on the index-buffer stage.
                     usage: wgpu::BufferUsages::INDEX
                         | wgpu::BufferUsages::STORAGE
-                        | wgpu::BufferUsages::COPY_DST,
+                        | wgpu::BufferUsages::COPY_DST
+                        | RAYTRACING_BUFFER_USAGES,
                     mapped_at_creation: false,
                 },
             );

@@ -56,6 +56,16 @@ import-stl = ["dep:stl_io"]
 ## longer needed -- upstream's video module dropped it.
 video = ["dep:re_video"]
 
+## Add `BufferUsages::BLAS_INPUT` to the vertex and index buffers a `GpuMesh`
+## owns, so a ray tracer can build its acceleration structures straight from the
+## display mesh instead of reading it back through the CPU.
+##
+## FORK DIVERGENCE: off by default, because creating a buffer with that usage
+## needs a device carrying the ray-tracing features and a build that never
+## raytraces should not require them. akatela turns it on only for
+## `solari-render`.
+blas_input = []
+
 [dependencies]
 re_byte_size = { workspace = true, features = ["macaw"] }
 re_error.workspace = true
