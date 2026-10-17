@@ -1226,7 +1226,8 @@ mod tests {
             };
             let mut view =
                 ViewBuilder::new(ctx, config, super::ViewBuilderId::new(0)).expect("view builds");
-            view.queue_draw(ctx, draw_data);
+            view.queue_draw(ctx, draw_data)
+                .expect("draw should queue");
             let draw = view.draw(ctx, crate::Rgba::BLACK).expect("view draws");
 
             let occlusion = &view

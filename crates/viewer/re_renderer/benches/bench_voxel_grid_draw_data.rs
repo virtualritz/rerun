@@ -10,7 +10,7 @@ use re_renderer::renderer::{
 };
 use re_renderer::{
     Color32, OutlineMaskPreference, PickingLayerId, PickingLayerObjectId, RenderConfig,
-    RenderContext, Rgba32Unmul, UnalignedColor32,
+    RenderContext, Rgba32Unmul, Span, UnalignedColor32,
 };
 use smallvec::smallvec;
 
@@ -126,7 +126,7 @@ fn cube_gpu_mesh(ctx: &RenderContext) -> Arc<GpuMesh> {
                 vertex_positions,
                 materials: smallvec![Material {
                     label: "opaque_material".into(),
-                    index_range: 0..36,
+                    index_range: Span::from_start_end(0, 36),
                     albedo: ctx.texture_manager_2d.white_texture_unorm_handle().clone(),
                     albedo_factor: re_renderer::Rgba::WHITE,
                     use_matcap: false,
@@ -166,6 +166,8 @@ fn mesh_instances(
                 outline_mask_ids: OutlineMaskPreference::NONE,
                 picking_layer_id: PickingLayerId::default(),
                 cull_mode: None,
+                hover_element_id: 0,
+                selection_tint: [0.0; 3],
             }
         })
         .collect();
