@@ -280,7 +280,7 @@ version = "0.38.0-alpha.1+dev"
 dependencies = [
  "anyhow",
  "clap",
- "emath",
+ "emath 0.36.2",
  "rerun",
 ]
 
@@ -3332,8 +3332,17 @@ checksum = "0656a7530b9e2841ee7a5f983965bdd9840c32f4012f759cfd44b912cced6b34"
 dependencies = [
  "bytemuck",
  "color-hex",
- "emath",
+ "emath 0.36.2",
  "serde",
+]
+
+[[package]]
+name = "ecolor"
+version = "0.37.0"
+source = "git+https://github.com/emilk/egui?branch=main#86099aca1276fe786921992c8d5a68914ee79bec"
+dependencies = [
+ "bytemuck",
+ "emath 0.37.0",
 ]
 
 [[package]]
@@ -3390,7 +3399,7 @@ dependencies = [
  "ahash",
  "backtrace",
  "bitflags 2.13.1",
- "emath",
+ "emath 0.36.2",
  "epaint",
  "itertools 0.15.0",
  "log",
@@ -3587,7 +3596,7 @@ checksum = "90f3711a5032bb65a41011b23fcdc6c4bb599757b82cc0181d41e7d1de16986a"
 dependencies = [
  "ahash",
  "egui",
- "emath",
+ "emath 0.36.2",
 ]
 
 [[package]]
@@ -3648,6 +3657,11 @@ dependencies = [
  "bytemuck",
  "serde",
 ]
+
+[[package]]
+name = "emath"
+version = "0.37.0"
+source = "git+https://github.com/emilk/egui?branch=main#86099aca1276fe786921992c8d5a68914ee79bec"
 
 [[package]]
 name = "encode_unicode"
@@ -3761,8 +3775,8 @@ checksum = "a0ec0308dc23130fc1a7d4623a8534c2ed069c6dc84e258ee4f3de99615aa1a3"
 dependencies = [
  "ahash",
  "bytemuck",
- "ecolor",
- "emath",
+ "ecolor 0.36.2",
+ "emath 0.36.2",
  "epaint_default_fonts",
  "font-types",
  "harfrust",
@@ -6348,7 +6362,7 @@ version = "0.38.0-alpha.1+dev"
 dependencies = [
  "anyhow",
  "clap",
- "emath",
+ "emath 0.36.2",
  "glam 0.33.7",
  "itertools 0.15.0",
  "rand 0.9.5",
@@ -8980,7 +8994,7 @@ name = "re_byte_size"
 version = "0.38.0-alpha.1+dev"
 dependencies = [
  "arrow",
- "ecolor",
+ "ecolor 0.37.0",
  "egui",
  "glam 0.33.7",
  "half",
@@ -9432,7 +9446,7 @@ dependencies = [
  "anyhow",
  "arrow",
  "document-features",
- "emath",
+ "emath 0.36.2",
  "indexmap 2.14.0",
  "insta",
  "itertools 0.15.0",
@@ -10304,7 +10318,7 @@ dependencies = [
  "crossbeam",
  "dae-parser",
  "document-features",
- "ecolor",
+ "ecolor 0.37.0",
  "enumset",
  "getrandom 0.3.4",
  "glam 0.33.7",
@@ -10445,9 +10459,9 @@ dependencies = [
  "arrow",
  "bytemuck",
  "document-features",
- "ecolor",
+ "ecolor 0.37.0",
  "egui_plot",
- "emath",
+ "emath 0.36.2",
  "glam 0.33.7",
  "half",
  "image",
@@ -11326,7 +11340,7 @@ dependencies = [
  "egui_kittest",
  "egui_plot",
  "ehttp",
- "emath",
+ "emath 0.36.2",
  "futures",
  "glam 0.33.7",
  "image",
@@ -11439,7 +11453,7 @@ dependencies = [
  "egui-wgpu",
  "egui_kittest",
  "egui_tiles",
- "emath",
+ "emath 0.36.2",
  "glam 0.33.7",
  "half",
  "image",
