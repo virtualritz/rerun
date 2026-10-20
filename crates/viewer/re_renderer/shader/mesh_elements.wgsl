@@ -37,6 +37,10 @@ struct ElementStyle {
     edge_ids_offset: u32,
     topology_ids_offset: u32,
     _padding: u32,
+
+    // The mesh is drawn from its resident buffers, without the mesh pass's
+    // per-instance transform, so the placement rides here.
+    world_from_mesh: mat4x4f,
 };
 
 @group(1) @binding(0) var<storage, read> indices: array<u32>;
@@ -95,8 +99,9 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
     var out: VertexOut;
 
     let index = indices[vertex_index];
-    out.clip_position =
-        frame.projection_from_world * vec4f(position_at(index), 1.0);
+    out.clip_position = frame.projection_from_world
+        * style.world_from_mesh
+        * vec4f(position_at(index), 1.0);
 
     out.barycentric = vec3f(
         f32(corner == 0u),

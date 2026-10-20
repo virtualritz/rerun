@@ -41,6 +41,11 @@ struct ElementStyleUniform {
     edge_ids_offset: u32,
     topology_ids_offset: u32,
     _padding: u32,
+
+    /// Placement of the mesh in world space. The pass draws the resident
+    /// buffers directly, so unlike the mesh pass -- which receives a
+    /// per-instance transform -- it has to carry the placement itself.
+    world_from_mesh: [[f32; 4]; 4],
 }
 
 /// What one mesh contributes to the pass.
@@ -95,6 +100,9 @@ pub struct MeshElementStyle {
     /// Encoded id of the hovered element, or 0. Compared per fragment, so
     /// hovering costs nothing beyond a uniform write.
     pub hover_element_id: u32,
+
+    /// Placement of the mesh in world space, column-major.
+    pub world_from_mesh: [[f32; 4]; 4],
 }
 
 impl MeshElementDrawData {
@@ -130,6 +138,7 @@ impl MeshElementDrawData {
                         mesh.vertex_buffer_topology_ids_range.start,
                     ),
                     _padding: 0,
+                    world_from_mesh: style.world_from_mesh,
                 };
                 let style_buffer = ctx.gpu_resources.buffers.alloc(
                     &ctx.device,
