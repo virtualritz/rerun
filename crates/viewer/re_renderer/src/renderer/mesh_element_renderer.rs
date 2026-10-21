@@ -59,6 +59,10 @@ pub struct MeshElementBatch {
 #[derive(Clone)]
 pub struct MeshElementDrawData {
     batches: std::sync::Arc<Vec<MeshElementBatch>>,
+    /// Draw only into the picking layer. An id pass still exposes a colour
+    /// target, but nothing reads it; repeating the vertex pull and edge
+    /// rasterization for it doubles the pass for no pixels.
+    picking_only: bool,
 }
 
 impl DrawData for MeshElementDrawData {
@@ -74,16 +78,17 @@ impl DrawData for MeshElementDrawData {
         }
         // Transparent: edges sit on top of the shaded surface, and stroking
         // discards everywhere else, so depth-writing them would punch holes.
-        for phase in [DrawPhase::Transparent, DrawPhase::PickingLayer] {
-            collector.add_drawable(
-                phase,
-                DrawDataDrawable {
-                    distance_sort_key: 0.0,
-                    secondary_sort_key: 0.0,
-                    draw_data_payload: 0,
-                },
-            );
+        // Picking-only data skips the colour phase: nobody reads that target
+        // on an id pass.
+        let drawable = DrawDataDrawable {
+            distance_sort_key: 0.0,
+            secondary_sort_key: 0.0,
+            draw_data_payload: 0,
+        };
+        if !self.picking_only {
+            collector.add_drawable(DrawPhase::Transparent, drawable);
         }
+        collector.add_drawable(DrawPhase::PickingLayer, drawable);
     }
 }
 
@@ -110,6 +115,18 @@ impl MeshElementDrawData {
         ctx: &RenderContext,
         meshes: impl IntoIterator<Item = (std::sync::Arc<crate::mesh::GpuMesh>, MeshElementStyle)>,
     ) -> Self {
+        Self::new_with_picking_only(ctx, meshes, false)
+    }
+
+    /// Build draw data that writes the picking layer only.
+    ///
+    /// Use this from an id-buffer pass: the pass is not composited, so its
+    /// colour target is dead work.
+    pub fn new_with_picking_only(
+        ctx: &RenderContext,
+        meshes: impl IntoIterator<Item = (std::sync::Arc<crate::mesh::GpuMesh>, MeshElementStyle)>,
+        picking_only: bool,
+    ) -> Self {
         // Upstream made `renderer::<T>()` fallible (explicit registration).
         // This constructor returns `Self`, so an unregistered renderer yields
         // draw data with no batches -- it draws nothing rather than taking the
@@ -118,6 +135,7 @@ impl MeshElementDrawData {
         let Ok(renderer_ok) = ctx.renderer::<MeshElementRenderer>() else {
             return Self {
                 batches: std::sync::Arc::new(Vec::new()),
+                picking_only,
             };
         };
 
@@ -198,6 +216,7 @@ impl MeshElementDrawData {
 
         Self {
             batches: std::sync::Arc::new(batches),
+            picking_only,
         }
     }
 }
