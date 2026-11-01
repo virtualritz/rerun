@@ -592,7 +592,11 @@ impl ViewBuilder {
                     // If MSAA is enabled, we don't read this texture ourselves as it is only used for resolve.
                     wgpu::TextureUsages::RENDER_ATTACHMENT
                 } else {
-                    wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+                    // Without MSAA this IS the resolved target, so it carries
+                    // `COPY_SRC` for the same reason (see below).
+                    wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC
                 },
             },
         );
@@ -609,8 +613,14 @@ impl ViewBuilder {
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: Self::MAIN_TARGET_COLOR_FORMAT,
+                    // `COPY_SRC` is for `say`: a caller that reads the view
+                    // back (`ViewBuilder::resolved_color_target` +
+                    // `schedule_read_texture`). It costs nothing on a pooled
+                    // texture and is the difference between a still and a
+                    // validation error.
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                        | wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC,
                 },
             )
         } else {
