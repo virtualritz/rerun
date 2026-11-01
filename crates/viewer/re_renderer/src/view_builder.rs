@@ -886,6 +886,18 @@ impl ViewBuilder {
         self.setup.resolution_in_pixel
     }
 
+    /// The view's colour target with MSAA resolved, for a direct readback.
+    ///
+    /// [`Self::schedule_screenshot`] is the usual way out, but it composites
+    /// through `composite.wgsl`, and that shader's `BlendWithBackground::No`
+    /// branch overwrites alpha with one. A caller that needs the view's own
+    /// alpha -- a still to be composited over an unknown background, say --
+    /// reads this texture instead, through
+    /// [`crate::schedule_read_texture`].
+    pub fn resolved_color_target(&self) -> &wgpu::Texture {
+        &self.setup.main_target_resolved.texture
+    }
+
     pub fn queue_draw(
         &mut self,
         ctx: &RenderContext,
