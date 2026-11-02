@@ -56,7 +56,10 @@ pub fn schedule_read_texture(
     );
 
     readback_buffer.read_texture2d(
-        ctx.active_frame.before_view_builder_encoder.lock().get(),
+        ctx.active_frame
+            .before_view_builder_encoder
+            .lock()
+            .get_or_create(&ctx.device),
         wgpu::TexelCopyTextureInfo {
             texture,
             mip_level: 0,

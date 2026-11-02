@@ -497,6 +497,17 @@ impl FrameGlobalCommandEncoder {
             .as_mut()
             .expect("Frame global encoder can't be accessed outside of a frame!")
     }
+
+    /// Gets the global encoder for a frame, creating a fresh one if the frame's
+    /// earlier encoder was [`Self::take`]n and already submitted.
+    ///
+    /// Only valid within a frame.
+    pub fn get_or_create(&mut self, device: &wgpu::Device) -> &mut wgpu::CommandEncoder {
+        if self.0.is_none() {
+            *self = Self::new(device);
+        }
+        self.get()
+    }
 }
 
 impl Drop for FrameGlobalCommandEncoder {
