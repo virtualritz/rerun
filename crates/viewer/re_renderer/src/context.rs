@@ -469,6 +469,18 @@ This means, either a call to RenderContext::before_submit was omitted, or the pr
 pub struct FrameGlobalCommandEncoder(Option<wgpu::CommandEncoder>);
 
 impl FrameGlobalCommandEncoder {
+    /// Take the encoder out of this frame, for a caller that has to submit it
+    /// before the frame ends.
+    ///
+    /// A view whose draws are submitted mid-frame -- rather than by the host's
+    /// paint callback at the end of it -- reads the uniforms and instance data
+    /// this encoder uploads. Submitting that work first is the difference
+    /// between drawing with the frame's camera and drawing with the previous
+    /// frame's.
+    pub fn take(&mut self) -> Option<wgpu::CommandEncoder> {
+        self.0.take()
+    }
+
     fn new(device: &wgpu::Device) -> Self {
         Self(Some(device.create_command_encoder(
             &wgpu::CommandEncoderDescriptor {
